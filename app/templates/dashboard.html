@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}拓扑监控{% endblock %}
+{% block content %}
+{% if error %}<div class="msg err">管理库暂不可用：{{ error }}（不影响业务，keepalived 已安全降级）</div>{% endif %}
+
+<div class="card">
+  <h2>集群拓扑</h2>
+  <table>
+    <tr><th>主机</th><th>角色</th><th>状态</th><th>复制延迟(s)</th><th>IO/SQL</th><th>最近探测</th><th>操作</th></tr>
+    {% for h in hosts %}
+    <tr class="{% if h.is_current_master %}master{% endif %}">
+      <td>{{ h.host }}:{{ h.port }}{% if h.is_current_master %} <span class="tag" style="background:#1a7f37;color:#fff">当前主</span>{% endif %}</td>
+      <td>{{ h.role }}{% if (h.initial_role or 'slave') == 'master' %} <span class="tag" style="background:#8250df;color:#fff">初始主</span>{% endif %}</td>
+      <td class="{% if h.status=='up' %}up{% else %}down{% endif %}">{{ h.status }}{% if h.status!='up' and h.err %} <span style="font-size:11px;color:#b42318" title="{{ h.err }}">{{ h.err }}</span>{% endif %}</td>
+      <td>{{ h.repl_delay if h.repl_delay is not none else '-' }}</td>
+      <td>{{ h.slave_io }}/{{ h.slave_sql }}</td>
+      <td>{{ h.last_seen }}</td>
+      <td>
+        {% if h.is_current_master %}
+          <span class="tag" style="background:#1a7f37;color:#fff">当前主</span>
+        {% elif h.status == 'up' %}
+          <button class="btn small" onclick="promoteTo('{{ h.host }}', {{ h.port }})">设为主库</button>
+        {% else %}
+          <span style="color:#b42318">离线</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7">尚未添加任何节点，请到「节点配置」添加节点。</td></tr>
+    {% endfor %}
+  </table>
+  <div style="margin-top:14px">
+    <button class="btn danger small" onclick="manualFailover()">自动切换(选延迟最小从库)</button>
+    <button class="btn small" onclick="location.reload()">刷新</button>
+    <span id="tip" style="margin-left:10px;color:#555"></span>
+  </div>
+  <p class="hint">提示：每行「设为主库」可手动指定任意在线节点提升为主库（其余节点自动重指向它）；「自动切换」则自动挑选复制延迟最小的从库。</p>
+</div>
+
+<div class="card">
+  <h2>切换历史</h2>
+  <table>
+    <tr><th>时间</th><th>原主</th><th>新主</th><th>原因</th></tr>
+    {% for r in history %}
+    <tr><td>{{ r.created_at }}</td><td>{{ r.from_host }}:{{ r.from_port }}</td>
+        <td>{{ r.to_host }}:{{ r.to_port }}</td><td>{{ r.reason }}</td></tr>
+    {% else %}
+    <tr><td colspan="4">无切换记录</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<script>
+function manualFailover(){
+  if(!confirm('确认手动切换主库？将提升延迟最小的从库为新主。')) return;
+  document.getElementById('tip').textContent='切换中...';
+  fetch('/api/failover',{method:'POST'}).then(r=>r.json()).then(d=>{
+    document.getElementById('tip').textContent=d.msg;
+    setTimeout(()=>location.reload(),1500);
+  });
+}
+function promoteTo(host, port){
+  if(!confirm('确认将 '+host+':'+port+' 设为主库？其余在线节点将重指向它。')) return;
+  document.getElementById('tip').textContent='设置中...';
+  const fd=new FormData(); fd.append('host', host); fd.append('port', port);
+  fetch('/api/failover/to',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
+    document.getElementById('tip').textContent=d.msg;
+    setTimeout(()=>location.reload(),1500);
+  });
+}
+setTimeout(()=>location.reload(),15000); // 每15秒自动刷新
+</script>
+{% endblock %}

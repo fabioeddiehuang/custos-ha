@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}节点配置{% endblock %}
+{% block content %}
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
+{% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+<div class="card">
+  <h2>添加节点（生成一键部署文件）</h2>
+  <p class="hint">
+    <b>节点配置 = 节点列表 + 节点添加，合并在本页。</b>
+    ha_monitor 账号、复制账号与 VIP 已在「服务端配置」中设置，添加节点时由系统
+    <b>自动套用</b>并写入生成的部署文件；节点 MySQL 的 root 账号即为本节点初始化用的
+    高权账号（仅用于首次启动 init.sql 创建 ha_monitor，之后可保留或回收，无需在管理端单独维护）。
+  </p>
+  <form method="post" action="/nodes/add">
+    <label>节点 IP（业务/管理可达的真实主机 IP）</label>
+    <input name="ip" placeholder="如 192.168.1.203">
+    <label>节点 MySQL 端口（容器外映射端口，如 3307；VIP 经此端口路由）</label>
+    <input name="port" value="3307">
+    <label>节点 MySQL root 账号</label>
+    <input name="root_user" value="root">
+    <label>节点 MySQL root 密码（将写入生成的 compose，请妥善保管）</label>
+    <input name="root_pass" type="password" placeholder="节点 MySQL root 密码">
+    <label>初始角色</label>
+    <select name="initial_role">
+      <option value="slave" selected>从库（默认）</option>
+      <option value="master">主库（VIP 优先在此节点绑定）</option>
+    </select>
+    <p style="color:#777;font-size:12px">生成后会自动在 <code>mysql-ha-manager/generated_nodes/&lt;ip&gt;/</code> 下产出自包含的部署单元（docker-compose.yaml、init.sql、keepalived/ 配置，MySQL 数据落在目录内 ./MySQL-data）；把该目录整体拷到目标主机 <code>/home/docker/&lt;ip&gt;/</code> 执行 <code>docker compose up -d</code> 即完成节点安装与基础配置（含 ha_monitor、GTID、VIP 漂移）。选「主库」仅决定集群首次启动时由哪个节点优先接管 VIP，后续仍可由监控自动切换。</p>
+    <div style="margin-top:12px"><button class="btn" type="submit">生成节点部署文件</button></div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>已生成节点</h2>
+  <table>
+    <tr><th>IP</th><th>端口</th><th>server_id</th><th>部署目录</th><th>操作</th></tr>
+    {% for n in nodes %}
+    <tr>
+      <td>{{ n.ip }}</td>
+      <td>{{ n.port }}</td>
+      <td>{{ n.server_id }}</td>
+      <td><code>{{ n.compose_path }}</code></td>
+      <td>
+        <form method="post" action="/nodes/delete" style="display:inline" onsubmit="return confirm('确认删除该节点记录？不会删除目标主机上的容器。')">
+          <input type="hidden" name="ip" value="{{ n.ip }}">
+          <button class="btn danger small" type="submit">删除</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5">尚未生成任何节点。请在上方添加。</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

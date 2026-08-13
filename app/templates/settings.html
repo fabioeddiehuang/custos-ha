@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}服务端配置{% endblock %}
+{% block content %}
+<h2 class="page-title">服务端配置</h2>
+<p class="hint">
+  按以下顺序完成服务端配置。本页只配置<strong>管理端自身</strong>的账号与网络；
+  数据库节点请到「节点配置」添加，添加时系统会<strong>自动套用</strong>这里的
+  ha_monitor 账号、复制账号与 VIP 生成节点部署文件，无需手动维护「临时高权账号」。
+</p>
+
+{% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
+{% if generated %}
+<div class="msg">
+  <b>以下凭证由系统自动生成，请妥善保存（再次保存时若对应字段留空，将沿用已保存值，不会重新生成）：</b>
+  <ul class="kv">
+    {% for k, v in generated %}<li>{{ k }}：<code>{{ v }}</code></li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<form method="post" action="/settings">
+  <div class="card">
+    <h3>第一步 · 管理账号（ha_monitor）</h3>
+    <p class="hint">监控探活与故障切换使用的专用账号；密码留空则系统自动生成并保存。</p>
+    <label>账号名</label>
+    <input name="ha_user" value="{{ cfg.ha_user or 'ha_monitor' }}">
+    <label>密码（留空 = 自动生成；已保存值会保留）</label>
+    <div class="pw-row">
+      <input class="pw" name="ha_pass" type="password" placeholder="留空则自动生成" value="{{ cfg.ha_pass or '' }}">
+      <button type="button" class="btn small pw-toggle" data-target="ha_pass">显示</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>第二步 · 复制账号（replication）</h3>
+    <p class="hint">主从复制使用的账号；密码留空则系统自动生成并保存。</p>
+    <label>账号名</label>
+    <input name="repl_user" value="{{ cfg.repl_user or 'repl' }}">
+    <label>密码（留空 = 自动生成；已保存值会保留）</label>
+    <div class="pw-row">
+      <input class="pw" name="repl_pass" type="password" placeholder="留空则自动生成" value="{{ cfg.repl_pass or '' }}">
+      <button type="button" class="btn small pw-toggle" data-target="repl_pass">显示</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>业务账号（app，供测试/应用连接 VIP）</h3>
+    <p class="hint">
+      已随「添加节点」自动创建在<strong>每个节点</strong>的 MySQL 中（<code>app@'%'</code>，
+      仅授予常用读写权限，不含 SUPER/REPLICATION 等运维权限）。测试项目请使用以下信息连接 VIP：
+    </p>
+    <ul class="kv">
+      <li>主机：<code>{{ cfg.vip or '(请先填写第三步 VIP)' }}</code>（VIP）</li>
+      <li>端口：<code>3307</code></li>
+      <li>账号：<code>{{ cfg.app_user or 'app' }}</code></li>
+      <li>密码：<code>{{ cfg.app_pass or '(保存配置后自动生成)' }}</code></li>
+    </ul>
+    <p class="hint" style="color:#b00">
+      注意：该账号在「节点首次初始化」时写入；若节点已初始化后再改密码，需到节点执行
+      <code>ALTER USER '{{ cfg.app_user or 'app' }}'@'%' IDENTIFIED BY '...'</code> 同步。
+    </p>
+  </div>
+
+  <div class="card">
+    <h3>第三步 · VIP / 网卡 / VRID</h3>
+    <p class="hint">
+      供「节点配置 → 添加节点」生成 keepalived 使用。
+      <b>VIP 为必填项</b>（需为节点同网段、当前空闲的 IP，系统无法自动探测）；
+      网卡与 VRID 留空将由系统填入默认值（eth0 / 51）。
+    </p>
+    <label>VIP（必填，节点同网段空闲 IP）</label>
+    <input name="vip" value="{{ cfg.vip or '' }}" placeholder="如 192.168.1.10">
+    <label>网卡（留空默认 eth0）</label>
+    <input name="interface" value="{{ cfg.interface or 'eth0' }}">
+    <label>VRID（留空默认 51）</label>
+    <input name="vrid" value="{{ cfg.vrid or '51' }}">
+  </div>
+
+  <div class="card">
+    <h3>第四步 · 邮件告警（可选）</h3>
+    <p class="hint">不配置则故障切换时不发送邮件告警。</p>
+    <label>SMTP 服务器</label>
+    <input name="smtp_host" value="{{ cfg.smtp_host or '' }}">
+    <label>端口</label>
+    <input name="smtp_port" value="{{ cfg.smtp_port or '' }}">
+    <label>发件账号</label>
+    <input name="smtp_user" value="{{ cfg.smtp_user or '' }}">
+    <label>发件密码（留空则不修改已保存值）</label>
+    <div class="pw-row">
+      <input class="pw" name="smtp_pass" type="password" placeholder="留空则不修改" value="">
+      <button type="button" class="btn small pw-toggle" data-target="smtp_pass">显示</button>
+    </div>
+    <label>接收邮箱（多个用逗号分隔）</label>
+    <input name="alert_email" value="{{ cfg.alert_email or '' }}">
+  </div>
+
+  <div class="card">
+    <button class="btn" type="submit">保存服务端配置</button>
+  </div>
+</form>
+
+<div class="card">
+  <h3>第五步 · 管理员密码修改</h3>
+  <form method="post" action="/change_password">
+    <label>当前密码</label>
+    <input type="password" name="current_password">
+    <label>新密码</label>
+    <input type="password" name="new_password">
+    <div style="margin-top:12px"><button class="btn" type="submit">修改密码</button></div>
+  </form>
+</div>
+
+<p class="hint">
+  <b>查看当前已保存密码：</b>点击各密码框右侧「显示」按钮即可明文查看当前
+  ha_monitor、replication 与邮件发件密码（这些密码保存在管理库，复制节点部署文件时会原样写入节点）。
+</p>
+
+<style>
+  .pw-row{display:flex;gap:8px;align-items:center}
+  .pw-row .pw{flex:1}
+  .pw-toggle{white-space:nowrap;flex:none}
+</style>
+<script>
+  document.querySelectorAll('.pw-toggle').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var el = document.querySelector('input[name="' + btn.dataset.target + '"]');
+      if (!el) return;
+      if (el.type === 'password') { el.type = 'text'; btn.textContent = '隐藏'; }
+      else { el.type = 'password'; btn.textContent = '显示'; }
+    });
+  });
+</script>
+{% endblock %}
