@@ -1,138 +1,274 @@
 {% extends "base.html" %}
-{% block title %}集群管理 · MySQL HA 管理器{% endblock %}
+{% macro cred_row(label, name, value, is_pw=false) %}
+<div class="cred-row">
+  <span class="k">{{ label }}</span>
+  <div class="cred-ctl">
+    <input class="inp {{ 'pw' if is_pw else '' }}" type="{{ 'password' if is_pw else 'text' }}"
+           name="{{ name }}" value="{{ value or '' }}" placeholder="留空则不修改">
+    <button type="button" class="btn-ico" title="显示/隐藏" onclick="togglePw(this)">👁</button>
+    <button type="button" class="btn-ico" title="复制" onclick="copyWithFeedback(this)">⧉</button>
+  </div>
+</div>
+{% endmacro %}
+{% block title %}集群管理{% endblock %}
 {% block content %}
-<style>
-  .clusters-layout { display:grid; grid-template-columns: 1fr 360px; gap:18px; align-items:start; }
-  @media (max-width: 980px) { .clusters-layout { grid-template-columns:1fr; } }
-  .cluster-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:16px; }
-  .ccard { background:#fff; border:1px solid #eef0f4; border-radius:14px; padding:16px; box-shadow:0 4px 14px rgba(17,24,39,.05); }
-  .ccard h3 { margin:0 0 6px; font-size:18px; display:flex; align-items:center; gap:8px; }
-  .ccard .meta { font-size:13px; color:#6b7280; margin-bottom:12px; }
-  .ccard .meta b { color:#1f2937; }
-  .creds { display:grid; gap:8px; margin:10px 0; }
-  .cred-row { display:flex; align-items:center; gap:8px; }
-  .cred-row .k { width:120px; color:#6b7280; font-size:13px; flex:none; }
-  .cred-row input { flex:1; }
-  .cred-row .btn { flex:none; }
-  .ccard .actions { display:flex; gap:8px; margin-top:10px; }
-  .new-cluster { position:sticky; top:14px; }
-  .copied { background:#16d39a !important; border-color:#16d39a !important; color:#fff !important; }
-  .edit-form { margin-top:12px; border-top:1px dashed #e5e7eb; padding-top:12px; display:none; }
-  .edit-form.show { display:block; }
-  .small-toggle { font-size:13px; color:#6b7280; display:inline-flex; align-items:center; gap:6px; cursor:pointer; }
-</style>
+<div class="page-head">
+  <h1>集群管理</h1>
+  <p class="muted">每个集群独立管理账号、复制账号与 VIP；切换与监控按集群隔离。</p>
+</div>
 
-<h1>集群管理</h1>
-<p class="muted">集群是 HA 的最小隔离单元：每个集群拥有独立的账号、VIP 与切换逻辑。新建集群请使用右侧表单；已有集群可直接查看账号 / 编辑 / 删除。</p>
+{% if msg %}<div class="banner ok">{{ msg }}</div>{% endif %}
+{% if error %}<div class="banner err">{{ error }}</div>{% endif %}
 
-<label class="small-toggle" style="margin-bottom:12px;">
-  <input type="checkbox" id="showPw" onchange="togglePw()"> 显示全部密码
-</label>
+<!-- 新建集群（默认收起） -->
+<div class="panel">
+  <button type="button" class="panel-toggle" onclick="togglePanel(this)">＋ 新建集群</button>
+  <div class="panel-body" style="display:none">
+    <form method="post" action="/clusters" class="grid-2">
+      <label>集群名称<input class="inp" name="name" placeholder="如 prod-bj" required></label>
+      <label>VIP 地址<input class="inp" name="vip" placeholder="192.168.1.10"></label>
+      <label>VIP 掩码位<input class="inp" name="vip_prefix" value="24" placeholder="24">
+        <span class="hint">keepalived 虚拟 IP 的子网掩码位（如 24）</span></label>
+      <label>网卡<input class="inp" name="interface" placeholder="eth0"></label>
+      <label>VRID<input class="inp" name="vrid" placeholder="51"></label>
+      <label>HA 监控账号<input class="inp" name="ha_user" placeholder="ha_monitor"></label>
+      <label>HA 监控密码<input class="inp pw" type="password" name="ha_pass" placeholder="留空则自动生成"></label>
+      <label>复制账号<input class="inp" name="repl_user" placeholder="replication"></label>
+      <label>复制密码<input class="inp pw" type="password" name="repl_pass" placeholder="留空则自动生成"></label>
+      <label>业务账号<input class="inp" name="app_user" placeholder="app"></label>
+      <label>业务密码<input class="inp pw" type="password" name="app_pass" placeholder="留空则自动生成"></label>
+      <div class="form-foot"><button class="btn" type="submit">创建集群</button></div>
+    </form>
+  </div>
+</div>
 
-{% if error %}<div class="banner err">⚠ <div>{{ error }}</div></div>{% endif %}
-{% if msg %}<div class="banner ok">✓ <div>{{ msg }}</div></div>{% endif %}
-
-<div class="clusters-layout">
-  <!-- 已有集群 -->
-  <div>
-    <h3 style="margin:0 0 12px;">已有集群（{{ clusters|length }}）</h3>
-    <div class="cluster-grid">
-      {% for c in clusters %}
-      <div class="ccard" data-cid="{{ c.id }}">
-        <h3>{{ c.name }} <span class="badge" style="background:#eef2ff;color:#7c3aed;">#{{ c.id }}</span></h3>
-        <div class="meta">
-          节点 <b>{{ c.node_count }}</b> · 当前主 <b>{{ c.current_master }}</b><br>
-          VIP <b>{{ c.vip }}</b> · VRID <b>{{ c.vrid }}</b> · 网卡 <b>{{ c.interface }}</b>
-        </div>
-
-        {% set cr = c.creds %}
-        <div class="creds">
-          <div class="cred-row"><span class="k">HA 监控用户</span><input class="cpw" readonly value="{{ cr.ha_user }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.ha_user }}')">复制</button></div>
-          <div class="cred-row"><span class="k">HA 监控密码</span><input class="cpw pw" readonly value="{{ cr.ha_pass }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.ha_pass }}')">复制</button></div>
-          <div class="cred-row"><span class="k">复制用户</span><input class="cpw" readonly value="{{ cr.repl_user }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.repl_user }}')">复制</button></div>
-          <div class="cred-row"><span class="k">复制密码</span><input class="cpw pw" readonly value="{{ cr.repl_pass }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.repl_pass }}')">复制</button></div>
-          <div class="cred-row"><span class="k">业务用户</span><input class="cpw" readonly value="{{ cr.app_user }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.app_user }}')">复制</button></div>
-          <div class="cred-row"><span class="k">业务密码</span><input class="cpw pw" readonly value="{{ cr.app_pass }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.app_pass }}')">复制</button></div>
-          <div class="cred-row"><span class="k">VIP 地址</span><input class="cpw" readonly value="{{ c.vip }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ c.vip }}')">复制</button></div>
-        </div>
-
-        <div class="actions">
-          <button class="btn btn-sm btn-accent" onclick="toggleEdit({{ c.id }})">编辑</button>
-          <button class="btn btn-sm btn-danger" onclick="delCluster({{ c.id }}, '{{ c.name }}')">删除</button>
-        </div>
-
-        <!-- 编辑表单（内联展开） -->
-        <form class="edit-form" id="edit-{{ c.id }}" method="post" action="/clusters/{{ c.id }}">
-          <div class="grid2" style="gap:10px;">
-            <label>集群名称<input name="name" value="{{ c.name }}"></label>
-            <label>VIP 地址<input name="vip" value="{{ c.vip }}"></label>
-            <label>VIP 前缀<input name="vip_prefix" value="{{ c.vip_prefix }}"></label>
-            <label>VRID<input name="vrid" value="{{ c.vrid }}"></label>
-            <label>网卡<input name="interface" value="{{ c.interface }}"></label>
-            <label>HA 用户<input name="ha_user" value="{{ cr.ha_user }}"></label>
-            <label>HA 密码<input name="ha_pass" type="password" value="{{ cr.ha_pass }}"></label>
-            <label>复制用户<input name="repl_user" value="{{ cr.repl_user }}"></label>
-            <label>复制密码<input name="repl_pass" type="password" value="{{ cr.repl_pass }}"></label>
-            <label>业务用户<input name="app_user" value="{{ cr.app_user }}"></label>
-            <label>业务密码<input name="app_pass" type="password" value="{{ cr.app_pass }}"></label>
+<!-- 已有集群（默认收起） -->
+<div class="panel">
+  <button type="button" class="panel-toggle" onclick="togglePanel(this)">▾ 已有集群（{{ clusters|length }}）</button>
+  <div class="panel-body cluster-grid" style="display:none">
+    {% for c in clusters %}
+    {% set cr = c.creds or {} %}
+    <div class="card cluster-card cc-theme-{{ loop.index0 % 6 }} {{ 'ok' if c.online == c.node_count else 'issue' }}" id="card{{ c.id }}">
+      <div class="cc-top">
+        <div class="cc-id">
+          <span class="cc-ico" title="集群" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <ellipse cx="12" cy="5" rx="8" ry="3"/>
+              <path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/>
+              <path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/>
+            </svg>
+          </span>
+          <div class="cc-id-text">
+            <div class="cluster-name">{{ c.name }}</div>
+            <div class="cc-sub">集群 #{{ c.id }}</div>
           </div>
-          <div style="display:flex;gap:8px;margin-top:10px;">
-            <button class="btn btn-primary btn-sm" type="submit">保存修改</button>
-            <button class="btn btn-sm" type="button" onclick="toggleEdit({{ c.id }})">取消</button>
+        </div>
+        <div class="cluster-actions head-actions">
+          <span class="status-pill {{ 'green' if c.online == c.node_count else 'amber' }}">{{ '运行正常' if c.online == c.node_count else '存在异常' }}</span>
+          <button type="button" class="btn btn-sm" onclick="toggleEdit('edit{{ c.id }}', this)">编辑</button>
+        </div>
+      </div>
+      <div class="cc-body">
+        <ul class="info-grid">
+          <li class="info-item tier-vip">
+            <span class="ii-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="2" y1="12" x2="22" y2="12"/>
+                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+              </svg>
+            </span>
+            <div class="ii-text">
+              <span class="il">VIP</span>
+              <span class="vip-badge">{{ c.vip or '—' }}</span>
+            </div>
+          </li>
+          <li class="info-item tier-node">
+            <span class="ii-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect width="20" height="8" x="2" y="2" rx="2"/>
+                <rect width="20" height="8" x="2" y="14" rx="2"/>
+                <line x1="6" x2="6.01" y1="6" y2="6"/>
+                <line x1="6" x2="6.01" y1="18" y2="18"/>
+              </svg>
+            </span>
+            <div class="ii-text">
+              <span class="il">节点数</span>
+              <span class="info-num">{{ c.node_count }}</span>
+            </div>
+          </li>
+          <li class="info-item tier-online">
+            <span class="ii-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+              </svg>
+            </span>
+            <div class="ii-text">
+              <span class="il">在线</span>
+              <span class="online-badge {{ 'up' if c.online == c.node_count else 'warn' }}">
+                <span class="dot-mini {{ 'green' if c.online == c.node_count else 'red' }}"></span>
+                {{ c.online }}/{{ c.node_count }}
+              </span>
+            </div>
+          </li>
+          <li class="info-item full tier-master">
+            <span class="ii-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+              </svg>
+            </span>
+            <div class="ii-text">
+              <span class="il">当前主库</span>
+              <span class="role-badge master">{{ c.current_master }}</span>
+            </div>
+          </li>
+          <li class="info-item full tier-slave">
+            <span class="ii-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="18" cy="5" r="3"/>
+                <circle cx="6" cy="12" r="3"/>
+                <circle cx="18" cy="19" r="3"/>
+                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+              </svg>
+            </span>
+            <div class="ii-text">
+              <span class="il">当前从库</span>
+              <span class="role-badge slave">{{ c.slaves|join('、 ') or '—' }}</span>
+            </div>
+          </li>
+        </ul>
+      </div>
+      {% if c.has_issue %}
+      <div class="cluster-anomaly">
+        <button type="button" class="anomaly-toggle" onclick="toggleAnomaly('anom{{ c.id }}', this)">
+          ⚠ 展开异常详情 / 复制日志排错
+        </button>
+        <div id="anom{{ c.id }}" class="anomaly-body" style="display:none">
+          <div class="anomaly-bar">
+            <span class="muted">以下节点存在异常，可复制后提交排错：</span>
+            <button class="btn btn-sm btn-ghost" type="button" onclick="copyAnomaly('anom{{ c.id }}', '{{ c.name }}')">复制异常</button>
+          </div>
+          <div class="anom-scroll">
+            <table class="anom-table">
+              <thead><tr><th>节点</th><th>角色</th><th>状态</th><th>IO</th><th>SQL</th><th>错误</th></tr></thead>
+              <tbody>
+              {% for r in c.host_rows if r.bad %}
+                <tr class="bad-row">
+                  <td class="mono">{{ r.host }}:{{ r.port }}</td>
+                  <td>{{ r.role }}</td>
+                  <td>{{ '在线' if r.status == 'up' else '离线' }}</td>
+                  <td>{{ r.slave_io }}</td>
+                  <td>{{ r.slave_sql }}</td>
+                  <td class="err-cell">{{ r.err or '—' }}</td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+      <div id="edit{{ c.id }}" class="edit-body" style="display:none">
+        <form method="post" action="/clusters/{{ c.id }}" class="cluster-form">
+          <div class="form-grid2">
+            <label>VIP 地址<input class="inp" name="vip" value="{{ c.vip or '' }}"></label>
+            <label>VIP 掩码位<input class="inp" name="vip_prefix" value="{{ c.vip_prefix or '24' }}" placeholder="24"></label>
+            <label>网卡<input class="inp" name="interface" value="{{ c.interface or '' }}"></label>
+            <label>VRID<input class="inp" name="vrid" value="{{ c.vrid or '' }}"></label>
+          </div>
+          <div class="cred-head">
+            <span>访问凭证</span>
+            <button type="button" class="btn btn-sm" onclick="toggleAllPw(this)">显示全部密码</button>
+          </div>
+          {{ cred_row("HA 监控账号", "ha_user", cr.ha_user) }}
+          {{ cred_row("HA 监控密码", "ha_pass", cr.ha_pass, true) }}
+          {{ cred_row("复制账号", "repl_user", cr.repl_user) }}
+          {{ cred_row("复制密码", "repl_pass", cr.repl_pass, true) }}
+          {{ cred_row("业务账号", "app_user", cr.app_user) }}
+          {{ cred_row("业务密码", "app_pass", cr.app_pass, true) }}
+          <div class="edit-actions">
+            <button class="btn" type="submit">保存修改</button>
+            <button type="button" class="btn btn-ghost" onclick="delCluster({{ c.id }})">删除集群</button>
+            <button type="button" class="btn btn-ghost" onclick="syncCreds({{ c.id }})">同步密码到节点</button>
+            <a class="btn btn-ghost" href="/nodes?cluster_id={{ c.id }}">节点部署 →</a>
           </div>
         </form>
       </div>
-      {% endfor %}
     </div>
-    {% if not clusters %}<div class="muted" style="padding:14px 0;">还没有集群，请在右侧新建第一个集群。</div>{% endif %}
-  </div>
-
-  <!-- 新建集群 -->
-  <div class="card new-cluster">
-    <h3 style="margin:0 0 10px;">新建集群</h3>
-    <form method="post" action="/clusters" class="grid2" style="gap:10px;" id="newClusterForm">
-      <label>集群名称 <span class="req">*</span><input name="name" required placeholder="如 prod-cluster"></label>
-      <label>VIP 地址 <span class="req">*</span><input name="vip" required placeholder="192.168.1.10"></label>
-      <label>VIP 前缀<input name="vip_prefix" placeholder="192.168.1."></label>
-      <label>VRID<input name="vrid" placeholder="51"></label>
-      <label>网卡<input name="interface" placeholder="eth0 / ens192"></label>
-      <label>HA 用户<input name="ha_user" value="ha_monitor"></label>
-      <label>HA 密码<input name="ha_pass" type="password" id="ha_pass"></label>
-      <label>复制用户<input name="repl_user" value="replication"></label>
-      <label>复制密码<input name="repl_pass" type="password" id="repl_pass"></label>
-      <label>业务用户<input name="app_user" value="app"></label>
-      <label>业务密码<input name="app_pass" type="password" id="app_pass"></label>
-    </form>
-    <div style="display:flex; gap:10px; margin-top:12px;">
-      <button class="btn btn-primary" type="submit" form="newClusterForm">创建集群</button>
-      <button class="btn" type="button" onclick="genPw()">随机生成密码</button>
-    </div>
+    {% endfor %}
   </div>
 </div>
 
 <script>
-  function genPw() {
-    var n = 22, s = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789-_", out = "";
-    var a = new Uint8Array(n); if (crypto && crypto.getRandomValues) crypto.getRandomValues(a);
-    else for (var i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256);
-    for (var i = 0; i < n; i++) out += s[a[i] % s.length];
-    document.getElementById("ha_pass").value = out;
-    document.getElementById("repl_pass").value = out.slice().split("").reverse().join("") || out;
-    document.getElementById("app_pass").value = out.slice(7) + out.slice(0, 7);
+  function togglePanel(btn) {
+    var body = btn.nextElementSibling;
+    var open = body.style.display !== "none";
+    body.style.display = open ? "none" : "block";
+    btn.classList.toggle("open", !open);
   }
-  function togglePw() {
-    var show = document.getElementById("showPw").checked;
-    document.querySelectorAll("input.pw").forEach(function (el) { el.type = show ? "text" : "password"; });
+  function toggleEdit(id, btn) {
+    var el = document.getElementById(id);
+    var open = el.style.display !== "none";
+    el.style.display = open ? "none" : "block";
+    btn.textContent = open ? "编辑" : "收起";
   }
-  function toggleEdit(id) {
-    var f = document.getElementById("edit-" + id);
-    f.classList.toggle("show");
+  function toggleAllPw(btn) {
+    var form = btn.closest("form");
+    var show = btn.dataset.show !== "1";
+    form.querySelectorAll("input.pw").forEach(function (i) { i.type = show ? "text" : "password"; });
+    btn.dataset.show = show ? "1" : "0";
+    btn.textContent = show ? "隐藏全部密码" : "显示全部密码";
   }
-  function delCluster(id, name) {
-    if (!confirm("确认删除集群「" + name + "」？将同时删除其全部节点与切换记录，且不可恢复。")) return;
-    fetch("/clusters/" + id + "/delete", { method: "POST" })
-      .then(function () { location.href = "/clusters?msg=已删除集群 " + encodeURIComponent(name); })
-      .catch(function (e) { alert("删除失败：" + e); });
+  function apiPost(url, body, cb) {
+    fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(body) })
+      .then(function (r) { return r.json(); })
+      .then(cb)
+      .catch(function (e) { toast("请求失败: " + e, "err"); });
+  }
+  function delCluster(id) {
+    if (!confirm("确认删除该集群及其所有节点？此操作不可恢复。")) return;
+    apiPost("/clusters/" + id + "/delete", {}, function (d) {
+      toast(d.msg || (d.ok ? "已删除" : "删除失败"), d.ok ? "ok" : "err");
+      if (d.ok) { var card = document.getElementById("card" + id); if (card) card.remove(); }
+    });
+  }
+  function syncCreds(id) {
+    apiPost("/clusters/" + id + "/sync", {}, function (d) {
+      toast(d.msg || (d.ok ? "已同步" : "同步失败"), d.ok ? "ok" : "err");
+    });
+  }
+  function toggleAnomaly(id, btn) {
+    var el = document.getElementById(id);
+    var open = el.style.display !== "none";
+    el.style.display = open ? "none" : "block";
+    btn.classList.toggle("open", !open);
+  }
+  function copyAnomaly(id, clusterName) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var lines = ["集群: " + (clusterName || ""), "时间: " + new Date().toLocaleString()];
+    el.querySelectorAll("table.anom-table tr").forEach(function (tr) {
+      var cells = Array.prototype.map.call(tr.querySelectorAll("th,td"),
+        function (c) { return c.textContent.trim(); });
+      lines.push(cells.join(" | "));
+    });
+    var text = lines.join("\n");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        toast("异常日志已复制", "ok");
+      }, function () { fallbackCopy(text); });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+  function fallbackCopy(text) {
+    var ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); toast("异常日志已复制", "ok"); }
+    catch (e) { toast("复制失败，请手动选择", "err"); }
+    document.body.removeChild(ta);
   }
 </script>
 {% endblock %}

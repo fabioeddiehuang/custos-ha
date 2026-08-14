@@ -42,7 +42,13 @@
       if (navigator.clipboard) navigator.clipboard.writeText(t);
     }
     // 一键复制（带反馈）：用于集群管理页的账号/密码复制
+    // 不传 text 时，自动复制同一控件组内的输入框值（避免密码含特殊字符注入 JS 出错）
     function copyWithFeedback(btn, text) {
+      var t = text;
+      if (t === undefined || t === null) {
+        var inp = btn.parentElement ? btn.parentElement.querySelector("input") : null;
+        t = inp ? inp.value : "";
+      }
       var done = function () {
         var old = btn.textContent;
         btn.textContent = "已复制✓";
@@ -50,13 +56,25 @@
         setTimeout(function () { btn.textContent = old; btn.classList.remove("copied"); }, 1200);
       };
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(done, done);
+        navigator.clipboard.writeText(t).then(done, done);
       } else {
         var ta = document.createElement("textarea");
-        ta.value = text; document.body.appendChild(ta); ta.select();
+        ta.value = t; document.body.appendChild(ta); ta.select();
         try { document.execCommand("copy"); } catch (e) {}
         document.body.removeChild(ta); done();
       }
+    }
+    // 页面顶部浮层提示（替代浏览器 alert 弹窗）
+    function toast(msg, type) {
+      var el = document.createElement("div");
+      el.className = "toast " + (type === "err" ? "toast-err" : "toast-ok");
+      el.textContent = msg;
+      document.body.appendChild(el);
+      setTimeout(function () { el.classList.add("show"); }, 10);
+      setTimeout(function () {
+        el.classList.remove("show");
+        setTimeout(function () { el.remove(); }, 300);
+      }, 2800);
     }
     // 通用：发起手动切换并提示结果
     function doFailover(url, body, btn) {
@@ -65,12 +83,25 @@
       if (btn) btn.disabled = true;
       fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: body }).then(function (r) { return r.json(); }).then(function (d) {
-        alert(d.msg || (d.ok ? "操作成功" : "操作失败"));
-        setTimeout(function () { location.reload(); }, 600);
+        toast(d.msg || (d.ok ? "操作成功" : "操作失败"), d.ok ? "ok" : "err");
+        setTimeout(function () { location.reload(); }, 700);
       }).catch(function (e) {
-        alert("请求失败: " + e);
+        toast("请求失败: " + e, "err");
         if (btn) { btn.disabled = false; btn.textContent = old; }
       });
+    }
+    // 手动触发某节点复制自愈（SQL 线程冲突跳过 / IO 线程 GTID 缺口补齐）
+    function healNode(host, port, cid, btn) {
+      if (btn) { btn.disabled = true; btn.textContent = "修复中…"; }
+      var body = "host=" + encodeURIComponent(host) + "&port=" + port + "&cluster_id=" + cid;
+      fetch("/api/heal", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          toast(d.msg || (d.ok ? "复制已修复" : "修复失败"), d.ok ? "ok" : "err");
+          setTimeout(function () { refreshStatus(true); }, 600);
+        })
+        .catch(function (e) { toast("请求失败: " + e, "err"); })
+        .finally(function () { if (btn) { btn.disabled = false; btn.textContent = "修复复制"; } });
     }
   </script>
 </body>

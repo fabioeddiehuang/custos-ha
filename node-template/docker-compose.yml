@@ -16,6 +16,7 @@ services:
   mysql:
     image: mysql:8.0
     container_name: ${NODE_NAME:-mysql-ha-node}
+    restart: always
     environment:
       MYSQL_ROOT_PASSWORD: "${ROOT_PASS}"
     command:
@@ -39,6 +40,7 @@ services:
 
   keepalived:
     build: ./keepalived
+    restart: always
     network_mode: host
     cap_add:
       - NET_ADMIN

@@ -28,8 +28,11 @@ WEB_PASS = env("WEB_PASS", "admin")  # 为空则首次启动随机生成并打�
 SECRET_KEY = env("SECRET_KEY", "change-me-in-production")
 
 # 检测与切换
-CHECK_INTERVAL = int(env("CHECK_INTERVAL", 5))   # 探活间隔(秒)
-FAIL_THRESHOLD = int(env("FAIL_THRESHOLD", 3))    # 连续失败次数阈值
+CHECK_INTERVAL = int(env("CHECK_INTERVAL", 3))   # 探活间隔(秒)
+FAIL_THRESHOLD = int(env("FAIL_THRESHOLD", 2))    # 连续失败次数阈值
+# 单节点探活超时（秒）：主库服务停止时会立即收到 RST（连接拒绝很快返回），
+# 仅当主机断电/网络黑洞时才走到该超时。调小可加快「主机失联」判定（配合 FAIL_THRESHOLD）。
+PROBE_TIMEOUT = int(env("PROBE_TIMEOUT", 3))
 
 # 节点生成目录（一键启动 compose 落地目录；建议挂卷持久化）
 NODES_DIR = env("NODES_DIR", "/app/generated_nodes")

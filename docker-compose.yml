@@ -26,6 +26,7 @@ services:
   # MySQL HA 管理器（单容器：决策器 + Web + 节点一键部署生成）
   ha-manager:
     build: .
+    restart: always
     # 若启用上面的 mgmt-mysql，取消下一行注释
     # depends_on:
     #   - mgmt-mysql
@@ -44,8 +45,8 @@ services:
       WEB_PORT: 28888
       WEB_USER: admin
       WEB_PASS: admin  #留空则首次启动随机生成并打印到日志；填写则以该密码为准（可改密码，每次启动同步）
-      CHECK_INTERVAL: 5
-      FAIL_THRESHOLD: 3
+      CHECK_INTERVAL: 3
+      FAIL_THRESHOLD: 2
       NODES_DIR: /app/generated_nodes
       # VIP / 网络（供「添加节点」生成的 compose 使用；网卡/VRID 有默认值，VIP 必填）
       # VIP 注意：需为节点同网段、当前空闲的 IP；系统无法自动探测，必须填写。

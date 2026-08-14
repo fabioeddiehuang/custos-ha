@@ -24,16 +24,16 @@
   <h3>添加节点</h3>
   <form method="post" action="/nodes/add" class="grid2">
     <label>节点 IP
-      <input name="ip" required placeholder="例如 192.168.1.203">
+      <input class="inp" name="ip" required placeholder="例如 192.168.1.203">
     </label>
     <label>MySQL 端口
-      <input name="port" value="{{ cfg.port }}" placeholder="3307">
+      <input class="inp" name="port" value="{{ cfg.port }}" placeholder="3307">
     </label>
     <label>节点 MySQL root 用户
-      <input name="root_user" value="root">
+      <input class="inp" name="root_user" value="root">
     </label>
     <label>节点 MySQL root 密码 <span class="req">*</span>
-      <input name="root_pass" type="password" required>
+      <input class="inp" name="root_pass" type="password" required>
     </label>
     <label>初始角色
       <select name="initial_role">

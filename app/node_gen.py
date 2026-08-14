@@ -106,6 +106,7 @@ services:
   mysql:
     image: mysql:8.0
     container_name: {node_name}
+    restart: always
     environment:
       MYSQL_ROOT_PASSWORD: "{root_pass}"
     command:
@@ -116,6 +117,8 @@ services:
       - --log-slave-updates=ON
       - --relay-log=relay-bin
       - --relay-log-recovery=ON
+      - --sync-binlog=1
+      - --innodb-flush-log-at-trx-commit=1
       - --read-only=ON
     ports:
       - "{port}:3306"
@@ -130,7 +133,13 @@ services:
       retries: 10
 
   keepalived:
+    # 模板化镜像：优先使用已编译并导入的镜像 mysql-ha-keepalived:latest（无需联网编译）。
+    # 若目标主机无法编译（如离线），可在可编译的机器上 `docker compose build keepalived`
+    # 后 `docker save mysql-ha-keepalived:latest -o keepalived.tar` 拷贝过来
+    # `docker load -i keepalived.tar`，再 `docker compose up --no-build` 启动。
+    image: mysql-ha-keepalived:latest
     build: ./keepalived
+    restart: always
     network_mode: host
     cap_add:
       - NET_ADMIN
@@ -143,6 +152,34 @@ services:
       - ./keepalived/check_mysql_master.sh:/etc/keepalived/check_mysql_master.sh:ro
       - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro
 """
+
+
+def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass):
+    """渲染 init.sql（首次启动即创建与所属集群一致的 ha_monitor / replication / app 账号）。
+
+    抽成模块级函数，供 generate_node（首次生成）与 sync_node_creds（密码变更后重生成）
+    共用，保证「节点部署文件」中的凭证与集群当前凭证始终一致——这样即使重部署
+    （清空 MySQL-data 后 init.sql 重新执行）也不会因旧密码导致无法连接。
+    """
+    return (
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
+        "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "GRANT REPLICATION SLAVE ON *.* TO '%s'@'%%';\n"
+        # 业务最小权限账号：供测试/应用通过 VIP 连接，仅授予常用读写与管理权限，
+        # 不含 SUPER/REPLICATION 等运维权限，避免应用直接用 ha_monitor/replication。
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, "
+        "REFERENCES, EXECUTE, SHOW VIEW, CREATE TEMPORARY TABLES ON *.* TO '%s'@'%%';\n"
+        # 本地状态库：管理端在切换主库时把「当前主」写入各节点本机 ha_local.state，
+        # keepalived 检查脚本只读本机判定 VIP 归属，完全不依赖节点回连管理库
+        # （避免管理库不可达时 VIP 不漂移、被 nopreempt 锁死在首节点）。
+        "CREATE DATABASE IF NOT EXISTS ha_local;\n"
+        "CREATE TABLE IF NOT EXISTS ha_local.state (k VARCHAR(32) PRIMARY KEY, v VARCHAR(255));\n"
+        "FLUSH PRIVILEGES;\n"
+    ) % (ha_user, ha_pass, ha_user, repl_user, repl_pass, repl_user,
+         app_user, app_pass, app_user)
 
 
 def _write(path: Path, text: str, mode=0o600):
@@ -258,25 +295,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     kd.mkdir(parents=True, exist_ok=True)
 
     # 1) init.sql：首次启动即创建 ha_monitor / replication / app（与所属集群凭证保持一致）
-    init_sql = (
-        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
-        "GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
-        "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
-        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
-        "GRANT REPLICATION SLAVE ON *.* TO '%s'@'%%';\n"
-        # 业务最小权限账号：供测试/应用通过 VIP 连接，仅授予常用读写与管理权限，
-        # 不含 SUPER/REPLICATION 等运维权限，避免应用直接用 ha_monitor/replication。
-        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
-        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, "
-        "REFERENCES, EXECUTE, SHOW VIEW, CREATE TEMPORARY TABLES ON *.* TO '%s'@'%%';\n"
-        # 本地状态库：管理端在切换主库时把「当前主」写入各节点本机 ha_local.state，
-        # keepalived 检查脚本只读本机判定 VIP 归属，完全不依赖节点回连管理库
-        # （避免管理库不可达时 VIP 不漂移、被 nopreempt 锁死在首节点）。
-        "CREATE DATABASE IF NOT EXISTS ha_local;\n"
-        "CREATE TABLE IF NOT EXISTS ha_local.state (k VARCHAR(32) PRIMARY KEY, v VARCHAR(255));\n"
-        "FLUSH PRIVILEGES;\n"
-    ) % (ha_user, ha_pass, ha_user, repl_user, repl_pass, repl_user,
-         app_user, app_pass, app_user)
+    init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
     # init.sql 会被 MySQL 容器以非 root 的 mysql 用户读取执行，
     # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。
     _write(d / "init.sql", init_sql, mode=0o644)
@@ -427,6 +446,10 @@ def sync_node_creds(cluster_id=None):
                 f"MGMT_DB={mgmt_db}\n"
             )
             _write(kd / "ha_check.conf", ha_check)
+            # 同步重生成 init.sql（仅凭证相关），保证后续「重部署」清空 MySQL-data 后
+            # init.sql 重新执行时使用的仍是当前密码，不会因旧密码导致无法连接。
+            init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
+            _write(Path(NODES_DIR) / ip / "init.sql", init_sql, mode=0o644)
             synced += 1
     return synced
 

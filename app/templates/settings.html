@@ -1,85 +1,134 @@
 {% extends "base.html" %}
-{% block title %}邮件配置 · MySQL HA 管理器{% endblock %}
+{% block title %}系统配置 · MySQL HA 管理器{% endblock %}
 {% block content %}
-<style>
-  .set-section { margin-bottom:18px; }
-  .status-msg { font-size:14px; font-weight:600; margin-top:10px; min-height:20px; }
-  .status-msg.ok { color:#16a34a; }
-  .status-msg.err { color:#ef4444; }
-  .pwd-hint { font-size:12px; color:#9ca3af; margin-top:4px; }
-</style>
-
-<h1>邮件配置</h1>
-<p class="muted">配置 SMTP 邮件告警（主库切换、节点离线、复制中断等会发送通知），并可在此修改管理员登录密码。</p>
-
-{% if error %}<div class="banner err">⚠ <div>{{ error }}</div></div>{% endif %}
-{% if msg %}<div class="banner ok">✓ <div>{{ msg }}</div></div>{% endif %}
-
-<!-- 邮件告警配置 -->
-<div class="card set-section">
-  <h3>邮件告警（SMTP）</h3>
-  <form id="settingsForm" class="grid2" onsubmit="return false;">
-    <label>SMTP 服务器<input name="smtp_host" value="{{ smtp_host }}" placeholder="smtp.example.com"></label>
-    <label>端口<input name="smtp_port" value="{{ smtp_port }}" placeholder="465 / 587"></label>
-    <label>发件账号<input name="smtp_user" value="{{ smtp_user }}" placeholder="alert@example.com"></label>
-    <label>发件密码<input name="smtp_pass" type="password" placeholder="留空表示不修改"></label>
-    <label style="grid-column:1/-1;">告警接收邮箱<input name="alert_email" value="{{ alert_email }}" placeholder="dba@example.com"></label>
-  </form>
-  <div style="display:flex; gap:10px; margin-top:12px;">
-    <button class="btn btn-primary" onclick="saveSettings()">保存</button>
-    <button class="btn btn-accent" onclick="testEmail()">发送测试邮件</button>
+<div class="dash-head">
+  <div>
+    <h1 style="margin:0 0 4px;">系统配置</h1>
+    <div style="font-size:13px;color:#6b7280;">SMTP 邮件告警与多收件人路由；各集群管理/复制账号请在「集群管理」中设置。</div>
   </div>
-  <div id="saveMsg" class="status-msg"></div>
-  <div id="testMsg" class="status-msg"></div>
 </div>
 
-<!-- 修改管理员密码 -->
-<div class="card set-section">
-  <h3>修改管理员密码</h3>
-  <form method="post" action="/change_password" class="grid2" onsubmit="return confirmChange(this)">
-    <label>当前密码<input type="password" name="old_pwd" required></label>
-    <label>新密码<input type="password" name="new_pwd" required minlength="6"></label>
-    <label style="grid-column:1/-1;">确认新密码<input type="password" name="new_pwd2" required minlength="6"></label>
+{% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
+{% if error %}<div class="banner err">⚠ {{ error }}</div>{% endif %}
+
+<div class="card">
+  <h3 style="margin:0 0 12px;">SMTP 服务器</h3>
+  <form id="cfgForm" onsubmit="return saveCfg(event)">
+    <div class="grid-2">
+      <label>SMTP 主机<input class="inp" name="smtp_host" value="{{ cfg.smtp_host }}" placeholder="如 smtp.exmail.qq.com"></label>
+      <label>SMTP 端口<input class="inp" name="smtp_port" value="{{ cfg.smtp_port }}" placeholder="465 / 587 / 25"></label>
+      <label>发件账号<input class="inp" name="smtp_user" value="{{ cfg.smtp_user }}" placeholder="告警发件邮箱"></label>
+      <label>发件密码
+        <input class="inp" name="smtp_pass" type="password" autocomplete="new-password" placeholder="留空表示不修改">
+        <span class="hint">发件密码不会自动生成，留空即不修改已有密码</span>
+      </label>
+    </div>
+    <div class="btn-row">
+      <button id="saveBtn" class="btn btn-primary" type="submit">保存配置</button>
+      <button id="testBtn" class="btn" type="button" onclick="testEmail()">发送测试邮件</button>
+    </div>
   </form>
-  <div class="pwd-hint" style="margin-top:8px;">密码长度至少 6 位；修改后请使用新密码登录。</div>
+</div>
+
+<div class="card" style="margin-top:18px;">
+  <div class="cred-panel-head" style="margin-bottom:12px;">
+    <h3 style="margin:0;">提醒邮箱</h3>
+    <span style="font-size:12.5px;color:var(--muted);">默认邮箱接收全部集群告警；其余邮箱可指定接收的集群</span>
+  </div>
+
+  <div class="email-row">
+    {% for e in alert_emails %}
+    <div class="email-card">
+      <div class="email-card-head">
+        <span class="email-addr">{{ e.email }}</span>
+        <button class="btn btn-sm btn-danger" type="button" onclick="delEmail({{ e.id }})">删除</button>
+      </div>
+      <label class="chk">
+        <input type="checkbox" id="def{{ e.id }}" {{ 'checked' if e.is_default else '' }}
+               onchange="setDefault({{ e.id }}, this.checked)">
+        接收全部集群告警
+      </label>
+      {% if e.is_default %}
+      <div class="email-allhint">✓ 该邮箱将接收所有集群的告警</div>
+      {% else %}
+      <div class="email-clusters">
+        <div class="email-clusters-title">仅接收以下集群提醒：</div>
+        {% for c in clusters %}
+        {% set mapped = e.clusters | map(attribute='id') | list %}
+        <label class="chip">
+          <input type="checkbox" class="emap" data-id="{{ e.id }}" value="{{ c.id }}"
+                 {{ 'checked' if c.id in mapped else '' }}> {{ c.name }}
+        </label>
+        {% endfor %}
+      </div>
+      {% if not e.clusters %}
+      <div class="email-warn">⚠ 该邮箱未绑定任何集群且未勾选「接收全部」，将不会收到任何告警</div>
+      {% endif %}
+      <button class="btn btn-sm" type="button" onclick="saveMap({{ e.id }})">保存集群绑定</button>
+      {% endif %}
+    </div>
+    {% endfor %}
+
+    <!-- 新建邮箱 -->
+    <div class="email-card email-new">
+      <div class="email-card-head"><span class="email-addr" style="color:var(--muted);">＋ 新建邮箱</span></div>
+      <input class="inp" id="newEmail" placeholder="输入提醒邮箱地址">
+      <button class="btn btn-primary btn-sm" type="button" onclick="addEmail()">添加</button>
+    </div>
+  </div>
 </div>
 
 <script>
-  function saveSettings() {
-    var f = document.getElementById("settingsForm");
-    var fd = new FormData(f);
-    fetch("/settings", { method: "POST", body: fd })
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        var el = document.getElementById("saveMsg");
-        el.className = "status-msg " + (d.ok ? "ok" : "err");
-        el.textContent = d.msg || (d.ok ? "已保存" : "保存失败");
-      })
-      .catch(function (e) {
-        var el = document.getElementById("saveMsg");
-        el.className = "status-msg err";
-        el.textContent = "请求失败：" + e;
-      });
+  function saveCfg(e) {
+    e.preventDefault();
+    var f = document.getElementById("cfgForm");
+    var fd = new URLSearchParams(new FormData(f));
+    var btn = document.getElementById("saveBtn");
+    btn.disabled = true; btn.textContent = "保存中…";
+    fetch("/settings", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: fd.toString() })
+      .then(function (r) { return r.json(); }).then(function (d) {
+        btn.disabled = false; btn.textContent = "保存配置";
+        if (d.ok) location.reload(); else alert(d.msg || "保存失败");
+      }).catch(function () { btn.disabled = false; btn.textContent = "保存配置"; alert("请求失败"); });
+    return false;
   }
   function testEmail() {
-    var el = document.getElementById("testMsg");
-    el.className = "status-msg";
-    el.textContent = "正在发送…";
+    var btn = document.getElementById("testBtn");
+    btn.disabled = true; btn.textContent = "发送中…";
     fetch("/settings/test_email", { method: "POST" })
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        el.className = "status-msg " + (d.ok ? "ok" : "err");
-        el.textContent = d.msg || (d.ok ? "✓ 发送成功" : "✗ 发送失败");
-      })
-      .catch(function (e) {
-        el.className = "status-msg err";
-        el.textContent = "请求失败：" + e;
-      });
+      .then(function (r) { return r.json(); }).then(function (d) {
+        btn.disabled = false; btn.textContent = "发送测试邮件";
+        alert(d.msg || (d.ok ? "已发送" : "发送失败"));
+      }).catch(function () { btn.disabled = false; btn.textContent = "发送测试邮件"; alert("请求失败"); });
   }
-  function confirmChange(form) {
-    var p1 = form.new_pwd.value, p2 = form.new_pwd2.value;
-    if (p1 !== p2) { alert("两次输入的新密码不一致"); return false; }
-    return confirm("确认修改管理员密码？");
+  function addEmail() {
+    var v = document.getElementById("newEmail").value.trim();
+    if (!v) { alert("请输入邮箱地址"); return; }
+    fetch("/settings/email/add", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "email=" + encodeURIComponent(v) })
+      .then(function (r) { return r.json(); }).then(function (d) {
+        if (d.ok) location.reload(); else alert(d.msg || "添加失败");
+      }).catch(function () { alert("请求失败"); });
+  }
+  function delEmail(id) {
+    if (!confirm("确认删除该提醒邮箱？")) return;
+    fetch("/settings/email/delete", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "id=" + id })
+      .then(function (r) { return r.json(); }).then(function (d) {
+        if (d.ok) location.reload(); else alert(d.msg || "删除失败");
+      }).catch(function () { alert("请求失败"); });
+  }
+  function setDefault(id, checked) {
+    fetch("/settings/email/set_default", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "id=" + id + "&is_default=" + (checked ? 1 : 0) })
+      .then(function (r) { return r.json(); }).then(function (d) {
+        if (d.ok) location.reload(); else alert(d.msg || "更新失败");
+      }).catch(function () { alert("请求失败"); });
+  }
+  function saveMap(id) {
+    var ids = [];
+    document.querySelectorAll('input.emap[data-id="' + id + '"]:checked').forEach(function (c) { ids.push(c.value); });
+    fetch("/settings/email/map", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "id=" + id + "&cluster_ids=" + ids.join(",") })
+      .then(function (r) { return r.json(); }).then(function (d) {
+        if (d.ok) location.reload(); else alert(d.msg || "保存失败");
+      }).catch(function () { alert("请求失败"); });
   }
 </script>
 {% endblock %}

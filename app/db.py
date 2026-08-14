@@ -102,6 +102,22 @@ SCHEMA_SQL = [
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB
     """,
+    """
+    CREATE TABLE IF NOT EXISTS alert_emails (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        is_default TINYINT(1) DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_email (email)
+    ) ENGINE=InnoDB
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS alert_email_map (
+        email_id INT NOT NULL,
+        cluster_id INT NOT NULL,
+        PRIMARY KEY (email_id, cluster_id)
+    ) ENGINE=InnoDB
+    """,
 ]
 
 

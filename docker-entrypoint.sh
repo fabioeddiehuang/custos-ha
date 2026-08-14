@@ -32,11 +32,9 @@ fi
 echo "[entrypoint] 初始化库表与管理员账号..."
 python -m app.init_db
 
-echo "[entrypoint] 启动后台监控线程..."
-python -m app.monitor &
-
 WEB_PORT=${WEB_PORT:-28888}
 echo "[entrypoint] 启动 Web 管理后台 (端口 ${WEB_PORT})..."
+echo "[entrypoint] 注：后台监控线程已改为随 Web 进程内常驻（uvicorn 加载 app.api 时自动拉起），无需单独启动。"
 if [ -n "$SSL_CERT" ] && [ -n "$SSL_KEY" ]; then
   exec uvicorn app.api:app --host 0.0.0.0 --port "$WEB_PORT" --ssl-keyfile "$SSL_KEY" --ssl-certfile "$SSL_CERT"
 else

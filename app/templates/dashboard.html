@@ -8,7 +8,7 @@
   .refresh-ind .dot.busy { background:#f7a23b; box-shadow:0 0 0 3px rgba(247,162,59,.18); }
   .spin { display:inline-block; width:14px; height:14px; border:2px solid #e5e7eb; border-top-color:#7c3aed; border-radius:50%; animation:sp .7s linear infinite; }
   @keyframes sp { to { transform:rotate(360deg); } }
-  .stat .val { font-size:15px; font-weight:700; color:#1f2937; word-break:break-all; }
+  .stat .val { font-size:14px; font-weight:700; color:#1f2937; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
   .history-tabs { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
   .history-tabs .tab { padding:6px 14px; border-radius:999px; border:1px solid #e5e7eb; background:#fff; cursor:pointer; font-size:13px; color:#374151; transition:.15s; }
   .history-tabs .tab:hover { border-color:#7c3aed; color:#7c3aed; }
@@ -19,11 +19,11 @@
 <div class="dash-head">
   <div>
     <h1 style="margin:0 0 4px;">集群仪表盘</h1>
-    <div style="font-size:13px;color:#6b7280;">自动探活与故障切换由后台守护进程执行；下方数据每 5 秒自动刷新。</div>
+    <div style="font-size:13px;color:#6b7280;">自动探活与故障切换由后台守护进程执行；下方数据每 10 秒自动刷新。</div>
   </div>
   <div class="refresh-ind">
     <span class="dot" id="liveDot"></span>
-    <span id="liveText">实时同步中</span>
+    <span id="liveText">实时监控中</span>
     <span class="spin" id="liveSpin" style="display:none;"></span>
     <span id="lastUpd"></span>
     <button class="btn" id="globalRefresh" onclick="refreshStatus(true)">↻ 刷新全部</button>
@@ -54,13 +54,15 @@
     </div>
 
     <div class="stats">
-      <div class="stat"><div class="lbl">当前主库</div><div class="val" id="cm-{{ c.cluster_id }}">{{ c.current_master }}</div></div>
-      <div class="stat"><div class="lbl">节点总数</div><div class="num">{{ c.total_nodes }}</div></div>
-      <div class="stat"><div class="lbl">在线</div><div class="num up">{{ c.online }}</div></div>
-      <div class="stat"><div class="lbl">离线</div><div class="num down">{{ c.offline }}</div></div>
-      <div class="stat"><div class="lbl">主库数</div><div class="num master">{{ c.masters }}</div></div>
-      <div class="stat"><div class="lbl">从库数</div><div class="num slave">{{ c.slaves }}</div></div>
+      <div class="stat"><div class="lbl">当前主库</div><div class="val" id="cm-{{ c.cluster_id }}" title="{{ c.current_master }}">{{ c.current_master }}</div></div>
+      <div class="stat"><div class="lbl">节点总数</div><div class="num" id="total-{{ c.cluster_id }}">{{ c.total_nodes }}</div></div>
+      <div class="stat"><div class="lbl">在线</div><div class="num up" id="online-{{ c.cluster_id }}">{{ c.online }}</div></div>
+      <div class="stat"><div class="lbl">离线</div><div class="num down" id="offline-{{ c.cluster_id }}">{{ c.offline }}</div></div>
+      <div class="stat"><div class="lbl">主库数</div><div class="num master" id="masters-{{ c.cluster_id }}">{{ c.masters }}</div></div>
+      <div class="stat"><div class="lbl">从库数</div><div class="num slave" id="slaves-{{ c.cluster_id }}">{{ c.slaves }}</div></div>
     </div>
+
+    <div class="banner" id="banner-{{ c.cluster_id }}" style="display:none"></div>
 
     <table class="tbl">
       <thead>
@@ -72,21 +74,25 @@
         {% for h in c.hosts %}
         <tr data-host="{{ h.host }}:{{ h.port }}">
           <td class="host">{{ h.host }}:{{ h.port }}</td>
-          <td data-f="role"><span class="role role-{{ h.role }}">{{ h.role }}</span></td>
+          <td data-f="role"><span class="role role-{{ h.display_role }}">{{ h.display_role }}</span></td>
           <td data-f="status">
             {% if h.status == 'up' %}
-              <span class="pill up">● up</span>
+              {% if h.err %}<span class="pill warn" title="{{ h.err }}">● up ⚠</span>
+              {% else %}<span class="pill up">● up</span>{% endif %}
             {% else %}
               <span class="pill down" title="{{ h.err or '' }}">● {{ h.status }}</span>
             {% endif %}
           </td>
           <td data-f="delay">{% if h.repl_delay is not none %}{{ h.repl_delay }}s{% else %}—{% endif %}</td>
-          <td data-f="io">{{ h.slave_io or '—' }}</td>
-          <td data-f="sql">{{ h.slave_sql or '—' }}</td>
+          <td data-f="io"{% if h.slave_io and h.slave_io != 'Yes' %} class="repl-bad" title="{{ h.err or '' }}"{% endif %}>{{ h.slave_io or '—' }}</td>
+          <td data-f="sql"{% if h.slave_sql and h.slave_sql != 'Yes' %} class="repl-bad" title="{{ h.err or '' }}"{% endif %}>{{ h.slave_sql or '—' }}</td>
           <td>{{ h.last_seen or '—' }}</td>
           <td>
-            {% if h.role != 'master' %}
-              <button class="btn btn-sm" onclick="doFailover('/api/failover/to', 'host={{ h.host }}&port={{ h.port }}&cluster_id={{ c.cluster_id }}', this)">设为主库</button>
+            {% if (h.host ~ ':' ~ h.port) != c.current_master %}
+              <div class="op-cell">
+                <button class="btn btn-sm" onclick="doFailover('/api/failover/to', 'host={{ h.host }}&port={{ h.port }}&cluster_id={{ c.cluster_id }}', this)">设为主库</button>
+                <button class="btn btn-sm btn-ghost" type="button" onclick="healNode('{{ h.host }}', '{{ h.port }}', {{ c.cluster_id }}, this)">修复复制</button>
+              </div>
             {% else %}
               <span class="badge" style="background:#e8f5e9;color:#16d39a;">当前主</span>
             {% endif %}
@@ -126,6 +132,48 @@
     function p(n){return (n<10?"0":"")+n;}
     return p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds());
   }
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+  // 更新统计卡片（在线/离线/主库数等）。离线数 >0 标红、=0 标绿；其余保持各自配色。
+  function setStat(id, val, baseClass) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = val;
+    if (baseClass === "offline") el.className = "num " + (val > 0 ? "down" : "up");
+    else el.className = "num " + baseClass;
+  }
+  // 全新部署场景：若集群仍「未建立主从复制」（无当前主 / 全离线 / 在线却无从库），
+  // 显示引导横幅，提示点击「刷新全部」由后台 monitor 自动搭建拓扑并漂 VIP。
+  function updateClusterBanners(data) {
+    var hosts = data.hosts || [];
+    var cms = data.current_masters || {};
+    var byCluster = {};
+    hosts.forEach(function (h) {
+      (byCluster[h.cluster_id] = byCluster[h.cluster_id] || []).push(h);
+    });
+    Object.keys(byCluster).forEach(function (cid) {
+      var rows = byCluster[cid];
+      var online = rows.filter(function (r) { return r.status === "up"; }).length;
+      var slaves = rows.filter(function (r) { return r.display_role === "slave"; }).length;
+      var hasMaster = !!cms[cid];
+      var banner = document.getElementById("banner-" + cid);
+      if (!banner) return;
+      if (online === 0) {
+        banner.style.display = "block";
+        banner.className = "banner warn";
+        banner.innerHTML = "⚠ 该集群全部节点离线（无法连接）。点击右上角「↻ 刷新」触发主动探活与重建；若仍离线，节点行会显示连接错误，请检查网络/端口/账号。";
+      } else if (!hasMaster || (online > 0 && slaves === 0)) {
+        banner.style.display = "block";
+        banner.className = "banner info";
+        banner.innerHTML = "ℹ 该集群尚未建立主从复制（3 台主机相互独立）。点击「↻ 刷新」即可由监控自动选主并搭建复制、漂移 VIP（约 1 个探活周期生效）。";
+      } else {
+        banner.style.display = "none";
+      }
+    });
+  }
   function refreshStatus(manual) {
     var dot = document.getElementById("liveDot");
     var spin = document.getElementById("liveSpin");
@@ -133,43 +181,111 @@
     if (dot) dot.classList.add("busy");
     if (spin) spin.style.display = "inline-block";
     if (txt) txt.textContent = "同步中…";
-    fetch("/api/status", { cache: "no-store" })
-      .then(function (r) { return r.json(); })
+    // 手动刷新：主动跑一次 monitor（探活+选主+建复制+漂 VIP），可自愈「monitor 未运行」导致的全离线
+    var req = manual
+      ? { method: "POST", cache: "no-store", credentials: "same-origin" }
+      : { method: "GET", cache: "no-store", credentials: "same-origin" };
+    var url = manual ? "/api/refresh" : "/api/status";
+    fetch(url, req)
+      .then(function (r) {
+        // 只读取一次响应体（先 text 再 JSON.parse），避免重复消费导致的
+        // "Response.text: Body has already been consumed" 错误
+        return r.text().then(function (t) {
+          try {
+            return JSON.parse(t);
+          } catch (e) {
+            throw new Error("HTTP " + r.status + " 非JSON响应: " + t.slice(0, 300));
+          }
+        });
+      })
       .then(function (data) {
-        if (!data.ok) return;
+        if (!data.ok) {
+          if (dot) dot.classList.remove("busy");
+          if (spin) spin.style.display = "none";
+          var why = (data && data.error) ? String(data.error).slice(0, 120) : "接口返回失败（无 ok 字段，可能被拦截）";
+          if (txt) txt.textContent = "同步失败: " + why;
+          console.error("[status] 同步失败:", data.error || "未知错误");
+          return;
+        }
         // 当前主库
         var cms = data.current_masters || {};
         Object.keys(cms).forEach(function (cid) {
           var el = document.getElementById("cm-" + cid);
-          if (el) el.textContent = cms[cid];
+          if (el) { el.textContent = cms[cid]; el.title = cms[cid]; }
         });
         // 节点状态
         (data.hosts || []).forEach(function (h) {
           var tr = document.querySelector('tr[data-host="' + h.host + ':' + h.port + '"]');
           if (!tr) return;
           var role = tr.querySelector('[data-f="role"]');
-          if (role) role.innerHTML = '<span class="role role-' + (h.role||'unknown') + '">' + (h.role||'unknown') + '</span>';
+          if (role) role.innerHTML = '<span class="role role-' + (h.display_role||'unknown') + '">' + (h.display_role||'unknown') + '</span>';
           var st = tr.querySelector('[data-f="status"]');
-          if (st) st.innerHTML = (h.status === 'up')
-            ? '<span class="pill up">● up</span>'
-            : '<span class="pill down" title="' + (h.err||'') + '">● ' + (h.status||'?') + '</span>';
+          if (st) {
+            // 状态药丸 + 可见的连接/复制错误（不再是只有 hover 才看得到的 title）
+            var pill = (h.status === 'up')
+              ? (h.err
+                  ? '<span class="pill warn" title="' + esc(h.err) + '">● up ⚠</span>'
+                  : '<span class="pill up">● up</span>')
+              : '<span class="pill down" title="' + esc(h.err || '') + '">● ' + (h.status || '?') + '</span>';
+            var errLine = h.err
+              ? '<div class="err-inline" title="' + esc(h.err) + '">⚠ ' + esc(h.err) + '</div>'
+              : '';
+            st.innerHTML = pill + errLine;
+          }
           var d = tr.querySelector('[data-f="delay"]');
-          if (d) d.textContent = (h.repl_delay != null) ? (h.repl_delay + 's') : '—';
-          var io = tr.querySelector('[data-f="io"]'); if (io) io.textContent = h.slave_io || '—';
-          var sql = tr.querySelector('[data-f="sql"]'); if (sql) sql.textContent = h.slave_sql || '—';
+          var isMaster = (h.display_role === 'master');
+          if (d) {
+            d.textContent = (h.repl_delay != null) ? (h.repl_delay + 's') : '—';
+            // 主库不参与复制，延迟/IO/SQL 线程本就无意义，显示「—」并加说明以免误判为异常
+            d.title = isMaster ? '当前主库不参与复制，无复制延迟' : '';
+          }
+          function setThreadCell(el, val, err) {
+            if (!el) return;
+            el.textContent = val || '—';
+            if (val && val !== 'Yes') { el.classList.add('repl-bad'); el.title = err || ''; }
+            else { el.classList.remove('repl-bad'); el.title = ''; }
+          }
+          // 主库传入 null -> 显示「—」，并明确说明是主库无复制从线程（非异常）
+          setThreadCell(tr.querySelector('[data-f="io"]'), isMaster ? null : h.slave_io,
+                        isMaster ? '当前主库，无复制从线程' : h.err);
+          setThreadCell(tr.querySelector('[data-f="sql"]'), isMaster ? null : h.slave_sql,
+                        isMaster ? '当前主库，无复制从线程' : h.err);
+        });
+        // 各集群统计（节点总数/在线/离线/主库数/从库数）——按钮刷新与周期刷新均实时更新
+        var byCid = {};
+        (data.hosts || []).forEach(function (h) {
+          var b = byCid[h.cluster_id] || (byCid[h.cluster_id] = { total: 0, online: 0, offline: 0, masters: 0, slaves: 0 });
+          b.total++;
+          if (h.status === "up") b.online++; else b.offline++;
+          if (h.is_cm) b.masters++; else if (h.display_role === "slave") b.slaves++;
+        });
+        Object.keys(byCid).forEach(function (cid) {
+          var b = byCid[cid];
+          setStat("total-" + cid, b.total, "");
+          setStat("online-" + cid, b.online, "up");
+          setStat("offline-" + cid, b.offline, "offline");
+          setStat("masters-" + cid, b.masters, "master");
+          setStat("slaves-" + cid, b.slaves, "slave");
         });
         // 切换记录（按集群 tab 过滤）
         buildHistoryTabs(data.clusters || [], data.switch_history || []);
+        updateClusterBanners(data);
         if (dot) dot.classList.remove("busy");
         if (spin) spin.style.display = "none";
-        if (txt) txt.textContent = "实时同步中";
+        if (txt) txt.textContent = "实时监控中";
         var lu = document.getElementById("lastUpd");
         if (lu) lu.textContent = "最后更新 " + fmtTime(new Date());
       })
-      .catch(function () {
+      .catch(function (e) {
         if (dot) dot.classList.remove("busy");
         if (spin) spin.style.display = "none";
-        if (txt) txt.textContent = "同步失败，将重试";
+        var m = String(e.message || e);
+        if (/redirect|Temporary Redirect|30[127]|location|Failed to fetch/i.test(m)) {
+          if (txt) txt.textContent = "登录已失效，请刷新页面重新登录";
+        } else {
+          if (txt) txt.textContent = "同步失败: " + m.slice(0, 100);
+        }
+        console.error("[status] 请求异常:", e);
       });
   }
   function buildHistoryTabs(clusters, history) {
@@ -210,6 +326,6 @@
     }).join('');
   }
   refreshStatus(false);
-  setInterval(function () { refreshStatus(false); }, 5000);
+  setInterval(function () { refreshStatus(false); }, 10000);
 </script>
 {% endblock %}
