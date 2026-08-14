@@ -81,6 +81,24 @@ SCHEMA_SQL = [
         root_pass VARCHAR(255) DEFAULT '',
         server_id INT,
         compose_path VARCHAR(255),
+        cluster_id INT DEFAULT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS clusters (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(64) NOT NULL,
+        ha_user VARCHAR(64),
+        ha_pass VARCHAR(255) DEFAULT '',
+        repl_user VARCHAR(64),
+        repl_pass VARCHAR(255) DEFAULT '',
+        app_user VARCHAR(64),
+        app_pass VARCHAR(255) DEFAULT '',
+        vip VARCHAR(45),
+        vip_prefix VARCHAR(4) DEFAULT '24',
+        interface VARCHAR(32),
+        vrid VARCHAR(8),
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB
     """,
@@ -144,6 +162,102 @@ def init_schema():
                 c.execute("ALTER TABLE nodes ADD COLUMN root_pass VARCHAR(255) DEFAULT ''")
             except Exception:
                 pass
+            # 兼容旧 schema：switch_history 增加 cluster_id（按集群区分切换记录）
+            try:
+                c.execute("ALTER TABLE switch_history ADD COLUMN cluster_id INT DEFAULT NULL")
+            except Exception:
+                pass
+            # ---- 多集群支持：新增 clusters 表 + hosts/nodes 的 cluster_id ----
+            try:
+                c.execute(
+                    """CREATE TABLE IF NOT EXISTS clusters (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        name VARCHAR(64) NOT NULL,
+                        ha_user VARCHAR(64),
+                        ha_pass VARCHAR(255) DEFAULT '',
+                        repl_user VARCHAR(64),
+                        repl_pass VARCHAR(255) DEFAULT '',
+                        app_user VARCHAR(64),
+                        app_pass VARCHAR(255) DEFAULT '',
+                        vip VARCHAR(45),
+                        vip_prefix VARCHAR(4) DEFAULT '24',
+                        interface VARCHAR(32),
+                        vrid VARCHAR(8),
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB"""
+                )
+            except Exception:
+                pass
+            # hosts 增加 cluster_id
+            try:
+                c.execute("ALTER TABLE hosts ADD COLUMN cluster_id INT DEFAULT NULL")
+            except Exception:
+                pass
+            # nodes 增加 cluster_id
+            try:
+                c.execute("ALTER TABLE nodes ADD COLUMN cluster_id INT DEFAULT NULL")
+            except Exception:
+                pass
+            # current_master 改为按集群（cluster_id 主键），兼容旧版单列(id=1)结构。
+            # 仅当 current_master 仍是旧结构（含 id 列、无 cluster_id 列）时迁移一次，
+            # 避免每次重启都把当前主数据清空。
+            try:
+                c.execute("SHOW COLUMNS FROM current_master")
+                cm_cols = [r["Field"] for r in c.fetchall()]
+            except Exception:
+                cm_cols = []
+            if "cluster_id" not in cm_cols and "id" in cm_cols:
+                try:
+                    c.execute(
+                        """CREATE TABLE IF NOT EXISTS current_master_new (
+                            cluster_id INT PRIMARY KEY,
+                            host VARCHAR(64) NOT NULL,
+                            port INT NOT NULL,
+                            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                        ) ENGINE=InnoDB"""
+                    )
+                    c.execute("SELECT id, host, port FROM current_master")
+                    for r in c.fetchall():
+                        c.execute(
+                            "INSERT IGNORE INTO current_master_new (cluster_id, host, port) VALUES (%s,%s,%s)",
+                            (1, r["host"], r["port"]),
+                        )
+                    c.execute("DROP TABLE IF EXISTS current_master")
+                    c.execute("ALTER TABLE current_master_new RENAME TO current_master")
+                except Exception as e:
+                    print(f"[init_db] 迁移 current_master 失败(可忽略): {e}")
+            # 首次迁移：把既有 hosts/nodes 归入默认集群(id=1)，并从旧 settings 迁移凭证
+            try:
+                c.execute("SELECT COUNT(*) AS n FROM clusters")
+                if (c.fetchone() or {}).get("n", 0) == 0:
+                    # 从 settings 读取旧凭证
+                    def _s(k):
+                        c.execute("SELECT value FROM settings WHERE `key`=%s", (k,))
+                        row = c.fetchone()
+                        return row["value"] if row else None
+                    name = _s("CLUSTER_NAME") or "默认集群"
+                    ha_user = _s("HA_USER") or "ha_monitor"
+                    ha_pass = _s("HA_PASS")
+                    repl_user = _s("REPL_USER") or "replication"
+                    repl_pass = _s("REPL_PASS")
+                    app_user = _s("APP_USER") or "app"
+                    app_pass = _s("APP_PASS")
+                    vip = _s("VIP")
+                    vip_prefix = _s("VIP_PREFIX") or "24"
+                    interface = _s("INTERFACE") or "eth0"
+                    vrid = _s("VRID") or "51"
+                    c.execute(
+                        """INSERT INTO clusters
+                        (id, name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
+                         vip, vip_prefix, interface, vrid)
+                        VALUES (1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
+                         vip, vip_prefix, interface, vrid),
+                    )
+                    c.execute("UPDATE hosts SET cluster_id=1 WHERE cluster_id IS NULL")
+                    c.execute("UPDATE nodes SET cluster_id=1 WHERE cluster_id IS NULL")
+            except Exception as e:
+                print(f"[init_db] 迁移默认集群失败(可忽略): {e}")
         conn.commit()
     finally:
         conn.close()

@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}集群管理 · MySQL HA 管理器{% endblock %}
+{% block content %}
+<style>
+  .clusters-layout { display:grid; grid-template-columns: 1fr 360px; gap:18px; align-items:start; }
+  @media (max-width: 980px) { .clusters-layout { grid-template-columns:1fr; } }
+  .cluster-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:16px; }
+  .ccard { background:#fff; border:1px solid #eef0f4; border-radius:14px; padding:16px; box-shadow:0 4px 14px rgba(17,24,39,.05); }
+  .ccard h3 { margin:0 0 6px; font-size:18px; display:flex; align-items:center; gap:8px; }
+  .ccard .meta { font-size:13px; color:#6b7280; margin-bottom:12px; }
+  .ccard .meta b { color:#1f2937; }
+  .creds { display:grid; gap:8px; margin:10px 0; }
+  .cred-row { display:flex; align-items:center; gap:8px; }
+  .cred-row .k { width:120px; color:#6b7280; font-size:13px; flex:none; }
+  .cred-row input { flex:1; }
+  .cred-row .btn { flex:none; }
+  .ccard .actions { display:flex; gap:8px; margin-top:10px; }
+  .new-cluster { position:sticky; top:14px; }
+  .copied { background:#16d39a !important; border-color:#16d39a !important; color:#fff !important; }
+  .edit-form { margin-top:12px; border-top:1px dashed #e5e7eb; padding-top:12px; display:none; }
+  .edit-form.show { display:block; }
+  .small-toggle { font-size:13px; color:#6b7280; display:inline-flex; align-items:center; gap:6px; cursor:pointer; }
+</style>
+
+<h1>集群管理</h1>
+<p class="muted">集群是 HA 的最小隔离单元：每个集群拥有独立的账号、VIP 与切换逻辑。新建集群请使用右侧表单；已有集群可直接查看账号 / 编辑 / 删除。</p>
+
+<label class="small-toggle" style="margin-bottom:12px;">
+  <input type="checkbox" id="showPw" onchange="togglePw()"> 显示全部密码
+</label>
+
+{% if error %}<div class="banner err">⚠ <div>{{ error }}</div></div>{% endif %}
+{% if msg %}<div class="banner ok">✓ <div>{{ msg }}</div></div>{% endif %}
+
+<div class="clusters-layout">
+  <!-- 已有集群 -->
+  <div>
+    <h3 style="margin:0 0 12px;">已有集群（{{ clusters|length }}）</h3>
+    <div class="cluster-grid">
+      {% for c in clusters %}
+      <div class="ccard" data-cid="{{ c.id }}">
+        <h3>{{ c.name }} <span class="badge" style="background:#eef2ff;color:#7c3aed;">#{{ c.id }}</span></h3>
+        <div class="meta">
+          节点 <b>{{ c.node_count }}</b> · 当前主 <b>{{ c.current_master }}</b><br>
+          VIP <b>{{ c.vip }}</b> · VRID <b>{{ c.vrid }}</b> · 网卡 <b>{{ c.interface }}</b>
+        </div>
+
+        {% set cr = c.creds %}
+        <div class="creds">
+          <div class="cred-row"><span class="k">HA 监控用户</span><input class="cpw" readonly value="{{ cr.ha_user }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.ha_user }}')">复制</button></div>
+          <div class="cred-row"><span class="k">HA 监控密码</span><input class="cpw pw" readonly value="{{ cr.ha_pass }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.ha_pass }}')">复制</button></div>
+          <div class="cred-row"><span class="k">复制用户</span><input class="cpw" readonly value="{{ cr.repl_user }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.repl_user }}')">复制</button></div>
+          <div class="cred-row"><span class="k">复制密码</span><input class="cpw pw" readonly value="{{ cr.repl_pass }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.repl_pass }}')">复制</button></div>
+          <div class="cred-row"><span class="k">业务用户</span><input class="cpw" readonly value="{{ cr.app_user }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.app_user }}')">复制</button></div>
+          <div class="cred-row"><span class="k">业务密码</span><input class="cpw pw" readonly value="{{ cr.app_pass }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ cr.app_pass }}')">复制</button></div>
+          <div class="cred-row"><span class="k">VIP 地址</span><input class="cpw" readonly value="{{ c.vip }}"><button class="btn btn-sm" onclick="copyWithFeedback(this,'{{ c.vip }}')">复制</button></div>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-sm btn-accent" onclick="toggleEdit({{ c.id }})">编辑</button>
+          <button class="btn btn-sm btn-danger" onclick="delCluster({{ c.id }}, '{{ c.name }}')">删除</button>
+        </div>
+
+        <!-- 编辑表单（内联展开） -->
+        <form class="edit-form" id="edit-{{ c.id }}" method="post" action="/clusters/{{ c.id }}">
+          <div class="grid2" style="gap:10px;">
+            <label>集群名称<input name="name" value="{{ c.name }}"></label>
+            <label>VIP 地址<input name="vip" value="{{ c.vip }}"></label>
+            <label>VIP 前缀<input name="vip_prefix" value="{{ c.vip_prefix }}"></label>
+            <label>VRID<input name="vrid" value="{{ c.vrid }}"></label>
+            <label>网卡<input name="interface" value="{{ c.interface }}"></label>
+            <label>HA 用户<input name="ha_user" value="{{ cr.ha_user }}"></label>
+            <label>HA 密码<input name="ha_pass" type="password" value="{{ cr.ha_pass }}"></label>
+            <label>复制用户<input name="repl_user" value="{{ cr.repl_user }}"></label>
+            <label>复制密码<input name="repl_pass" type="password" value="{{ cr.repl_pass }}"></label>
+            <label>业务用户<input name="app_user" value="{{ cr.app_user }}"></label>
+            <label>业务密码<input name="app_pass" type="password" value="{{ cr.app_pass }}"></label>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px;">
+            <button class="btn btn-primary btn-sm" type="submit">保存修改</button>
+            <button class="btn btn-sm" type="button" onclick="toggleEdit({{ c.id }})">取消</button>
+          </div>
+        </form>
+      </div>
+      {% endfor %}
+    </div>
+    {% if not clusters %}<div class="muted" style="padding:14px 0;">还没有集群，请在右侧新建第一个集群。</div>{% endif %}
+  </div>
+
+  <!-- 新建集群 -->
+  <div class="card new-cluster">
+    <h3 style="margin:0 0 10px;">新建集群</h3>
+    <form method="post" action="/clusters" class="grid2" style="gap:10px;" id="newClusterForm">
+      <label>集群名称 <span class="req">*</span><input name="name" required placeholder="如 prod-cluster"></label>
+      <label>VIP 地址 <span class="req">*</span><input name="vip" required placeholder="192.168.1.10"></label>
+      <label>VIP 前缀<input name="vip_prefix" placeholder="192.168.1."></label>
+      <label>VRID<input name="vrid" placeholder="51"></label>
+      <label>网卡<input name="interface" placeholder="eth0 / ens192"></label>
+      <label>HA 用户<input name="ha_user" value="ha_monitor"></label>
+      <label>HA 密码<input name="ha_pass" type="password" id="ha_pass"></label>
+      <label>复制用户<input name="repl_user" value="replication"></label>
+      <label>复制密码<input name="repl_pass" type="password" id="repl_pass"></label>
+      <label>业务用户<input name="app_user" value="app"></label>
+      <label>业务密码<input name="app_pass" type="password" id="app_pass"></label>
+    </form>
+    <div style="display:flex; gap:10px; margin-top:12px;">
+      <button class="btn btn-primary" type="submit" form="newClusterForm">创建集群</button>
+      <button class="btn" type="button" onclick="genPw()">随机生成密码</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  function genPw() {
+    var n = 22, s = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789-_", out = "";
+    var a = new Uint8Array(n); if (crypto && crypto.getRandomValues) crypto.getRandomValues(a);
+    else for (var i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256);
+    for (var i = 0; i < n; i++) out += s[a[i] % s.length];
+    document.getElementById("ha_pass").value = out;
+    document.getElementById("repl_pass").value = out.slice().split("").reverse().join("") || out;
+    document.getElementById("app_pass").value = out.slice(7) + out.slice(0, 7);
+  }
+  function togglePw() {
+    var show = document.getElementById("showPw").checked;
+    document.querySelectorAll("input.pw").forEach(function (el) { el.type = show ? "text" : "password"; });
+  }
+  function toggleEdit(id) {
+    var f = document.getElementById("edit-" + id);
+    f.classList.toggle("show");
+  }
+  function delCluster(id, name) {
+    if (!confirm("确认删除集群「" + name + "」？将同时删除其全部节点与切换记录，且不可恢复。")) return;
+    fetch("/clusters/" + id + "/delete", { method: "POST" })
+      .then(function () { location.href = "/clusters?msg=已删除集群 " + encodeURIComponent(name); })
+      .catch(function (e) { alert("删除失败：" + e); });
+  }
+</script>
+{% endblock %}

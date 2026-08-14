@@ -134,11 +134,35 @@ def promote_to_master(host, port, user, password, root_user="root", root_pass=""
 
 
 def make_slave_of(host, port, user, password, master_host, master_port,
-                  repl_user, repl_pass, root_user="root", root_pass=""):
+                  repl_user, repl_pass, root_user="root", root_pass="",
+                  force_reset_master=False):
+    """把本节点改造为 master_host 的从库（GTID 自动定位）。
+
+    关键修复（2026-08-13）：离线的旧主库重新上线时，仍残留自己的 GTID
+    事务，可能和新主库产生分歧（divergence），导致 START SLAVE 后
+    Slave_SQL_Running=No，表现为「独立主库」。因此重指向前先
+    RESET SLAVE ALL 清掉残留复制通道，并按需 RESET MASTER 清掉本机
+    GTID（新主库数据为准），确保干净地重新加入为从库。
+
+    force_reset_master=True 时无条件 RESET MASTER（用于旧主重入场景）。
+    返回 (ok, msg)。
+    """
     conn = connect_robust(host, port, user, password, root_user, root_pass)
+    if conn is None:
+        return False, "无法连接节点(ha_monitor/root均失败)"
     try:
         cur = conn.cursor()
-        cur.execute("STOP SLAVE")
+        try:
+            cur.execute("STOP SLAVE")
+            cur.execute("RESET SLAVE ALL")
+        except Exception:
+            pass
+        # 旧主重入 / 复制分歧时，清掉本机 GTID 让新主库数据为准。
+        if force_reset_master:
+            try:
+                cur.execute("RESET MASTER")
+            except Exception:
+                pass
         cur.execute(
             "CHANGE MASTER TO MASTER_HOST=%s, MASTER_PORT=%s, "
             "MASTER_USER=%s, MASTER_PASSWORD=%s, "
@@ -159,6 +183,16 @@ def make_slave_of(host, port, user, password, master_host, master_port,
             conn.close()
         except Exception:
             pass
+
+
+def is_stale_master(status):
+    """判断一个节点是否为「残留的独立主库」（非当前主、但自己是主且无复制通道）。
+
+    用于 ensure_topology 决定是否需要对旧主上线做 RESET MASTER 干净重入。
+    """
+    if not status:
+        return False
+    return status.get("mode") == "master" and not status.get("master_host")
 
 
 def stop_slave(host, port, user, password, root_user="root", root_pass=""):

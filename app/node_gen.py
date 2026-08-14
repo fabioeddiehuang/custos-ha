@@ -2,22 +2,24 @@
 
 每个被添加的节点会在 NODES_DIR/<ip>/ 下生成：
   docker-compose.yaml   # mysql:8.0 + keepalived(本地 build)
-  init.sql              # 首次启动即创建与全局一致的 ha_monitor
+  init.sql              # 首次启动即创建与「所属集群」一致的 ha_monitor / replication / app
   keepalived/
     Dockerfile
     check_mysql_master.sh
-    keepalived.conf     # 含全部对等节点（unicast_peer）
-    ha_check.conf       # 含管理库连接与各节点凭证
+    keepalived.conf     # 含同集群全部对等节点（unicast_peer）
+    ha_check.conf       # 含管理库连接与节点凭证
 
 用户只需在目标主机上 `cd <目录> && docker compose up -d` 即可完成节点安装与基础配置。
+每个节点归属一个集群（cluster_id），其账号/VIP 均取自该集群配置。
 """
 import os
 import shutil
 from pathlib import Path
 
-from .db import get_setting, query, execute, upsert_setting
-from .config import MGMT, NODES_DIR, NODES_HOST_BASE, get_mgmt_host, VIP, VIP_PREFIX, INTERFACE, VRID, rand_secret
+from .db import get_setting, query, execute
+from .config import MGMT, NODES_DIR, NODES_HOST_BASE, get_mgmt_host, VIP, VIP_PREFIX, INTERFACE, VRID
 from .ha_client import get_status, ensure_ha_creds
+from .clusters import get_cluster_creds
 
 NODE_ASSETS = Path(__file__).parent / "node_assets" / "keepalived"
 
@@ -39,16 +41,21 @@ def get_next_server_id():
     return base + 1
 
 
-def _peer_ips(self_ip):
+def _peer_ips(self_ip, cluster_id):
+    """同一集群内的对等节点（用于 keepalived unicast_peer）。"""
     peers = set()
+    if not cluster_id:
+        return sorted(peers)
     try:
-        for r in query("SELECT ip FROM nodes WHERE ip<>%s", (self_ip,)):
-            peers.add(r["ip"])
+        for r in query("SELECT host FROM hosts WHERE cluster_id=%s AND host<>%s",
+                       (cluster_id, self_ip)):
+            peers.add(r["host"])
     except Exception:
         pass
     try:
-        for r in query("SELECT host FROM hosts WHERE host<>%s", (self_ip,)):
-            peers.add(r["host"])
+        for r in query("SELECT ip FROM nodes WHERE cluster_id=%s AND ip<>%s",
+                       (cluster_id, self_ip)):
+            peers.add(r["ip"])
     except Exception:
         pass
     return sorted(peers)
@@ -143,18 +150,30 @@ def _write(path: Path, text: str, mode=0o600):
     os.chmod(path, mode)
 
 
-def _refresh_all_keepalived_conf():
-    """任一节点增删后，重算所有节点的 unicast_peer 并刷新 keepalived.conf。"""
+def _refresh_all_keepalived_conf(cluster_id=None):
+    """任一节点增删后，重算对应集群所有节点的 unicast_peer 并刷新 keepalived.conf。
+
+    cluster_id 为 None 时刷新全部集群。
+    """
     try:
-        rows = query("SELECT ip, port, server_id FROM nodes")
+        if cluster_id:
+            rows = query("SELECT ip, port, server_id FROM nodes WHERE cluster_id=%s",
+                         (cluster_id,))
+        else:
+            rows = query("SELECT ip, port, server_id FROM nodes")
     except Exception:
         return
     for r in rows:
         ip = r["ip"]
-        peers = _peer_ips(ip)
+        cid = r.get("cluster_id")
+        peers = _peer_ips(ip, cid)
+        creds = get_cluster_creds(cid) if cid else None
+        vip = (creds or {}).get("vip") or get_setting("VIP") or VIP
+        vip_prefix = (creds or {}).get("vip_prefix") or VIP_PREFIX
+        interface = (creds or {}).get("interface") or INTERFACE
+        vrid = (creds or {}).get("vrid") or VRID
         conf = _render_keepalived_conf(
-            ip, peers, get_setting("VIP") or VIP, get_setting("VIP_PREFIX") or VIP_PREFIX,
-            get_setting("INTERFACE") or INTERFACE, get_setting("VRID") or VRID,
+            ip, peers, vip, vip_prefix, interface, vrid,
             f"ha_mysql_{ip.replace('.', '_')}",
         )
         p = Path(NODES_DIR) / ip / "keepalived" / "keepalived.conf"
@@ -175,35 +194,54 @@ def _clean_generated_dir(d: Path):
             item.unlink()
 
 
-def generate_node(ip, port, root_user, root_pass, initial_role="slave"):
+def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None):
     ip = (ip or "").strip()
     if not ip:
         raise ValueError("节点 IP 不能为空")
     port = int(port)
-    ha_user = get_setting("HA_USER") or "ha_monitor"
-    ha_pass = get_setting("HA_PASS")
-    if not ha_pass:
-        # 兜底：服务端配置未手动设置时，自动生成并保存（保证添加节点始终可用）
-        ha_pass = rand_secret(16)
-        upsert_setting("HA_PASS", ha_pass)
-    repl_user = get_setting("REPL_USER") or "repl"
-    repl_pass = get_setting("REPL_PASS")
-    if not repl_pass:
-        repl_pass = rand_secret(16)
-        upsert_setting("REPL_PASS", repl_pass)
-    # 业务最小权限账号：测试/应用连接 VIP 使用，避免直接用 ha_monitor/replication
-    app_user = get_setting("APP_USER") or "app"
-    app_pass = get_setting("APP_PASS")
-    if not app_pass:
-        app_pass = rand_secret(16)
-        upsert_setting("APP_PASS", app_pass)
+    if not cluster_id:
+        # 缺省归入首个集群
+        from .clusters import get_default_cluster
+        d = get_default_cluster()
+        if not d:
+            raise ValueError("尚未创建任何集群，请先在「集群管理」中创建集群")
+        cluster_id = d["id"]
 
-    vip = get_setting("VIP") or VIP
+    creds = get_cluster_creds(cluster_id)
+    if not creds:
+        raise ValueError("集群不存在或凭证缺失")
+    ha_user = creds["ha_user"] or "ha_monitor"
+    ha_pass = creds["ha_pass"]
+    if not ha_pass:
+        # 兜底：集群未设密码时自动生成并写回（保证添加节点始终可用）
+        from .config import rand_secret
+        ha_pass = rand_secret(16)
+        from .clusters import update_cluster
+        update_cluster(cluster_id, ha_pass=ha_pass)
+        creds["ha_pass"] = ha_pass
+    repl_user = creds["repl_user"] or "replication"
+    repl_pass = creds["repl_pass"]
+    if not repl_pass:
+        from .config import rand_secret
+        repl_pass = rand_secret(16)
+        from .clusters import update_cluster
+        update_cluster(cluster_id, repl_pass=repl_pass)
+        creds["repl_pass"] = repl_pass
+    app_user = creds["app_user"] or "app"
+    app_pass = creds["app_pass"]
+    if not app_pass:
+        from .config import rand_secret
+        app_pass = rand_secret(16)
+        from .clusters import update_cluster
+        update_cluster(cluster_id, app_pass=app_pass)
+        creds["app_pass"] = app_pass
+
+    vip = creds["vip"]
     if not vip:
-        raise ValueError("请先在「服务端配置」中设置 VIP（节点同网段空闲 IP）后再添加节点")
-    vip_prefix = get_setting("VIP_PREFIX") or VIP_PREFIX
-    interface = get_setting("INTERFACE") or INTERFACE
-    vrid = get_setting("VRID") or VRID
+        raise ValueError("请先在「集群管理」中为该集群设置 VIP（节点同网段空闲 IP）后再添加节点")
+    vip_prefix = creds["vip_prefix"] or VIP_PREFIX
+    interface = creds["interface"] or INTERFACE
+    vrid = creds["vrid"] or VRID
     mgmt_host = get_mgmt_host()
     mgmt_port = MGMT["port"]
     mgmt_user = MGMT["user"]
@@ -211,7 +249,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave"):
     mgmt_db = MGMT["db"]
     server_id = get_next_server_id()
     node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
-    peers = _peer_ips(ip)
+    peers = _peer_ips(ip, cluster_id)
 
     d = Path(NODES_DIR) / ip
     d.mkdir(parents=True, exist_ok=True)
@@ -219,8 +257,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave"):
     kd = d / "keepalived"
     kd.mkdir(parents=True, exist_ok=True)
 
-    # 1) init.sql：首次启动即创建 ha_monitor 与复制账号（与全局 HA/复制凭证保持一致）
-    #    因此「服务端配置」中自动生成的账号密码会直接落地到节点，无需手动建账号。
+    # 1) init.sql：首次启动即创建 ha_monitor / replication / app（与所属集群凭证保持一致）
     init_sql = (
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         "GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
@@ -289,30 +326,29 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave"):
     #    自愈与切换回退的权威凭据（不随 HA_PASS 漂移）。
     host_compose = f"{NODES_HOST_BASE}/{ip}"
     execute(
-        "INSERT INTO nodes (ip, port, root_user, root_pass, server_id, compose_path) "
-        "VALUES (%s,%s,%s,%s,%s,%s) "
-        "ON DUPLICATE KEY UPDATE port=%s, root_user=%s, root_pass=%s, server_id=%s, compose_path=%s",
-        (ip, port, root_user, root_pass, server_id, host_compose,
-         port, root_user, root_pass, server_id, host_compose),
+        "INSERT INTO nodes (ip, port, root_user, root_pass, server_id, compose_path, cluster_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+        "ON DUPLICATE KEY UPDATE port=%s, root_user=%s, root_pass=%s, server_id=%s, "
+        "compose_path=%s, cluster_id=%s",
+        (ip, port, root_user, root_pass, server_id, host_compose, cluster_id,
+         port, root_user, root_pass, server_id, host_compose, cluster_id),
     )
     execute(
-        "INSERT INTO hosts (host, port, role, status, initial_role) "
-        "VALUES (%s,%s,'unknown','down',%s) "
-        "ON DUPLICATE KEY UPDATE initial_role=%s",
-        (ip, port, initial_role, initial_role),
+        "INSERT INTO hosts (host, port, role, status, initial_role, cluster_id) "
+        "VALUES (%s,%s,'unknown','down',%s,%s) "
+        "ON DUPLICATE KEY UPDATE initial_role=%s, cluster_id=%s",
+        (ip, port, initial_role, cluster_id, initial_role, cluster_id),
     )
-    # 若指定为初始主库，则登记为 current_master，使 keepalived VIP 选举偏向上位
+    # 若指定为初始主库，则登记为当前主库，使 keepalived VIP 选举偏向上位
     if initial_role == "master":
-        execute("UPDATE hosts SET is_current_master=0")
-        execute("UPDATE hosts SET is_current_master=1 WHERE host=%s AND port=%s", (ip, port))
-        execute(
-            "INSERT INTO current_master (id, host, port) VALUES (1,%s,%s) "
-            "ON DUPLICATE KEY UPDATE host=%s, port=%s",
-            (ip, port, ip, port),
-        )
+        execute("UPDATE hosts SET is_current_master=0 WHERE cluster_id=%s", (cluster_id,))
+        execute("UPDATE hosts SET is_current_master=1 WHERE cluster_id=%s AND host=%s AND port=%s",
+                (cluster_id, ip, port))
+        from .state import set_current_master
+        set_current_master(cluster_id, ip, port)
 
-    # 7) 新增节点后刷新所有节点的对等列表
-    _refresh_all_keepalived_conf()
+    # 7) 新增节点后刷新同集群所有节点的对等列表
+    _refresh_all_keepalived_conf(cluster_id)
 
     return dict(
         dir=host_compose, node_name=node_name, server_id=server_id, peers=peers,
@@ -320,29 +356,23 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave"):
     )
 
 
-def sync_node_creds():
-    """把当前 HA_PASS / REPL_PASS / APP_PASS 同步到所有已登记节点。
+def sync_node_creds(cluster_id=None):
+    """把指定集群（或全局）的 HA/复制/业务账号密码同步到其在线节点。
 
-    触发时机：「服务端配置」保存且 HA_PASS / REPL_PASS 发生变化时。
+    触发时机：「集群管理」保存且该集群 HA/复制/业务密码发生变化时。
     作用：
-      1) 用节点 MySQL **root** 账号（root 密码在容器创建时固定，不随 HA_PASS 漂移）
-         执行 ALTER USER，将 ha_monitor / replication / app 账号密码校正为当前设定值。
-         这是权威自愈手段——无论 ha_monitor 当前密码是什么（哪怕已完全脱节），
-         都能连上节点并校正，避免「节点 MySQL 账号与管理端脱节 → 监控探活失败 /
-         keepalived 本地检查认证失败 / VIP 不跟随真实主库漂移」的坑（此前 213/177 踩过）。
-      2) 重新生成各节点 keepalived/ha_check.conf（含 LOCAL_ROOT_PASS），保持与节点一致。
-
-    注意：仅对「root 可达」的节点执行；离线节点需在恢复后用最新配置重新生成部署文件。
-    仅改密码（账号名不变）；若改了账号名，需重新生成节点部署文件并初始化。
+      1) 用节点 MySQL **root** 账号执行 ALTER USER，将 ha_monitor / replication / app
+         账号密码校正为当前设定值（权威自愈，不依赖 ha_monitor 是否可达）。
+      2) 重新生成各节点 keepalived/ha_check.conf，保持与节点一致。
     """
-    ha_user = get_setting("HA_USER") or "ha_monitor"
-    ha_pass = get_setting("HA_PASS") or ""
-    repl_user = get_setting("REPL_USER") or "repl"
-    repl_pass = get_setting("REPL_PASS") or ""
-    app_user = get_setting("APP_USER") or "app"
-    app_pass = get_setting("APP_PASS") or ""
-    if not ha_pass or not repl_pass:
-        return 0
+    if cluster_id:
+        clusters = [cluster_id]
+        creds_map = {cluster_id: get_cluster_creds(cluster_id)}
+    else:
+        cls = query("SELECT id FROM clusters")
+        clusters = [c["id"] for c in cls]
+        creds_map = {c["id"]: get_cluster_creds(c["id"]) for c in cls}
+
     mgmt_host = get_mgmt_host()
     mgmt_port = MGMT["port"]
     mgmt_user = MGMT["user"]
@@ -350,61 +380,102 @@ def sync_node_creds():
     mgmt_db = MGMT["db"]
 
     synced = 0
-    for n in list_nodes():
-        ip = n["ip"]
-        port = int(n["port"])
-        root_user = n.get("root_user") or "root"
-        root_pass = n.get("root_pass") or ""
-
-        # 用 root 权威自愈账号密码（不依赖 ha_monitor 是否可达）
-        ok, msg = ensure_ha_creds(
-            ip, port, root_user, root_pass,
-            ha_user, ha_pass, repl_user, repl_pass,
-            app_user, app_pass,
-        )
-        if not ok:
-            # root 不可达（节点离线/密码不符），跳过（恢复后重新生成部署文件）
+    for cid in clusters:
+        creds = creds_map.get(cid)
+        if not creds:
             continue
+        ha_user = creds["ha_user"] or "ha_monitor"
+        ha_pass = creds["ha_pass"] or ""
+        repl_user = creds["repl_user"] or "replication"
+        repl_pass = creds["repl_pass"] or ""
+        app_user = creds["app_user"] or "app"
+        app_pass = creds["app_pass"] or ""
+        if not ha_pass or not repl_pass:
+            continue
+        rows = query(
+            "SELECT ip, port, root_user, root_pass FROM nodes WHERE cluster_id=%s", (cid,))
+        for n in rows:
+            ip = n["ip"]
+            port = int(n["port"])
+            root_user = n.get("root_user") or "root"
+            root_pass = n.get("root_pass") or ""
 
-        # 重新生成该节点 ha_check.conf，保持与节点一致
-        kd = Path(NODES_DIR) / ip / "keepalived"
-        kd.mkdir(parents=True, exist_ok=True)
-        ha_check = (
-            f"LOCAL_HOST={ip}\n"
-            f"LOCAL_PORT={port}\n"
-            f"LOCAL_USER={ha_user}\n"
-            f"LOCAL_PASS={ha_pass}\n"
-            f"LOCAL_ROOT_USER={root_user}\n"
-            f"LOCAL_ROOT_PASS={root_pass}\n"
-            f"MGMT_HOST={mgmt_host}\n"
-            f"MGMT_PORT={mgmt_port}\n"
-            f"MGMT_USER={mgmt_user}\n"
-            f"MGMT_PASS={mgmt_pass}\n"
-            f"MGMT_DB={mgmt_db}\n"
-        )
-        _write(kd / "ha_check.conf", ha_check)
-        synced += 1
+            # 用 root 权威自愈账号密码（不依赖 ha_monitor 是否可达）
+            ok, msg = ensure_ha_creds(
+                ip, port, root_user, root_pass,
+                ha_user, ha_pass, repl_user, repl_pass,
+                app_user, app_pass,
+            )
+            if not ok:
+                # root 不可达（节点离线/密码不符），跳过（恢复后重新生成部署文件）
+                continue
+
+            # 重新生成该节点 ha_check.conf，保持与节点一致
+            kd = Path(NODES_DIR) / ip / "keepalived"
+            kd.mkdir(parents=True, exist_ok=True)
+            ha_check = (
+                f"LOCAL_HOST={ip}\n"
+                f"LOCAL_PORT={port}\n"
+                f"LOCAL_USER={ha_user}\n"
+                f"LOCAL_PASS={ha_pass}\n"
+                f"LOCAL_ROOT_USER={root_user}\n"
+                f"LOCAL_ROOT_PASS={root_pass}\n"
+                f"MGMT_HOST={mgmt_host}\n"
+                f"MGMT_PORT={mgmt_port}\n"
+                f"MGMT_USER={mgmt_user}\n"
+                f"MGMT_PASS={mgmt_pass}\n"
+                f"MGMT_DB={mgmt_db}\n"
+            )
+            _write(kd / "ha_check.conf", ha_check)
+            synced += 1
     return synced
 
 
-def list_nodes():
+def list_nodes(cluster_id=None):
     try:
+        if cluster_id:
+            return query(
+                "SELECT n.ip, n.port, n.root_user, n.server_id, n.compose_path, n.created_at, "
+                "h.initial_role, h.role, h.status, n.cluster_id "
+                "FROM nodes n LEFT JOIN hosts h ON h.host = n.ip AND h.cluster_id=n.cluster_id "
+                "WHERE n.cluster_id=%s ORDER BY n.ip",
+                (cluster_id,),
+            )
         return query(
-            "SELECT ip, port, root_user, root_pass, server_id, compose_path, created_at "
-            "FROM nodes ORDER BY ip"
+            "SELECT n.ip, n.port, n.root_user, n.server_id, n.compose_path, n.created_at, "
+            "h.initial_role, h.role, h.status, n.cluster_id "
+            "FROM nodes n LEFT JOIN hosts h ON h.host = n.ip AND h.cluster_id=n.cluster_id "
+            "ORDER BY n.cluster_id, n.ip"
         )
     except Exception:
         return []
 
 
+def delete_node_dir(ip):
+    """仅删除生成目录（不含 MySQL-data 数据卷）。"""
+    import shutil as _sh
+    d = Path(NODES_DIR) / ip
+    if d.exists():
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def delete_node(ip):
+    # 查询该节点所属集群，便于仅清理对应集群的 current_master 与 keepalived 对等列表
+    cid = None
+    try:
+        r = query("SELECT cluster_id FROM nodes WHERE ip=%s", (ip,))
+        if r:
+            cid = r[0]["cluster_id"]
+    except Exception:
+        pass
     try:
         execute("DELETE FROM nodes WHERE ip=%s", (ip,))
         execute("DELETE FROM hosts WHERE host=%s", (ip,))
-        # 若被删节点恰是当前主，清除 current_master 以便监控重新选举
-        cur = query("SELECT host, port FROM current_master WHERE id=1")
-        if cur and cur[0]["host"] == ip:
-            execute("DELETE FROM current_master WHERE id=1")
+        # 若被删节点恰是其所在集群的当前主，清除该集群 current_master 以便监控重新选举
+        if cid:
+            cur = query("SELECT host FROM current_master WHERE cluster_id=%s", (cid,))
+            if cur and cur[0]["host"] == ip:
+                execute("DELETE FROM current_master WHERE cluster_id=%s", (cid,))
     except Exception as e:
         raise ValueError(f"删除节点失败: {e}")
-    _refresh_all_keepalived_conf()
+    _refresh_all_keepalived_conf(cid)

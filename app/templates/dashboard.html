@@ -1,73 +1,215 @@
 {% extends "base.html" %}
-{% block title %}拓扑监控{% endblock %}
+{% block title %}仪表盘 · MySQL HA 管理器{% endblock %}
 {% block content %}
-{% if error %}<div class="msg err">管理库暂不可用：{{ error }}（不影响业务，keepalived 已安全降级）</div>{% endif %}
+<style>
+  .dash-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+  .refresh-ind { display:flex; align-items:center; gap:10px; font-size:13px; color:#6b7280; }
+  .refresh-ind .dot { width:8px; height:8px; border-radius:50%; background:#16d39a; box-shadow:0 0 0 3px rgba(22,211,154,.18); }
+  .refresh-ind .dot.busy { background:#f7a23b; box-shadow:0 0 0 3px rgba(247,162,59,.18); }
+  .spin { display:inline-block; width:14px; height:14px; border:2px solid #e5e7eb; border-top-color:#7c3aed; border-radius:50%; animation:sp .7s linear infinite; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+  .stat .val { font-size:15px; font-weight:700; color:#1f2937; word-break:break-all; }
+  .history-tabs { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+  .history-tabs .tab { padding:6px 14px; border-radius:999px; border:1px solid #e5e7eb; background:#fff; cursor:pointer; font-size:13px; color:#374151; transition:.15s; }
+  .history-tabs .tab:hover { border-color:#7c3aed; color:#7c3aed; }
+  .history-tabs .tab.active { background:#7c3aed; border-color:#7c3aed; color:#fff; }
+  .cluster-actions { display:flex; gap:8px; align-items:center; }
+</style>
 
-<div class="card">
-  <h2>集群拓扑</h2>
-  <table>
-    <tr><th>主机</th><th>角色</th><th>状态</th><th>复制延迟(s)</th><th>IO/SQL</th><th>最近探测</th><th>操作</th></tr>
-    {% for h in hosts %}
-    <tr class="{% if h.is_current_master %}master{% endif %}">
-      <td>{{ h.host }}:{{ h.port }}{% if h.is_current_master %} <span class="tag" style="background:#1a7f37;color:#fff">当前主</span>{% endif %}</td>
-      <td>{{ h.role }}{% if (h.initial_role or 'slave') == 'master' %} <span class="tag" style="background:#8250df;color:#fff">初始主</span>{% endif %}</td>
-      <td class="{% if h.status=='up' %}up{% else %}down{% endif %}">{{ h.status }}{% if h.status!='up' and h.err %} <span style="font-size:11px;color:#b42318" title="{{ h.err }}">{{ h.err }}</span>{% endif %}</td>
-      <td>{{ h.repl_delay if h.repl_delay is not none else '-' }}</td>
-      <td>{{ h.slave_io }}/{{ h.slave_sql }}</td>
-      <td>{{ h.last_seen }}</td>
-      <td>
-        {% if h.is_current_master %}
-          <span class="tag" style="background:#1a7f37;color:#fff">当前主</span>
-        {% elif h.status == 'up' %}
-          <button class="btn small" onclick="promoteTo('{{ h.host }}', {{ h.port }})">设为主库</button>
-        {% else %}
-          <span style="color:#b42318">离线</span>
-        {% endif %}
-      </td>
-    </tr>
-    {% else %}
-    <tr><td colspan="7">尚未添加任何节点，请到「节点配置」添加节点。</td></tr>
-    {% endfor %}
-  </table>
-  <div style="margin-top:14px">
-    <button class="btn danger small" onclick="manualFailover()">自动切换(选延迟最小从库)</button>
-    <button class="btn small" onclick="location.reload()">刷新</button>
-    <span id="tip" style="margin-left:10px;color:#555"></span>
+<div class="dash-head">
+  <div>
+    <h1 style="margin:0 0 4px;">集群仪表盘</h1>
+    <div style="font-size:13px;color:#6b7280;">自动探活与故障切换由后台守护进程执行；下方数据每 5 秒自动刷新。</div>
   </div>
-  <p class="hint">提示：每行「设为主库」可手动指定任意在线节点提升为主库（其余节点自动重指向它）；「自动切换」则自动挑选复制延迟最小的从库。</p>
+  <div class="refresh-ind">
+    <span class="dot" id="liveDot"></span>
+    <span id="liveText">实时同步中</span>
+    <span class="spin" id="liveSpin" style="display:none;"></span>
+    <span id="lastUpd"></span>
+    <button class="btn" id="globalRefresh" onclick="refreshStatus(true)">↻ 刷新全部</button>
+  </div>
 </div>
 
+{% if error %}
+  <div class="banner err">⚠ <div>无法读取集群状态：{{ error }}</div></div>
+{% endif %}
+
+{% if not clusters %}
+  <div class="card" style="text-align:center;color:#6b7280;padding:40px;">
+    暂无集群。请前往 <a href="/clusters" style="color:#f4511e;font-weight:600;">集群管理</a> 创建集群并添加节点。
+  </div>
+{% endif %}
+
+{% for c in clusters %}
+  <div class="card cluster-card" style="margin-bottom:18px;">
+    <div class="cluster-head">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span class="cluster-name">{{ c.name }}</span>
+        <span class="badge" style="background:#eef2ff;color:#7c3aed;">VIP {{ c.vip }}</span>
+      </div>
+      <div class="cluster-actions">
+        <button class="btn btn-primary" onclick="doFailover('/api/failover', 'cluster_id={{ c.cluster_id }}', this)">⚡ 自动切换主库</button>
+        <button class="btn" onclick="refreshStatus(true)">↻ 刷新</button>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="lbl">当前主库</div><div class="val" id="cm-{{ c.cluster_id }}">{{ c.current_master }}</div></div>
+      <div class="stat"><div class="lbl">节点总数</div><div class="num">{{ c.total_nodes }}</div></div>
+      <div class="stat"><div class="lbl">在线</div><div class="num up">{{ c.online }}</div></div>
+      <div class="stat"><div class="lbl">离线</div><div class="num down">{{ c.offline }}</div></div>
+      <div class="stat"><div class="lbl">主库数</div><div class="num master">{{ c.masters }}</div></div>
+      <div class="stat"><div class="lbl">从库数</div><div class="num slave">{{ c.slaves }}</div></div>
+    </div>
+
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>主机</th><th>角色</th><th>状态</th><th>复制延迟</th><th>IO 线程</th><th>SQL 线程</th><th>最后心跳</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for h in c.hosts %}
+        <tr data-host="{{ h.host }}:{{ h.port }}">
+          <td class="host">{{ h.host }}:{{ h.port }}</td>
+          <td data-f="role"><span class="role role-{{ h.role }}">{{ h.role }}</span></td>
+          <td data-f="status">
+            {% if h.status == 'up' %}
+              <span class="pill up">● up</span>
+            {% else %}
+              <span class="pill down" title="{{ h.err or '' }}">● {{ h.status }}</span>
+            {% endif %}
+          </td>
+          <td data-f="delay">{% if h.repl_delay is not none %}{{ h.repl_delay }}s{% else %}—{% endif %}</td>
+          <td data-f="io">{{ h.slave_io or '—' }}</td>
+          <td data-f="sql">{{ h.slave_sql or '—' }}</td>
+          <td>{{ h.last_seen or '—' }}</td>
+          <td>
+            {% if h.role != 'master' %}
+              <button class="btn btn-sm" onclick="doFailover('/api/failover/to', 'host={{ h.host }}&port={{ h.port }}&cluster_id={{ c.cluster_id }}', this)">设为主库</button>
+            {% else %}
+              <span class="badge" style="background:#e8f5e9;color:#16d39a;">当前主</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endfor %}
+
 <div class="card">
-  <h2>切换历史</h2>
-  <table>
-    <tr><th>时间</th><th>原主</th><th>新主</th><th>原因</th></tr>
-    {% for r in history %}
-    <tr><td>{{ r.created_at }}</td><td>{{ r.from_host }}:{{ r.from_port }}</td>
-        <td>{{ r.to_host }}:{{ r.to_port }}</td><td>{{ r.reason }}</td></tr>
-    {% else %}
-    <tr><td colspan="4">无切换记录</td></tr>
-    {% endfor %}
+  <h3 style="margin:0 0 12px;">切换记录</h3>
+  <div class="history-tabs" id="historyTabs"></div>
+  <table class="tbl">
+    <thead>
+      <tr><th>时间</th><th>集群</th><th>原主库</th><th>新主库</th><th>原因</th></tr>
+    </thead>
+    <tbody id="historyBody">
+      {% for r in history %}
+      <tr data-cluster="{{ r.cluster_id or '' }}">
+        <td>{{ r.created_at }}</td>
+        <td>{{ r.cluster_name or '—' }}</td>
+        <td>{% if r.from_host %}{{ r.from_host }}:{{ r.from_port }}{% else %}—{% endif %}</td>
+        <td>{{ r.to_host }}:{{ r.to_port }}</td>
+        <td>{{ r.reason }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
   </table>
+  {% if not history %}<div style="color:#9ca3af;padding:12px 0;">暂无切换记录</div>{% endif %}
 </div>
 
 <script>
-function manualFailover(){
-  if(!confirm('确认手动切换主库？将提升延迟最小的从库为新主。')) return;
-  document.getElementById('tip').textContent='切换中...';
-  fetch('/api/failover',{method:'POST'}).then(r=>r.json()).then(d=>{
-    document.getElementById('tip').textContent=d.msg;
-    setTimeout(()=>location.reload(),1500);
-  });
-}
-function promoteTo(host, port){
-  if(!confirm('确认将 '+host+':'+port+' 设为主库？其余在线节点将重指向它。')) return;
-  document.getElementById('tip').textContent='设置中...';
-  const fd=new FormData(); fd.append('host', host); fd.append('port', port);
-  fetch('/api/failover/to',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
-    document.getElementById('tip').textContent=d.msg;
-    setTimeout(()=>location.reload(),1500);
-  });
-}
-setTimeout(()=>location.reload(),15000); // 每15秒自动刷新
+  var activeTab = "all";  // 切换记录当前选中的集群标签
+  function fmtTime(d) {
+    function p(n){return (n<10?"0":"")+n;}
+    return p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds());
+  }
+  function refreshStatus(manual) {
+    var dot = document.getElementById("liveDot");
+    var spin = document.getElementById("liveSpin");
+    var txt = document.getElementById("liveText");
+    if (dot) dot.classList.add("busy");
+    if (spin) spin.style.display = "inline-block";
+    if (txt) txt.textContent = "同步中…";
+    fetch("/api/status", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data.ok) return;
+        // 当前主库
+        var cms = data.current_masters || {};
+        Object.keys(cms).forEach(function (cid) {
+          var el = document.getElementById("cm-" + cid);
+          if (el) el.textContent = cms[cid];
+        });
+        // 节点状态
+        (data.hosts || []).forEach(function (h) {
+          var tr = document.querySelector('tr[data-host="' + h.host + ':' + h.port + '"]');
+          if (!tr) return;
+          var role = tr.querySelector('[data-f="role"]');
+          if (role) role.innerHTML = '<span class="role role-' + (h.role||'unknown') + '">' + (h.role||'unknown') + '</span>';
+          var st = tr.querySelector('[data-f="status"]');
+          if (st) st.innerHTML = (h.status === 'up')
+            ? '<span class="pill up">● up</span>'
+            : '<span class="pill down" title="' + (h.err||'') + '">● ' + (h.status||'?') + '</span>';
+          var d = tr.querySelector('[data-f="delay"]');
+          if (d) d.textContent = (h.repl_delay != null) ? (h.repl_delay + 's') : '—';
+          var io = tr.querySelector('[data-f="io"]'); if (io) io.textContent = h.slave_io || '—';
+          var sql = tr.querySelector('[data-f="sql"]'); if (sql) sql.textContent = h.slave_sql || '—';
+        });
+        // 切换记录（按集群 tab 过滤）
+        buildHistoryTabs(data.clusters || [], data.switch_history || []);
+        if (dot) dot.classList.remove("busy");
+        if (spin) spin.style.display = "none";
+        if (txt) txt.textContent = "实时同步中";
+        var lu = document.getElementById("lastUpd");
+        if (lu) lu.textContent = "最后更新 " + fmtTime(new Date());
+      })
+      .catch(function () {
+        if (dot) dot.classList.remove("busy");
+        if (spin) spin.style.display = "none";
+        if (txt) txt.textContent = "同步失败，将重试";
+      });
+  }
+  function buildHistoryTabs(clusters, history) {
+    var tabs = document.getElementById("historyTabs");
+    if (!tabs) return;
+    // 每个集群一个 tab + 「全部」
+    var html = '<div class="tab ' + (activeTab === "all" ? "active" : "") + '" data-tab="all">全部</div>';
+    (clusters || []).forEach(function (c) {
+      html += '<div class="tab ' + (String(activeTab) === String(c.id) ? "active" : "") + '" data-tab="' + c.id + '">' + (c.name || ('集群' + c.id)) + '</div>';
+    });
+    tabs.innerHTML = html;
+    Array.prototype.forEach.call(tabs.querySelectorAll(".tab"), function (t) {
+      t.onclick = function () { activeTab = t.getAttribute("data-tab"); renderHistory(history); markActive(tabs); };
+    });
+    renderHistory(history);
+  }
+  function markActive(tabs) {
+    Array.prototype.forEach.call(tabs.querySelectorAll(".tab"), function (t) {
+      t.classList.toggle("active", t.getAttribute("data-tab") === String(activeTab));
+    });
+  }
+  function renderHistory(history) {
+    var body = document.getElementById("historyBody");
+    if (!body) return;
+    var rows = history.filter(function (r) {
+      return activeTab === "all" || String(r.cluster_id) === String(activeTab);
+    });
+    if (!rows.length) { body.innerHTML = '<tr><td colspan="5" style="color:#9ca3af;">该集群暂无切换记录</td></tr>'; return; }
+    body.innerHTML = rows.map(function (r) {
+      var from = r.from_host ? (r.from_host + ':' + r.from_port) : '—';
+      return '<tr>' +
+        '<td>' + (r.created_at || '') + '</td>' +
+        '<td>' + (r.cluster_name || '—') + '</td>' +
+        '<td>' + from + '</td>' +
+        '<td>' + r.to_host + ':' + r.to_port + '</td>' +
+        '<td>' + (r.reason || '') + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+  refreshStatus(false);
+  setInterval(function () { refreshStatus(false); }, 5000);
 </script>
 {% endblock %}

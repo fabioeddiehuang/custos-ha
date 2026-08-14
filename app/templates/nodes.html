@@ -1,56 +1,155 @@
 {% extends "base.html" %}
-{% block title %}节点配置{% endblock %}
+{% block title %}节点配置 · MySQL HA 管理器{% endblock %}
 {% block content %}
-{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
-{% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+<style>
+  .req { color:#f4511e; }
+  .node-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .node-toolbar select, .node-toolbar input { margin:0; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; word-break:break-all; }
+  .md5-list { margin:0; padding:0; list-style:none; max-height:320px; overflow:auto; }
+  .md5-list li { display:flex; justify-content:space-between; gap:14px; padding:7px 0; border-bottom:1px dashed #eee; font-size:12.5px; }
+  .md5-list .f { color:#374151; font-family:ui-monospace,monospace; }
+  .md5-list .m { color:#7c3aed; font-family:ui-monospace,monospace; }
+  .modal-mask { position:fixed; inset:0; background:rgba(17,24,39,.45); display:none; align-items:center; justify-content:center; z-index:50; }
+  .modal-mask.show { display:flex; }
+  .modal { background:#fff; border-radius:14px; width:min(640px,92vw); max-height:86vh; overflow:auto; padding:22px; box-shadow:0 20px 50px rgba(0,0,0,.25); }
+  .modal h3 { margin:0 0 6px; }
+  .modal .runcmd { background:#0f172a; color:#e2e8f0; padding:10px 12px; border-radius:8px; margin:10px 0 14px; font-family:ui-monospace,monospace; font-size:12.5px; word-break:break-all; }
+</style>
+
+<h1>节点配置</h1>
+<p class="muted">在此生成各节点的部署单元（docker-compose + keepalived + 初始化 SQL），并下发到目标主机 <code class="mono">/home/docker/&lt;节点IP&gt;/</code> 运行。也可对已生成节点「重新生成」配置或删除。</p>
 
 <div class="card">
-  <h2>添加节点（生成一键部署文件）</h2>
-  <p class="hint">
-    <b>节点配置 = 节点列表 + 节点添加，合并在本页。</b>
-    ha_monitor 账号、复制账号与 VIP 已在「服务端配置」中设置，添加节点时由系统
-    <b>自动套用</b>并写入生成的部署文件；节点 MySQL 的 root 账号即为本节点初始化用的
-    高权账号（仅用于首次启动 init.sql 创建 ha_monitor，之后可保留或回收，无需在管理端单独维护）。
-  </p>
-  <form method="post" action="/nodes/add">
-    <label>节点 IP（业务/管理可达的真实主机 IP）</label>
-    <input name="ip" placeholder="如 192.168.1.203">
-    <label>节点 MySQL 端口（容器外映射端口，如 3307；VIP 经此端口路由）</label>
-    <input name="port" value="3307">
-    <label>节点 MySQL root 账号</label>
-    <input name="root_user" value="root">
-    <label>节点 MySQL root 密码（将写入生成的 compose，请妥善保管）</label>
-    <input name="root_pass" type="password" placeholder="节点 MySQL root 密码">
-    <label>初始角色</label>
-    <select name="initial_role">
-      <option value="slave" selected>从库（默认）</option>
-      <option value="master">主库（VIP 优先在此节点绑定）</option>
-    </select>
-    <p style="color:#777;font-size:12px">生成后会自动在 <code>mysql-ha-manager/generated_nodes/&lt;ip&gt;/</code> 下产出自包含的部署单元（docker-compose.yaml、init.sql、keepalived/ 配置，MySQL 数据落在目录内 ./MySQL-data）；把该目录整体拷到目标主机 <code>/home/docker/&lt;ip&gt;/</code> 执行 <code>docker compose up -d</code> 即完成节点安装与基础配置（含 ha_monitor、GTID、VIP 漂移）。选「主库」仅决定集群首次启动时由哪个节点优先接管 VIP，后续仍可由监控自动切换。</p>
-    <div style="margin-top:12px"><button class="btn" type="submit">生成节点部署文件</button></div>
+  <h3>添加节点</h3>
+  <form method="post" action="/nodes/add" class="grid2">
+    <label>节点 IP
+      <input name="ip" required placeholder="例如 192.168.1.203">
+    </label>
+    <label>MySQL 端口
+      <input name="port" value="{{ cfg.port }}" placeholder="3307">
+    </label>
+    <label>节点 MySQL root 用户
+      <input name="root_user" value="root">
+    </label>
+    <label>节点 MySQL root 密码 <span class="req">*</span>
+      <input name="root_pass" type="password" required>
+    </label>
+    <label>初始角色
+      <select name="initial_role">
+        <option value="master" selected>主库（首次将作为当前主，VIP 优先绑定此节点）</option>
+        <option value="slave">从库</option>
+      </select>
+    </label>
+    <label>所属集群
+      <select name="cluster_id" required>
+        <option value="" disabled {% if not active_cluster %}selected{% endif %}>请选择已有集群</option>
+        {% for c in clusters %}
+          <option value="{{ c.id }}" {% if active_cluster == c.id %}selected{% endif %}>{{ c.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <div style="grid-column:1/-1; display:flex; gap:10px; align-items:center;">
+      <button class="btn btn-primary" type="submit">生成节点配置</button>
+      <span class="muted" style="font-size:13px;">集群的新建请在 <a href="/clusters" style="color:#f4511e;font-weight:600;">集群管理</a> 页面完成。</span>
+    </div>
   </form>
 </div>
 
 <div class="card">
-  <h2>已生成节点</h2>
-  <table>
-    <tr><th>IP</th><th>端口</th><th>server_id</th><th>部署目录</th><th>操作</th></tr>
-    {% for n in nodes %}
-    <tr>
-      <td>{{ n.ip }}</td>
-      <td>{{ n.port }}</td>
-      <td>{{ n.server_id }}</td>
-      <td><code>{{ n.compose_path }}</code></td>
-      <td>
-        <form method="post" action="/nodes/delete" style="display:inline" onsubmit="return confirm('确认删除该节点记录？不会删除目标主机上的容器。')">
-          <input type="hidden" name="ip" value="{{ n.ip }}">
-          <button class="btn danger small" type="submit">删除</button>
-        </form>
-      </td>
-    </tr>
-    {% else %}
-    <tr><td colspan="5">尚未生成任何节点。请在上方添加。</td></tr>
-    {% endfor %}
+  <div class="node-toolbar">
+    <strong>已生成节点（{{ nodes|length }}）</strong>
+    <span class="muted">按集群筛选：</span>
+    <select id="clusterFilter" onchange="filterNodes()">
+      <option value="">全部集群</option>
+      {% for c in clusters %}
+        <option value="{{ c.id }}">{{ c.name }}</option>
+      {% endfor %}
+    </select>
+    <input id="nodeSearch" placeholder="搜索 IP / 目录…" oninput="filterNodes()">
+  </div>
+  <table class="tbl">
+    <thead>
+      <tr>
+        <th>IP</th><th>端口</th><th>server_id</th><th>初始角色</th><th>所属集群</th><th>部署目录</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for n in nodes %}
+      <tr data-cluster="{{ n.cluster_id or '' }}" data-search="{{ n.ip }} {{ n.dir_display }}">
+        <td class="mono">{{ n.ip }}</td>
+        <td>{{ n.port }}</td>
+        <td>{{ n.server_id }}</td>
+        <td>{{ n.initial_role or 'slave' }}</td>
+        <td>{{ n.cluster_name }}</td>
+        <td class="mono" title="{{ n.compose_path }}">{{ n.dir_display }}</td>
+        <td class="row-actions">
+          <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
+          <form method="post" action="/nodes/delete" style="display:inline" onsubmit="return confirm('确认删除该节点？将同时清理项目目录中已生成的同名部署文件。');">
+            <input type="hidden" name="ip" value="{{ n.ip }}">
+            <button class="btn btn-sm btn-danger" type="submit">删除</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
   </table>
+  {% if not nodes %}<div class="muted" style="padding:14px 0;">暂无已生成节点。</div>{% endif %}
 </div>
+
+<!-- 重新生成结果弹窗 -->
+<div class="modal-mask" id="regenModal">
+  <div class="modal">
+    <h3 id="regenTitle">重新生成结果</h3>
+    <div id="regenBody"></div>
+    <div style="text-align:right;margin-top:14px;">
+      <button class="btn" onclick="closeRegen()">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  function filterNodes() {
+    var cf = document.getElementById("clusterFilter").value;
+    var kw = document.getElementById("nodeSearch").value.trim().toLowerCase();
+    document.querySelectorAll('tbody tr[data-cluster]').forEach(function (tr) {
+      var okC = !cf || tr.getAttribute("data-cluster") === cf;
+      var okK = !kw || (tr.getAttribute("data-search") || "").toLowerCase().indexOf(kw) >= 0;
+      tr.style.display = (okC && okK) ? "" : "none";
+    });
+  }
+  function closeRegen() { document.getElementById("regenModal").classList.remove("show"); }
+  function regenNode(ip, btn) {
+    if (!confirm("确认重新生成 " + ip + " 的配置文件？将覆盖原文件。")) return;
+    var old = btn.textContent; btn.disabled = true; btn.textContent = "生成中…";
+    fetch("/nodes/" + encodeURIComponent(ip) + "/regen", { method: "POST" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        btn.disabled = false; btn.textContent = old;
+        var body = document.getElementById("regenBody");
+        if (!d.ok) { body.innerHTML = '<div class="banner err">⚠ <div>' + d.msg + '</div></div>'; }
+        else {
+          var md5html = '<ul class="md5-list">';
+          (d.md5s || []).forEach(function (x) {
+            md5html += '<li><span class="f">' + x.file + '</span><span class="m">' + x.md5 + '</span></li>';
+          });
+          md5html += '</ul>';
+          body.innerHTML =
+            '<div class="banner ok">✓ <div>' + d.msg + '</div></div>' +
+            (d.run_cmd ? '<div class="runcmd">到目标主机执行：\n' + d.run_cmd + '</div>' : '') +
+            '<p class="muted" style="font-size:13px;margin:8px 0 4px;">生成文件 MD5（用于核对一致性）：</p>' +
+            md5html;
+        }
+        document.getElementById("regenModal").classList.add("show");
+      })
+      .catch(function (e) {
+        btn.disabled = false; btn.textContent = old;
+        document.getElementById("regenBody").innerHTML = '<div class="banner err">⚠ <div>请求失败：' + e + '</div></div>';
+        document.getElementById("regenModal").classList.add("show");
+      });
+  }
+  document.getElementById("regenModal").addEventListener("click", function (e) {
+    if (e.target === this) closeRegen();
+  });
+</script>
 {% endblock %}
