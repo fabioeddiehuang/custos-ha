@@ -12,6 +12,7 @@
 用户只需在目标主机上 `cd <目录> && docker compose up -d` 即可完成节点安装与基础配置。
 每个节点归属一个集群（cluster_id），其账号/VIP 均取自该集群配置。
 """
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -21,7 +22,36 @@ from .config import MGMT, NODES_DIR, NODES_HOST_BASE, get_mgmt_host, VIP, VIP_PR
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
 
+logger = logging.getLogger("node_gen")
+
 NODE_ASSETS = Path(__file__).parent / "node_assets" / "keepalived"
+
+
+def _valid_vip(vip):
+    """校验 VIP 是否为合法 IPv4。
+
+    防止空值 / 非法值进入 keepalived.conf 的 virtual_ipaddress，否则 keepalived
+    会静默报 “No VIP specified” / 解析到无效 IP “/24”，导致 VIP 永远不上浮。
+    """
+    if not vip or not str(vip).strip():
+        return False
+    parts = str(vip).strip().split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except (TypeError, ValueError):
+        return False
+
+
+def _shq(s):
+    """把值安全地写成 shell 赋值（单引号包裹，转义内嵌单引号）。
+
+    防止密码/连接串含 # $ 空格 等特殊字符被 shell 解析破坏，导致
+    check_mysql_master.sh 连不上 MySQL、静默返回 1、VIP 永远不上浮。
+    """
+    s = "" if s is None else str(s)
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def get_next_server_id():
@@ -62,6 +92,9 @@ def _peer_ips(self_ip, cluster_id):
 
 
 def _render_keepalived_conf(local_ip, peers, vip, vip_prefix, interface, vrid, router_id):
+    # 硬性校验：VIP 非法时拒绝生成（避免写出 “/24” 这类坏配置让 keepalived 静默失败）
+    if not _valid_vip(vip):
+        raise ValueError("VIP 非法（%r），拒绝生成 keepalived.conf，请先在集群管理设置正确 VIP" % vip)
     peer_block = "\n".join(f"        {p}" for p in peers)
     return f"""global_defs {{
     router_id {router_id}
@@ -70,7 +103,8 @@ def _render_keepalived_conf(local_ip, peers, vip, vip_prefix, interface, vrid, r
 
 vrrp_script chk_mysql_master {{
     script "/etc/keepalived/check_mysql_master.sh"
-    interval 2
+    interval 3
+    timeout 2
     fall 2
     rise 2
     user root
@@ -218,10 +252,14 @@ def _refresh_all_keepalived_conf(cluster_id=None):
         vip_prefix = (creds or {}).get("vip_prefix") or VIP_PREFIX
         interface = (creds or {}).get("interface") or INTERFACE
         vrid = (creds or {}).get("vrid") or VRID
-        conf = _render_keepalived_conf(
-            ip, peers, vip, vip_prefix, interface, vrid,
-            f"ha_mysql_{ip.replace('.', '_')}",
-        )
+        try:
+            conf = _render_keepalived_conf(
+                ip, peers, vip, vip_prefix, interface, vrid,
+                f"ha_mysql_{ip.replace('.', '_')}",
+            )
+        except ValueError as e:
+            logger.warning("跳过刷新 %s 的 keepalived.conf：%s", ip, e)
+            continue
         p = Path(NODES_DIR) / ip / "keepalived" / "keepalived.conf"
         if p.exists():
             _write(p, conf)
@@ -256,13 +294,17 @@ def regenerate_cluster_compose(cluster_id):
         # 重渲染 keepalived.conf：同步最新 VIP / 网卡 / VRID / unicast_peer。
         # 修复此前改 VIP 只刷新 docker-compose、漏刷 keepalived.conf，导致节点配置文件里
         # virtual_ipaddress 仍为空（只剩 /24），keepalived 报 “No VIP specified” / 解析到
-        # 无效 IP “/24”，VIP 永远不上浮。
+        # 无效 IP “/24”，VIP 永远不上浮。VIP 非法时跳过写入（避免覆盖为坏配置）。
         peers = _peer_ips(ip, cluster_id)
-        conf = _render_keepalived_conf(
-            ip, peers, vip, vip_prefix, interface, vrid,
-            f"ha_mysql_{ip.replace('.', '_')}",
-        )
-        _write(kd / "keepalived.conf", conf)
+        try:
+            conf = _render_keepalived_conf(
+                ip, peers, vip, vip_prefix, interface, vrid,
+                f"ha_mysql_{ip.replace('.', '_')}",
+            )
+            _write(kd / "keepalived.conf", conf)
+        except ValueError as e:
+            logger.warning("集群 %s 节点 %s 的 keepalived.conf 渲染跳过（%s）；"
+                           "请先在集群管理设置正确 VIP 后再刷新", cluster_id, ip, e)
         p = kd.parent / "docker-compose.yaml"
         if not p.exists():
             p = kd.parent / "docker-compose.yml"
@@ -333,6 +375,8 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     vip = creds["vip"]
     if not vip:
         raise ValueError("请先在「集群管理」中为该集群设置 VIP（节点同网段空闲 IP）后再添加节点")
+    if not _valid_vip(vip):
+        raise ValueError("集群 VIP 格式非法（%r），应为合法 IPv4，如 192.168.1.10" % vip)
     vip_prefix = creds["vip_prefix"] or VIP_PREFIX
     interface = creds["interface"] or INTERFACE
     vrid = creds["vrid"] or VRID
@@ -368,17 +412,17 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     #    LOCAL_ROOT_USER/LOCAL_ROOT_PASS 用于 keepalived 本地探活（root 密码在容器创建时
     #    固定，不随 HA_PASS 漂移，避免 ha_monitor 密码脱节导致 VIP 不漂移）。
     ha_check = (
-        f"LOCAL_HOST={ip}\n"
+        f"LOCAL_HOST={_shq(ip)}\n"
         f"LOCAL_PORT={port}\n"
-        f"LOCAL_USER={ha_user}\n"
-        f"LOCAL_PASS={ha_pass}\n"
-        f"LOCAL_ROOT_USER={root_user}\n"
-        f"LOCAL_ROOT_PASS={root_pass}\n"
-        f"MGMT_HOST={mgmt_host}\n"
+        f"LOCAL_USER={_shq(ha_user)}\n"
+        f"LOCAL_PASS={_shq(ha_pass)}\n"
+        f"LOCAL_ROOT_USER={_shq(root_user)}\n"
+        f"LOCAL_ROOT_PASS={_shq(root_pass)}\n"
+        f"MGMT_HOST={_shq(mgmt_host)}\n"
         f"MGMT_PORT={mgmt_port}\n"
-        f"MGMT_USER={mgmt_user}\n"
-        f"MGMT_PASS={mgmt_pass}\n"
-        f"MGMT_DB={mgmt_db}\n"
+        f"MGMT_USER={_shq(mgmt_user)}\n"
+        f"MGMT_PASS={_shq(mgmt_pass)}\n"
+        f"MGMT_DB={_shq(mgmt_db)}\n"
     )
     _write(kd / "ha_check.conf", ha_check)
 

@@ -8,7 +8,8 @@ global_defs {
 
 vrrp_script chk_mysql_master {
     script "/etc/keepalived/check_mysql_master.sh"
-    interval 2
+    interval 3
+    timeout 2
     fall 2
     rise 2
 }

@@ -1,13 +1,11 @@
-# keepalived 健康检查用配置 —— 放到两台 DB 主机 /etc/keepalived/ha_check.conf
-# 本机受管 MySQL 连接（用于探活与读 read_only）
-LOCAL_HOST=192.168.1.203
-LOCAL_PORT=3307
-LOCAL_USER=ha_monitor
-LOCAL_PASS=__HA_MONITOR_PASS__
-
-# 管理 MySQL（独立容器）连接 —— vrrp_script 据此防脑裂
-MGMT_HOST=192.168.1.50
-MGMT_PORT=3306
-MGMT_USER=root
-MGMT_PASS=__MGMT_PASS__
-MGMT_DB=ha          # 管理库名（与 docker-compose 中 MGMT_MYSQL_DB 一致，默认 ha）
+LOCAL_HOST='${LOCAL_HOST}'
+LOCAL_PORT=${LOCAL_PORT}
+LOCAL_USER='${LOCAL_USER}'
+LOCAL_PASS='${LOCAL_PASS}'
+LOCAL_ROOT_USER='${LOCAL_ROOT_USER}'
+LOCAL_ROOT_PASS='${LOCAL_ROOT_PASS}'
+MGMT_HOST='${MGMT_HOST}'
+MGMT_PORT=${MGMT_PORT}
+MGMT_USER='${MGMT_USER}'
+MGMT_PASS='${MGMT_PASS}'
+MGMT_DB='${MGMT_DB}'
