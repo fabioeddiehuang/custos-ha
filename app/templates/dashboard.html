@@ -8,7 +8,18 @@
   .refresh-ind .dot.busy { background:#f7a23b; box-shadow:0 0 0 3px rgba(247,162,59,.18); }
   .spin { display:inline-block; width:14px; height:14px; border:2px solid #e5e7eb; border-top-color:#7c3aed; border-radius:50%; animation:sp .7s linear infinite; }
   @keyframes sp { to { transform:rotate(360deg); } }
-  .stat .val { font-size:14px; font-weight:700; color:#1f2937; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .stat .val { font-size:14px; font-weight:700; color:#1f2937; white-space:normal; overflow-wrap:anywhere; min-width:0; }
+  /* 仪表盘集群卡片顶部 VIP 在线检测徽章 */
+  .vip-mon::before { display: none; }
+  .vip-mon { gap: 7px; align-items: center; }
+  .vip-dot { width: 9px; height: 9px; border-radius: 50%; background: #94a3b8; flex: 0 0 auto; transition: background .2s, box-shadow .2s; }
+  .vip-dot.on { background: #16a34a; box-shadow: 0 0 0 3px rgba(22,163,74,.18); }
+  .vip-dot.off { background: #e11d48; box-shadow: 0 0 0 3px rgba(225,29,72,.18); }
+  .vip-addr { font-family: var(--mono); }
+  .vip-st { font-weight: 600; font-size: 12px; margin-left: 1px; }
+  .vip-st.on { color: #16a34a; }
+  .vip-st.off { color: #e11d48; }
+  .vip-st.pending { color: #94a3b8; }
   .history-tabs { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
   .history-tabs .tab { padding:6px 14px; border-radius:999px; border:1px solid #e5e7eb; background:#fff; cursor:pointer; font-size:13px; color:#374151; transition:.15s; }
   .history-tabs .tab:hover { border-color:#7c3aed; color:#7c3aed; }
@@ -45,7 +56,15 @@
     <div class="cluster-head">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
         <span class="cluster-name">{{ c.name }}</span>
-        <span class="badge" style="background:#eef2ff;color:#7c3aed;">VIP {{ c.vip }}:{{ c.vip_port or 3307 }}</span>
+        {% if c.vip and c.vip != "—" %}
+        <span class="badge vip-mon" id="vipbadge-{{ c.cluster_id }}" style="background:#eef2ff;color:#7c3aed;">
+          <span class="vip-dot" id="vipdot-{{ c.cluster_id }}"></span>
+          <span class="vip-addr">VIP {{ c.vip }}:{{ c.vip_port or 3307 }}</span>
+          <span class="vip-st pending" id="vipst-{{ c.cluster_id }}">检测中…</span>
+        </span>
+        {% else %}
+        <span class="badge" style="background:#eef2ff;color:#7c3aed;">VIP —</span>
+        {% endif %}
       </div>
       <div class="cluster-actions">
         <button class="btn btn-primary" onclick="doFailover('/api/failover', 'cluster_id={{ c.cluster_id }}', this)">⚡ 自动切换主库</button>
@@ -325,7 +344,35 @@
       '</tr>';
     }).join('');
   }
+  // 仪表盘集群卡片顶部 VIP 在线检测：TCP 连通 VIP:vip_port 即视为在线。
+  // 独立轮询（15s），不阻塞 10s 状态刷新；接口异常时保留上次状态，不误报离线。
+  function checkVip() {
+    fetch("/api/vip_status", { method: "GET", cache: "no-store", credentials: "same-origin" })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          try { return JSON.parse(t); }
+          catch (e) { throw new Error("HTTP " + r.status + " 非JSON响应: " + t.slice(0, 200)); }
+        });
+      })
+      .then(function (d) {
+        if (!d || !d.ok) return;
+        var vips = d.vips || {};
+        Object.keys(vips).forEach(function (cid) {
+          var dot = document.getElementById("vipdot-" + cid);
+          var st = document.getElementById("vipst-" + cid);
+          if (!dot || !st) return;
+          if (vips[cid].online) {
+            dot.className = "vip-dot on"; st.className = "vip-st on"; st.textContent = "在线";
+          } else {
+            dot.className = "vip-dot off"; st.className = "vip-st off"; st.textContent = "离线";
+          }
+        });
+      })
+      .catch(function (e) { console.error("[vip] 在线检测失败:", e); });
+  }
   refreshStatus(false);
+  checkVip();
   setInterval(function () { refreshStatus(false); }, 10000);
+  setInterval(checkVip, 15000);
 </script>
 {% endblock %}

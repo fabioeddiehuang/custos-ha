@@ -1,6 +1,8 @@
 """FastAPI Web 管理后台：登录鉴权、拓扑展示、手动切换、配置管理、历史、节点一键部署、改密码。"""
 import hashlib
 import json
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, date, time
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
@@ -108,6 +110,19 @@ def _build_status_payload():
         "clusters": clusters,
         "switch_history": switch_history,
     }
+
+
+def _vip_online(host, port, timeout=2.0):
+    """TCP 连通性探测：VIP 是否在线（能连上 VIP:vip_port 即视为在线）。
+
+    纯展示用辅助函数，不依赖、也不改动 HA 核心逻辑（failover/monitor/clusters）。
+    仅做 TCP 三次握手探测，不涉及任何 MySQL 鉴权或复制操作。
+    """
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 
 @app.get("/login")
@@ -238,6 +253,35 @@ def api_refresh(user=Depends(auth_required)):
     if err:
         payload["msg"] = "探活过程中出错: " + err
     return _json_ok(payload)
+
+
+@app.get("/api/vip_status")
+def api_vip_status(user=Depends(auth_required)):
+    """仪表盘集群卡片顶部 VIP 在线检测（TCP 连通 VIP:vip_port）。
+
+    新增展示功能，不改动 HA 核心逻辑（failover/monitor/clusters）。
+    各集群并发探测（线程池），返回 {cluster_id: {online, vip, vip_port}}。
+    """
+    try:
+        rows = query(
+            "SELECT id, vip, vip_port FROM clusters WHERE vip IS NOT NULL AND vip <> ''"
+        )
+        result = {}
+
+        def probe(r):
+            cid = r["id"]
+            vip = r["vip"]
+            port = int(r["vip_port"]) if r.get("vip_port") else 3307
+            return cid, {"vip": vip, "vip_port": port, "online": _vip_online(vip, port)}
+
+        if rows:
+            with ThreadPoolExecutor(max_workers=min(len(rows), 8)) as ex:
+                for fut in as_completed([ex.submit(probe, r) for r in rows]):
+                    cid, info = fut.result()
+                    result[cid] = info
+        return _json_ok({"ok": True, "vips": result})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
 @app.post("/api/heal")

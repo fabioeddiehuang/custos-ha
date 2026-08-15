@@ -685,7 +685,7 @@ label.check input { width: auto; margin: 0; }
 }
 
 /* 磁贴内数值：去掉旧色块底，改为醒目文字 / 渐变芯片 */
-.vip-badge { display: inline-flex; align-items: center; font-weight: 800; font-size: 15px; font-family: var(--mono); background: transparent; border: none; padding: 0; }
+.vip-badge { display: inline-block; font-weight: 800; font-size: 15px; font-family: var(--mono); background: transparent; border: none; padding: 0; white-space: normal; word-break: break-all; max-width: 100%; }
 .info-num { display: inline-flex; align-items: center; font-weight: 800; font-size: 24px; background: transparent; border: none; padding: 0; }
 .online-badge { display: inline-flex; align-items: center; gap: 7px; font-weight: 800; font-size: 15px; }
 .role-badge {
