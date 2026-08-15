@@ -691,11 +691,16 @@ def cluster_update(
     if synced:
         msg += f"；已把新密码同步到 {synced} 个在线节点（到各节点执行 docker compose restart keepalived 使 ha_check.conf 生效）"
     # 重新生成该集群各节点的部署文件：补拷缺失的 notify 脚本、刷新 docker-compose
-    #（含 VIP 端口映射）。修复早期版本节点缺失 notify 脚本导致 keepalived 起不来 / VIP 不上浮。
+    #（含 VIP 端口映射）、并重渲染 keepalived.conf（同步最新 VIP/网卡/VRID/unicast_peer）。
+    # 修复此前改 VIP 只刷 compose、漏刷 keepalived.conf，导致节点配置 virtual_ipaddress 为空、
+    # keepalived 报 “No VIP specified”，VIP 永远不上浮。
     try:
         from .node_gen import regenerate_cluster_compose
         regenerate_cluster_compose(cid)
-        msg += "；已刷新各节点部署文件（notify 脚本 + docker-compose），请到各节点执行 docker compose up -d 生效"
+        msg += ("；已刷新各节点部署文件（keepalived.conf + notify 脚本 + docker-compose），"
+                "请把各节点目录下 keepalived/keepalived.conf 同步到目标机并重载 keepalived 生效"
+                "（如：scp keepalived/keepalived.conf 目标机:/home/docker/<ip>/keepalived/ 后 "
+                "docker compose restart keepalived）")
     except Exception:
         pass
     return render(

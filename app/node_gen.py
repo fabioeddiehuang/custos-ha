@@ -236,6 +236,10 @@ def regenerate_cluster_compose(cluster_id):
     """
     creds = get_cluster_creds(cluster_id) if cluster_id else None
     vip_port = (creds or {}).get("vip_port") or VIP_PORT
+    vip = (creds or {}).get("vip") or ""
+    vip_prefix = (creds or {}).get("vip_prefix") or VIP_PREFIX
+    interface = (creds or {}).get("interface") or INTERFACE
+    vrid = (creds or {}).get("vrid") or VRID
     rows = query(
         "SELECT ip, port, root_pass, server_id FROM nodes WHERE cluster_id=%s",
         (cluster_id,))
@@ -249,6 +253,16 @@ def regenerate_cluster_compose(cluster_id):
             src = NODE_ASSETS / nf
             if src.exists() and not (kd / nf).exists():
                 _write(kd / nf, src.read_text(), mode=0o755)
+        # 重渲染 keepalived.conf：同步最新 VIP / 网卡 / VRID / unicast_peer。
+        # 修复此前改 VIP 只刷新 docker-compose、漏刷 keepalived.conf，导致节点配置文件里
+        # virtual_ipaddress 仍为空（只剩 /24），keepalived 报 “No VIP specified” / 解析到
+        # 无效 IP “/24”，VIP 永远不上浮。
+        peers = _peer_ips(ip, cluster_id)
+        conf = _render_keepalived_conf(
+            ip, peers, vip, vip_prefix, interface, vrid,
+            f"ha_mysql_{ip.replace('.', '_')}",
+        )
+        _write(kd / "keepalived.conf", conf)
         p = kd.parent / "docker-compose.yaml"
         if not p.exists():
             p = kd.parent / "docker-compose.yml"
