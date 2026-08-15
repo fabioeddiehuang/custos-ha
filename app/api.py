@@ -168,6 +168,7 @@ def dashboard(request: Request, user=Depends(auth_required)):
             dash.append(dict(
                 cluster_id=cid, name=cl.get("name") or f"集群{cid}",
                 vip=cl.get("vip") or "—",
+                vip_port=cl.get("vip_port") or 3307,
                 total_nodes=len(annotated),
                 online=sum(1 for h in annotated if h["status"] == "up"),
                 offline=len(annotated) - sum(1 for h in annotated if h["status"] == "up"),
@@ -574,6 +575,7 @@ def clusters_create(
     request: Request, name: str = Form(...),
     vip: str = Form(""), vip_prefix: str = Form("24"),
     interface: str = Form(""), vrid: str = Form(""),
+    vip_port: str = Form(""),
     ha_user: str = Form(""), ha_pass: str = Form(""),
     repl_user: str = Form(""), repl_pass: str = Form(""),
     app_user: str = Form(""), app_pass: str = Form(""),
@@ -582,6 +584,16 @@ def clusters_create(
     name = name.strip()
     if not name:
         return RedirectResponse("/clusters?error=集群名称不能为空", status_code=303)
+    # 解析 VIP 端口
+    vip_port_val = None
+    if vip_port.strip():
+        try:
+            vip_port_val = int(vip_port.strip())
+            if not (1 <= vip_port_val <= 65535):
+                raise ValueError()
+        except ValueError:
+            return RedirectResponse(
+                "/clusters?error=vip端口必须是 1-65535 之间的整数", status_code=303)
     try:
         new_id = create_cluster(
             name,
@@ -595,6 +607,7 @@ def clusters_create(
             vip_prefix=vip_prefix.strip() or None,
             interface=interface.strip() or None,
             vrid=vrid.strip() or None,
+            vip_port=vip_port_val,
         )
     except Exception as e:
         return RedirectResponse(f"/clusters?error={e}", status_code=303)
@@ -611,6 +624,7 @@ def cluster_update(
     cid: int, request: Request,
     name: str = Form(""), vip: str = Form(""), vip_prefix: str = Form(""),
     interface: str = Form(""), vrid: str = Form(""),
+    vip_port: str = Form(""),
     ha_user: str = Form(""), ha_pass: str = Form(""),
     repl_user: str = Form(""), repl_pass: str = Form(""),
     app_user: str = Form(""), app_pass: str = Form(""),
@@ -647,6 +661,18 @@ def cluster_update(
         fields["app_pass"] = rand_secret(16)
     elif app_pass.strip():
         fields["app_pass"] = app_pass.strip()
+    # VIP 端口：合法则纳入更新（节点 compose 需随之重渲染）
+    if vip_port.strip():
+        try:
+            vp = int(vip_port.strip())
+            if not (1 <= vp <= 65535):
+                raise ValueError()
+            fields["vip_port"] = vp
+        except ValueError:
+            return render(
+                "clusters.html", request, user=user, clusters=list_clusters(),
+                active=get_cluster(cid), creds=get_cluster_creds(cid),
+                error="vip端口必须是 1-65535 之间的整数")
     try:
         update_cluster(cid, **fields)
     except Exception as e:
@@ -664,6 +690,14 @@ def cluster_update(
     msg = "已保存集群配置"
     if synced:
         msg += f"；已把新密码同步到 {synced} 个在线节点（到各节点执行 docker compose restart keepalived 使 ha_check.conf 生效）"
+    # 重新生成该集群各节点的部署文件：补拷缺失的 notify 脚本、刷新 docker-compose
+    #（含 VIP 端口映射）。修复早期版本节点缺失 notify 脚本导致 keepalived 起不来 / VIP 不上浮。
+    try:
+        from .node_gen import regenerate_cluster_compose
+        regenerate_cluster_compose(cid)
+        msg += "；已刷新各节点部署文件（notify 脚本 + docker-compose），请到各节点执行 docker compose up -d 生效"
+    except Exception:
+        pass
     return render(
         "clusters.html", request, user=user, clusters=list_clusters(),
         active=get_cluster(cid), creds=get_cluster_creds(cid), msg=msg,

@@ -45,7 +45,7 @@
     <div class="cluster-head">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
         <span class="cluster-name">{{ c.name }}</span>
-        <span class="badge" style="background:#eef2ff;color:#7c3aed;">VIP {{ c.vip }}</span>
+        <span class="badge" style="background:#eef2ff;color:#7c3aed;">VIP {{ c.vip }}:{{ c.vip_port or 3307 }}</span>
       </div>
       <div class="cluster-actions">
         <button class="btn btn-primary" onclick="doFailover('/api/failover', 'cluster_id={{ c.cluster_id }}', this)">⚡ 自动切换主库</button>

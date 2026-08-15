@@ -128,7 +128,7 @@ docker compose up -d --build
 | `PROBE_TIMEOUT` | 单节点探活超时(秒) | `3` |
 | `NODES_DIR` | 容器内节点生成目录 | `/app/generated_nodes` |
 | `NODES_HOST_BASE` | 节点目录在宿主机的**显示路径**（Web 展示用） | `mysql-ha-manager/generated_nodes` |
-| `VIP` / `VIP_PREFIX` / `INTERFACE` / `VRID` | VIP / 掩码位 / 网卡 / 虚拟路由ID | 空 / `24` / `eth0` / `51` |
+| `VIP` / `VIP_PREFIX` / `INTERFACE` / `VRID` / `VIP_PORT` | VIP / 掩码位 / 网卡 / 虚拟路由ID / VIP 对外访问端口 | 空 / `24` / `eth0` / `51` / `3307` |
 | `SMTP_*` / `ALERT_EMAIL` | 切换告警邮件（可选） | — |
 
 > 也支持通过文件注入敏感信息：`MGMT_MYSQL_PASS_FILE`、`WEB_PASS_FILE`（容器内路径）。
@@ -142,7 +142,7 @@ docker compose up -d --build
 
 登录后，主要配置在两个页面完成：
 
-1. **集群管理（核心）**：在「集群管理」页为每个集群配置独立参数 —— 集群名称、VIP 地址 / 掩码位、网卡、VRID，以及 HA 监控账号、复制账号、业务账号（密码留空则自动生成）。点击「同步密码到节点」可把账号密码下发到该集群所有已生成节点（节点 root 自愈）。
+1. **集群管理（核心）**：在「集群管理」页为每个集群配置独立参数 —— 集群名称、VIP 地址 / 掩码位、网卡、VRID、**VIP 端口**，以及 HA 监控账号、复制账号、业务账号（密码留空则自动生成）。保存集群时会自动刷新该集群各节点部署文件（含 notify 脚本与 docker-compose 的 VIP 端口映射）。点击「同步密码到节点」可把账号密码下发到该集群所有已生成节点（节点 root 自愈）。
 2. **系统配置**：在「系统配置」页配置 SMTP 邮件告警服务器，并维护提醒邮箱（可设默认接收全部集群，或按集群绑定路由）。
 
 > 管理库（管理 MySQL）连接**不再通过 Web 表单设置**，而是通过服务端环境变量 `MGMT_MYSQL_*` 配置（见第 4 节）。

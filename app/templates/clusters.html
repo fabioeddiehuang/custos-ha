@@ -31,6 +31,7 @@
         <span class="hint">keepalived 虚拟 IP 的子网掩码位（如 24）</span></label>
       <label>网卡<input class="inp" name="interface" placeholder="eth0"></label>
       <label>VRID<input class="inp" name="vrid" placeholder="51"></label>
+      <label>VIP 端口<input class="inp" name="vip_port" type="number" min="1" max="65535" value="3307"></label>
       <label>HA 监控账号<input class="inp" name="ha_user" placeholder="ha_monitor"></label>
       <label>HA 监控密码<input class="inp pw" type="password" name="ha_pass" placeholder="留空则自动生成"></label>
       <label>复制账号<input class="inp" name="repl_user" placeholder="replication"></label>
@@ -80,7 +81,7 @@
             </span>
             <div class="ii-text">
               <span class="il">VIP</span>
-              <span class="vip-badge">{{ c.vip or '—' }}</span>
+              <span class="vip-badge">{{ c.vip or '—' }}:{{ c.vip_port or 3307 }}</span>
             </div>
           </li>
           <li class="info-item tier-node">
@@ -176,6 +177,7 @@
             <label>VIP 掩码位<input class="inp" name="vip_prefix" value="{{ c.vip_prefix or '24' }}" placeholder="24"></label>
             <label>网卡<input class="inp" name="interface" value="{{ c.interface or '' }}"></label>
             <label>VRID<input class="inp" name="vrid" value="{{ c.vrid or '' }}"></label>
+            <label>VIP 端口<input class="inp" name="vip_port" type="number" min="1" max="65535" value="{{ c.vip_port or 3307 }}"></label>
           </div>
           <div class="cred-head">
             <span>访问凭证</span>

@@ -5,7 +5,7 @@
 监控均按集群隔离进行。
 """
 from .db import query, execute, get_setting
-from .config import rand_secret, VIP, VIP_PREFIX, INTERFACE, VRID
+from .config import rand_secret, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
 
 
 def list_clusters():
@@ -19,7 +19,7 @@ def get_cluster(cluster_id):
 
 def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=None,
                    app_user=None, app_pass=None, vip=None, vip_prefix=None,
-                   interface=None, vrid=None):
+                   interface=None, vrid=None, vip_port=None):
     name = (name or "").strip() or "未命名集群"
     ha_user = ha_user or "ha_monitor"
     ha_pass = ha_pass or rand_secret(16)
@@ -30,13 +30,15 @@ def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=N
     vip_prefix = vip_prefix or VIP_PREFIX
     interface = interface or INTERFACE
     vrid = vrid or VRID
+    if vip_port is None:
+        vip_port = VIP_PORT
     execute(
         """INSERT INTO clusters
         (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
-         vip, vip_prefix, interface, vrid)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+         vip, vip_prefix, interface, vrid, vip_port)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
         (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
-         vip, vip_prefix, interface, vrid),
+         vip, vip_prefix, interface, vrid, int(vip_port)),
     )
     rows = query("SELECT LAST_INSERT_ID() AS id")
     return rows[0]["id"] if rows else None
@@ -44,7 +46,7 @@ def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=N
 
 def update_cluster(cluster_id, **fields):
     allowed = {"name", "ha_user", "ha_pass", "repl_user", "repl_pass", "app_user",
-               "app_pass", "vip", "vip_prefix", "interface", "vrid"}
+               "app_pass", "vip", "vip_prefix", "interface", "vrid", "vip_port"}
     sets, args = [], []
     for k, v in fields.items():
         if k in allowed and v is not None:
@@ -86,6 +88,7 @@ def get_cluster_creds(cluster_id):
         vip_prefix=c.get("vip_prefix") or VIP_PREFIX,
         interface=c.get("interface") or INTERFACE,
         vrid=c.get("vrid") or VRID,
+        vip_port=c.get("vip_port") or VIP_PORT,
     )
 
 

@@ -17,7 +17,7 @@ import shutil
 from pathlib import Path
 
 from .db import get_setting, query, execute
-from .config import MGMT, NODES_DIR, NODES_HOST_BASE, get_mgmt_host, VIP, VIP_PREFIX, INTERFACE, VRID
+from .config import MGMT, NODES_DIR, NODES_HOST_BASE, get_mgmt_host, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
 
@@ -97,8 +97,15 @@ vrrp_instance VI_MYSQL {{
 """
 
 
-def _render_compose(node_name, root_pass, port, server_id):
+def _render_compose(node_name, root_pass, port, server_id, vip_port=None):
     # 注意：YAML 无花括号，可用 f-string。root_pass 含特殊字符时建议改用 .env，此处直接内联。
+    if vip_port is None:
+        vip_port = VIP_PORT
+    # 端口映射：节点自身端口 + VIP 端口都映射到容器 3306，
+    # 使「业务连 VIP:VIP_PORT」在任意主库节点上均可达（VIP 浮动到哪台，哪台就提供该端口）。
+    port_lines = f'      - "{port}:3306"\n'
+    if str(vip_port) != str(port):
+        port_lines += f'      - "{vip_port}:3306"\n'
     return f"""# 自动生成：MySQL 8.0 + keepalived 合一节点部署
 # 前置：目标主机需支持 --network host 与 NET_ADMIN/NET_RAW（Linux）；首次启动会创建 ha_monitor。
 # 运行： cd 本目录 && docker compose up -d
@@ -121,7 +128,7 @@ services:
       - --innodb-flush-log-at-trx-commit=1
       - --read-only=ON
     ports:
-      - "{port}:3306"
+{port_lines}
     volumes:
       # MySQL 数据目录：统一落在节点目录内的 ./MySQL-data（自包含，可直接拷到 /home/docker/<ip>/ 运行）
       - ./MySQL-data:/var/lib/mysql
@@ -150,6 +157,8 @@ services:
     volumes:
       - ./keepalived/keepalived.conf:/etc/keepalived/keepalived.conf:ro
       - ./keepalived/check_mysql_master.sh:/etc/keepalived/check_mysql_master.sh:ro
+      - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro
+      - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro
       - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro
 """
 
@@ -218,6 +227,40 @@ def _refresh_all_keepalived_conf(cluster_id=None):
             _write(p, conf)
 
 
+def regenerate_cluster_compose(cluster_id):
+    """集群 VIP 端口(vip_port)变更后，重渲染该集群所有节点的 docker-compose；
+    并补拷缺失的 notify 脚本（早期版本生成节点时不拷贝 notify 脚本，会导致
+    keepalived 配置指向不存在的脚本、VIP 不上浮）。
+
+    仅写入节点部署文件，不影响正在运行的容器；需到各节点执行 docker compose up -d 生效。
+    """
+    creds = get_cluster_creds(cluster_id) if cluster_id else None
+    vip_port = (creds or {}).get("vip_port") or VIP_PORT
+    rows = query(
+        "SELECT ip, port, root_pass, server_id FROM nodes WHERE cluster_id=%s",
+        (cluster_id,))
+    for r in rows:
+        ip = r["ip"]
+        kd = Path(NODES_DIR) / ip / "keepalived"
+        if not kd.exists():
+            continue
+        # 确保 notify 脚本存在（早期版本缺失，导致 keepalived 起不来 / VIP 不上浮）
+        for nf in ("notify_master.sh", "notify_backup.sh"):
+            src = NODE_ASSETS / nf
+            if src.exists() and not (kd / nf).exists():
+                _write(kd / nf, src.read_text(), mode=0o755)
+        p = kd.parent / "docker-compose.yaml"
+        if not p.exists():
+            p = kd.parent / "docker-compose.yml"
+        if not p.exists():
+            continue
+        content = _render_compose(
+            f"mysql-ha-node-{ip.replace('.', '-')}",
+            r.get("root_pass") or "", int(r["port"]),
+            int(r.get("server_id") or 0), vip_port)
+        _write(p, content)
+
+
 def _clean_generated_dir(d: Path):
     """重新生成节点前清理目录中旧的自生成文件；保留 MySQL-data 数据卷，绝不删除。"""
     if not d.exists():
@@ -279,6 +322,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     vip_prefix = creds["vip_prefix"] or VIP_PREFIX
     interface = creds["interface"] or INTERFACE
     vrid = creds["vrid"] or VRID
+    vip_port = creds.get("vip_port") or VIP_PORT
     mgmt_host = get_mgmt_host()
     mgmt_port = MGMT["port"]
     mgmt_user = MGMT["user"]
@@ -327,14 +371,15 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # 4) 复制静态资源：keepalived Dockerfile + 检查脚本 + 启动入口
     # check_mysql_master.sh 通过 :ro 绑定挂载进 keepalived 容器，其可执行位由宿主机文件
     # 权限决定；若不可执行，keepalived 会禁用 track_script，导致 split-brain。故此处必须 0755。
-    for f in ("Dockerfile", "check_mysql_master.sh", "entrypoint.sh"):
+    for f in ("Dockerfile", "check_mysql_master.sh", "entrypoint.sh",
+              "notify_master.sh", "notify_backup.sh"):
         src = NODE_ASSETS / f
         if src.exists():
-            mode = 0o755 if f in ("check_mysql_master.sh", "entrypoint.sh") else 0o644
+            mode = 0o755 if f.endswith(".sh") else 0o644
             _write(kd / f, src.read_text(), mode=mode)
 
     # 5) docker-compose.yaml
-    compose = _render_compose(node_name, root_pass, port, server_id)
+    compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
     _write(d / "docker-compose.yaml", compose)
 
     # 6) 登记到 nodes 表 + hosts 表（供监控自动接入）

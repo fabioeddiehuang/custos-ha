@@ -52,6 +52,9 @@ VIP = env("VIP", "")
 VIP_PREFIX = env("VIP_PREFIX", "24")
 INTERFACE = env("INTERFACE", "eth0")
 VRID = env("VRID", "51")
+# VIP 对外访问端口：业务连 VIP:VIP_PORT 访问当前主库。默认 3307（与节点默认端口一致）。
+# 该端口会在生成节点时一并映射到容器内 3306，使任意主库节点上 VIP:VIP_PORT 均可达。
+VIP_PORT = int(env("VIP_PORT", "3307"))
 
 
 def get_mgmt_host():

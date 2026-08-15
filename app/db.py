@@ -204,6 +204,11 @@ def init_schema():
                 )
             except Exception:
                 pass
+            # clusters 增加 vip_port（VIP 对外访问端口，业务连 VIP:VIP_PORT 访问主库）
+            try:
+                c.execute("ALTER TABLE clusters ADD COLUMN vip_port INT NOT NULL DEFAULT 3307")
+            except Exception:
+                pass
             # hosts 增加 cluster_id
             try:
                 c.execute("ALTER TABLE hosts ADD COLUMN cluster_id INT DEFAULT NULL")
