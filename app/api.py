@@ -2,6 +2,7 @@
 import hashlib
 import json
 import socket
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, date, time
@@ -16,10 +17,11 @@ from .db import query, execute, get_conn, get_setting, upsert_setting
 from .state import get_current_master
 from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root
 from .node_gen import generate_node, list_nodes, delete_node, delete_node_dir, sync_node_creds
-from .clusters import list_clusters, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
+from .clusters import list_clusters, validate_node_version, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
 from .alerts import send_alert, last_error
 from .ha_client import heal_replication, heal_io_gtid_gap, get_status, make_slave_of
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
+from . import precheck, audit, metrics, slow_log, config_drift
 
 app = FastAPI()
 TEMPLATES = Environment(
@@ -123,6 +125,11 @@ def _vip_online(host, port, timeout=2.0):
             return True
     except Exception:
         return False
+
+
+def _port_online(host, port, timeout=2.0):
+    """TCP 连通性探测：节点 MySQL 端口是否可达（管理器→节点 段）。"""
+    return _vip_online(host, port, timeout)
 
 
 @app.get("/login")
@@ -272,7 +279,16 @@ def api_vip_status(user=Depends(auth_required)):
             cid = r["id"]
             vip = r["vip"]
             port = int(r["vip_port"]) if r.get("vip_port") else 3307
-            return cid, {"vip": vip, "vip_port": port, "online": _vip_online(vip, port)}
+            info = {"vip": vip, "vip_port": port, "online": _vip_online(vip, port), "nodes": []}
+            # 每节点端口可达性（管理器→节点 MySQL 端口 TCP 探活）
+            nrows = query("SELECT ip, port, node_type FROM nodes WHERE cluster_id=%s", (cid,))
+            for nr in nrows:
+                info["nodes"].append({
+                    "host": nr["ip"], "port": int(nr["port"]),
+                    "node_type": nr.get("node_type") or "docker",
+                    "reachable": _port_online(nr["ip"], int(nr["port"])),
+                })
+            return cid, info
 
         if rows:
             with ThreadPoolExecutor(max_workers=min(len(rows), 8)) as ex:
@@ -282,6 +298,121 @@ def api_vip_status(user=Depends(auth_required)):
         return _json_ok({"ok": True, "vips": result})
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+# ---------------- v2.1：预检 / 历史趋势 / 慢日志 / 配置漂移 / 审计 ----------------
+
+@app.post("/api/precheck")
+def api_precheck(cluster_id: int = Form(...), host: str = Form(""), port: int = Form(0),
+                 user=Depends(auth_required)):
+    """节点/集群预检（仅告警）。可用 host/port 指定单节点，否则整集群。"""
+    try:
+        if host and port:
+            creds = get_cluster_creds(cluster_id)
+            role = None
+            rr = query("SELECT role FROM hosts WHERE cluster_id=%s AND host=%s AND port=%s",
+                       (cluster_id, host, int(port)))
+            if rr:
+                role = rr[0].get("role")
+            findings = precheck.check_node(host, int(port), creds.get("ha_user"),
+                                           creds.get("ha_pass"), role)
+            return _json_ok({"ok": True, "findings": [{"host": host, "port": int(port), **f}
+                                                       for f in findings]})
+        findings = precheck.check_cluster(cluster_id)
+        return _json_ok({"ok": True, "findings": findings})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/metric_history")
+def api_metric_history(cluster_id: int = 0, host: str = "", port: int = 0, hours: int = 24,
+                       user=Depends(auth_required)):
+    """指标历史快照（趋势图数据源）。"""
+    try:
+        rows = metrics.get_metric_history(int(cluster_id), host or None, port or None, int(hours))
+        return _json_ok({"ok": True, "rows": rows})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/slow_log")
+def api_slow_log(cluster_id: int = 0, host: str = "", port: int = 0, limit: int = 200,
+                 min_ms: int = 0, user=Depends(auth_required)):
+    """慢日志明细（按耗时倒序）。"""
+    try:
+        rows = slow_log.get_slow_log(int(cluster_id), host or None, port or None, int(limit),
+                                     int(min_ms) if min_ms else None)
+        return _json_ok({"ok": True, "rows": rows})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/config_drift")
+def api_config_drift(cluster_id: int = 0, user=Depends(auth_required)):
+    """最新一次配置一致性巡检结果。"""
+    try:
+        rows, drift = config_drift.get_latest_drift(int(cluster_id))
+        return _json_ok({"ok": True, "rows": rows, "drift": drift})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/audit")
+def api_audit(limit: int = 200, cluster_id: int = 0, user=Depends(auth_required)):
+    """操作审计日志列表。"""
+    try:
+        rows = audit.list_audit(int(limit), 0, int(cluster_id) if cluster_id else None)
+        return _json_ok({"ok": True, "rows": rows})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+# 后台采集锁：保证同一时刻只有一次手动采集在进行，避免并发打满节点连接。
+_collect_lock = threading.Lock()
+_collect_state = {"active": False, "error": None, "last": None}
+
+
+@app.post("/api/collect")
+def api_collect(target: str = Form("all"), cluster_id: int = Form(0), user=Depends(auth_required)):
+    """手动触发采集：metrics / slow / drift / all。
+
+    改为后台线程非阻塞执行：请求立即返回 accepted，采集在守护线程中跑。
+    原因：原实现在单 worker 内同步执行 collect_metrics/collect_slow_log/check_cluster，
+    节点不可达时 connect_robust 超时叠加，会长时间阻塞唯一 worker，请求连接被上游/
+    浏览器重置，前端表现为 fetch 的 NetworkError。后台化后彻底消除该失败模式。
+    """
+    def _run():
+        with _collect_lock:
+            _collect_state["active"] = True
+            _collect_state["error"] = None
+            try:
+                done = []
+                cid = int(cluster_id) if cluster_id else None
+                if target in ("all", "metrics"):
+                    metrics.collect_metrics(cid)
+                    done.append("metrics")
+                if target in ("all", "slow"):
+                    slow_log.collect_slow_log(cid)
+                    done.append("slow")
+                if target in ("all", "drift"):
+                    if cid:
+                        config_drift.check_cluster(cid)
+                    else:
+                        for c in list_clusters():
+                            config_drift.check_cluster(c["id"])
+                    done.append("drift")
+                _collect_state["last"] = done
+            except Exception as e:
+                _collect_state["error"] = f"{type(e).__name__}: {e}"
+                print(f"[collect] 后台采集异常: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+            finally:
+                _collect_state["active"] = False
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return _json_ok({"ok": True, "accepted": True, "msg": "采集任务已提交，正在后台执行…"})
 
 
 @app.post("/api/heal")
@@ -295,6 +426,8 @@ def api_heal(request: Request, user=Depends(auth_required),
         creds = load_creds(cluster_id)
         ru, rp = node_root(host, cluster_id)
         p = int(port)
+        audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                        "heal", f"{host}:{p}", f"cluster={cluster_id}", cluster_id)
 
         def live():
             return get_status(host, p, creds["ha_user"], creds["ha_pass"], ru, rp, timeout=10)
@@ -380,6 +513,8 @@ def api_failover(cluster_id: int = Form(...), user=Depends(auth_required)):
         run_once()  # 切换后立即重建拓扑并回写状态，使仪表盘即时刷新
     except Exception:
         pass
+    audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                    "failover", f"cluster={cluster_id}", "manual", cluster_id)
     return JSONResponse({"ok": ok, "msg": "已触发手动切换" if ok else "切换未执行(检查配置/日志)"})
 
 
@@ -402,6 +537,8 @@ def api_failover_to(host: str = Form(...), port: int = Form(...),
         run_once()  # 设主后立即重建拓扑并回写状态，使仪表盘即时刷新
     except Exception:
         pass
+    audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                    "failover_to", f"{host}:{port}", f"cluster={cid}", cid)
     return JSONResponse({"ok": ok,
                          "msg": ("已将 %s:%s 设为主库" % (host, port))
                          if ok else "设置失败(确认节点在线且已配置账号)"})
@@ -620,6 +757,7 @@ def clusters_create(
     vip: str = Form(""), vip_prefix: str = Form("24"),
     interface: str = Form(""), vrid: str = Form(""),
     vip_port: str = Form(""),
+    node_type: str = Form("docker"), mysql_version: str = Form(""),
     ha_user: str = Form(""), ha_pass: str = Form(""),
     repl_user: str = Form(""), repl_pass: str = Form(""),
     app_user: str = Form(""), app_pass: str = Form(""),
@@ -652,9 +790,13 @@ def clusters_create(
             interface=interface.strip() or None,
             vrid=vrid.strip() or None,
             vip_port=vip_port_val,
+            node_type=node_type.strip() or "docker",
+            mysql_version=mysql_version.strip() or None,
         )
     except Exception as e:
         return RedirectResponse(f"/clusters?error={e}", status_code=303)
+    audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                    "create_cluster", f"cluster={new_id}", name, new_id)
     # 直接渲染新集群，便于用户立即查看自动生成的账号密码（眼睛图标可显隐）
     return render(
         "clusters.html", request, user=user, clusters=list_clusters(),
@@ -669,6 +811,7 @@ def cluster_update(
     name: str = Form(""), vip: str = Form(""), vip_prefix: str = Form(""),
     interface: str = Form(""), vrid: str = Form(""),
     vip_port: str = Form(""),
+    node_type: str = Form(""), mysql_version: str = Form(""),
     ha_user: str = Form(""), ha_pass: str = Form(""),
     repl_user: str = Form(""), repl_pass: str = Form(""),
     app_user: str = Form(""), app_pass: str = Form(""),
@@ -705,6 +848,10 @@ def cluster_update(
         fields["app_pass"] = rand_secret(16)
     elif app_pass.strip():
         fields["app_pass"] = app_pass.strip()
+    if node_type.strip():
+        fields["node_type"] = node_type.strip()
+    if mysql_version.strip():
+        fields["mysql_version"] = mysql_version.strip()
     # VIP 端口：合法则纳入更新（节点 compose 需随之重渲染）
     if vip_port.strip():
         try:
@@ -808,6 +955,12 @@ def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", err
                   creds=creds, cfg=cfg, active_cluster=ac, msg=msg, error=error)
 
 
+@app.get("/audit")
+def audit_page(request: Request, user=Depends(auth_required), limit: int = 200):
+    rows = audit.list_audit(int(limit), 0, None)
+    return render("audit.html", request, user=user, rows=rows, limit=int(limit))
+
+
 @app.post("/nodes/add")
 def nodes_add(
     request: Request,
@@ -817,6 +970,8 @@ def nodes_add(
     root_pass: str = Form(...),
     initial_role: str = Form("master"),
     cluster_id: int = Form(0),
+    node_type: str = Form("docker"),
+    mysql_version: str = Form(""),
     user=Depends(auth_required),
 ):
     initial_role = "master" if initial_role == "master" else "slave"
@@ -824,13 +979,29 @@ def nodes_add(
     cid = int(cluster_id) if cluster_id else None
     if not cid:
         return RedirectResponse("/nodes?error=请先在「集群管理」创建集群，再选择所属集群", status_code=303)
+    # 同集群「同构」校验：禁止 docker/baremetal 混部、主版本须一致
     try:
-        info = generate_node(ip, port, root_user, root_pass, initial_role, cid)
+        validate_node_version(cid, node_type.strip() or "docker", mysql_version.strip() or None)
+    except Exception as e:
+        return RedirectResponse(f"/nodes?error={e}", status_code=303)
+    try:
+        info = generate_node(
+            ip, port, root_user, root_pass, initial_role, cid,
+            node_type=node_type.strip() or "docker", mysql_version=mysql_version.strip() or None,
+        )
+        audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                        "add_node", f"{ip}:{port}",
+                        f"type={node_type} ver={mysql_version}", cluster_id=cid)
     except Exception as e:
         return RedirectResponse(f"/nodes?error={e}", status_code=303)
     role_tip = "（已设为初始主库，VIP 将优先在此节点绑定）" if initial_role == "master" else ""
+    # 裸机节点需提示用户手工应用 init 文件
+    extra_tip = ""
+    if node_type.strip() == "baremetal":
+        extra_tip = ("（裸机节点：请先按 my.cnf.ha-fragment 配置并重启 MySQL，"
+                     "再在节点执行 init_baremetal.sql 创建账号，最后部署 keepalived 容器）")
     return RedirectResponse(
-        f"/nodes?msg=已生成节点 {info['node_name']}{role_tip}，到目标主机执行：{info['run_cmd']}",
+        f"/nodes?msg=已生成节点 {info['node_name']}{role_tip}{extra_tip}，到目标主机执行：{info['run_cmd']}",
         status_code=303,
     )
 
@@ -852,7 +1023,8 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
     """用节点已保存的参数重新生成配置文件（覆盖原文件），并返回生成文件的 md5 便于核对。"""
     try:
         row = query(
-            "SELECT n.ip, n.port, n.root_user, n.root_pass, n.cluster_id, h.initial_role "
+            "SELECT n.ip, n.port, n.root_user, n.root_pass, n.cluster_id, h.initial_role, "
+            "n.node_type, n.mysql_version "
             "FROM nodes n LEFT JOIN hosts h ON h.host=n.ip AND h.cluster_id=n.cluster_id "
             "WHERE n.ip=%s", (ip,)
         )
@@ -861,9 +1033,13 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
         n = row[0]
         # 节点可能尚未探活登记 initial_role，缺省为 slave
         initial_role = n.get("initial_role") or "slave"
+        # 必须沿用节点已保存的 node_type / mysql_version，否则会按默认 docker 重建，
+        # 把裸机节点错误地重生成成「MySQL 容器 + keepalived」合一部署（覆盖掉裸机专属文件）。
         info = generate_node(
             n["ip"], n["port"], n["root_user"], n["root_pass"],
             initial_role, int(n["cluster_id"] or 0),
+            node_type=n.get("node_type") or "docker",
+            mysql_version=n.get("mysql_version"),
         )
         # 计算生成目录内各文件的 md5，便于核对
         import hashlib

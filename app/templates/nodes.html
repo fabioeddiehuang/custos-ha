@@ -41,6 +41,15 @@
         <option value="slave">从库</option>
       </select>
     </label>
+    <label>节点类型
+      <select name="node_type" id="nodeType" onchange="onNodeTypeChange()">
+        <option value="docker" selected>Docker（容器化 MySQL + keepalived 客户端）</option>
+        <option value="baremetal">裸机（宿主机既有 MySQL，仅部署 keepalived 客户端）</option>
+      </select>
+    </label>
+    <label>MySQL 版本
+      <input class="inp" name="mysql_version" id="mysqlVersion" placeholder="如 8.0.36 / 8.4.0（留空=沿用旧语法/自动探测）">
+    </label>
     <label>所属集群
       <select name="cluster_id" required>
         <option value="" disabled {% if not active_cluster %}selected{% endif %}>请选择已有集群</option>
@@ -49,6 +58,12 @@
         {% endfor %}
       </select>
     </label>
+    <div id="baremetalTip" style="grid-column:1/-1; display:none; padding:10px 12px; border:1px dashed #7c2d52; border-radius:10px; background:#fdf2f8; font-size:13px; color:#7c2d52;">
+      <strong>裸机节点部署流程：</strong>生成后请按以下顺序操作 ——
+      ① 在宝塔/编辑器中追加 <code class="mono">my.cnf.ha-fragment</code> 到 MySQL 配置并<strong>重启 MySQL</strong>（宝塔会重写 my.cnf，故参数走配置文件最稳）；
+      ② 在节点登录 MySQL 执行 <code class="mono">init_baremetal.sql</code> 创建 ha_monitor / replication / app 账号；
+      ③ 把生成的 <code class="mono">docker-compose.yaml</code> 拷到目标机运行（仅 keepalived 客户端）。
+    </div>
     <div style="grid-column:1/-1; display:flex; gap:10px; align-items:center;">
       <button class="btn btn-primary" type="submit">生成节点配置</button>
       <span class="muted" style="font-size:13px;">集群的新建请在 <a href="/clusters" style="color:#f4511e;font-weight:600;">集群管理</a> 页面完成。</span>
@@ -77,12 +92,12 @@
     <tbody>
       {% for n in nodes %}
       <tr data-cluster="{{ n.cluster_id or '' }}" data-search="{{ n.ip }} {{ n.dir_display }}">
-        <td class="mono">{{ n.ip }}</td>
-        <td>{{ n.port }}</td>
+        <td class="mono">{{ n.ip }}{% if n.node_type == 'baremetal' %} <span class="badge" style="background:#fdf2f8;color:#7c2d52;">裸机</span>{% elif n.node_type == 'docker' %} <span class="badge" style="background:#eef2ff;color:#7c3aed;">Docker</span>{% endif %}</td>
+        <td>{{ n.port }}{% if n.mysql_version %} <span class="muted" style="font-size:11px;">{{ n.mysql_version }}</span>{% endif %}</td>
         <td>{{ n.server_id }}</td>
         <td>{{ n.initial_role or 'slave' }}</td>
         <td>{{ n.cluster_name }}</td>
-        <td class="mono" title="{{ n.compose_path }}">{{ n.dir_display }}</td>
+        <td class="mono" title="{{ n.compose_path }}">{{ n.dir_display }}{% if n.node_type == 'baremetal' %}<br><span style="color:#7c2d52;font-size:11px;">my.cnf.ha-fragment · init_baremetal.sql</span>{% endif %}</td>
         <td class="row-actions">
           <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
           <form method="post" action="/nodes/delete" style="display:inline" onsubmit="return confirm('确认删除该节点？将同时清理项目目录中已生成的同名部署文件。');">
@@ -109,6 +124,11 @@
 </div>
 
 <script>
+  function onNodeTypeChange() {
+    var t = document.getElementById("nodeType").value;
+    var tip = document.getElementById("baremetalTip");
+    if (tip) tip.style.display = (t === "baremetal") ? "block" : "none";
+  }
   function filterNodes() {
     var cf = document.getElementById("clusterFilter").value;
     var kw = document.getElementById("nodeSearch").value.trim().toLowerCase();

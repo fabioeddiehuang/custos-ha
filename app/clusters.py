@@ -19,7 +19,8 @@ def get_cluster(cluster_id):
 
 def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=None,
                    app_user=None, app_pass=None, vip=None, vip_prefix=None,
-                   interface=None, vrid=None, vip_port=None):
+                   interface=None, vrid=None, vip_port=None, node_type="docker",
+                   mysql_version=None):
     name = (name or "").strip() or "未命名集群"
     ha_user = ha_user or "ha_monitor"
     ha_pass = ha_pass or rand_secret(16)
@@ -35,18 +36,47 @@ def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=N
     execute(
         """INSERT INTO clusters
         (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
-         vip, vip_prefix, interface, vrid, vip_port)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+         vip, vip_prefix, interface, vrid, vip_port, node_type, mysql_version)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
         (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
-         vip, vip_prefix, interface, vrid, int(vip_port)),
+         vip, vip_prefix, interface, vrid, int(vip_port), node_type, mysql_version),
     )
     rows = query("SELECT LAST_INSERT_ID() AS id")
     return rows[0]["id"] if rows else None
 
 
+def validate_node_version(cluster_id, node_type, mysql_version):
+    """同集群「同构」校验：禁止 docker/baremetal 混部；同集群主版本须一致。
+
+    允许 mysql_version=None（老集群/自动探测）与已设版本共存，仅当两者都显式设置
+    且主版本不一致时报错，避免跨大版本复制脆弱。
+    """
+    c = get_cluster(cluster_id)
+    if not c:
+        return
+    exist_type = c.get("node_type") or "docker"
+    if node_type and exist_type != node_type:
+        raise ValueError(f"同集群禁止混部：集群已为 {exist_type}，不能加入 {node_type} 节点")
+    exist_ver = c.get("mysql_version")
+    if mysql_version and exist_ver and _major_minor(mysql_version) != _major_minor(exist_ver):
+        raise ValueError(
+            f"同集群 MySQL 主版本须一致：集群已为 {exist_ver}，不能加入 {mysql_version} 节点"
+        )
+
+
+def _major_minor(version_str):
+    if not version_str:
+        return None
+    parts = (version_str.split("-")[0]).split(".")
+    if len(parts) >= 2:
+        return f"{parts[0]}.{parts[1]}"
+    return version_str
+
+
 def update_cluster(cluster_id, **fields):
     allowed = {"name", "ha_user", "ha_pass", "repl_user", "repl_pass", "app_user",
-               "app_pass", "vip", "vip_prefix", "interface", "vrid", "vip_port"}
+               "app_pass", "vip", "vip_prefix", "interface", "vrid", "vip_port",
+               "node_type", "mysql_version"}
     sets, args = [], []
     for k, v in fields.items():
         if k in allowed and v is not None:

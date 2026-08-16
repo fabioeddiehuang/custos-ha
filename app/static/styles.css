@@ -387,6 +387,19 @@ textarea { resize: vertical; min-height: 84px; line-height: 1.5; }
 .tbl th, .tbl td { padding: 11px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
 .tbl th { color: var(--muted); font-weight: 600; font-size: 12.5px; background: #f8fafc; }
 .tbl tbody tr:hover { background: #f8fafc; }
+/* 慢日志表：固定列宽 + SQL 单元格自动换行，避免长 SQL 撑破卡片边框 */
+.slow-tbl { table-layout: fixed; }
+.slow-tbl th:nth-child(1) { width: 74px; }   /* 耗时 */
+.slow-tbl th:nth-child(2) { width: 72px; }   /* 库 */
+.slow-tbl th:nth-child(3) { width: 92px; }   /* 扫描/返回 */
+.slow-tbl td.q {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
 
 /* ---------------- 状态点 / 标签 ---------------- */
 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }

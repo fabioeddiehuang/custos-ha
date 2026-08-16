@@ -17,6 +17,7 @@
         <a href="/nodes"{% if request.url.path.startswith('/nodes') %} class="active"{% endif %}>节点配置</a>
         <a href="/clusters"{% if request.url.path.startswith('/clusters') %} class="active"{% endif %}>集群管理</a>
         <a href="/settings"{% if request.url.path.startswith('/settings') %} class="active"{% endif %}>系统配置</a>
+        <a href="/audit"{% if request.url.path.startswith('/audit') %} class="active"{% endif %}>审计日志</a>
         <a href="/logout" class="nav-logout">退出</a>
       </nav>
     </div>

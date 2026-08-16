@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}审计日志 · MySQL HA 管理器{% endblock %}
+{% block content %}
+<style>
+  .audit-tbl td.act { font-weight:600; color:#7c2d52; white-space:nowrap; }
+  .audit-tbl td.tgt { font-family:ui-monospace,monospace; font-size:12.5px; }
+  .audit-tbl td.detail { color:#475569; max-width:420px; }
+  .audit-tbl td.actor { font-weight:600; }
+  .pill-sys { background:#eef2ff; color:#7c3aed; padding:1px 8px; border-radius:999px; font-size:11px; }
+</style>
+
+<h1>操作审计日志</h1>
+<p class="muted">记录所有手动操作（Web 用户）与自动操作（故障切换/自愈/设主库等，记为 system）。仅追加、不可篡改，也不影响业务运行。</p>
+
+<div class="card">
+  <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px;">
+    <button class="btn btn-sm" onclick="location.reload()">↻ 刷新</button>
+    <span class="muted">显示最近 {{ limit }} 条</span>
+  </div>
+  <table class="tbl audit-tbl">
+    <thead>
+      <tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>说明</th><th>集群</th></tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>{{ r.created_at }}</td>
+        <td class="actor">{% if r.actor == 'system' %}<span class="pill-sys">system</span>{% else %}{{ r.actor }}{% endif %}</td>
+        <td class="act">{{ r.action }}</td>
+        <td class="tgt">{{ r.target or '—' }}</td>
+        <td class="detail">{{ r.detail or '' }}</td>
+        <td>{% if r.cluster_id %}{{ r.cluster_id }}{% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if not rows %}<div class="muted" style="padding:14px 0;">暂无审计记录。</div>{% endif %}
+</div>
+{% endblock %}

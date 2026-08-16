@@ -1,6 +1,7 @@
 # MySQL HA Manager 版本说明（Release Notes）
 
 > 当前稳定版：**v2.0（正式版 / GA）**，发布日期：2026-08-15
+> 开发中版本：**v2.1**（裸机支持 + 慢日志 + 历史趋势，分支策略：直接在 `master` 开发）
 > 完整部署与使用指南见 [`README.md`](./README.md)；本文件为版本定位与变更记录。
 
 ---
@@ -67,6 +68,34 @@
 
 ---
 
+## v2.1 — 开发中（合并发布：裸机支持 + 慢日志 + 历史趋势）
+
+> 状态：**开发中（在 `master` 直接开发）**。`app/VERSION` 已升 `v2.1`。
+> 设计原则：**无损升级** —— 纯增量 `ALTER`（新增 `node_type` 默认 `docker`、`mysql_version` 默认 `NULL`）+ 4 张新表（`metric_history`/`slow_log`/`config_drift`/`audit_log`）；老 Docker 8.0 集群因 `mysql_version=NULL` 走旧复制语法，行为字节级不变。
+
+### 新增能力
+
+| 能力 | 说明 |
+|------|------|
+| 裸机 MySQL 支持 | 集群/节点可选 `node_type=baremetal`：仅部署 keepalived 客户端容器，复用宿主机既有 MySQL（宝塔等）；`server_id`/GTID 参数走 `my.cnf` 片段（规避宝塔重写 my.cnf），账号创建走 `init_baremetal.sql` 由用户手工应用（管理器不自动连 root 推送）。同集群**禁止 docker/baremetal 混部**、主版本须一致。 |
+| 复制 SQL 兼容层 `mysql_compat` | 按 `SELECT VERSION()` 路由：`<8.0.22` 走 `CHANGE MASTER`/`SHOW SLAVE`；`>=8.0.22`/8.4 走 `CHANGE REPLICATION SOURCE`/`SHOW REPLICA`。Docker 8.0 行为不变；顺带支持 8.4。 |
+| 裸机 root 认证修复 | `connect` 增加 `get_server_public_key=True`，修复裸机 root 的 `caching_sha2` 非 TLS 连接。 |
+| 慢日志监控 | 后台周期采集各节点 `mysql.slow_log`（`log_output=TABLE`）到管理库，节点侧采集后 `TRUNCATE`；仪表盘「慢日志 Top」面板。 |
+| 指标历史趋势 | 后台周期快照复制延迟/线程/连接数到 `metric_history`；仪表盘「复制延迟趋势」零依赖内联 SVG 折线图（色板 `#E11D74`/`#0ABAB5`）。 |
+| 跨节点配置一致性巡检 | `config_drift`：比对 `server_id` 唯一性、`gtid_mode`/`log_bin`/`binlog_format` 一致性、`read_only` 与角色匹配、主版本一致；仪表盘每集群「配置一致/漂移 N」徽标。 |
+| VIP/端口主动探测增强 | `/api/vip_status` 新增每节点 MySQL 端口可达性探测，仪表盘展示端口可达芯片。 |
+| 裸机/节点预检 | `/api/precheck`：连通性 + 复制参数 + `server_id` 唯一性 + 版本一致性，仅告警不修改。 |
+| 操作审计日志 | `audit_log` + `/audit` 页面：记录手动（Web 用户）与自动（故障切换/自愈/system）操作，仅追加不可改。 |
+
+### 与 v2.0 的差异（v2.1 新增 / 变更）
+
+- 节点形态扩展为 **Docker + 裸机** 两类；新增 `node_type`/`mysql_version` 字段（集群与节点）。
+- 复制 SQL 统一经 `mysql_compat` 路由（新增兼容层，老集群不受影响）。
+- 仪表盘新增「观测中心」（趋势图 + 慢日志）、每集群配置漂移徽标、每节点端口可达芯片、预检按钮。
+- 已知限制收窄：裸机支持、慢日志、历史趋势、配置巡检、审计 已在 v2.1 补齐（仍不含 Webhook 与备份，见 v2.2/v2.3）。
+
+---
+
 ## 升级说明
 
 - **v2.0 是稳定基线**：部署即 `docker compose up -d --build ha-manager` 重建镜像，无需数据迁移。
@@ -79,6 +108,6 @@
 | 版本 | 状态 | 范围 |
 |------|------|------|
 | **v2.0** | 已发布（GA） | 多集群隔离 + 自动切换 + 复制自愈 + 节点部署 + Web 控制台 + 产品文档。 |
-| **v2.1** | 规划中 | 裸机编译安装 MySQL 支持（8.x、Docker 客户端模式）+ 共享兼容层 `mysql_compat`（顺带支持 8.4）+ 统一后端 / Web Tab 分离视图 + VIP/端口主动探测增强 + 跨节点配置一致性巡检 + 裸机 OS 预检 + 操作审计日志 + **慢日志监控** + **复制延迟 / 指标历史趋势**。无损升级，老 Docker 集群行为不变。 |
+| **v2.1** | 开发中（master） | 裸机编译安装 MySQL 支持（8.x、Docker 客户端模式）+ 共享兼容层 `mysql_compat`（顺带支持 8.4）+ 统一后端 / Web Tab 分离视图 + VIP/端口主动探测增强 + 跨节点配置一致性巡检 + 裸机 OS 预检 + 操作审计日志 + **慢日志监控** + **复制延迟 / 指标历史趋势**。无损升级，老 Docker 集群行为不变。 |
 | **v2.2** | 规划中 | 计划内 switchover（优雅切换）+ 集群拓扑图可视化 + Webhook 告警（钉钉 / 企业微信 / 飞书）+ 维护窗口静默。 |
 | **v2.3** | 规划中 | 备份管理（定时备份 / 保留策略 / 一键恢复，重投入，独立排期）。 |

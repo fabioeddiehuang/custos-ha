@@ -167,6 +167,9 @@ services:
       # MySQL 数据目录：统一落在节点目录内的 ./MySQL-data（自包含，可直接拷到 /home/docker/<ip>/ 运行）
       - ./MySQL-data:/var/lib/mysql
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # 慢日志覆盖配置（slow_query_log=1 + log_output=TABLE），供 slow_log 采集 mysql.slow_log。
+      # 必须挂载，否则节点慢查询不入库，/api/slow_log 永远空（节点默认 slow_query_log=OFF）。
+      - ./ha-overrides.cnf:/etc/mysql/conf.d/ha-overrides.cnf:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p{root_pass}"]
       interval: 5s
@@ -197,6 +200,85 @@ services:
 """
 
 
+def render_my_cnf_fragment(server_id, port, mysql_version=None):
+    """生成裸机 my.cnf [mysqld] 片段（供用户在宝塔/编辑器中追加并重启 MySQL 生效）。
+
+    原因：宝塔等面板重启会重写 my.cnf，SET PERSIST 写入的 mysqld-auto.cnf 可能被覆盖；
+    故 server_id / gtid / binlog 等关键复制参数走配置文件最稳。
+    """
+    return (
+        "# ---- MySQL HA Manager 裸机节点参数（追加到 my.cnf 的 [mysqld] 段，重启 MySQL 生效）----\n"
+        f"server-id = {server_id}\n"
+        "gtid_mode = ON\n"
+        "enforce_gtid_consistency = ON\n"
+        "log_bin = mysql-bin\n"
+        "log_slave_updates = ON\n"
+        "relay_log = relay-bin\n"
+        "relay_log_recovery = ON\n"
+        "sync_binlog = 1\n"
+        "innodb_flush_log_at_trx_commit = 1\n"
+        "read_only = ON\n"
+        "slow_query_log = 1\n"
+        "long_query_time = 0.5\n"
+        "log_output = TABLE\n"
+        "log_queries_not_using_indexes = 0\n"
+        f"# 业务/复制端口（修改后须与管理器节点端口 {port} 一致）\n"
+    )
+
+
+def render_init_baremetal_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass):
+    """裸机 init.sql：创建 ha_monitor / replication / app 账号 + ha_local 状态库。
+
+    不含 server_id 等参数（走 my.cnf 片段）。用户须在「应用 my.cnf 片段并重启 MySQL」后手动执行。
+    """
+    return _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
+
+
+def render_baremetal_compose(node_name, vip_port=None):
+    """裸机节点：只跑 keepalived 客户端（docker 模式），MySQL 由宿主机既有实例提供。
+
+    keepalived 容器使用 host 网络，连接 127.0.0.1:<port> 探活本机 MySQL。
+    """
+    if vip_port is None:
+        vip_port = VIP_PORT
+    return (
+        "# 自动生成：裸机 MySQL + keepalived-only 客户端节点部署\n"
+        "# 前置：目标机已运行 MySQL（宝塔等），已应用 my.cnf 片段并创建账号（init_baremetal.sql）。\n"
+        "# 运行： cd 本目录 && docker compose up -d\n"
+        "services:\n"
+        "  keepalived:\n"
+        "    image: mysql-ha-keepalived:latest\n"
+        "    build: ./keepalived\n"
+        "    restart: always\n"
+        "    network_mode: host\n"
+        "    cap_add:\n"
+        "      - NET_ADMIN\n"
+        "      - NET_BROADCAST\n"
+        "      - NET_RAW\n"
+        "    volumes:\n"
+        "      - ./keepalived/keepalived.conf:/etc/keepalived/keepalived.conf:ro\n"
+        "      - ./keepalived/check_mysql_master.sh:/etc/keepalived/check_mysql_master.sh:ro\n"
+        "      - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro\n"
+        "      - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro\n"
+        "      - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro\n"
+    )
+
+
+def render_docker_my_cnf():
+    """Docker 节点 MySQL 覆盖配置：开启慢日志（log_output=TABLE），供 slow_log 采集。
+
+    挂载到容器 /etc/mysql/conf.d/ha-overrides.cnf。对 v2.0 已部署集群无副作用，
+    仅在该节点重新生成并部署后生效。
+    """
+    return (
+        "[mysqld]\n"
+        "slow_query_log = 1\n"
+        "long_query_time = 0.5\n"
+        "log_output = TABLE\n"
+        "log_queries_not_using_indexes = 0\n"
+    )
+
+
 def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass):
     """渲染 init.sql（首次启动即创建与所属集群一致的 ha_monitor / replication / app 账号）。
 
@@ -207,7 +289,7 @@ def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
     return (
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         "GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
-        "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
+        "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* TO '%s'@'%%';\n"
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         "GRANT REPLICATION SLAVE ON *.* TO '%s'@'%%';\n"
         # 业务最小权限账号：供测试/应用通过 VIP 连接，仅授予常用读写与管理权限，
@@ -279,10 +361,11 @@ def regenerate_cluster_compose(cluster_id):
     interface = (creds or {}).get("interface") or INTERFACE
     vrid = (creds or {}).get("vrid") or VRID
     rows = query(
-        "SELECT ip, port, root_pass, server_id FROM nodes WHERE cluster_id=%s",
+        "SELECT ip, port, root_pass, server_id, node_type FROM nodes WHERE cluster_id=%s",
         (cluster_id,))
     for r in rows:
         ip = r["ip"]
+        node_type = r.get("node_type") or "docker"
         kd = Path(NODES_DIR) / ip / "keepalived"
         if not kd.exists():
             continue
@@ -310,10 +393,14 @@ def regenerate_cluster_compose(cluster_id):
             p = kd.parent / "docker-compose.yml"
         if not p.exists():
             continue
-        content = _render_compose(
-            f"mysql-ha-node-{ip.replace('.', '-')}",
-            r.get("root_pass") or "", int(r["port"]),
-            int(r.get("server_id") or 0), vip_port)
+        node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
+        if node_type == "baremetal":
+            content = render_baremetal_compose(node_name, vip_port)
+        else:
+            content = _render_compose(
+                node_name, r.get("root_pass") or "", int(r["port"]),
+                int(r.get("server_id") or 0), vip_port)
+            _write(kd.parent / "ha-overrides.cnf", render_docker_my_cnf(), mode=0o644)
         _write(p, content)
 
 
@@ -330,7 +417,8 @@ def _clean_generated_dir(d: Path):
             item.unlink()
 
 
-def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None):
+def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None,
+                  node_type="docker", mysql_version=None):
     ip = (ip or "").strip()
     if not ip:
         raise ValueError("节点 IP 不能为空")
@@ -389,6 +477,9 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     server_id = get_next_server_id()
     node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
     peers = _peer_ips(ip, cluster_id)
+    # 裸机模式 keepalived 容器在 host 网络，连本机 MySQL 用 127.0.0.1；
+    # Docker 模式连节点 IP（容器已把端口发布到宿主机）。
+    local_host = "127.0.0.1" if node_type == "baremetal" else ip
 
     d = Path(NODES_DIR) / ip
     d.mkdir(parents=True, exist_ok=True)
@@ -396,11 +487,23 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     kd = d / "keepalived"
     kd.mkdir(parents=True, exist_ok=True)
 
-    # 1) init.sql：首次启动即创建 ha_monitor / replication / app（与所属集群凭证保持一致）
+    # 1) init.sql / compose（按节点类型分支）
     init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
-    # init.sql 会被 MySQL 容器以非 root 的 mysql 用户读取执行，
-    # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。
-    _write(d / "init.sql", init_sql, mode=0o644)
+    extra_files = {}
+    if node_type == "baremetal":
+        # 裸机：不生成 MySQL 容器，仅生成「手工应用文件」（init_baremetal.sql + my.cnf 片段）。
+        # 管理器不自动连 root 执行 init（避免生产 root 凭据被用于远程推送）。
+        _write(d / "init_baremetal.sql", init_sql, mode=0o644)
+        my_cnf = render_my_cnf_fragment(server_id, port, mysql_version)
+        _write(d / "my.cnf.ha-fragment", my_cnf, mode=0o644)
+        extra_files["init_baremetal_sql"] = f"{NODES_HOST_BASE}/{ip}/init_baremetal.sql"
+        extra_files["my_cnf_fragment"] = f"{NODES_HOST_BASE}/{ip}/my.cnf.ha-fragment"
+    else:
+        # init.sql 会被 MySQL 容器以非 root 的 mysql 用户读取执行，
+        # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。
+        _write(d / "init.sql", init_sql, mode=0o644)
+        # 慢日志覆盖配置（挂载到容器 /etc/mysql/conf.d）
+        _write(d / "ha-overrides.cnf", render_docker_my_cnf(), mode=0o644)
 
     # 2) keepalived.conf
     keep_conf = _render_keepalived_conf(
@@ -412,7 +515,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     #    LOCAL_ROOT_USER/LOCAL_ROOT_PASS 用于 keepalived 本地探活（root 密码在容器创建时
     #    固定，不随 HA_PASS 漂移，避免 ha_monitor 密码脱节导致 VIP 不漂移）。
     ha_check = (
-        f"LOCAL_HOST={_shq(ip)}\n"
+        f"LOCAL_HOST={_shq(local_host)}\n"
         f"LOCAL_PORT={port}\n"
         f"LOCAL_USER={_shq(ha_user)}\n"
         f"LOCAL_PASS={_shq(ha_pass)}\n"
@@ -436,8 +539,11 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             mode = 0o755 if f.endswith(".sh") else 0o644
             _write(kd / f, src.read_text(), mode=mode)
 
-    # 5) docker-compose.yaml
-    compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
+    # 5) docker-compose.yaml（裸机仅 keepalived 客户端）
+    if node_type == "baremetal":
+        compose = render_baremetal_compose(node_name, vip_port)
+    else:
+        compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
     _write(d / "docker-compose.yaml", compose)
 
     # 6) 登记到 nodes 表 + hosts 表（供监控自动接入）
@@ -448,12 +554,12 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     #    自愈与切换回退的权威凭据（不随 HA_PASS 漂移）。
     host_compose = f"{NODES_HOST_BASE}/{ip}"
     execute(
-        "INSERT INTO nodes (ip, port, root_user, root_pass, server_id, compose_path, cluster_id) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+        "INSERT INTO nodes (ip, port, root_user, root_pass, server_id, compose_path, cluster_id, node_type, mysql_version) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON DUPLICATE KEY UPDATE port=%s, root_user=%s, root_pass=%s, server_id=%s, "
-        "compose_path=%s, cluster_id=%s",
-        (ip, port, root_user, root_pass, server_id, host_compose, cluster_id,
-         port, root_user, root_pass, server_id, host_compose, cluster_id),
+        "compose_path=%s, cluster_id=%s, node_type=%s, mysql_version=%s",
+        (ip, port, root_user, root_pass, server_id, host_compose, cluster_id, node_type, mysql_version,
+         port, root_user, root_pass, server_id, host_compose, cluster_id, node_type, mysql_version),
     )
     execute(
         "INSERT INTO hosts (host, port, role, status, initial_role, cluster_id) "
@@ -474,7 +580,9 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
 
     return dict(
         dir=host_compose, node_name=node_name, server_id=server_id, peers=peers,
+        node_type=node_type,
         run_cmd=f"cd {host_compose} && docker compose up -d",
+        **extra_files,
     )
 
 
@@ -515,12 +623,13 @@ def sync_node_creds(cluster_id=None):
         if not ha_pass or not repl_pass:
             continue
         rows = query(
-            "SELECT ip, port, root_user, root_pass FROM nodes WHERE cluster_id=%s", (cid,))
+            "SELECT ip, port, root_user, root_pass, node_type, mysql_version FROM nodes WHERE cluster_id=%s", (cid,))
         for n in rows:
             ip = n["ip"]
             port = int(n["port"])
             root_user = n.get("root_user") or "root"
             root_pass = n.get("root_pass") or ""
+            node_type = n.get("node_type") or "docker"
 
             # 用 root 权威自愈账号密码（不依赖 ha_monitor 是否可达）
             ok, msg = ensure_ha_creds(
@@ -533,10 +642,12 @@ def sync_node_creds(cluster_id=None):
                 continue
 
             # 重新生成该节点 ha_check.conf，保持与节点一致
+            # 裸机节点 keepalived 探活连 127.0.0.1（宿主机既有 MySQL）；docker 节点连宿主机 IP。
+            local_host = "127.0.0.1" if node_type == "baremetal" else ip
             kd = Path(NODES_DIR) / ip / "keepalived"
             kd.mkdir(parents=True, exist_ok=True)
             ha_check = (
-                f"LOCAL_HOST={ip}\n"
+                f"LOCAL_HOST={local_host}\n"
                 f"LOCAL_PORT={port}\n"
                 f"LOCAL_USER={ha_user}\n"
                 f"LOCAL_PASS={ha_pass}\n"
@@ -549,10 +660,14 @@ def sync_node_creds(cluster_id=None):
                 f"MGMT_DB={mgmt_db}\n"
             )
             _write(kd / "ha_check.conf", ha_check)
-            # 同步重生成 init.sql（仅凭证相关），保证后续「重部署」清空 MySQL-data 后
-            # init.sql 重新执行时使用的仍是当前密码，不会因旧密码导致无法连接。
-            init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
-            _write(Path(NODES_DIR) / ip / "init.sql", init_sql, mode=0o644)
+            # 同步重生成 init 凭证 SQL（仅凭证相关），保证后续「重部署」后执行时使用的仍是当前密码。
+            # 裸机节点写 init_baremetal.sql（不含 server_id 参数，需配合 my.cnf 片段）；docker 节点写 init.sql。
+            if node_type == "baremetal":
+                init_sql = render_init_baremetal_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
+                _write(Path(NODES_DIR) / ip / "init_baremetal.sql", init_sql, mode=0o644)
+            else:
+                init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
+                _write(Path(NODES_DIR) / ip / "init.sql", init_sql, mode=0o644)
             synced += 1
     return synced
 
@@ -561,14 +676,16 @@ def list_nodes(cluster_id=None):
     try:
         if cluster_id:
             return query(
-                "SELECT n.ip, n.port, n.root_user, n.server_id, n.compose_path, n.created_at, "
+                "SELECT n.ip, n.port, n.root_user, n.root_pass, n.server_id, n.compose_path, n.created_at, "
+                "n.node_type, n.mysql_version, "
                 "h.initial_role, h.role, h.status, n.cluster_id "
                 "FROM nodes n LEFT JOIN hosts h ON h.host = n.ip AND h.cluster_id=n.cluster_id "
                 "WHERE n.cluster_id=%s ORDER BY n.ip",
                 (cluster_id,),
             )
         return query(
-            "SELECT n.ip, n.port, n.root_user, n.server_id, n.compose_path, n.created_at, "
+            "SELECT n.ip, n.port, n.root_user, n.root_pass, n.server_id, n.compose_path, n.created_at, "
+            "n.node_type, n.mysql_version, "
             "h.initial_role, h.role, h.status, n.cluster_id "
             "FROM nodes n LEFT JOIN hosts h ON h.host = n.ip AND h.cluster_id=n.cluster_id "
             "ORDER BY n.cluster_id, n.ip"

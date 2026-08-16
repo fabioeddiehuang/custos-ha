@@ -118,6 +118,47 @@ SCHEMA_SQL = [
         PRIMARY KEY (email_id, cluster_id)
     ) ENGINE=InnoDB
     """,
+    # ---- v2.1：指标历史快照（monitor 周期落库，供趋势图）----
+    """
+    CREATE TABLE IF NOT EXISTS metric_history (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        cluster_id INT, host VARCHAR(64), port INT,
+        seconds_behind INT, slave_io VARCHAR(16), slave_sql VARCHAR(16),
+        ro TINYINT(1), connections INT, repl_delay INT,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_host (cluster_id, host, port, ts)
+    ) ENGINE=InnoDB
+    """,
+    # ---- v2.1：慢日志采集（节点 mysql.slow_log 采集后 TRUNCATE，保持节点侧极小）----
+    """
+    CREATE TABLE IF NOT EXISTS slow_log (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        cluster_id INT, host VARCHAR(64), port INT,
+        query_time_ms INT, lock_time_ms INT, rows_sent INT, rows_examined INT,
+        db VARCHAR(64), sql_text MEDIUMTEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_host (cluster_id, host, port, ts)
+    ) ENGINE=InnoDB
+    """,
+    # ---- v2.1：跨节点配置一致性巡检结果（定时/手动跑）----
+    """
+    CREATE TABLE IF NOT EXISTS config_drift (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        cluster_id INT, host VARCHAR(64), port INT,
+        var_name VARCHAR(64), expected VARCHAR(255), actual VARCHAR(255),
+        status VARCHAR(8),
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_cid (cluster_id, ts)
+    ) ENGINE=InnoDB
+    """,
+    # ---- v2.1：操作审计日志 ----
+    """
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        actor VARCHAR(64), action VARCHAR(64), target VARCHAR(128),
+        detail TEXT, cluster_id INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_ts (created_at)
+    ) ENGINE=InnoDB
+    """,
 ]
 
 
@@ -209,6 +250,18 @@ def init_schema():
                 c.execute("ALTER TABLE clusters ADD COLUMN vip_port INT NOT NULL DEFAULT 3307")
             except Exception:
                 pass
+            # ---- v2.1：节点/集群支持裸机（node_type）与 MySQL 大版本（mysql_version）----
+            # 默认 node_type='docker' 行为完全不变；mysql_version=NULL 表示沿用旧复制语法。
+            for _tbl, _col, _def in (
+                ("nodes", "node_type", "varchar(16) NOT NULL DEFAULT 'docker'"),
+                ("nodes", "mysql_version", "varchar(16) DEFAULT NULL"),
+                ("clusters", "node_type", "varchar(16) NOT NULL DEFAULT 'docker'"),
+                ("clusters", "mysql_version", "varchar(16) DEFAULT NULL"),
+            ):
+                try:
+                    c.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_def}")
+                except Exception:
+                    pass
             # hosts 增加 cluster_id
             try:
                 c.execute("ALTER TABLE hosts ADD COLUMN cluster_id INT DEFAULT NULL")
@@ -279,6 +332,10 @@ def init_schema():
                     c.execute("UPDATE nodes SET cluster_id=1 WHERE cluster_id IS NULL")
             except Exception as e:
                 print(f"[init_db] 迁移默认集群失败(可忽略): {e}")
+        # v2.1：保留期默认值（仅首次写入，已存在则不动）
+        for _k, _v in (("METRIC_RETENTION_DAYS", "30"), ("SLOWLOG_RETENTION_DAYS", "7")):
+            if get_setting(_k) is None:
+                upsert_setting(_k, _v)
         conn.commit()
     finally:
         conn.close()

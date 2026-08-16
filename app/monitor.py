@@ -9,6 +9,7 @@ from .state import get_current_master
 from .failover import do_failover, ensure_topology, load_creds, node_root
 from .alerts import send_alert
 from .clusters import list_clusters
+from . import metrics, slow_log, config_drift
 
 # 复制延迟告警阈值（秒）。超过即发邮件告警，避免重复刷屏只在「跨阈值的那一刻」触发。
 REPL_LAG_ALERT_SEC = 30
@@ -296,7 +297,48 @@ def run_forever():
         except Exception as e:
             # 管理库不可用等：降级，仅记录，不影响业务(keepalived 有安全回退)
             print(f"[monitor] 周期错误(已降级继续): {e}")
+        try:
+            _maybe_collect()
+        except Exception as e:
+            print(f"[monitor] 周期采集异常(已降级继续): {e}")
         time.sleep(CHECK_INTERVAL)
+
+
+# 周期计数：用于错峰触发采集任务（避免每周期都重连库写指标）。
+_COLLECT_CYCLE = {"metrics": 0, "slow": 0, "drift": 0}
+# 采集周期倍数（相对于 CHECK_INTERVAL）：指标采样较频繁，慢日志/漂移较稀疏。
+_METRICS_EVERY = 3      # 约 CHECK_INTERVAL*3（默认 9s）采样一次指标
+_SLOW_EVERY = 20        # 约默认 60s 采集一次慢日志
+_DRIFT_EVERY = 20       # 约默认 60s 巡检一次配置漂移
+
+
+def _maybe_collect():
+    """在后台 monitor 周期内错峰触发指标/慢日志/配置漂移采集（仅写入，无副作用）。"""
+    _COLLECT_CYCLE["metrics"] += 1
+    _COLLECT_CYCLE["slow"] += 1
+    _COLLECT_CYCLE["drift"] += 1
+    if _COLLECT_CYCLE["metrics"] >= _METRICS_EVERY:
+        _COLLECT_CYCLE["metrics"] = 0
+        try:
+            metrics.collect_metrics()
+        except Exception as e:
+            print(f"[monitor] 指标采集异常: {e}", flush=True)
+            import traceback; traceback.print_exc()
+    if _COLLECT_CYCLE["slow"] >= _SLOW_EVERY:
+        _COLLECT_CYCLE["slow"] = 0
+        try:
+            slow_log.collect_slow_log()
+        except Exception as e:
+            print(f"[monitor] 慢日志采集异常: {e}", flush=True)
+            import traceback; traceback.print_exc()
+    if _COLLECT_CYCLE["drift"] >= _DRIFT_EVERY:
+        _COLLECT_CYCLE["drift"] = 0
+        try:
+            for cl in list_clusters():
+                config_drift.check_cluster(cl["id"])
+        except Exception as e:
+            print(f"[monitor] 配置漂移巡检异常: {e}", flush=True)
+            import traceback; traceback.print_exc()
 
 
 def start_in_background():

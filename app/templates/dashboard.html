@@ -25,6 +25,69 @@
   .history-tabs .tab:hover { border-color:#7c3aed; color:#7c3aed; }
   .history-tabs .tab.active { background:#7c3aed; border-color:#7c3aed; color:#fff; }
   .cluster-actions { display:flex; gap:8px; align-items:center; }
+  /* v2.1：节点端口可达芯片 / 配置漂移徽标 */
+  .port-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .port-chip { display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-family:var(--mono); padding:2px 8px; border-radius:999px; background:#f1f5f9; color:#475569; }
+  .port-chip .pdot { width:7px; height:7px; border-radius:50%; background:#94a3b8; }
+  .port-chip.ok .pdot { background:#16a34a; }
+  .port-chip.bad .pdot { background:#e11d48; }
+  .port-chip.ok { background:#ecfdf5; color:#047857; }
+  .port-chip.bad { background:#fef2f2; color:#b91c1c; }
+  .badge.drift-ok { background:#ecfdf5; color:#047857; }
+  .badge.drift-bad { background:#fef2f2; color:#b91c1c; }
+  /* 观测中心 · 重设计布局 */
+  .obs-wrap { padding:16px; }
+  .obs-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+  .obs-title { display:flex; align-items:center; gap:8px; margin:0; font-size:16px; font-weight:700; color:#0f172a; }
+  .obs-title-ico { width:18px; height:18px; color:#0ABAB5; }
+  .obs-actions { display:flex; align-items:center; gap:8px; }
+  .obs-grid { display:grid; grid-template-columns:1fr; gap:14px; align-items:stretch; }
+  .obs-card--trend .trend-svg { height:240px; }
+  .mini-sel { font-size:12px; padding:4px 8px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; color:#334155; max-width:160px; }
+  .obs-card { background:#fff; border:1px solid #eef2f7; border-radius:14px; padding:14px; display:flex; flex-direction:column; min-width:0; }
+  .obs-card-h { display:flex; align-items:center; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  .obs-dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
+  .obs-dot--teal { background:#0ABAB5; }
+  .obs-dot--rose { background:#E11D74; }
+  .obs-dot--plum { background:#7C2D52; }
+  .obs-card-name { font-weight:700; font-size:14px; color:#1e293b; }
+  .obs-ctrls { margin-left:auto; display:flex; gap:6px; }
+  .obs-sum { margin-left:auto; font-size:12px; color:#64748b; font-weight:600; }
+  .obs-sum .ok { color:#16a34a; }
+  .obs-sum .bad { color:#e11d48; }
+  /* 趋势 KPI 摘要条 */
+  .obs-kpi { display:flex; gap:8px; margin-bottom:8px; }
+  .kpi { flex:1; background:#f8fafc; border:1px solid #eef2f7; border-radius:10px; padding:6px 10px; min-width:0; }
+  .kpi-k { display:block; font-size:11px; color:#94a3b8; }
+  .kpi-v { display:block; font-size:17px; font-weight:800; color:#0f172a; line-height:1.2; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .trend-wrap { position:relative; }
+  .trend-svg { width:100%; height:188px; display:block; background:#fafafa; border-radius:10px; border:1px solid #eef2f7; }
+  .trend-empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#9ca3af; font-size:13px; }
+  /* 慢日志 / 巡检 滚动体 */
+  .obs-body { display:flex; flex-direction:column; gap:8px; min-height:0; }
+  .obs-scroll { max-height:300px; overflow:auto; padding-right:2px; }
+  .obs-empty { color:#9ca3af; font-size:13px; padding:8px 2px; }
+  /* 慢日志排行 */
+  .slow-item { display:flex; gap:10px; align-items:flex-start; }
+  .slow-rank { flex:0 0 auto; width:20px; height:20px; border-radius:6px; background:#fff0f6; color:#E11D74; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center; margin-top:2px; }
+  .slow-main { min-width:0; flex:1; }
+  .slow-meta { display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+  .slow-dur { font-size:14px; font-weight:800; font-family:var(--mono); }
+  .slow-tag { font-size:11.5px; color:#64748b; font-family:var(--mono); }
+  .slow-bar { height:4px; background:#f1f5f9; border-radius:3px; margin:5px 0; overflow:hidden; }
+  .slow-bar > i { display:block; height:100%; border-radius:3px; }
+  .slow-sql { margin:0; font-family:var(--mono); font-size:12px; line-height:1.45; color:#334155; background:#f8fafc; border:1px solid #eef2f7; border-radius:8px; padding:6px 8px; max-height:2.9em; overflow:hidden; cursor:pointer; white-space:pre-wrap; word-break:break-word; }
+  .slow-sql.exp { max-height:none; }
+  /* 配置漂移 */
+  .drift-item { border:1px solid #fbe4ec; background:#fff5f8; border-radius:10px; padding:8px 10px; }
+  .drift-node { font-family:var(--mono); font-size:12px; font-weight:700; color:#7C2D52; }
+  .drift-var { font-family:var(--mono); font-size:12px; color:#334155; margin:0 6px; }
+  .drift-line { margin-top:3px; }
+  .drift-exp { font-family:var(--mono); font-size:11.5px; color:#64748b; }
+  .drift-arrow { color:#94a3b8; margin:0 4px; }
+  .drift-act { font-family:var(--mono); font-size:11.5px; color:#e11d48; font-weight:600; }
+  .drift-ok-box { display:flex; align-items:center; gap:8px; color:#16a34a; font-size:13px; font-weight:600; padding:8px 10px; background:#ecfdf5; border:1px solid #d1fae5; border-radius:10px; }
+  .drift-foot { font-size:11.5px; color:#94a3b8; padding-top:2px; }
 </style>
 
 <div class="dash-head">
@@ -65,10 +128,13 @@
         {% else %}
         <span class="badge" style="background:#eef2ff;color:#7c3aed;">VIP —</span>
         {% endif %}
+        <span class="badge drift-ok" id="driftbadge-{{ c.cluster_id }}" title="配置一致性巡检">配置检测中…</span>
       </div>
+      <div class="port-chips" id="portchips-{{ c.cluster_id }}"></div>
       <div class="cluster-actions">
         <button class="btn btn-primary" onclick="doFailover('/api/failover', 'cluster_id={{ c.cluster_id }}', this)">⚡ 自动切换主库</button>
         <button class="btn" onclick="refreshStatus(true)">↻ 刷新</button>
+        <button class="btn btn-ghost" type="button" data-cid="{{ c.cluster_id }}" onclick="precheckCluster(this)">预检</button>
       </div>
     </div>
 
@@ -143,6 +209,66 @@
     </tbody>
   </table>
   {% if not history %}<div style="color:#9ca3af;padding:12px 0;">暂无切换记录</div>{% endif %}
+</div>
+
+<div class="card obs-wrap">
+  <div class="obs-head">
+    <h3 class="obs-title">
+      <svg class="obs-title-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l3-3 3 3 4-5"/></svg>
+      观测中心
+    </h3>
+    <div class="obs-actions">
+      <select id="obsCluster" class="mini-sel" title="选择集群">
+        {% for c in clusters %}<option value="{{ c.cluster_id }}">{{ c.name }}</option>{% endfor %}
+      </select>
+      <button class="btn btn-sm" onclick="collectNow('all')">采集</button>
+      <button class="btn btn-sm btn-ghost" onclick="refreshObs()">刷新</button>
+    </div>
+  </div>
+
+  <div class="obs-grid">
+    <!-- 运行趋势 -->
+    <div class="obs-card obs-card--trend">
+      <div class="obs-card-h">
+        <span class="obs-dot obs-dot--teal"></span>
+        <span class="obs-card-name">运行趋势</span>
+        <div class="obs-ctrls">
+          <select id="trendMetric" class="mini-sel" title="指标"></select>
+          <select id="trendHours" class="mini-sel" title="时间范围">
+            <option value="6">6h</option>
+            <option value="24" selected>24h</option>
+            <option value="72">3d</option>
+            <option value="168">7d</option>
+          </select>
+        </div>
+      </div>
+      <div class="obs-kpi" id="trendKpi"></div>
+      <div class="trend-wrap">
+        <svg class="trend-svg" id="trendSvg" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+        <div class="trend-empty" id="trendEmpty" hidden>暂无数据</div>
+      </div>
+    </div>
+
+    <!-- 慢日志 Top -->
+    <div class="obs-card obs-card--slow">
+      <div class="obs-card-h">
+        <span class="obs-dot obs-dot--rose"></span>
+        <span class="obs-card-name">慢日志 Top</span>
+        <div class="obs-sum" id="slowSum"></div>
+      </div>
+      <div class="obs-body obs-scroll" id="slowBody"><div class="obs-empty">加载中…</div></div>
+    </div>
+
+    <!-- 配置一致性巡检 -->
+    <div class="obs-card obs-card--drift">
+      <div class="obs-card-h">
+        <span class="obs-dot obs-dot--plum"></span>
+        <span class="obs-card-name">配置一致性巡检</span>
+        <div class="obs-sum" id="driftSum"></div>
+      </div>
+      <div class="obs-body obs-scroll" id="driftBody"><div class="obs-empty">加载中…</div></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -360,19 +486,310 @@
         Object.keys(vips).forEach(function (cid) {
           var dot = document.getElementById("vipdot-" + cid);
           var st = document.getElementById("vipst-" + cid);
-          if (!dot || !st) return;
-          if (vips[cid].online) {
-            dot.className = "vip-dot on"; st.className = "vip-st on"; st.textContent = "在线";
-          } else {
-            dot.className = "vip-dot off"; st.className = "vip-st off"; st.textContent = "离线";
+          if (dot && st) {
+            if (vips[cid].online) {
+              dot.className = "vip-dot on"; st.className = "vip-st on"; st.textContent = "在线";
+            } else {
+              dot.className = "vip-dot off"; st.className = "vip-st off"; st.textContent = "离线";
+            }
+          }
+          // v2.1：每节点端口可达芯片
+          var pc = document.getElementById("portchips-" + cid);
+          if (pc && vips[cid].nodes) {
+            pc.innerHTML = vips[cid].nodes.map(function (n) {
+              return '<span class="port-chip ' + (n.reachable ? "ok" : "bad") + '">' +
+                '<span class="pdot"></span>' + esc(n.host) + ':' + n.port + '</span>';
+            }).join('');
           }
         });
       })
       .catch(function (e) { console.error("[vip] 在线检测失败:", e); });
   }
+  // ---------------- 观测中心（重设计布局） ----------------
+  var METRIC_LABEL = {
+    repl_delay: "复制延迟(s)", seconds_behind: "复制延迟(s)", connections: "连接数",
+    ro: "只读(0/1)", slave_io: "IO线程", slave_sql: "SQL线程"
+  };
+  var _metricBuilt = false;
+  function curCluster() {
+    var s = document.getElementById("obsCluster");
+    return s ? s.value : "0";
+  }
+  function fmtTrendNum(v) {
+    v = Number(v) || 0;
+    if (Math.abs(v) >= 1000) return (v / 1000).toFixed(1) + "k";
+    return String(Math.round(v));
+  }
+  function fmtTrendTime(ts) {
+    if (!ts) return "";
+    var s = String(ts);
+    return s.length >= 16 ? s.substr(11, 5) : s;
+  }
+  function fmtMs(ms) {
+    ms = Number(ms) || 0;
+    return ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : Math.round(ms) + "ms";
+  }
+  function drawTrend(rows, metric) {
+    var svg = document.getElementById("trendSvg");
+    var kpi = document.getElementById("trendKpi");
+    var empty = document.getElementById("trendEmpty");
+    if (!svg) return;
+    var W = 600, H = 200, padL = 42, padR = 14, padT = 16, padB = 24;
+    if (!rows.length) {
+      svg.innerHTML = '';
+      if (kpi) kpi.innerHTML = '';
+      if (empty) { empty.hidden = false; empty.textContent = "暂无数据"; }
+      return;
+    }
+    if (empty) empty.hidden = true;
+    var vals = rows.map(function (r) { return (r[metric] == null ? null : Number(r[metric])); });
+    var valid = vals.filter(function (v) { return v !== null; });
+    if (!valid.length) {
+      svg.innerHTML = '<text x="300" y="105" text-anchor="middle" fill="#9ca3af" font-size="13">该指标暂无可绘制数据</text>';
+      if (kpi) kpi.innerHTML = '';
+      return;
+    }
+    var max = Math.max.apply(null, valid);
+    var min = Math.min.apply(null, valid);
+    var baseline = Math.min(min, 0);
+    var top = (max <= 0 ? 1 : max * 1.15);
+    var isDelay = (metric === "repl_delay" || metric === "seconds_behind");
+    var lineColor = isDelay ? "#E11D74" : "#0ABAB5";
+    var fillColor = isDelay ? "rgba(225,29,116,.12)" : "rgba(10,186,181,.12)";
+    function yOf(v) { return padT + (H - padT - padB) * (1 - (v - baseline) / (top - baseline)); }
+    var n = rows.length;
+    var pts = rows.map(function (r, i) {
+      var x = padL + (W - padL - padR) * (i / (n - 1 || 1));
+      var v = vals[i];
+      return [x, v === null ? null : yOf(v), v];
+    });
+    // 降采样：点数过多时按步长抽点（≤500），避免 SVG 暴涨/DOM 卡顿
+    var MAXPTS = 500;
+    var stride = n > MAXPTS ? Math.ceil(n / MAXPTS) : 1;
+    var drawPts = [];
+    for (var i = 0; i < n; i += stride) drawPts.push(pts[i]);
+    if (drawPts[drawPts.length - 1] !== pts[n - 1]) drawPts.push(pts[n - 1]);
+    // 按 null 断开成多段
+    var segs = [], cur = [];
+    drawPts.forEach(function (p) {
+      if (p[1] === null) { if (cur.length) { segs.push(cur); cur = []; } }
+      else cur.push(p);
+    });
+    if (cur.length) segs.push(cur);
+    var lineParts = segs.map(function (seg) {
+      return seg.map(function (p, i) { return (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1); }).join(" ");
+    });
+    var areaParts = segs.map(function (seg) {
+      return seg.map(function (p, i) { return (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1); }).join(" ")
+        + " L" + seg[seg.length - 1][0].toFixed(1) + " " + (H - padB)
+        + " L" + seg[0][0].toFixed(1) + " " + (H - padB) + " Z";
+    });
+    var grid = "", ticks = 4;
+    for (var g = 0; g <= ticks; g++) {
+      var val = baseline + (top - baseline) * g / ticks;
+      var gy = padT + (H - padT - padB) * (1 - g / ticks);
+      grid += '<line x1="' + padL + '" y1="' + gy.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + gy.toFixed(1) + '" stroke="#eef2f7" stroke-width="1"/>';
+      grid += '<text x="' + (padL - 6) + '" y="' + (gy + 3).toFixed(1) + '" text-anchor="end" fill="#9ca3af" font-size="10">' + fmtTrendNum(val) + '</text>';
+    }
+    var xlab = '<text x="' + padL + '" y="' + (H - padB + 15) + '" text-anchor="start" fill="#9ca3af" font-size="10">' + fmtTrendTime(rows[0].ts) + '</text>'
+      + '<text x="' + (W - padR) + '" y="' + (H - padB + 15) + '" text-anchor="end" fill="#9ca3af" font-size="10">' + fmtTrendTime(rows[n - 1].ts) + '</text>';
+    // 仅峰值点 + 最新点做标记（不再逐点画圆）
+    var peakX = null, peakY = null, peakPY = null, lastX = null, lastY = null;
+    pts.forEach(function (p) {
+      if (p[1] === null) return;
+      if (peakY === null || p[2] > peakY) { peakY = p[2]; peakX = p[0]; peakPY = p[1]; }
+      lastX = p[0]; lastY = p[1];
+    });
+    var markers = "";
+    if (peakX !== null) markers += '<circle cx="' + peakX.toFixed(1) + '" cy="' + peakPY.toFixed(1) + '" r="3" fill="' + lineColor + '"/>';
+    if (lastX !== null && (lastX !== peakX || lastY !== peakPY)) markers += '<circle cx="' + lastX.toFixed(1) + '" cy="' + lastY.toFixed(1) + '" r="2.5" fill="#fff" stroke="' + lineColor + '" stroke-width="1.5"/>';
+    svg.innerHTML = grid
+      + areaParts.map(function (d) { return '<path d="' + d + '" fill="' + fillColor + '"/>'; }).join("")
+      + lineParts.map(function (d) { return '<path d="' + d + '" fill="none" stroke="' + lineColor + '" stroke-width="2" stroke-linejoin="round"/>'; }).join("")
+      + markers + xlab;
+    // KPI 摘要：当前 / 峰值 / 均值（替代原冗长说明文字，缓解数值堆砌）
+    var unit = isDelay ? "s" : "";
+    var curV = (pts[n - 1][2] == null) ? (valid.length ? valid[valid.length - 1] : 0) : pts[n - 1][2];
+    var sum = 0; valid.forEach(function (v) { sum += v; });
+    var avg = sum / valid.length;
+    if (kpi) {
+      kpi.innerHTML =
+        '<div class="kpi"><span class="kpi-k">当前</span><span class="kpi-v">' + fmtTrendNum(curV) + unit + '</span></div>'
+        + '<div class="kpi"><span class="kpi-k">峰值</span><span class="kpi-v">' + fmtTrendNum(max) + unit + '</span></div>'
+        + '<div class="kpi"><span class="kpi-k">均值</span><span class="kpi-v">' + fmtTrendNum(avg) + unit + '</span></div>';
+    }
+  }
+  function showTrendEmpty(msg) {
+    var svg = document.getElementById("trendSvg"); if (svg) svg.innerHTML = '';
+    var k = document.getElementById("trendKpi"); if (k) k.innerHTML = '';
+    var e = document.getElementById("trendEmpty");
+    if (e) { e.hidden = false; e.textContent = msg ? ("加载失败: " + msg) : "暂无数据"; }
+  }
+  function loadTrend() {
+    var cid = curCluster();
+    var hours = document.getElementById("trendHours").value;
+    var metricSel = document.getElementById("trendMetric");
+    fetch("/api/metric_history?cluster_id=" + cid + "&hours=" + hours, { cache: "no-store", credentials: "same-origin" })
+      .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { throw new Error(t.slice(0, 200)); } }); })
+      .then(function (d) {
+        if (!d.ok) { showTrendEmpty(d.error || ""); return; }
+        var rows = d.rows || [];
+        if (!_metricBuilt) {
+          // 依据实际返回字段构建指标下拉（仅数值型，剔除 ts/host/port 与 Yes/No 型线程字段）
+          var keys = rows.length
+            ? Object.keys(rows[0]).filter(function (k) { return ["ts", "host", "port", "slave_io", "slave_sql", "seconds_behind"].indexOf(k) < 0; })
+            : ["repl_delay", "connections"];
+          metricSel.innerHTML = keys.map(function (k) {
+            return '<option value="' + k + '">' + (METRIC_LABEL[k] || k) + '</option>';
+          }).join("");
+          metricSel.value = keys.indexOf("repl_delay") >= 0 ? "repl_delay" : keys[0];
+          _metricBuilt = true;
+        }
+        var metric = metricSel.value;
+        drawTrend(rows, metric);
+      })
+      .catch(function (e) { showTrendEmpty(e.message); });
+  }
+  function loadSlow() {
+    var cid = curCluster();
+    fetch("/api/slow_log?cluster_id=" + cid + "&limit=200", { cache: "no-store", credentials: "same-origin" })
+      .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { throw new Error(t.slice(0, 200)); } }); })
+      .then(function (d) {
+        var body = document.getElementById("slowBody");
+        var sum = document.getElementById("slowSum");
+        if (!d.ok) { if (body) body.innerHTML = '<div class="obs-empty" style="color:#b91c1c;">加载失败: ' + esc(d.error || "") + '</div>'; return; }
+        var rows = d.rows || [];
+        if (!rows.length) {
+          if (sum) sum.innerHTML = '<span>近24h 0 条</span>';
+          if (body) body.innerHTML = '<div class="obs-empty">暂无慢日志</div>';
+          return;
+        }
+        var maxMs = 0, sumMs = 0;
+        rows.forEach(function (r) { var m = Number(r.query_time_ms) || 0; if (m > maxMs) maxMs = m; sumMs += m; });
+        if (sum) sum.innerHTML = '近24h ' + rows.length + ' 条 · 最慢 ' + fmtMs(maxMs) + ' · 平均 ' + fmtMs(sumMs / rows.length);
+        // 仅展示 Top8，长 SQL 截断（点击展开），以相对条替代原始扫描/返回数字堆砌
+        var top = rows.slice(0, 8);
+        body.innerHTML = top.map(function (r, i) {
+          var m = Number(r.query_time_ms) || 0;
+          var pct = maxMs > 0 ? Math.max(6, Math.round(m / maxMs * 100)) : 0;
+          var color = m >= 1000 ? "#E11D74" : (m >= 200 ? "#f7a23b" : "#0ABAB5");
+          return '<div class="slow-item">'
+            + '<div class="slow-rank">' + (i + 1) + '</div>'
+            + '<div class="slow-main">'
+            + '<div class="slow-meta"><span class="slow-dur" style="color:' + color + '">' + fmtMs(m) + '</span>'
+            + '<span class="slow-tag">db: ' + esc(r.db || "-") + '</span>'
+            + '<span class="slow-tag">扫描 ' + (r.rows_examined || 0) + ' · 返回 ' + (r.rows_sent || 0) + '</span></div>'
+            + '<div class="slow-bar"><i style="width:' + pct + '%;background:' + color + '"></i></div>'
+            + '<pre class="slow-sql" onclick="this.classList.toggle(\'exp\')" title="点击展开/收起">' + esc(r.sql_text) + '</pre>'
+            + '</div></div>';
+        }).join("");
+      })
+      .catch(function (e) {
+        var body = document.getElementById("slowBody");
+        if (body) body.innerHTML = '<div class="obs-empty" style="color:#b91c1c;">' + esc(e.message) + '</div>';
+      });
+  }
+  function loadDrift() {
+    // 1) 更新各集群卡片上的漂移徽标
+    Array.prototype.forEach.call(document.querySelectorAll('[id^="driftbadge-"]'), function (b) {
+      var cid = b.id.replace("driftbadge-", "");
+      fetch("/api/config_drift?cluster_id=" + cid, { cache: "no-store", credentials: "same-origin" })
+        .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { return null; } }); })
+        .then(function (d) {
+          if (!d || !d.ok) return;
+          if (d.drift > 0) { b.className = "badge drift-bad"; b.textContent = "配置漂移 " + d.drift; }
+          else { b.className = "badge drift-ok"; b.textContent = "配置一致"; }
+        })
+        .catch(function () {});
+    });
+    // 2) 渲染巡检明细：只列漂移项（问题聚焦），一致项折叠为一句话
+    var sel = document.getElementById("obsCluster");
+    if (!sel) return;
+    var cid = sel.value;
+    fetch("/api/config_drift?cluster_id=" + cid, { cache: "no-store", credentials: "same-origin" })
+      .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { return null; } }); })
+      .then(function (d) {
+        var body = document.getElementById("driftBody");
+        var sum = document.getElementById("driftSum");
+        if (!body) return;
+        if (!d || !d.ok) { body.innerHTML = '<div class="obs-empty" style="color:#b91c1c;">加载失败</div>'; return; }
+        var rows = d.rows || [];
+        var drift = d.drift || 0;
+        if (!rows.length) {
+          if (sum) sum.innerHTML = '<span class="ok">无记录</span>';
+          body.innerHTML = '<div class="obs-empty">暂无巡检记录（点上方「采集」生成）</div>';
+          return;
+        }
+        if (sum) sum.innerHTML = drift > 0
+          ? '<span class="bad">' + drift + ' 项漂移</span>'
+          : '<span class="ok">全部一致</span>';
+        var bad = rows.filter(function (r) { return r.status === "DRIFT"; });
+        if (!bad.length) {
+          body.innerHTML = '<div class="drift-ok-box"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>全部配置一致</div>';
+          return;
+        }
+        var okCount = rows.length - bad.length;
+        body.innerHTML = bad.map(function (r) {
+          return '<div class="drift-item">'
+            + '<div><span class="drift-node">' + esc(r.host + ":" + (r.port || "")) + '</span>'
+            + '<span class="drift-var">' + esc(r.var_name || "") + '</span></div>'
+            + '<div class="drift-line"><span class="drift-exp">期望 ' + esc(r.expected || "") + '</span>'
+            + '<span class="drift-arrow">→</span>'
+            + '<span class="drift-act">实际 ' + esc(r.actual || "") + '</span></div>'
+            + '</div>';
+        }).join("") + '<div class="drift-foot">其余 ' + okCount + ' 项一致</div>';
+      })
+      .catch(function (e) {
+        var body = document.getElementById("driftBody");
+        if (body) body.innerHTML = '<div class="obs-empty" style="color:#b91c1c;">' + esc(e.message) + '</div>';
+      });
+  }
+  function refreshObs() { loadTrend(); loadSlow(); loadDrift(); }
+  function precheckCluster(btn) {
+    var cid = btn.getAttribute("data-cid");
+    btn.disabled = true; var old = btn.textContent; btn.textContent = "检测中…";
+    fetch("/api/precheck", { method: "POST", cache: "no-store", credentials: "same-origin",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "cluster_id=" + cid })
+      .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { throw new Error(t.slice(0, 200)); } }); })
+      .then(function (d) {
+        btn.disabled = false; btn.textContent = old;
+        if (!d.ok) { alert("预检失败: " + (d.error || "")); return; }
+        var hasErr = d.findings.some(function (f) { return f.level === "ERR"; });
+        var html = d.findings.map(function (f) {
+          var color = f.level === "ERR" ? "#e11d48" : (f.level === "WARN" ? "#f7a23b" : "#16a34a");
+          return '<div style="color:' + color + '">[' + f.level + '] ' + esc(f.host || "") + ':' + (f.port || "") + " " + esc(f.message || "") + '</div>';
+        }).join("");
+        var banner = document.getElementById("banner-" + cid);
+        if (banner) { banner.style.display = "block"; banner.className = "banner " + (hasErr ? "err" : "info"); banner.innerHTML = "<strong>预检结果：</strong>" + html; }
+      })
+      .catch(function (e) { btn.disabled = false; btn.textContent = old; alert("预检异常: " + e.message); });
+  }
+  function collectNow(target) {
+    var msg = document.getElementById("collectMsg");
+    if (msg) msg.textContent = "采集中…";
+    fetch("/api/collect", { method: "POST", cache: "no-store", credentials: "same-origin",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "target=" + target })
+      .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { return null; } }); })
+      .then(function (d) {
+        if (d && d.ok) {
+          // 采集已在后台线程异步执行，立即返回；稍等图表数据落库后自动刷新。
+          if (msg) msg.textContent = "已提交，后台采集中，稍候自动刷新…";
+          setTimeout(refreshObs, 3000);
+          setTimeout(function () { if (msg) msg.textContent = ""; }, 6000);
+        } else {
+          if (msg) msg.textContent = "";
+          alert("采集失败: " + ((d && d.error) || "未知错误")); }
+      })
+      .catch(function (e) { if (msg) msg.textContent = ""; alert("采集请求异常: " + e.message); });
+  }
+
   refreshStatus(false);
   checkVip();
+  loadTrend(); loadSlow(); loadDrift();
   setInterval(function () { refreshStatus(false); }, 10000);
   setInterval(checkVip, 15000);
+  setInterval(loadDrift, 30000);
+  setInterval(loadTrend, 60000);
+  setInterval(loadSlow, 60000);
 </script>
 {% endblock %}

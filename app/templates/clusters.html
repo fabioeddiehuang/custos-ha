@@ -32,6 +32,17 @@
       <label>网卡<input class="inp" name="interface" placeholder="eth0"></label>
       <label>VRID<input class="inp" name="vrid" placeholder="51"></label>
       <label>VIP 端口<input class="inp" name="vip_port" type="number" min="1" max="65535" value="3307"></label>
+      <label>节点类型（部署形态）
+        <select name="node_type">
+          <option value="docker" selected>Docker（默认，容器化 MySQL + keepalived）</option>
+          <option value="baremetal">裸机（宿主机既有 MySQL，仅 keepalived 客户端）</option>
+        </select>
+        <span class="hint">创建后该集群所有节点须为同一类型（禁止混部）</span>
+      </label>
+      <label>MySQL 版本（可选）
+        <input class="inp" name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=沿用旧语法）">
+        <span class="hint">同集群主版本须一致；影响复制 SQL 语法（8.0.22+/8.4 走新语法）</span>
+      </label>
       <label>HA 监控账号<input class="inp" name="ha_user" placeholder="ha_monitor"></label>
       <label>HA 监控密码<input class="inp pw" type="password" name="ha_pass" placeholder="留空则自动生成"></label>
       <label>复制账号<input class="inp" name="repl_user" placeholder="replication"></label>
@@ -178,6 +189,15 @@
             <label>网卡<input class="inp" name="interface" value="{{ c.interface or '' }}"></label>
             <label>VRID<input class="inp" name="vrid" value="{{ c.vrid or '' }}"></label>
             <label>VIP 端口<input class="inp" name="vip_port" type="number" min="1" max="65535" value="{{ c.vip_port or 3307 }}"></label>
+            <label>节点类型
+              <select name="node_type">
+                <option value="docker" {% if (c.node_type or 'docker') == 'docker' %}selected{% endif %}>Docker</option>
+                <option value="baremetal" {% if c.node_type == 'baremetal' %}selected{% endif %}>裸机</option>
+              </select>
+            </label>
+            <label>MySQL 版本
+              <input class="inp" name="mysql_version" value="{{ c.mysql_version or '' }}" placeholder="如 8.0.36 / 8.4.0（留空=沿用旧语法）">
+            </label>
           </div>
           <div class="cred-head">
             <span>访问凭证</span>

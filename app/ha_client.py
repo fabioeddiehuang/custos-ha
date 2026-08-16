@@ -13,6 +13,21 @@ import re
 import pymysql
 from pymysql import OperationalError, ProgrammingError, DatabaseError
 
+# get_server_public_key 仅 PyMySQL >= 1.0.0 支持；老版本（如 0.10.x）传此参数会
+# 直接抛 TypeError（Connection.__init__() got an unexpected keyword argument ...）。
+# 裸机 root 若用 caching_sha2_password 且非 TLS 连接才需要它；不支持时忽略即可
+# （老版本本身也无法用该方式完成 caching_sha2 认证，属预期降级，无新增回归）。
+def _pymysql_at_least(major, minor):
+    try:
+        parts = [int(x) for x in pymysql.__version__.split(".")[:2]]
+    except Exception:
+        return False
+    return tuple(parts) >= (major, minor)
+
+_PYMYSQL_SUPPORTS_PUBKEY = _pymysql_at_least(1, 0)
+from .mysql_compat import (detect_syntax, change_replication_sql, start_replication_sql,
+                           stop_replication_sql, reset_replica_sql, show_replica_status_sql)
+
 
 # 可安全做「空事务跳过」的复制错误码集合（均为幂等类冲突：对象/记录已存在或已不存在，
 # 说明该事务的效果在当前节点实际上已经完成，跳过不会造成数据丢失）。
@@ -48,7 +63,8 @@ def heal_replication(host, port, user, password, root_user="root", root_pass="")
         return False, "无法连接节点(ha_monitor/root均失败)"
     try:
         cur = conn.cursor()
-        cur.execute("SHOW SLAVE STATUS")
+        syntax = detect_syntax(cur)
+        cur.execute(show_replica_status_sql(syntax))
         row = _one_dict(cur)
         if not row:
             return False, "无复制通道（该节点非从库）"
@@ -69,7 +85,7 @@ def heal_replication(host, port, user, password, root_user="root", root_pass="")
         if not last_err:
             # SQL 线程停了但没有错误信息，尝试直接重启
             try:
-                cur.execute("START SLAVE")
+                cur.execute(start_replication_sql(syntax))
                 return True, "已尝试重启复制线程"
             except Exception as e:
                 return False, str(e)
@@ -79,18 +95,18 @@ def heal_replication(host, port, user, password, root_user="root", root_pass="")
         m = re.search(r"executing transaction '([0-9a-fA-F-]+:\d+)'", last_err)
         if not m:
             try:
-                cur.execute("START SLAVE")
+                cur.execute(start_replication_sql(syntax))
                 return True, "已尝试重启复制线程(无 GTID 可跳过)"
             except Exception as e:
                 return False, str(e)
         gtid = m.group(1)
         try:
-            cur.execute("STOP SLAVE")
+            cur.execute(stop_replication_sql(syntax))
             cur.execute(f"SET GTID_NEXT='{gtid}'")
             cur.execute("BEGIN")
             cur.execute("COMMIT")
             cur.execute("SET GTID_NEXT='AUTOMATIC'")
-            cur.execute("START SLAVE")
+            cur.execute(start_replication_sql(syntax))
             return True, f"已跳过冲突事务 {gtid}，复制恢复"
         except Exception as e:
             return False, str(e)
@@ -154,7 +170,8 @@ def heal_io_gtid_gap(slave_host, slave_port, ha_user, ha_pass,
         return False, "无法连接从库(ha_monitor/root均失败)"
     try:
         scur = sconn.cursor()
-        scur.execute("SHOW REPLICA STATUS")
+        ssyntax = detect_syntax(scur)
+        scur.execute(show_replica_status_sql(ssyntax))
         row = _one_dict(scur)
         if not row:
             return False, "从库无复制通道，无需处理"
@@ -230,15 +247,34 @@ def heal_io_gtid_gap(slave_host, slave_port, ha_user, ha_pass,
 
 
 def connect(host, port, user, password, timeout=5):
-    """建立连接；失败时抛 RuntimeError（带原始异常信息）。"""
-    try:
-        return pymysql.connect(
-            host=host, port=int(port), user=user, password=password,
-            connect_timeout=timeout, autocommit=True,
-            charset="utf8mb4",
-        )
-    except Exception as e:
-        raise RuntimeError(str(e))
+    """建立连接；失败时抛 RuntimeError（带原始异常信息）。
+
+    注意：get_server_public_key 仅 PyMySQL >= 1.0.0 支持。但实测某些容器内的
+    PyMySQL「版本号 ≥1.0.0 却实际不支持该参数」（镜像源/缓存调包或安装不干净），
+    光靠版本号判断不可靠。故：先按版本守卫尝试携带该参数；若仍抛 TypeError
+    （无论版本号怎么报），去掉该参数重试，保证原生密码等常规连接不受影响。
+    """
+    base = dict(
+        host=host, port=int(port), user=user, password=password,
+        connect_timeout=timeout, autocommit=True,
+        charset="utf8mb4",
+    )
+    attempts = [base]
+    if _PYMYSQL_SUPPORTS_PUBKEY:
+        attempts.insert(0, {**base, "get_server_public_key": True})
+    last_err = None
+    for kwargs in attempts:
+        try:
+            return pymysql.connect(**kwargs)
+        except TypeError as e:
+            # 老版本 / 被调包的 PyMySQL 不识别 get_server_public_key：去掉后重试。
+            if "get_server_public_key" in str(e):
+                last_err = e
+                continue
+            raise
+        except Exception as e:
+            raise RuntimeError(str(e))
+    raise RuntimeError(str(last_err))
 
 
 def connect_robust(host, port, user, password, root_user="root", root_pass="", timeout=5):
@@ -265,6 +301,7 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
         seconds_behind=None, slave_io=None, slave_sql=None,
         slave_io_err="", slave_sql_err="",
         master_host=None, master_port=None, error=None,
+        connections=None, threads_running=None, qps=None,
     )
     try:
         conn = connect_robust(host, port, user, password, root_user, root_pass, timeout=timeout)
@@ -273,13 +310,14 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
         return result
     cur = conn.cursor()
     try:
+        syntax = detect_syntax(cur)
         try:
             cur.execute("SELECT @@read_only")
             result["ro"] = cur.fetchone()[0]
         except Exception:
             result["ro"] = None
         try:
-            cur.execute("SHOW SLAVE STATUS")
+            cur.execute(show_replica_status_sql(syntax))
             row = cur.fetchone()
             if row:
                 cols = [d[0] for d in cur.description]
@@ -305,6 +343,22 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
                 result["role"] = result.get("role") or "master"
                 result["slave_io"] = None
                 result["slave_sql"] = None
+        except Exception:
+            pass
+        # 轻量采集实时运行指标（供观测中心趋势图使用）。
+        # 失败不影响核心探活结果，故整体包 try 吞掉。
+        try:
+            cur.execute("SHOW GLOBAL STATUS LIKE 'Threads_connected'")
+            rc = cur.fetchone()
+            result["connections"] = int(rc[1]) if rc else None
+            cur.execute("SHOW GLOBAL STATUS LIKE 'Threads_running'")
+            rr = cur.fetchone()
+            result["threads_running"] = int(rr[1]) if rr else None
+            # QPS：用两次 Questions 差值估算（此处仅取当前瞬时值，由调用方做差更准；
+            # 采集线程已在 metrics.py 用相邻样本做差，这里提供原始值即可）。
+            cur.execute("SHOW GLOBAL STATUS LIKE 'Queries'")
+            rq = cur.fetchone()
+            result["qps"] = int(rq[1]) if rq else None
         except Exception:
             pass
         result["alive"] = True
@@ -367,9 +421,10 @@ def promote_to_master(host, port, user, password, root_user="root", root_pass=""
         return False, "无法连接节点(ha_monitor/root均失败)"
     try:
         cur = conn.cursor()
+        syntax = detect_syntax(cur)
         try:
-            cur.execute("STOP SLAVE")
-            cur.execute("RESET SLAVE ALL")
+            cur.execute(stop_replication_sql(syntax))
+            cur.execute(reset_replica_sql(syntax))
         except Exception:
             pass
         cur.execute("SET GLOBAL read_only=0")
@@ -401,20 +456,18 @@ def make_slave_of(host, port, user, password, master_host, master_port,
         return False, "无法连接节点(ha_monitor/root均失败)"
     try:
         cur = conn.cursor()
+        syntax = detect_syntax(cur)
         try:
-            cur.execute("STOP SLAVE")
-            cur.execute("RESET SLAVE ALL")
+            cur.execute(stop_replication_sql(syntax))
+            cur.execute(reset_replica_sql(syntax))
         except Exception:
             pass
         # 注意：这里不再 RESET MASTER，避免 GTID 执行集合被清空后
         # 旧事务被新主库重放而报「已存在」类错误。
         cur.execute(
-            "CHANGE MASTER TO MASTER_HOST=%s, MASTER_PORT=%s, "
-            "MASTER_USER=%s, MASTER_PASSWORD=%s, "
-            "MASTER_AUTO_POSITION=1, MASTER_SSL=0",
-            (master_host, int(master_port), repl_user, repl_pass),
+            change_replication_sql(syntax, master_host, int(master_port), repl_user, repl_pass),
         )
-        cur.execute("START SLAVE")
+        cur.execute(start_replication_sql(syntax))
         # 从库设为只读，避免双写脑裂：仅当前主库可写。
         try:
             cur.execute("SET GLOBAL read_only=1")
@@ -442,8 +495,12 @@ def is_stale_master(status):
 
 def stop_slave(host, port, user, password, root_user="root", root_pass=""):
     conn = connect_robust(host, port, user, password, root_user, root_pass)
+    if conn is None:
+        return False, "无法连接节点(ha_monitor/root均失败)"
     try:
-        conn.cursor().execute("STOP SLAVE")
+        cur = conn.cursor()
+        syntax = detect_syntax(cur)
+        cur.execute(stop_replication_sql(syntax))
         return True, None
     except Exception as e:
         return False, str(e)
@@ -456,8 +513,12 @@ def stop_slave(host, port, user, password, root_user="root", root_pass=""):
 
 def start_slave(host, port, user, password, root_user="root", root_pass=""):
     conn = connect_robust(host, port, user, password, root_user, root_pass)
+    if conn is None:
+        return False, "无法连接节点(ha_monitor/root均失败)"
     try:
-        conn.cursor().execute("START SLAVE")
+        cur = conn.cursor()
+        syntax = detect_syntax(cur)
+        cur.execute(start_replication_sql(syntax))
         return True, None
     except Exception as e:
         return False, str(e)
@@ -470,10 +531,13 @@ def start_slave(host, port, user, password, root_user="root", root_pass=""):
 
 def reset_slave(host, port, user, password, root_user="root", root_pass=""):
     conn = connect_robust(host, port, user, password, root_user, root_pass)
+    if conn is None:
+        return False, "无法连接节点(ha_monitor/root均失败)"
     try:
         cur = conn.cursor()
-        cur.execute("STOP SLAVE")
-        cur.execute("RESET SLAVE ALL")
+        syntax = detect_syntax(cur)
+        cur.execute(stop_replication_sql(syntax))
+        cur.execute(reset_replica_sql(syntax))
         return True, None
     except Exception as e:
         return False, str(e)
