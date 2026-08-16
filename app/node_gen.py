@@ -342,7 +342,7 @@ def _refresh_all_keepalived_conf(cluster_id=None):
         except ValueError as e:
             logger.warning("跳过刷新 %s 的 keepalived.conf：%s", ip, e)
             continue
-        p = Path(NODES_DIR) / ip / "keepalived" / "keepalived.conf"
+        p = _safe_node_path(ip) / "keepalived" / "keepalived.conf"
         if p.exists():
             _write(p, conf)
 
@@ -366,7 +366,7 @@ def regenerate_cluster_compose(cluster_id):
     for r in rows:
         ip = r["ip"]
         node_type = r.get("node_type") or "docker"
-        kd = Path(NODES_DIR) / ip / "keepalived"
+        kd = _safe_node_path(ip) / "keepalived"
         if not kd.exists():
             continue
         # 确保 notify 脚本存在（早期版本缺失，导致 keepalived 起不来 / VIP 不上浮）
@@ -415,6 +415,23 @@ def _clean_generated_dir(d: Path):
             shutil.rmtree(item)
         else:
             item.unlink()
+
+
+def _safe_node_path(ip):
+    """把节点 ip 解析为 NODES_DIR 下的安全绝对路径，杜绝路径穿越导致的误删/越权写。
+
+    节点地址是 MySQL 主机 IP/主机名，本不应含路径分隔符或 `..`。即使传入 '/etc'、
+    '../../etc' 这类字符串，也必须在拼接并 resolve 后断言路径仍位于 NODES_DIR 之内，
+    否则直接拒绝——避免 _clean_generated_dir / delete_node_dir 递归删除宿主任意目录，
+    或 sync_node_creds / _refresh_all_keepalived_conf 越权读写宿主文件系统。
+    """
+    if not ip or any(sep in ip for sep in ("/", "\\")) or ".." in ip:
+        raise ValueError(f"非法的节点地址（疑似路径穿越）: {ip!r}")
+    base = Path(NODES_DIR).resolve()
+    d = (base / ip).resolve()
+    if d != base and not str(d).startswith(str(base) + os.sep):
+        raise ValueError(f"非法的节点路径（越过部署根目录）: {ip!r}")
+    return d
 
 
 def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None,
@@ -481,7 +498,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # Docker 模式连节点 IP（容器已把端口发布到宿主机）。
     local_host = "127.0.0.1" if node_type == "baremetal" else ip
 
-    d = Path(NODES_DIR) / ip
+    d = _safe_node_path(ip)
     d.mkdir(parents=True, exist_ok=True)
     _clean_generated_dir(d)
     kd = d / "keepalived"
@@ -644,7 +661,7 @@ def sync_node_creds(cluster_id=None):
             # 重新生成该节点 ha_check.conf，保持与节点一致
             # 裸机节点 keepalived 探活连 127.0.0.1（宿主机既有 MySQL）；docker 节点连宿主机 IP。
             local_host = "127.0.0.1" if node_type == "baremetal" else ip
-            kd = Path(NODES_DIR) / ip / "keepalived"
+            kd = _safe_node_path(ip) / "keepalived"
             kd.mkdir(parents=True, exist_ok=True)
             ha_check = (
                 f"LOCAL_HOST={local_host}\n"
@@ -664,10 +681,10 @@ def sync_node_creds(cluster_id=None):
             # 裸机节点写 init_baremetal.sql（不含 server_id 参数，需配合 my.cnf 片段）；docker 节点写 init.sql。
             if node_type == "baremetal":
                 init_sql = render_init_baremetal_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
-                _write(Path(NODES_DIR) / ip / "init_baremetal.sql", init_sql, mode=0o644)
+                _write(_safe_node_path(ip) / "init_baremetal.sql", init_sql, mode=0o644)
             else:
                 init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
-                _write(Path(NODES_DIR) / ip / "init.sql", init_sql, mode=0o644)
+                _write(_safe_node_path(ip) / "init.sql", init_sql, mode=0o644)
             synced += 1
     return synced
 
@@ -697,7 +714,7 @@ def list_nodes(cluster_id=None):
 def delete_node_dir(ip):
     """仅删除生成目录（不含 MySQL-data 数据卷）。"""
     import shutil as _sh
-    d = Path(NODES_DIR) / ip
+    d = _safe_node_path(ip)
     if d.exists():
         _sh.rmtree(d, ignore_errors=True)
 
