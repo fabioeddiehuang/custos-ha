@@ -59,10 +59,13 @@
       </select>
     </label>
     <div id="baremetalTip" style="grid-column:1/-1; display:none; padding:10px 12px; border:1px dashed #7c2d52; border-radius:10px; background:#fdf2f8; font-size:13px; color:#7c2d52;">
-      <strong>裸机节点部署流程：</strong>生成后请按以下顺序操作 ——
-      ① 在宝塔/编辑器中追加 <code class="mono">my.cnf.ha-fragment</code> 到 MySQL 配置并<strong>重启 MySQL</strong>（宝塔会重写 my.cnf，故参数走配置文件最稳）；
-      ② 在节点登录 MySQL 执行 <code class="mono">init_baremetal.sql</code> 创建 ha_monitor / replication / app 账号；
-      ③ 把生成的 <code class="mono">docker-compose.yaml</code> 拷到目标机运行（仅 keepalived 客户端）。
+      <strong>裸机节点部署流程：</strong>生成后目录内含 <code class="mono">Install-ha-mysql-Node.sh</code>（接入准备）与 <code class="mono">uninstall-ha-mysql-Node.sh</code>（一键还原）。推荐顺序 ——
+      ① 把生成的整个目录拷到目标机 <code class="mono">/home/docker/&lt;本机IP&gt;/</code>，执行
+        <code class="mono">sudo bash Install-ha-mysql-Node.sh -p '节点MySQL的root密码'</code>
+        （自动开放内网权限、bind 0.0.0.0、写入 GTID 片段、放行防火墙；<strong>强烈建议省略 <code class="mono">-m</code> 创建 <code class="mono">root@'%'</code></strong>。若加 <code class="mono">-m</code> 限制来源，必须是【管理器宿主机 IP】（docker 所在机器，节点看到的连接源 IP，本例 192.168.1.66），<strong>绝不是 VIP 192.168.1.10</strong>，否则管理器连不上所有节点）；
+      ② 执行 <code class="mono">-i init_baremetal.sql</code>（同一命令加该参数）创建 ha_monitor / replication / app 账号；
+      ③ 把生成的 <code class="mono">docker-compose.yaml</code> 用 <code class="mono">docker compose up -d</code> 跑起来（仅 keepalived 客户端）。
+      手工方式见 <code class="mono">doc/mysql编译版安装说明.md</code>。
     </div>
     <div style="grid-column:1/-1; display:flex; gap:10px; align-items:center;">
       <button class="btn btn-primary" type="submit">生成节点配置</button>

@@ -25,6 +25,7 @@ from .clusters import get_cluster_creds
 logger = logging.getLogger("node_gen")
 
 NODE_ASSETS = Path(__file__).parent / "node_assets" / "keepalived"
+NODE_SCRIPTS = Path(__file__).parent / "node_assets"
 
 
 def _valid_vip(vip):
@@ -515,6 +516,12 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         _write(d / "my.cnf.ha-fragment", my_cnf, mode=0o644)
         extra_files["init_baremetal_sql"] = f"{NODES_HOST_BASE}/{ip}/init_baremetal.sql"
         extra_files["my_cnf_fragment"] = f"{NODES_HOST_BASE}/{ip}/my.cnf.ha-fragment"
+        # 裸机节点接入准备 / 卸载脚本：随节点目录一同交付，降低手动改配置门槛。
+        # 这两个脚本是「宿主机 MySQL 准备」专用，仅裸机节点需要（Docker 节点 MySQL 在容器内）。
+        for sf in ("Install-ha-mysql-Node.sh", "uninstall-ha-mysql-Node.sh"):
+            src = NODE_SCRIPTS / sf
+            if src.exists():
+                _write(d / sf, src.read_text(), mode=0o755)
     else:
         # init.sql 会被 MySQL 容器以非 root 的 mysql 用户读取执行，
         # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。

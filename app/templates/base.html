@@ -83,7 +83,14 @@
       var old = btn ? btn.textContent : "";
       if (btn) btn.disabled = true;
       fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: body }).then(function (r) { return r.json(); }).then(function (d) {
+        body: body }).then(function (r) {
+        // 先 text 再 JSON.parse：避免后端返回非 JSON（如 500 裸 HTML）时
+        // 抛晦涩的「SyntaxError: JSON.parse」原生错误，改为可读的错误提示
+        return r.text().then(function (t) {
+          try { return JSON.parse(t); }
+          catch (e) { throw new Error("HTTP " + r.status + " 非JSON响应: " + t.slice(0, 300)); }
+        });
+      }).then(function (d) {
         toast(d.msg || (d.ok ? "操作成功" : "操作失败"), d.ok ? "ok" : "err");
         setTimeout(function () { location.reload(); }, 700);
       }).catch(function (e) {

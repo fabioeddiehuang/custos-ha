@@ -508,14 +508,18 @@ def api_failover(cluster_id: int = Form(...), user=Depends(auth_required)):
         run_once()  # 先按现状刷新，确保切换基于最新拓扑
     except Exception:
         pass
-    ok = do_failover(cluster_id, "manual")
+    try:
+        ok = do_failover(cluster_id, "manual")
+        msg = "已触发手动切换" if ok else "切换未执行(检查配置/日志)"
+    except Exception as e:
+        ok, msg = False, f"切换失败: {e}"
     try:
         run_once()  # 切换后立即重建拓扑并回写状态，使仪表盘即时刷新
     except Exception:
         pass
     audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
                     "failover", f"cluster={cluster_id}", "manual", cluster_id)
-    return JSONResponse({"ok": ok, "msg": "已触发手动切换" if ok else "切换未执行(检查配置/日志)"})
+    return JSONResponse({"ok": ok, "msg": msg})
 
 
 @app.post("/api/failover/to")
@@ -532,16 +536,18 @@ def api_failover_to(host: str = Form(...), port: int = Form(...),
         run_once()
     except Exception:
         pass
-    ok = do_failover_to(cid, host, int(port), "manual: 指定主库")
+    try:
+        ok = do_failover_to(cid, host, int(port), "manual: 指定主库")
+        msg = ("已将 %s:%s 设为主库" % (host, port)) if ok else "设置失败(确认节点在线且已配置账号)"
+    except Exception as e:
+        ok, msg = False, f"切换失败: {e}"
     try:
         run_once()  # 设主后立即重建拓扑并回写状态，使仪表盘即时刷新
     except Exception:
         pass
     audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
                     "failover_to", f"{host}:{port}", f"cluster={cid}", cid)
-    return JSONResponse({"ok": ok,
-                         "msg": ("已将 %s:%s 设为主库" % (host, port))
-                         if ok else "设置失败(确认节点在线且已配置账号)"})
+    return JSONResponse({"ok": ok, "msg": msg})
 
 
 def _load_alert_emails():
