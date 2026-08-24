@@ -9,8 +9,23 @@
 # （如 Anolis 7.9 节点 33 无法连通管理端时 VIP 卡死）。
 set -u
 
-CONF=/etc/keepalived/ha_check.conf
+# 诊断日志：把每次判定结果/失败原因落盘到宿主机 /var/log（keepalived 容器为 host 网络，
+# /var/log 即宿主机目录，便于排障时 `cat /var/log/keepalived_chk.log` 直接查看，
+# 无需依赖 docker logs 被 keepalived 自身日志淹没）。最近 200 行循环覆盖。
+# 日志落盘：优先 /var/log（生产 keepalived 容器以 root 运行可写）；
+# 若该目录不可写（如调试时非 root），自动回退到 /tmp，保证诊断日志始终可用。
+LOG=/var/log/keepalived_chk.log
+if ! : >>"$LOG" 2>/dev/null; then
+    LOG=/tmp/keepalived_chk.log
+fi
+log() {
+    echo "$(date '+%F %T') [$MY_NODE] $*" >>"$LOG" 2>/dev/null
+    echo "$(date '+%F %T') [$MY_NODE] $*" >&2
+}
+
+CONF="${HA_CHECK_CONF:-/etc/keepalived/ha_check.conf}"
 [ -f "$CONF" ] && source "$CONF"
+MY_NODE="${NODE_IP:-${LOCAL_HOST:-127.0.0.1}}"
 
 # 本机 MySQL 探活连接（127.0.0.1 走宿主机回环，由 keepalived 容器 host 网络映射）
 MYSQL_LOCAL="mysql -h127.0.0.1 -P${LOCAL_PORT} -u${LOCAL_ROOT_USER:-root} -N --connect-timeout=2"
@@ -20,15 +35,30 @@ TO=""
 command -v timeout >/dev/null 2>&1 && TO="timeout 2"
 
 # 1) 本机 MySQL 必须存活（root 探活）
-if ! MYSQL_PWD="${LOCAL_ROOT_PASS}" $TO $MYSQL_LOCAL -e "SELECT 1" >/dev/null 2>&1; then
+#    捕获 mysql 真实错误（如 Access denied / Can't connect）到诊断日志，
+# 避免 2>/dev/null 吞掉根因导致无从排障。
+PROBE_ERR=$(MYSQL_PWD="${LOCAL_ROOT_PASS}" $TO $MYSQL_LOCAL -e "SELECT 1" 2>&1)
+if [ $? -ne 0 ]; then
+    log "FAIL@1 本机MySQL探活失败 (host=127.0.0.1 port=$LOCAL_PORT user=${LOCAL_ROOT_USER:-root})：$PROBE_ERR"
     exit 1
 fi
+log "OK@1 本机MySQL探活通过"
 
 # 2) 本机必须是可写主库（read_only = OFF）
-RO=$(MYSQL_PWD="${LOCAL_ROOT_PASS}" $TO $MYSQL_LOCAL -e "SELECT @@read_only" 2>/dev/null)
-if [ "$RO" != "0" ]; then
+#    注意：MySQL 的 @@read_only 返回 0/1，而 MariaDB 返回 OFF/ON（字符串）。
+#    两种都要识别——否则 MariaDB 节点永远被判为「只读」→ 所有节点都放弃 VIP → VIP 离线。
+RO=$(MYSQL_PWD="${LOCAL_ROOT_PASS}" $TO $MYSQL_LOCAL -e "SELECT @@read_only" 2>&1 | tr '[:lower:]' '[:upper:]')
+# 读不到 read_only（连接/权限异常，输出里含 ERROR/Access denied/Can't connect）时，
+# 不应误判为「可写」放行，须明确失败并暴露真实错误，否则主库拿不到 VIP 且无从排障。
+if echo "$RO" | grep -qiE "ERROR|ACCESS DENIED|CAN'T CONNECT|UNKNOWN VARIABLE|TIMED OUT"; then
+    log "FAIL@2 读取 read_only 异常 (host=127.0.0.1 port=$LOCAL_PORT)：$RO"
     exit 1
 fi
+if [ "$RO" = "1" ] || [ "$RO" = "ON" ]; then
+    log "FAIL@2 本机read_only=$RO（只读，非主库）：放弃VIP。若本机应为主库，请检查管理端是否已将其提升为可写(SET GLOBAL read_only=OFF)"
+    exit 1
+fi
+log "OK@2 本机read_only=$RO（可写主库）"
 
 # 3) 本机必须被管理端标记为当前主库（防脑裂）。
 #    读取【本机本地】MySQL 的 ha_local.state.current_master，无需回连管理库。
@@ -37,8 +67,26 @@ fi
 #    - 等于本机（LOCAL_HOST:LOCAL_PORT）：放行。
 #    - 等于其它节点：放弃 VIP（本机非主，避免双主脑裂）。
 CM=$(MYSQL_PWD="${LOCAL_ROOT_PASS}" $TO $MYSQL_LOCAL -e \
-     "SELECT v FROM ha_local.state WHERE k='current_master'" 2>/dev/null)
-if [ -n "$CM" ] && [ "$CM" != "${LOCAL_HOST}:${LOCAL_PORT}" ]; then
+     "SELECT v FROM ha_local.state WHERE k='current_master'" 2>&1)
+# 读取失败（连接/权限/表不存在）时 CM 会含 ERROR，视为「本地状态缺失」安全放行，
+# 避免误判为「本机非主」而放弃 VIP；但同时打日志暴露异常便于排障。
+if echo "$CM" | grep -qiE "ERROR|ACCESS DENIED|CAN'T CONNECT|UNKNOWN TABLE|TIMED OUT"; then
+    log "WARN@3 读取 current_master 异常（视为状态缺失，安全放行）：$CM"
+    CM=""
+fi
+# 本节点的「对外标识」：裸机场景本地探活走 127.0.0.1，但管理器写入的 current_master
+# 是节点注册用的真实 IP（如 192.168.1.203:33065），故以 NODE_IP 为主、LOCAL_HOST 兜底，
+# 二者任一命中即视为「本机就是当前主库」，避免裸机节点永远拿不到 VIP。
+# 为兼容 current_master 可能不带端口（早期写入格式），同时按「IP 段」比较。
+MY_NODE="${NODE_IP:-$LOCAL_HOST}"
+cm_ip="${CM%%:*}"   # current_master 的 IP 段
+if [ -z "$CM" ]; then
+    # 为空：安全放行（尚未划分主库 / 本地状态缺失），由 read_only 兜底，避免管理端抖动误杀 VIP
+    log "OK@3 current_master 为空：安全放行（read_only 已把关，VIP 由可写状态决定）"
+elif [ "$CM" = "${MY_NODE}:${LOCAL_PORT}" ] || [ "$CM" = "${LOCAL_HOST}:${LOCAL_PORT}" ] || [ "$cm_ip" = "$MY_NODE" ] || [ "$cm_ip" = "$LOCAL_HOST" ]; then
+    log "OK@3 current_master=$CM 命中本机($MY_NODE/$LOCAL_HOST)：放行持 VIP"
+else
+    log "FAIL@3 current_master=$CM 不等于本机($MY_NODE:$LOCAL_PORT 或 $LOCAL_HOST:$LOCAL_PORT)：本机非主库，放弃VIP（防脑裂）"
     exit 1
 fi
 

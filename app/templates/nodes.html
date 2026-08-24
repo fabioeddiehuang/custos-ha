@@ -44,7 +44,7 @@
     <label>节点类型
       <select name="node_type" id="nodeType" onchange="onNodeTypeChange()">
         <option value="docker" selected>Docker（容器化 MySQL + keepalived 客户端）</option>
-        <option value="baremetal">裸机（宿主机既有 MySQL，仅部署 keepalived 客户端）</option>
+        <option value="mariadb">MariaDB（裸机全量安装，脱离宝塔，独立数据库）</option>
       </select>
     </label>
     <label>MySQL 版本
@@ -58,14 +58,14 @@
         {% endfor %}
       </select>
     </label>
-    <div id="baremetalTip" style="grid-column:1/-1; display:none; padding:10px 12px; border:1px dashed #7c2d52; border-radius:10px; background:#fdf2f8; font-size:13px; color:#7c2d52;">
-      <strong>裸机节点部署流程：</strong>生成后目录内含 <code class="mono">Install-ha-mysql-Node.sh</code>（接入准备）与 <code class="mono">uninstall-ha-mysql-Node.sh</code>（一键还原）。推荐顺序 ——
-      ① 把生成的整个目录拷到目标机 <code class="mono">/home/docker/&lt;本机IP&gt;/</code>，执行
-        <code class="mono">sudo bash Install-ha-mysql-Node.sh -p '节点MySQL的root密码'</code>
-        （自动开放内网权限、bind 0.0.0.0、写入 GTID 片段、放行防火墙；<strong>强烈建议省略 <code class="mono">-m</code> 创建 <code class="mono">root@'%'</code></strong>。若加 <code class="mono">-m</code> 限制来源，必须是【管理器宿主机 IP】（docker 所在机器，节点看到的连接源 IP，本例 192.168.1.66），<strong>绝不是 VIP 192.168.1.10</strong>，否则管理器连不上所有节点）；
-      ② 执行 <code class="mono">-i init_baremetal.sql</code>（同一命令加该参数）创建 ha_monitor / replication / app 账号；
-      ③ 把生成的 <code class="mono">docker-compose.yaml</code> 用 <code class="mono">docker compose up -d</code> 跑起来（仅 keepalived 客户端）。
-      手工方式见 <code class="mono">doc/mysql编译版安装说明.md</code>。
+    <div id="mariadbTip" style="grid-column:1/-1; display:none; padding:10px 12px; border:1px dashed #1d4ed8; border-radius:10px; background:#eff6ff; font-size:13px; color:#1e3a8a;">
+      <strong>MariaDB 节点部署流程（全量安装，脱离宝塔）：</strong>生成后目录内含 <code class="mono">Install-ha-mariadb-Node.sh</code>（唯一全量安装脚本，自包含）、<code class="mono">Uninstall-mariadb-Node.sh</code>、<code class="mono">my.cnf</code>、<code class="mono">init_mariadb.sql</code>。推荐顺序 ——
+      ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/ha-node/&lt;本机IP&gt;/</code>），并把 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 放到同一目录（脚本会优先用本地包，跳过下载）；
+      ② 执行 <code class="mono">sudo bash Install-ha-mariadb-Node.sh</code>
+        （自动：解压 → mariadb-install-db 初始化 → 落盘服务端 my.cnf → systemd 启动 → 跑 init/fix SQL → 起 keepalived）。若需指定安装路径/数据目录/下载链接，设置环境变量
+        <code class="mono">MARIADB_INSTALL_DIR</code> / <code class="mono">MARIADB_DATA_DIR</code> / <code class="mono">MARIADB_DOWNLOAD_URL</code> 后重跑；
+      ③ 各节点都装好后，管理器自动建复制、选主、漂移 VIP。
+      <strong>注意：MariaDB 与 MySQL GTID 机制不兼容，MariaDB 集群所有节点必须都是 MariaDB 类型。</strong>
     </div>
     <div style="grid-column:1/-1; display:flex; gap:10px; align-items:center;">
       <button class="btn btn-primary" type="submit">生成节点配置</button>
@@ -95,14 +95,15 @@
     <tbody>
       {% for n in nodes %}
       <tr data-cluster="{{ n.cluster_id or '' }}" data-search="{{ n.ip }} {{ n.dir_display }}">
-        <td class="mono">{{ n.ip }}{% if n.node_type == 'baremetal' %} <span class="badge" style="background:#fdf2f8;color:#7c2d52;">裸机</span>{% elif n.node_type == 'docker' %} <span class="badge" style="background:#eef2ff;color:#7c3aed;">Docker</span>{% endif %}</td>
+        <td class="mono">{{ n.ip }}{% if n.node_type == 'mariadb' %} <span class="badge" style="background:#eff6ff;color:#1d4ed8;">MariaDB</span>{% elif n.node_type == 'docker' %} <span class="badge" style="background:#eef2ff;color:#7c3aed;">Docker</span>{% endif %}</td>
         <td>{{ n.port }}{% if n.mysql_version %} <span class="muted" style="font-size:11px;">{{ n.mysql_version }}</span>{% endif %}</td>
         <td>{{ n.server_id }}</td>
         <td>{{ n.initial_role or 'slave' }}</td>
         <td>{{ n.cluster_name }}</td>
-        <td class="mono" title="{{ n.compose_path }}">{{ n.dir_display }}{% if n.node_type == 'baremetal' %}<br><span style="color:#7c2d52;font-size:11px;">my.cnf.ha-fragment · init_baremetal.sql</span>{% endif %}</td>
+        <td class="mono" title="{{ n.compose_path }}">{{ n.dir_display }}{% if n.node_type == 'mariadb' %}<br><span style="color:#1d4ed8;font-size:11px;">my.cnf · init_mariadb.sql · Install-ha-mariadb-Node.sh</span>{% endif %}</td>
         <td class="row-actions">
           <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
+          <a class="btn btn-sm" style="background:#0ABAB5;color:#fff;" href="/nodes/{{ n.ip }}/creds_sql" title="下载该节点账号/权限修复脚本 fix-node-creds.sql（含真实凭证，需节点本机以真实 root 执行）">下载修复SQL</a>
           <form method="post" action="/nodes/delete" style="display:inline" onsubmit="return confirm('确认删除该节点？将同时清理项目目录中已生成的同名部署文件。');">
             <input type="hidden" name="ip" value="{{ n.ip }}">
             <button class="btn btn-sm btn-danger" type="submit">删除</button>
@@ -129,8 +130,8 @@
 <script>
   function onNodeTypeChange() {
     var t = document.getElementById("nodeType").value;
-    var tip = document.getElementById("baremetalTip");
-    if (tip) tip.style.display = (t === "baremetal") ? "block" : "none";
+    var maria = document.getElementById("mariadbTip");
+    if (maria) maria.style.display = (t === "mariadb") ? "block" : "none";
   }
   function filterNodes() {
     var cf = document.getElementById("clusterFilter").value;

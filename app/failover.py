@@ -1,13 +1,28 @@
 """自动/手动故障切换核心逻辑（多集群：所有操作均按 cluster_id 隔离）。"""
 from .db import query, execute
+from .config import get_manager_public_ip
 from .state import get_current_master, set_current_master
 from .ha_client import (set_read_only, promote_to_master, make_slave_of,
                         set_local_master_flag, is_stale_master, get_status,
                         heal_replication, heal_io_gtid_gap, get_gtid_executed,
-                        parse_gtid_set)
+                        parse_gtid_set, fix_node_mysql_params, ensure_ha_creds,
+                        heal_anonymous_gtid_io)
 import time
 from .alerts import send_alert
 from .clusters import get_cluster_creds
+
+# 节点重指向失败的告警按 (host, port) 做冷却（默认 5 分钟最多提示一次），
+# 避免 gtid_mode=OFF 等根因未解时，monitor 每个周期都刷同样的失败日志。
+_repoint_fail_ts = {}
+_REPOINT_WARN_COOLDOWN = 300
+
+
+def _warn_repoint(host, port, msg):
+    now = time.time()
+    key = (host, port)
+    if now - _repoint_fail_ts.get(key, 0) > _REPOINT_WARN_COOLDOWN:
+        print(f"[failover] {msg}")
+        _repoint_fail_ts[key] = now
 
 
 def load_creds(cluster_id=None):
@@ -100,7 +115,7 @@ def _repoint_slave(cluster_id, h, target_host, target_port, creds):
                             target_host, int(target_port), creds["repl_user"],
                             creds["repl_pass"], ru, rp)
     if not ok:
-        print(f"[failover] 重指向 {host}:{port} 失败: {err}")
+        _warn_repoint(host, port, f"重指向 {host}:{port} 失败: {err}")
         return False
     for _ in range(8):
         try:
@@ -119,6 +134,21 @@ def _repoint_slave(cluster_id, h, target_host, target_port, creds):
                              target_host, int(target_port), mru, mrp)
         except Exception as e:
             print(f"[failover] IO 自愈异常 {host}:{port}: {e}")
+        # IO 仍失败且为「Access denied」：主库 replication 账号密码漂移，到主库重置密码并重启从库 IO
+        try:
+            st = get_status(host, port, creds["ha_user"], creds["ha_pass"], ru, rp)
+            if st.get("slave_io") != "Yes" and "Access denied for user" in (st.get("slave_io_err") or ""):
+                from .ha_client import reset_replication_creds_on_master, restart_slave_io
+                mru, mrp = node_root(target_host, cluster_id)
+                rok, rmsg = reset_replication_creds_on_master(
+                    target_host, int(target_port), creds["ha_user"], creds["ha_pass"],
+                    mru, mrp, creds["repl_user"], creds["repl_pass"], slave_ip=host)
+                print(f"[failover] 主库重置复制密码 {host}:{port}: {rmsg}")
+                if rok:
+                    sok, smsg = restart_slave_io(host, port, creds["ha_user"], creds["ha_pass"], ru, rp)
+                    print(f"[failover] {smsg}")
+        except Exception as e:
+            print(f"[failover] 复制密码重置异常 {host}:{port}: {e}")
         time.sleep(2)
     return True
 
@@ -283,12 +313,76 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
     return True
 
 
+def _selfheal_cluster(cluster_id):
+    """对集群内每台存活节点自愈复制关键参数（gtid_mode/enforce_gtid_consistency/server_id）。
+
+    通过 SET PERSIST 写入 mysqld-auto.cnf（重启仍生效），彻底摆脱「裸机 my.cnf 片段被面板/
+    重启覆盖导致反复 gtid_mode=OFF、server_id 退回默认值 1」的问题。仅在参数未达标时执行，
+    已达标则为空操作，可安全每周期调用。
+    """
+    creds = load_creds(cluster_id)
+    if not creds["ha_user"]:
+        return
+    hosts = [h for h in list_hosts(cluster_id) if h["status"] == "up"]
+    if not hosts:
+        return
+    # 计算各节点唯一 server_id（处理登记冲突/缺值），并回写 nodes 表保持一致
+    want_sid = {}
+    used = set()
+    for h in hosts:
+        row = query("SELECT server_id FROM nodes WHERE cluster_id=%s AND ip=%s AND port=%s",
+                    (cluster_id, h["host"], int(h["port"])))
+        sid = int(row[0]["server_id"]) if row and row[0].get("server_id") else 0
+        if sid and sid not in used:
+            used.add(sid)
+            want_sid[(h["host"], int(h["port"]))] = sid
+        else:
+            cand = 2
+            while cand in used:
+                cand += 1
+            used.add(cand)
+            want_sid[(h["host"], int(h["port"]))] = cand
+            try:
+                execute("UPDATE nodes SET server_id=%s WHERE cluster_id=%s AND ip=%s AND port=%s",
+                        (cand, cluster_id, h["host"], int(h["port"])))
+            except Exception:
+                pass
+    for h in hosts:
+        ip, port = h["host"], int(h["port"])
+        ru, rp = node_root(ip, cluster_id)
+        ok, rep = fix_node_mysql_params(ip, port, ru, rp,
+                                        target_server_id=want_sid.get((ip, port)))
+        if ok and rep.get("changes"):
+            print(f"[selfheal] {ip}:{port} 已自愈: {', '.join(rep['changes'])}")
+        elif not ok:
+            print(f"[selfheal] {ip}:{port} 自愈失败: {rep.get('error')}")
+        for w in (rep.get("warns") or []):
+            print(f"[selfheal] {ip}:{port} 警告: {w}")
+        # 账号自愈（防 1130「Host ... not allowed」）：CREATE IF NOT EXISTS + 改密 + 授权。
+        # 优先用 ha_monitor（已知正确）连接，并把 root@'<管理器IP>' 密码校正为库存值，
+        # 打破「root 密码漂移 -> 连不上 -> 自愈不跑」死循环。
+        cok, cmsg = ensure_ha_creds(ip, port, ru, rp,
+                                    creds["ha_user"], creds["ha_pass"],
+                                    creds["repl_user"], creds["repl_pass"],
+                                    creds.get("app_user", ""), creds.get("app_pass", ""),
+                                    manager_ip=get_manager_public_ip())
+        if not cok:
+            print(f"[selfheal] {ip}:{port} 账号自愈失败: {cmsg}")
+
+
 def ensure_topology(cluster_id):
     """保证每台存活的'非当前主'库都是当前主的从库（用于切后对齐 + 旧主恢复重入）。"""
     cur_h, cur_p = get_current_master(cluster_id)
     creds = load_creds(cluster_id)
     if not creds["ha_user"]:
         return
+    # 先自愈：确保各节点 gtid_mode=ON / server_id 唯一，否则后续 make_slave_of 会因
+    # gtid_mode=OFF 反复失败（裸机 my.cnf 片段被覆盖时尤为常见）。SET PERSIST 持久化，
+    # 已达标则为空操作。
+    try:
+        _selfheal_cluster(cluster_id)
+    except Exception as e:
+        print(f"[monitor] _selfheal_cluster 集群错误(可忽略): {e}")
     # 首次无主：优先选生成时指定为 master 的节点，否则选第一个存活库作为主，
     # 写入 current_master（确保一定有可写主，VIP 才能绑定）
     if not cur_h:
@@ -306,12 +400,15 @@ def ensure_topology(cluster_id):
         set_current_master(cluster_id, cur_h, cur_p)
     # 确保被指定为主库的 MySQL 实际可写（read_only=OFF），否则 keepalived VIP 检查不通过
     ru, rp = node_root(cur_h, cluster_id)
-    try:
-        # 用 promote_to_master：不仅置可写，还清空残留复制通道，
-        # 避免主库被 monitor 误判为 slave / 形成环形复制
-        promote_to_master(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], ru, rp)
-    except Exception as e:
-        print(f"[topology] 设置主库可写出错(可忽略): {e}")
+    # 用 promote_to_master：不仅置可写，还清空残留复制通道，
+    # 避免主库被 monitor 误判为 slave / 形成环形复制。
+    # 注意：此处失败绝不能再「可忽略」——主库若仍是 read_only=ON，
+    # keepalived 检查脚本会判定本机只读而放弃 VIP，导致 VIP 永不绑定。
+    ok, perr = promote_to_master(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], ru, rp)
+    if not ok:
+        print(f"[topology][严重] 提升主库 {cur_h}:{cur_p} 为可写失败（VIP 将无法绑定到该节点，请检查账号权限/连接）：{perr}")
+    else:
+        print(f"[topology] 主库 {cur_h}:{cur_p} 已置为可写(read_only=OFF)")
     # 把当前主写入各节点本地 ha_local.state（keepalived 检查脚本据此持有/释放 VIP）
     push_current_master_to_nodes(cluster_id, f"{cur_h}:{cur_p}")
     for h in list_hosts(cluster_id):
@@ -339,7 +436,24 @@ def ensure_topology(cluster_id):
                 send_alert("节点重新加入集群", msg)
             print(f"[topology] {msg}")
         else:
-            print(f"[topology] {h['host']}:{h['port']} 重指向失败")
+            _warn_repoint(h['host'], h['port'], f"{h['host']}:{h['port']} 重指向失败")
+        # 自愈：从库 IO 报「匿名事务」1236（主库 binlog 含 gtid_mode=OFF 时期写入的匿名事务，
+        # AUTO_POSITION=1 无法复制）。清理主库 binlog 后从库续传。每次重指向后都查一次。
+        try:
+            st2 = get_status(h["host"], int(h["port"]), creds["ha_user"], creds["ha_pass"],
+                             ru, rp)
+            io_err = (st2.get("slave_io_err") or "")
+            if "anonymous transaction" in io_err:
+                # 注意：主库与从库 root 凭证通常不同，必须用主库的 root 连主库做
+                # FLUSH/PURGE；这里取主库 root（cur_h），不可复用从库 ru/rp，否则
+                # 主库连接失败、匿名事务自愈失效。
+                mru, mrp = node_root(cur_h, cluster_id)
+                ok2, msg2 = heal_anonymous_gtid_io(
+                    h["host"], int(h["port"]), creds["ha_user"], creds["ha_pass"],
+                    ru, rp, cur_h, int(cur_p), mru, mrp)
+                print(f"[topology] 匿名事务自愈 {h['host']}:{h['port']}: {msg2}")
+        except Exception as e:
+            print(f"[topology] 匿名事务自愈异常(可忽略): {e}")
 
     # 收尾校准：以 current_master 表为权威口径，统一 hosts.is_current_master，
     # 避免 keepalived/监控提升或旧主重入后，is_current_master 与 current_master 表长期不一致

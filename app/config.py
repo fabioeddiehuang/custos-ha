@@ -28,11 +28,13 @@ WEB_PASS = env("WEB_PASS", "admin")  # 为空则首次启动随机生成并打�
 SECRET_KEY = env("SECRET_KEY", "change-me-in-production")
 
 # 检测与切换
-CHECK_INTERVAL = int(env("CHECK_INTERVAL", 3))   # 探活间隔(秒)
+CHECK_INTERVAL = int(env("CHECK_INTERVAL", 2))   # 探活间隔(秒)
 FAIL_THRESHOLD = int(env("FAIL_THRESHOLD", 2))    # 连续失败次数阈值
 # 单节点探活超时（秒）：主库服务停止时会立即收到 RST（连接拒绝很快返回），
 # 仅当主机断电/网络黑洞时才走到该超时。调小可加快「主机失联」判定（配合 FAIL_THRESHOLD）。
-PROBE_TIMEOUT = int(env("PROBE_TIMEOUT", 3))
+PROBE_TIMEOUT = int(env("PROBE_TIMEOUT", 2))
+# 注：主库失联切换延迟 ≈ FAIL_THRESHOLD×PROBE_TIMEOUT（当前 2×2=4s），已为安全下限，
+# 再调小易误切。如确需更快可临时设环境变量覆盖，不建议写死更小值。
 
 # 节点生成目录（一键启动 compose 落地目录；建议挂卷持久化）
 NODES_DIR = env("NODES_DIR", "/app/generated_nodes")
@@ -74,3 +76,48 @@ def get_mgmt_host():
         return "127.0.0.1"
     finally:
         s.close()
+
+
+# 管理器对外 IP（裸机节点实际看到的【连接来源 IP】）。
+# 这是「运行管理器的服务端后台」的 IP —— 节点只允许该 IP 连入；
+# 它与「管理端自建的后台 MySQL（MGMT_MYSQL_HOST，如 192.168.1.88）」是**两回事**：
+# 管理库仅用于管理器自身存储，绝不作为集群节点、也绝不写入节点配置。
+# 生产环境强烈建议显式指定（docker 部署填运行 docker 那台宿主机的对外 IP，
+# 即节点看到的连接源 IP），避免 docker SNAT / 多网卡下自动探测到错误地址。
+MANAGER_PUBLIC_IP = (env("MANAGER_PUBLIC_IP", "") or "").strip()
+
+# 慢日志采集 / 观测中心开关。默认 False（暂停）：节点侧 mysql.slow_log 清空需 ha_monitor
+# 持 DELETE 权限，未授权时每周期会报 1556 并重复采集刷日志；v2.1 起默认暂停，避免干扰。
+# 如需开启采集，设置 SLOWLOG_ENABLED=1 并在节点以真实 root 跑 fix-node-creds.sql 授权 DELETE。
+SLOWLOG_ENABLED = str(env("SLOWLOG_ENABLED", "0") or "0").strip() in ("1", "true", "yes", "on")
+
+
+def get_manager_public_ip():
+    """管理器对外 IP —— 裸机节点应允许此 IP 连接、并写入节点部署配置。
+
+    这是「服务端后台（管理器应用）」的 IP，节点只允许该 IP 连入；
+    它与「管理端后台 MySQL（MGMT_MYSQL_HOST）」无关 —— 管理库只供管理器自身
+    存储，绝不能作为集群节点、也不应出现在任何节点配置里。
+
+    优先用显式 MANAGER_PUBLIC_IP（生产强烈建议显式设置）；未设置时自动探测本机
+    主网卡 IPv4 并打印告警提示显式配置（docker 桥接网络下探测到的是容器 IP，
+    与节点看到的宿主机 IP 不同，此时必须显式设置 MANAGER_PUBLIC_IP，否则
+    root@'<IP>' / ha_monitor@'<IP>' 授权会错位，导致管理器连不上节点）。
+    """
+    import logging
+    if MANAGER_PUBLIC_IP and MANAGER_PUBLIC_IP not in ("127.0.0.1", "localhost", "auto"):
+        return MANAGER_PUBLIC_IP
+    _log = logging.getLogger("ha.config")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    _log.warning(
+        "MANAGER_PUBLIC_IP 未显式设置，已自动探测为 %s。若以 docker 部署，节点看到的连接"
+        "来源是宿主机 IP，请显式设置 MANAGER_PUBLIC_IP 为管理器宿主机的对外 IP，"
+        "否则 root@'<IP>' / ha_monitor@'<IP>' 授权错位，管理器连不上节点。", ip)
+    return ip

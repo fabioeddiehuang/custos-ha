@@ -15,14 +15,19 @@
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 
 from .db import get_setting, query, execute
-from .config import MGMT, NODES_DIR, NODES_HOST_BASE, get_mgmt_host, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
+from .config import NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
 
 logger = logging.getLogger("node_gen")
+
+# VIP 非法（如集群尚未设置 VIP）时，keepalived.conf 刷新会被跳过并告警。
+# 该告警每周期都打会刷屏，这里按 ip 做冷却（默认 5 分钟最多提示一次）。
+_vip_warn_ts = {}
 
 NODE_ASSETS = Path(__file__).parent / "node_assets" / "keepalived"
 NODE_SCRIPTS = Path(__file__).parent / "node_assets"
@@ -201,50 +206,107 @@ services:
 """
 
 
-def render_my_cnf_fragment(server_id, port, mysql_version=None):
-    """生成裸机 my.cnf [mysqld] 片段（供用户在宝塔/编辑器中追加并重启 MySQL 生效）。
+def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/mariadb", install_dir="/opt/mariadb"):
+    """生成 MariaDB 裸机节点的【完整 my.cnf】（非片段，可直接用）。
 
-    原因：宝塔等面板重启会重写 my.cnf，SET PERSIST 写入的 mysqld-auto.cnf 可能被覆盖；
-    故 server_id / gtid / binlog 等关键复制参数走配置文件最稳。
+    MariaDB 的 GTID 机制与 MySQL【根本不兼容】：MariaDB 用 gtid_domain_id + 基于 server_id
+    的序列 GTID（形如 0-1-100），没有 MySQL 的 gtid_mode 变量，复制挂载用
+    MASTER_USE_GTID=slave_pos（不是 AUTO_POSITION=1）。
+
+    该配置文件由 Install-ha-mariadb-Node.sh 在节点上全量落盘，确保「配置一致性」：
+    每个 MariaDB 节点的 server_id / gtid_domain_id / port / 数据目录 / binlog 完全一致风格，
+    避免手动改配置带来的漂移（用户要求：配置一致性由服务端生成保证）。
     """
+    if gtid_domain_id is None:
+        # 默认域：统一使用 0（不推荐；generate_node 现已显式传入 server_id 作为非 0 域）
+        gtid_domain_id = 0
     return (
-        "# ---- MySQL HA Manager 裸机节点参数（追加到 my.cnf 的 [mysqld] 段，重启 MySQL 生效）----\n"
+        "# ---- MySQL HA Manager 生成的 MariaDB 节点配置（完整 my.cnf，Install 脚本落盘）----\n"
+        "[mysqld]\n"
         f"server-id = {server_id}\n"
-        "gtid_mode = ON\n"
-        "enforce_gtid_consistency = ON\n"
+        f"gtid_domain_id = {gtid_domain_id}\n"
+        "# MariaDB 默认启用 GTID，无需 gtid_mode（与 MySQL 不兼容，请勿添加）\n"
         "log_bin = mysql-bin\n"
         "log_slave_updates = ON\n"
         "relay_log = relay-bin\n"
         "relay_log_recovery = ON\n"
         "sync_binlog = 1\n"
         "innodb_flush_log_at_trx_commit = 1\n"
+        "binlog_format = ROW\n"
         "read_only = ON\n"
+        "# 慢日志（供观测/排错）\n"
         "slow_query_log = 1\n"
         "long_query_time = 0.5\n"
         "log_output = TABLE\n"
         "log_queries_not_using_indexes = 0\n"
-        f"# 业务/复制端口（修改后须与管理器节点端口 {port} 一致）\n"
+        f"port = {port}\n"
+        f"datadir = {data_dir}\n"
+        f"socket = {data_dir}/mysql.sock\n"
+        f"pid_file = {data_dir}/mariadb.pid\n"
+        "bind_address = 0.0.0.0\n"
+        "# 字符集\n"
+        "character_set_server = utf8mb4\n"
+        "collation_server = utf8mb4_general_ci\n"
+        "# 允许 root 从管理器 IP 连入（Install 脚本会创建 root@'<管理器IP>'）\n"
+        "# 认证插件统一 mysql_native_password，便于老驱动/管理器连接\n"
+        "\n"
+        "# 客户端默认连接参数：使 `mysql -uroot -p` 无需指定 -h/-P/-S 即可登录\n"
+        "[client]\n"
+        f"port = {port}\n"
+        f"socket = {data_dir}/mysql.sock\n"
+        "default-character-set = utf8mb4\n"
     )
 
 
-def render_init_baremetal_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass):
-    """裸机 init.sql：创建 ha_monitor / replication / app 账号 + ha_local 状态库。
+def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass):
+    """MariaDB 节点的 init.sql：创建 ha_monitor / replication / app 账号 + ha_local 状态库。
 
-    不含 server_id 等参数（走 my.cnf 片段）。用户须在「应用 my.cnf 片段并重启 MySQL」后手动执行。
+    与 MySQL init.sql 的差异：
+      - MariaDB 无 gtid_mode 变量，跳过 SET GLOBAL gtid_mode 那几行。
+      - GTID 由 my.cnf 的 gtid_domain_id 保证，无需在线开启。
+      - CREATE/ALTER USER 用 mysql_native_password（MariaDB 10.4+ 默认 ed25519，
+        显式指定以确保管理器用 native 密码协议连接稳定）。
     """
-    return _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
+    return (
+        # MariaDB 默认已开启 GTID（gtid_domain_id 在 my.cnf 指定），无需 SET gtid_mode。
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
+        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, REPLICATION CLIENT, PROCESS, "
+        "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
+        "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        # replication 复制账号（从库从其自身 IP 连，必须 @'%%'）
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "GRANT REPLICATION SLAVE, REPLICATION SLAVE ADMIN ON *.* TO '%s'@'%%';\n"
+        "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        # 业务最小权限账号
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, "
+        "REFERENCES, EXECUTE, SHOW VIEW, CREATE TEMPORARY TABLES ON *.* TO '%s'@'%%';\n"
+        "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        # 本地状态库：切换主库时写入当前主，keepalived 检查脚本据此持有/释放 VIP
+        "CREATE DATABASE IF NOT EXISTS ha_local;\n"
+        "CREATE TABLE IF NOT EXISTS ha_local.state (k VARCHAR(32) PRIMARY KEY, v VARCHAR(255));\n"
+        "FLUSH PRIVILEGES;\n"
+    ) % (
+        ha_user, ha_pass, ha_user,
+        ha_user, ha_pass,
+        repl_user, repl_pass, repl_user,
+        repl_user, repl_pass,
+        app_user, app_pass, app_user,
+        app_user, app_pass,
+    )
 
 
 def render_baremetal_compose(node_name, vip_port=None):
-    """裸机节点：只跑 keepalived 客户端（docker 模式），MySQL 由宿主机既有实例提供。
+    """裸机 MariaDB 节点：只跑 keepalived 客户端（docker 模式），MySQL/MariaDB 由宿主机既有实例提供。
 
-    keepalived 容器使用 host 网络，连接 127.0.0.1:<port> 探活本机 MySQL。
+    keepalived 容器使用 host 网络，连接 127.0.0.1:<port> 探活本机 MariaDB。
     """
     if vip_port is None:
         vip_port = VIP_PORT
     return (
-        "# 自动生成：裸机 MySQL + keepalived-only 客户端节点部署\n"
-        "# 前置：目标机已运行 MySQL（宝塔等），已应用 my.cnf 片段并创建账号（init_baremetal.sql）。\n"
+        "# 自动生成：裸机 MariaDB + keepalived-only 客户端节点部署\n"
+        "# 前置：目标机已按 my.cnf（含 server_id/gtid_domain_id）部署 MariaDB 并创建账号（init_mariadb.sql）。\n"
         "# 运行： cd 本目录 && docker compose up -d\n"
         "services:\n"
         "  keepalived:\n"
@@ -288,24 +350,140 @@ def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
     （清空 MySQL-data 后 init.sql 重新执行）也不会因旧密码导致无法连接。
     """
     return (
+        # 启用 GTID（复制/切换必需）。gtid_mode 不能从 OFF 直接跳到 ON，必须按
+        # OFF→OFF_PERMISSIVE→ON_PERMISSIVE→ON 逐级过渡；已为 ON 时后续步会报无关错误
+        # （脚本继续，不影响）。持久化由 my.cnf 片段 + 重启 MySQL 保证。
+        "SET GLOBAL enforce_gtid_consistency=ON;\n"
+        "SET GLOBAL gtid_mode=OFF_PERMISSIVE;\n"
+        "SET GLOBAL gtid_mode=ON_PERMISSIVE;\n"
+        "SET GLOBAL gtid_mode=ON;\n"
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
-        "GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
-        "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* TO '%s'@'%%';\n"
+        # 注意：CREATE/ALTER/DROP USER 这三项**不能**写进静态 GRANT——MySQL 5.7 / MariaDB
+        # 不认识这些动态权限名（GRANT 直接报 1064 语法错误），会导致 init 整段失败。
+        # 8.0 上由 ensure_ha_creds 自愈时再容错补授（失败忽略，兼容低版本）。
+        "GRANT CREATE USER, REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
+        "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* "
+        "TO '%s'@'%%';\n"
+        # 关键：CREATE 后 ALTER 强制密码，即使账号此前已存在（旧密码漂移）也校正回集群当前值；
+        # 否则重装时 CREATE IF NOT EXISTS 不覆盖、从库连主库报 Access denied。ALTER USER 在
+        # 5.7.6+/MariaDB 10.2+ 均支持，版本安全。
+        "ALTER USER '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         "GRANT REPLICATION SLAVE ON *.* TO '%s'@'%%';\n"
+        "ALTER USER '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         # 业务最小权限账号：供测试/应用通过 VIP 连接，仅授予常用读写与管理权限，
         # 不含 SUPER/REPLICATION 等运维权限，避免应用直接用 ha_monitor/replication。
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, "
         "REFERENCES, EXECUTE, SHOW VIEW, CREATE TEMPORARY TABLES ON *.* TO '%s'@'%%';\n"
+        "ALTER USER '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         # 本地状态库：管理端在切换主库时把「当前主」写入各节点本机 ha_local.state，
         # keepalived 检查脚本只读本机判定 VIP 归属，完全不依赖节点回连管理库
         # （避免管理库不可达时 VIP 不漂移、被 nopreempt 锁死在首节点）。
         "CREATE DATABASE IF NOT EXISTS ha_local;\n"
         "CREATE TABLE IF NOT EXISTS ha_local.state (k VARCHAR(32) PRIMARY KEY, v VARCHAR(255));\n"
         "FLUSH PRIVILEGES;\n"
-    ) % (ha_user, ha_pass, ha_user, repl_user, repl_pass, repl_user,
-         app_user, app_pass, app_user)
+    ) % (
+        ha_user, ha_pass, ha_user,
+        ha_user, ha_pass,
+        repl_user, repl_pass, repl_user,
+        repl_user, repl_pass,
+        app_user, app_pass, app_user,
+        app_user, app_pass,
+    )
+
+
+def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_ip):
+    """生成「节点账号/权限修复脚本」，当节点 ha_monitor 权限被面板/重装回退（只剩 USAGE）、
+    或 root@'<管理器IP>' 密码漂移导致管理器连不上时使用。注入真实凭证。"""
+    return (
+        "-- 节点账号/权限修复脚本（由管理器生成，已注入真实凭证）\n"
+        "-- ⚠ 无需手动执行：Install-ha-mariadb-Node.sh 在节点准备阶段【自动重放】本文件，\n"
+        "--   用于校正 ha_monitor 权限被面板/重装回退、或 root@'<管理器IP>' 密码漂移。\n"
+        "--   仅当自动重放失败（日志有提示）时，才需在本机手动跑：\n"
+        "--   mysql -uroot -p'<节点真实root密码>' < fix-node-creds.sql\n"
+        "SET SQL_LOG_BIN=0;\n"
+        # 1) ha_monitor：同时校正 @'%' 与 @'<管理器IP>' 两种 host 的密码。
+        #    关键：MySQL 会优先匹配「特定 host」账号，若节点上残留 ha_monitor@'<管理器IP>'
+        #    且密码漂移，管理器从管理器 IP 连入会命中该特定 host 而认证失败；把两种 host
+        #    都设为同一正确密码可消除歧义。CREATE/ALTER/DROP USER 三项不写进静态 GRANT
+        #    （5.7/MariaDB 会报 1064），8.0 由 ensure_ha_creds 容错补授。
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "ALTER USER '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "GRANT CREATE USER, REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
+        "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* TO '%s'@'%%';\n"
+        "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "ALTER USER '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "GRANT CREATE USER, REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
+        "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* TO '%s'@'%s';\n"
+        # 2) root@'<管理器IP>'：修正为管理器 nodes.root_pass，使管理器 root 连接可用
+        "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "ALTER USER '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION;\n"
+        # 3) replication：复制通道账号（从库从其自身 IP 连，必须 @'%'）。
+        #    ⚠ 关键：CREATE 之后必须再 ALTER 强制密码——否则节点曾用旧 repl_pass 安装、
+        #    重装/跑修复脚本时 CREATE IF NOT EXISTS 不覆盖已存在账号 → 密码仍是旧的 →
+        #    从库连主库报 Access denied。ALTER 兜底可彻底校正回集群当前 repl_pass。
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "GRANT REPLICATION SLAVE ON *.* TO '%s'@'%%';\n"
+        "ALTER USER '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "FLUSH PRIVILEGES;\n"
+        "SET SQL_LOG_BIN=1;\n"
+    ) % (
+        ha_user, ha_pass, ha_user, ha_pass, ha_user,
+        ha_user, manager_ip, ha_pass, ha_user, manager_ip, ha_pass, ha_user, manager_ip,
+        root_user, manager_ip, root_pass,
+        root_user, manager_ip, root_pass,
+        root_user, manager_ip,
+        repl_user, repl_pass, repl_user, repl_user, repl_pass,
+    )
+
+
+def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
+                                       root_user, root_pass, manager_ip, port):
+    """MariaDB 的节点账号/权限修复脚本（语法与 MySQL 不同）。
+
+    差异：
+      - MariaDB 10.4+ 默认认证插件是 ed25519，显式用 IDENTIFIED VIA mysql_native_password
+        并 USING PASSWORD('<哈希>') 注入——但此处我们直接给明文密码（INSTALL 脚本本机跑，
+        非经主从复制，无明文穿越复制链路风险）。等价写法是 `IDENTIFIED BY`，保持与 init 一致。
+      - MariaDB 无 REPLICATION_SLAVE_ADMIN / SYSTEM_VARIABLES_ADMIN（或用旧名），用通用权限集。
+      - gtid_domain_id 不在本脚本处理（已由 my.cnf 固定）。
+    """
+    return (
+        "-- MariaDB 节点账号/权限修复脚本（由管理器生成，已注入真实凭证）\n"
+        "-- ⚠ 无需手动执行：Install-ha-mariadb-Node.sh 在节点准备阶段【自动重放】本文件。\n"
+        "--   仅当自动重放失败（日志有提示）时，才需在本机手动跑：\n"
+        "--   mysql -uroot -p'<节点真实root密码>' < fix-node-creds.sql\n"
+        "SET SQL_LOG_BIN=0;\n"
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
+        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, REPLICATION CLIENT, PROCESS, "
+        "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
+        "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "ALTER USER '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
+        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, REPLICATION CLIENT, PROCESS, "
+        "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%s';\n"
+        "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "ALTER USER '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION;\n"
+        "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "GRANT REPLICATION SLAVE, REPLICATION SLAVE ADMIN ON *.* TO '%s'@'%%';\n"
+        "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "CREATE DATABASE IF NOT EXISTS ha_local;\n"
+        "CREATE TABLE IF NOT EXISTS ha_local.state (k VARCHAR(32) PRIMARY KEY, v VARCHAR(255));\n"
+        "FLUSH PRIVILEGES;\n"
+        "SET SQL_LOG_BIN=1;\n"
+    ) % (
+        ha_user, ha_pass, ha_user, ha_pass, ha_user,
+        ha_user, manager_ip, ha_pass, ha_user, manager_ip, ha_pass, ha_user, manager_ip,
+        root_user, manager_ip, root_pass,
+        root_user, manager_ip, root_pass,
+        root_user, manager_ip,
+        repl_user, repl_pass, repl_user, repl_user, repl_pass,
+    )
 
 
 def _write(path: Path, text: str, mode=0o600):
@@ -341,7 +519,11 @@ def _refresh_all_keepalived_conf(cluster_id=None):
                 f"ha_mysql_{ip.replace('.', '_')}",
             )
         except ValueError as e:
-            logger.warning("跳过刷新 %s 的 keepalived.conf：%s", ip, e)
+            now = time.time()
+            last = _vip_warn_ts.get(ip, 0)
+            if now - last > 300:
+                logger.warning("跳过刷新 %s 的 keepalived.conf：%s", ip, e)
+                _vip_warn_ts[ip] = now
             continue
         p = _safe_node_path(ip) / "keepalived" / "keepalived.conf"
         if p.exists():
@@ -395,7 +577,7 @@ def regenerate_cluster_compose(cluster_id):
         if not p.exists():
             continue
         node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
-        if node_type == "baremetal":
+        if node_type == "mariadb":
             content = render_baremetal_compose(node_name, vip_port)
         else:
             content = _render_compose(
@@ -487,17 +669,13 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     interface = creds["interface"] or INTERFACE
     vrid = creds["vrid"] or VRID
     vip_port = creds.get("vip_port") or VIP_PORT
-    mgmt_host = get_mgmt_host()
-    mgmt_port = MGMT["port"]
-    mgmt_user = MGMT["user"]
-    mgmt_pass = MGMT["password"]
-    mgmt_db = MGMT["db"]
+    manager_public_ip = get_manager_public_ip()
     server_id = get_next_server_id()
     node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
     peers = _peer_ips(ip, cluster_id)
-    # 裸机模式 keepalived 容器在 host 网络，连本机 MySQL 用 127.0.0.1；
+    # MariaDB 裸机模式 keepalived 容器在 host 网络，连本机 MariaDB 用 127.0.0.1；
     # Docker 模式连节点 IP（容器已把端口发布到宿主机）。
-    local_host = "127.0.0.1" if node_type == "baremetal" else ip
+    local_host = "127.0.0.1" if node_type == "mariadb" else ip
 
     d = _safe_node_path(ip)
     d.mkdir(parents=True, exist_ok=True)
@@ -508,17 +686,24 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # 1) init.sql / compose（按节点类型分支）
     init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
     extra_files = {}
-    if node_type == "baremetal":
-        # 裸机：不生成 MySQL 容器，仅生成「手工应用文件」（init_baremetal.sql + my.cnf 片段）。
-        # 管理器不自动连 root 执行 init（避免生产 root 凭据被用于远程推送）。
-        _write(d / "init_baremetal.sql", init_sql, mode=0o644)
-        my_cnf = render_my_cnf_fragment(server_id, port, mysql_version)
-        _write(d / "my.cnf.ha-fragment", my_cnf, mode=0o644)
-        extra_files["init_baremetal_sql"] = f"{NODES_HOST_BASE}/{ip}/init_baremetal.sql"
-        extra_files["my_cnf_fragment"] = f"{NODES_HOST_BASE}/{ip}/my.cnf.ha-fragment"
-        # 裸机节点接入准备 / 卸载脚本：随节点目录一同交付，降低手动改配置门槛。
-        # 这两个脚本是「宿主机 MySQL 准备」专用，仅裸机节点需要（Docker 节点 MySQL 在容器内）。
-        for sf in ("Install-ha-mysql-Node.sh", "uninstall-ha-mysql-Node.sh"):
+    if node_type == "mariadb":
+        # MariaDB 裸机：完全独立安装（脱离宝塔），由 Install 脚本全量安装 tarball。
+        # 服务端在此生成完整 my.cnf + init_mariadb.sql + 安装/卸载脚本，确保「配置一致性」。
+        _write(d / "init_mariadb.sql", render_mariadb_init_sql(
+            ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass), mode=0o644)
+        # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
+        # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
+        # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
+        my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=server_id)
+        _write(d / "my.cnf", my_cnf, mode=0o644)
+        # 账号/权限修复脚本（MariaDB 语法，native 密码）
+        fix_sql = render_fix_node_creds_sql_mariadb(
+            ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port)
+        _write(d / "fix-node-creds.sql", fix_sql, mode=0o644)
+        extra_files["init_mariadb_sql"] = f"{NODES_HOST_BASE}/{ip}/init_mariadb.sql"
+        extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/my.cnf"
+        # MariaDB 全量安装 / 卸载脚本：随节点目录一同交付（用户操作：下载安装包 -> 执行 Install）
+        for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh"):
             src = NODE_SCRIPTS / sf
             if src.exists():
                 _write(d / sf, src.read_text(), mode=0o755)
@@ -535,21 +720,22 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     )
     _write(kd / "keepalived.conf", keep_conf)
 
-    # 3) ha_check.conf（含管理库连接与节点凭证；限制权限）
-    #    LOCAL_ROOT_USER/LOCAL_ROOT_PASS 用于 keepalived 本地探活（root 密码在容器创建时
-    #    固定，不随 HA_PASS 漂移，避免 ha_monitor 密码脱节导致 VIP 不漂移）。
+    # 3) ha_check.conf（仅含节点本地探活凭证 + 管理器服务端后台 IP；限制权限）
+    #    - 管理端后台 MySQL（MGMT_MYSQL_HOST，如 192.168.1.88）仅管理器自身存储使用，
+    #      绝不作为集群节点，也不写入此处（节点脚本不会、也不应回连管理库）。
+    #    - MANAGER_IP 是「运行管理器的服务端后台」的 IP，节点只允许该 IP 连入；
+    #      它与管理库 IP 是两回事，请勿混淆。
+    #    - LOCAL_ROOT_USER/LOCAL_ROOT_PASS 用于 keepalived 本地探活（root 密码在容器创建时
+    #      固定，不随 HA_PASS 漂移，避免 ha_monitor 密码脱节导致 VIP 不漂移）。
     ha_check = (
         f"LOCAL_HOST={_shq(local_host)}\n"
         f"LOCAL_PORT={port}\n"
+        f"NODE_IP={_shq(ip)}\n"
+        f"MANAGER_IP={_shq(manager_public_ip)}\n"
         f"LOCAL_USER={_shq(ha_user)}\n"
         f"LOCAL_PASS={_shq(ha_pass)}\n"
         f"LOCAL_ROOT_USER={_shq(root_user)}\n"
         f"LOCAL_ROOT_PASS={_shq(root_pass)}\n"
-        f"MGMT_HOST={_shq(mgmt_host)}\n"
-        f"MGMT_PORT={mgmt_port}\n"
-        f"MGMT_USER={_shq(mgmt_user)}\n"
-        f"MGMT_PASS={_shq(mgmt_pass)}\n"
-        f"MGMT_DB={_shq(mgmt_db)}\n"
     )
     _write(kd / "ha_check.conf", ha_check)
 
@@ -563,12 +749,16 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             mode = 0o755 if f.endswith(".sh") else 0o644
             _write(kd / f, src.read_text(), mode=mode)
 
-    # 5) docker-compose.yaml（裸机仅 keepalived 客户端）
-    if node_type == "baremetal":
+    # 5) docker-compose.yaml（MariaDB 裸机仅 keepalived 客户端；Docker 才含 MySQL 容器）
+    if node_type == "mariadb":
         compose = render_baremetal_compose(node_name, vip_port)
     else:
         compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
     _write(d / "docker-compose.yaml", compose)
+    if node_type == "mariadb":
+        # MariaDB 节点额外记录安装/卸载脚本的下载地址（前端可展示，便于用户操作）
+        extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/Install-ha-mariadb-Node.sh"
+        extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-Node.sh"
 
     # 6) 登记到 nodes 表 + hosts 表（供监控自动接入）
     #    compose_path 记录「宿主机路径」（便于 Web 展示与到目标主机执行），
@@ -605,7 +795,11 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     return dict(
         dir=host_compose, node_name=node_name, server_id=server_id, peers=peers,
         node_type=node_type,
-        run_cmd=f"cd {host_compose} && docker compose up -d",
+        # MariaDB 裸机节点：宿主机已原生运行 MariaDB，只需拉起 keepalived 容器（否则会再起一个 MySQL 容器抢占 3306）。
+        # docker 节点：MySQL 也在容器里，整套一起拉起。
+        _svc = "mariadb" if node_type.strip() == "mariadb" else "",
+        run_cmd=(f"cd {host_compose} && docker compose up -d"
+                 + (" keepalived" if node_type.strip() == "mariadb" else "")),
         **extra_files,
     )
 
@@ -627,11 +821,7 @@ def sync_node_creds(cluster_id=None):
         clusters = [c["id"] for c in cls]
         creds_map = {c["id"]: get_cluster_creds(c["id"]) for c in cls}
 
-    mgmt_host = get_mgmt_host()
-    mgmt_port = MGMT["port"]
-    mgmt_user = MGMT["user"]
-    mgmt_pass = MGMT["password"]
-    mgmt_db = MGMT["db"]
+    manager_public_ip = get_manager_public_ip()
 
     synced = 0
     for cid in clusters:
@@ -655,43 +845,51 @@ def sync_node_creds(cluster_id=None):
             root_pass = n.get("root_pass") or ""
             node_type = n.get("node_type") or "docker"
 
-            # 用 root 权威自愈账号密码（不依赖 ha_monitor 是否可达）
+            # 优先用 ha_monitor（已知正确）自愈账号密码，并把 root@'<管理器IP>' 密码
+            # 校正为库存值，打破「root 密码漂移 -> 连不上 -> 自愈不跑」死循环。
             ok, msg = ensure_ha_creds(
                 ip, port, root_user, root_pass,
                 ha_user, ha_pass, repl_user, repl_pass,
                 app_user, app_pass,
+                manager_ip=manager_public_ip,
             )
             if not ok:
-                # root 不可达（节点离线/密码不符），跳过（恢复后重新生成部署文件）
+                # root 与 ha_monitor 均不可达（节点离线），跳过（恢复后重新生成部署文件）
                 continue
 
             # 重新生成该节点 ha_check.conf，保持与节点一致
-            # 裸机节点 keepalived 探活连 127.0.0.1（宿主机既有 MySQL）；docker 节点连宿主机 IP。
-            local_host = "127.0.0.1" if node_type == "baremetal" else ip
+            # MariaDB 裸机节点 keepalived 探活连 127.0.0.1（宿主机既有 MariaDB）；docker 节点连宿主机 IP。
+            local_host = "127.0.0.1" if node_type == "mariadb" else ip
             kd = _safe_node_path(ip) / "keepalived"
             kd.mkdir(parents=True, exist_ok=True)
             ha_check = (
                 f"LOCAL_HOST={local_host}\n"
                 f"LOCAL_PORT={port}\n"
+                f"NODE_IP={ip}\n"
+                f"MANAGER_IP={manager_public_ip}\n"
                 f"LOCAL_USER={ha_user}\n"
                 f"LOCAL_PASS={ha_pass}\n"
                 f"LOCAL_ROOT_USER={root_user}\n"
                 f"LOCAL_ROOT_PASS={root_pass}\n"
-                f"MGMT_HOST={mgmt_host}\n"
-                f"MGMT_PORT={mgmt_port}\n"
-                f"MGMT_USER={mgmt_user}\n"
-                f"MGMT_PASS={mgmt_pass}\n"
-                f"MGMT_DB={mgmt_db}\n"
             )
             _write(kd / "ha_check.conf", ha_check)
             # 同步重生成 init 凭证 SQL（仅凭证相关），保证后续「重部署」后执行时使用的仍是当前密码。
-            # 裸机节点写 init_baremetal.sql（不含 server_id 参数，需配合 my.cnf 片段）；docker 节点写 init.sql。
-            if node_type == "baremetal":
-                init_sql = render_init_baremetal_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
-                _write(_safe_node_path(ip) / "init_baremetal.sql", init_sql, mode=0o644)
+            # MariaDB 节点写 init_mariadb.sql（MariaDB 语法）；docker 节点写 init.sql。
+            if node_type == "mariadb":
+                init_sql = render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
+                _write(_safe_node_path(ip) / "init_mariadb.sql", init_sql, mode=0o644)
             else:
                 init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
                 _write(_safe_node_path(ip) / "init.sql", init_sql, mode=0o644)
+            # 同步修复脚本（凭证变更/权限回退时，可在节点本机重放）
+            # MariaDB 用 MariaDB 语法修复脚本（native 密码，无 MySQL8 专有特权）；其余用通用版。
+            if node_type == "mariadb":
+                fix_sql = render_fix_node_creds_sql_mariadb(
+                    ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port)
+            else:
+                fix_sql = render_fix_node_creds_sql(
+                    ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip)
+            _write(_safe_node_path(ip) / "fix-node-creds.sql", fix_sql, mode=0o644)
             synced += 1
     return synced
 

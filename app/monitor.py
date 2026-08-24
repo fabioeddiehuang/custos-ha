@@ -2,13 +2,14 @@
 import concurrent.futures as _cf
 import threading
 import time
-from .config import CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT
+from .config import CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENABLED
 from .db import query, execute
 from .ha_client import get_status, heal_replication, heal_io_gtid_gap
 from .state import get_current_master
-from .failover import do_failover, ensure_topology, load_creds, node_root
+from .failover import do_failover, ensure_topology, load_creds, node_root, _repoint_slave, promote_to_master
 from .alerts import send_alert
 from .clusters import list_clusters
+from . import node_gen
 from . import metrics, slow_log, config_drift
 
 # 复制延迟告警阈值（秒）。超过即发邮件告警，避免重复刷屏只在「跨阈值的那一刻」触发。
@@ -92,12 +93,20 @@ _ACT_THREAD_LOCK = threading.Lock()
 # 供 _act_once 复用，避免「探活」与「切换/自愈/拓扑」两次重复连库。
 _LAST_STATUS = {}
 
+# 凭证漂移自愈：每隔该秒数，用各节点 root 把 ha_monitor/replication/app 账号密码
+# 重新校正为集群当前设定值，避免重装/改密后从库报 Access denied（密码不匹配）。
+# 复用 sync_node_creds（含 ensure_ha_creds 权威 ALTER + 重生成部署文件），限频避免每周期触发。
+CRED_SYNC_INTERVAL = 300
+
 
 def run_once():
     # 连续探活失败计数挂在函数对象上（每个集群独立）。延迟到此处初始化，
     # 因为模块加载时函数尚未定义，顶层执行 run_once._fails = {} 会 NameError。
     if not hasattr(run_once, "_fails"):
         run_once._fails = {}
+    # 凭证漂移自愈的限频时间戳挂在函数对象上（每集群独立）
+    if not hasattr(run_once, "_last_cred_sync"):
+        run_once._last_cred_sync = {}
     # ① 探活：无锁，立即把在线/离线状态写库，使仪表盘与手动「刷新全部」
     #    能实时反映设备上下线，而不必等待下方互斥锁（手动刷新不再被跳过）。
     try:
@@ -110,6 +119,10 @@ def run_once():
         return
     try:
         _act_once()
+        # ②.5 凭证漂移自愈（限频）：用各节点 root 把 ha_monitor/replication/app
+        #      密码校正为集群当前值，防止重装/改密后从库报 Access denied。
+        #      放在锁内，避免与复制变更并发；限频 CRED_SYNC_INTERVAL 减少 ALTER 频率。
+        _cred_self_heal()
     finally:
         _RUN_ONCE_LOCK.release()
 
@@ -118,6 +131,37 @@ def run_once():
 # 保证即使手动「刷新全部」(api_refresh) 在后台 monitor 首个周期之前就直接调用
 # _probe_all()，也不会因 run_once._fails 未初始化而抛 AttributeError。
 run_once._fails = {}
+
+
+def _cred_self_heal():
+    """限频的凭证漂移自愈：用各节点 root 将 ha_monitor/replication/app 账号密码
+    校正为集群当前设定值，防止重装/改密后从库报 Access denied（密码不匹配）。
+
+    放在 run_once 的互斥锁内调用，避免与复制变更并发。按 CRED_SYNC_INTERVAL
+    限频（每个集群独立计时），避免每个探活周期都执行 ALTER。
+    复用 node_gen.sync_node_creds（含 ensure_ha_creds 权威 ALTER + 重生成部署文件）。
+    """
+    try:
+        clusters = list_clusters()
+    except Exception as e:
+        print(f"[monitor][cred-heal] 读取集群失败(可忽略): {e}")
+        return
+    now = time.time()
+    for cl in clusters:
+        cid = cl["id"]
+        last = run_once._last_cred_sync.get(cid, 0.0)
+        if now - last < CRED_SYNC_INTERVAL:
+            continue
+        try:
+            # sync_node_creds 返回已同步节点数(int)
+            synced = node_gen.sync_node_creds(cid)
+            if synced:
+                print(f"[monitor][cred-heal] 集群 {cid} 凭证已校正到 {synced} 个节点")
+        except Exception as e:
+            # 自愈失败不应影响主流程（下次周期再试）
+            print(f"[monitor][cred-heal] 集群 {cid} 校正失败(可忽略): {e}")
+        finally:
+            run_once._last_cred_sync[cid] = now
 
 
 def request_act_once():
@@ -205,7 +249,14 @@ def _probe_all():
     with _cf.ThreadPoolExecutor(max_workers=min(16, len(tasks))) as ex:
         for cid, cluster_name, host, port, cur_key, st in ex.map(_probe_one, tasks):
             key = (host, port, cid)
-            is_master = (host, port) == cur_key
+            # is_master 判定不能只依赖管理库记录的 current_master：切换完成后，
+            # 新主写入管理库与 monitor 读取之间有时间窗，且若节点其实仍挂着复制通道
+            # （slave 形态，如被提升为主时未清干净残留通道的边界情况），不应被当作主库。
+            # 故 is_master = 管理库记它为主 且 该节点实际不是 slave 形态。
+            # 这样：节点真实挂着复制通道(SQL/IO 可能停)时，无论管理库如何记，都走从库
+            # 自愈分支（heal_replication / heal_io_gtid_gap），避免「切换后 SQL 线程停却
+            # 不自愈、复制永久断流」的 bug。
+            is_master = ((host, port) == cur_key) and (st.get("mode") != "slave")
             _update_host({"host": host, "port": port, "cluster_id": cid}, st, is_master)
             # 连续失败计数（用于阈值触发自动切换）
             f = run_once._fails.setdefault(cid, {})
@@ -249,25 +300,55 @@ def _act_once():
                 continue
             h_host, h_port = key[0], key[1]
             ru, rp = node_root(h_host, cid)
-            # 复制 SQL 线程中断（多为幂等冲突导致的 1007/1062），尝试自愈跳过冲突事务
-            if not is_master and st["slave_sql"] != "Yes":
+            # 当前主库但若仍挂着复制通道（SHOW REPLICA STATUS 有输出）：这是提升为主时
+            # RESET SLAVE ALL 未清干净、或被 ensure_topology 误 repoint 的残留。它会让主库
+            # 仍尝试拉旧源 binlog 而报 1236（"master 却 IO 错误"的矛盾现象）。
+            # 必须强制 promote_to_master 清通道，使其成为纯主库。
+            if is_master and st.get("slave_io") is not None:
+                ok_p, msg_p = promote_to_master(
+                    h_host, h_port, creds["ha_user"], creds["ha_pass"], ru, rp)
+                if ok_p:
+                    print(f"[monitor] 主库 {h_host}:{h_port} 清残留复制通道成功")
+                else:
+                    print(f"[monitor] 主库 {h_host}:{h_port} 清残留通道失败: {msg_p}")
+            # 复制 SQL 线程中断（多为幂等冲突导致的 1007/1062），尝试自愈跳过冲突事务。
+            # 仅当 SQL 线程明确为 "No"（非 None/空，即确有复制通道且停了）才触发，
+            # 避免无复制通道节点（slave_sql=None）被误判为「需自愈」刷日志。
+            if not is_master and st.get("slave_sql") == "No":
                 ok, msg = heal_replication(h_host, h_port, creds["ha_user"], creds["ha_pass"], ru, rp)
                 if ok:
                     print(f"[monitor] 自愈 {h_host}:{h_port} 成功: {msg}")
                 else:
                     print(f"[monitor] 自愈 {h_host}:{h_port} 失败: {msg}")
-            # 复制 IO 线程中断（13114/1236：源端主库丢失 GTID，从库已执行过）
-            # 需在【源端主库】为缺失 GTID 注入空事务，从库 IO 方可恢复
-            if not is_master and st["slave_io"] != "Yes":
-                sru, srp = node_root(h_host, cid)
-                mru, mrp = (node_root(cur_h, cid) if cur_h else ("root", ""))
-                ok_g, msg_g = heal_io_gtid_gap(
-                    h_host, h_port, creds["ha_user"], creds["ha_pass"],
-                    sru, srp, cur_h, int(cur_p) if cur_p else None, mru, mrp)
-                if ok_g:
-                    print(f"[monitor] IO 自愈 {h_host}:{h_port}: {msg_g}")
-                elif "more GTIDs" in msg_g or "13114" in msg_g or "1236" in msg_g:
-                    print(f"[monitor] IO 自愈 {h_host}:{h_port} 失败: {msg_g}")
+            # 复制 IO 线程中断，分两类处理：
+            #  (A) 匿名事务 1236（"Cannot replicate anonymous transaction when AUTO_POSITION=1"）：
+            #      源端 binlog 含匿名事务（节点曾被提升为主、旧 binlog 写于 gtid_mode<ON 期）。
+            #      注入空事务无效，必须【重新挂载】并带 ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS=LOCAL
+            #      （从库侧把匿名事务当本地 GTID 接收），故走 _repoint_slave（内部 make_slave_of 已带该选项）。
+            #  (B) 缺 GTID 1236/13114（源端主库丢失从库已执行的 GTID）：在源端主库注入空事务，
+            #      走 heal_io_gtid_gap。
+            if not is_master and st.get("slave_io") == "No":
+                io_err = st.get("slave_io_err") or ""
+                if "anonymous transaction" in io_err and cur_h:
+                    # (A) 匿名事务 1236：强制重挂载（带 ASSIGN_GTIDS），不治本则永久循环
+                    ok_r, msg_r = _repoint_slave(
+                        cid, {"host": h_host, "port": h_port, "status": "up"},
+                        cur_h, cur_p, creds)
+                    if ok_r:
+                        print(f"[monitor] 匿名事务1236 自愈(重挂载) {h_host}:{h_port}: {msg_r}")
+                    else:
+                        print(f"[monitor] 匿名事务1236 重挂载失败 {h_host}:{h_port}: {msg_r}")
+                else:
+                    # (B) 缺 GTID 类：源端注入空事务
+                    sru, srp = node_root(h_host, cid)
+                    mru, mrp = (node_root(cur_h, cid) if cur_h else ("root", ""))
+                    ok_g, msg_g = heal_io_gtid_gap(
+                        h_host, h_port, creds["ha_user"], creds["ha_pass"],
+                        sru, srp, cur_h, int(cur_p) if cur_p else None, mru, mrp)
+                    if ok_g:
+                        print(f"[monitor] IO 自愈 {h_host}:{h_port}: {msg_g}")
+                    elif "more GTIDs" in msg_g or "13114" in msg_g or "1236" in msg_g:
+                        print(f"[monitor] IO 自愈 {h_host}:{h_port} 失败: {msg_g}")
         # 当前主库连续失败达到阈值 -> 自动切换
         fails = run_once._fails.setdefault(cid, {})
         for key, (st, is_master) in list(cache.items()):
@@ -326,11 +407,14 @@ def _maybe_collect():
             import traceback; traceback.print_exc()
     if _COLLECT_CYCLE["slow"] >= _SLOW_EVERY:
         _COLLECT_CYCLE["slow"] = 0
-        try:
-            slow_log.collect_slow_log()
-        except Exception as e:
-            print(f"[monitor] 慢日志采集异常: {e}", flush=True)
-            import traceback; traceback.print_exc()
+        if SLOWLOG_ENABLED:
+            try:
+                slow_log.collect_slow_log()
+            except Exception as e:
+                print(f"[monitor] 慢日志采集异常: {e}", flush=True)
+                import traceback; traceback.print_exc()
+        else:
+            print("[monitor] 慢日志采集已暂停(SLOWLOG_ENABLED=0)", flush=True)
     if _COLLECT_CYCLE["drift"] >= _DRIFT_EVERY:
         _COLLECT_CYCLE["drift"] = 0
         try:

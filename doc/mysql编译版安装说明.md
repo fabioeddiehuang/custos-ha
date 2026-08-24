@@ -1,92 +1,118 @@
-# MySQL 编译版 / 裸机 / 宝塔 安装说明（接入 HA-MySQL-Manager）
+# MariaDB 裸机节点安装说明（接入 HA-MySQL-Manager）
 
-> 适用：MySQL 8.0.x、8.4（**不支持 MariaDB**，管理器基于 MySQL GTID 实现）。
-> 目标：让 **HA-MySQL-Manager 管理器**能从内网连上你的裸机 MySQL 节点，并顺利部署复制 + 高可用。
+> 适用：裸机部署 **MariaDB 12.x**（管理器基于 MariaDB GTID `slave_pos` 实现高可用）。
+> 目标：让 **HA-MySQL-Manager 管理器**能从内网连上你的裸机 MariaDB 节点，并顺利部署复制 + 高可用。
+>
+> 另一种节点形态是 **Docker MySQL 8.0 模式**（MySQL + keepalived 容器，见 README「节点一键部署」），二者互斥、二选一，按节点选择 `node_type`。
 
 ---
 
 ## 0. 管理器需要节点满足什么
 
-管理器会在「节点配置」页用你填写的 **root 用户 / root 密码 / 端口 / IP** 去连接每台节点 MySQL，因此节点必须：
+管理器会在「节点配置」页用节点目录里 `keepalived/ha_check.conf` 的 **root 用户 / root 密码 / 端口 / IP** 去连接每台节点 MariaDB，因此节点必须：
 
 | 要求 | 说明 | 不满足的后果 |
 |---|---|---|
-| 可从管理器内网连通 | MySQL 必须监听 `0.0.0.0` 且防火墙放行 | 管理器报 `2003 Can't connect`（宝塔默认只绑 `127.0.0.1`，最常见） |
+| 可从管理器内网连通 | MariaDB 必须监听 `0.0.0.0` 且防火墙放行 | 管理器报 `2003 Can't connect` |
 | root 可远程登录 | 需有 `root@'%'`（或 `root@'<管理器IP>'`）账号 | 报 `1130 Host 'x' is not allowed to connect` |
 | 开启 GTID | `gtid_mode=ON`、`log_bin=ON`、`log_slave_updates=ON` | 复制 / 自动切换无法建立 |
 | server_id 唯一 | 同集群各节点不能重复 | 复制报错、配置巡检 DRIFT |
-| HA 账号 | `ha_monitor` / `replication` / `app` 三个账号（由 `init_baremetal.sql` 创建） | 监控 / 复制 / 业务连不上 |
+| HA 账号 | `ha_monitor` / `replication` / `app` 三个账号（由 `init_mariadb.sql` 创建） | 监控 / 复制 / 业务连不上 |
+
+以上除「内网连通 / 防火墙」外，均由 `Install-ha-mariadb-Node.sh` 自动完成，无需手工干预。
 
 ---
 
-## 1. 一键准备（推荐）
+## 1. 一键安装（推荐，全量安装 MariaDB）
 
-这两个脚本（`Install-ha-mysql-Node.sh` 接入准备 / `uninstall-ha-mysql-Node.sh` 一键还原）**随节点目录一同生成**：在「节点配置 → 添加节点」生成后，它们已位于 `generated_nodes/<节点IP>/` 内。把整个目录拷到目标机 `/home/docker/<节点IP>/`，以 root 执行一次即可完成全部 MySQL 侧修改：
+裸机 MariaDB 是**独立全量安装**（不依赖宿主既有 MySQL，独立 datadir `/data/mariadb`、独立 systemd 单元 `mariadb-ha.service`），因此宿主上即使已有 MySQL 也不冲突。
+
+这些脚本（`Install-ha-mariadb-Node.sh` 唯一全量安装脚本，自包含 / `Uninstall-mariadb-Node.sh` 卸载）**随节点目录一同生成**：在「节点配置 → 添加节点（类型选 MariaDB）」生成后，它们已位于 `generated_nodes/<节点IP>/` 内。
+
+### 1.1 安装步骤
+
+```bash
+# 1) 把生成的整个目录拷到目标机某目录
+scp -r generated_nodes/<节点IP>/ 目标机:/home/docker/<节点IP>/
+ssh 目标机
+
+cd /home/docker/<节点IP>/
+
+# 2) 把 MariaDB 安装包放到同一目录（脚本优先用本地包，跳过下载）
+#    也可留空，脚本按节点目录 my.cnf 里的版本自动从镜像下载
+ls mariadb-*-linux-*.tar.gz
+
+# 3) 全量安装（读取同目录 ha_check.conf 的真实凭证，无需交互输入）
+sudo bash Install-ha-mariadb-Node.sh
+```
+
+脚本自动完成：下载/解压 MariaDB → `mariadb-install-db` 初始化 → 落盘服务端 `my.cnf` → systemd 启动 `mariadb-ha.service` → 跑 `init_mariadb.sql` + `fix-node-creds.sql` → 起 keepalived 客户端。
+
+### 1.2 幂等更新（改密码 / 改配置后重跑即可）
+
+`Install-ha-mariadb-Node.sh` 是**幂等**的：
+- 已解压过 → 跳过解压；数据目录已初始化 → 跳过 `mariadb-install-db`；
+- 重新生成节点目录并覆盖 `my.cnf` / `ha_check.conf` 后，**直接重跑**即可更新配置与 root 密码（脚本先连旧密码再改密，不会因「MariaDB 已启动」而误报失败）。
+
+> 无需单独的 update 脚本：覆盖配置目录 → `sudo bash Install-ha-mariadb-Node.sh` 即为「快速更新密码/配置」。
+
+---
+
+## 2. 卸载
 
 ```bash
 cd /home/docker/<节点IP>/
 
-# 基础用法：把节点 MySQL root 密码作为参数
-sudo bash Install-ha-mysql-Node.sh -p '你的MySQL的root密码'
+# 交互式卸载：默认【保留】MariaDB 程序目录 /opt/mariadb（便于快速重装），
+# 其余新增文件（数据目录 / my.cnf / 软链 / 状态文件 / 账号 / 复制通道）全部清理并恢复原状
+sudo bash Uninstall-mariadb-Node.sh
 
-# 只允许来自管理器的连接（更安全）—— 注意 -m 必须是【管理器宿主机 IP】，不是 VIP！
-# 管理器是 docker 容器，连节点时源 IP 被 SNAT 成宿主机 IP（本例 192.168.1.66）。
-# 在管理器宿主机上执行 `hostname -I` 查看其内网 IP，用它作为 -m 的值。
-sudo bash Install-ha-mysql-Node.sh -p '密码' -m 192.168.1.66
-
-# 不确定管理器 IP / 内网可信环境：省略 -m，脚本会创建 root@'%'（允许任意来源）
-sudo bash Install-ha-mysql-Node.sh -p '密码'
-
-# 连 init_baremetal.sql 也一起执行（同目录内）
-sudo bash Install-ha-mysql-Node.sh -p '密码' -i init_baremetal.sql
-
-# 自己用宝塔面板重启 MySQL，则加 --skip-restart
-sudo bash Install-ha-mysql-Node.sh -p '密码' --skip-restart
+# 如需彻底删除程序目录，加 -f
+sudo bash Uninstall-mariadb-Node.sh -f
 ```
 
-脚本会自动完成：创建远程 `root@'%'`、改 `bind-address=0.0.0.0`、追加 GTID 片段到 `my.cnf` 的 `[mysqld]`、放行防火墙（MySQL 端口 + VRRP 112）、重启 MySQL、自检参数。
-
-脚本会**备份原 my.cnf**（加 `.bak.时间戳`，并在状态文件记录），需要回滚时执行同目录的 `uninstall-ha-mysql-Node.sh` 即可还原原配置、删除远程账号、回退防火墙与 keepalived：
-
-```bash
-sudo bash uninstall-ha-mysql-Node.sh          # 按状态文件逐项还原
-sudo bash uninstall-ha-mysql-Node.sh --force  # 状态文件缺失时强制还原（用备份 .bak 还原 my.cnf）
-```
+卸载会：停止并禁用 `mariadb-ha.service`、清理复制通道与 HA 账号/远程 root、删除 `ha_local`、回退防火墙、恢复安装前 `/etc/my.cnf`、停止 keepalived 容器。卸载后请到管理器 Web 删除该节点。
 
 ---
 
-## 2. 手工准备（不使用脚本时）
+## 3. 在管理器 Web 上添加节点并部署
 
-### 2.1 开启内网登录权限（解决你遇到的「root 无法连接」）
+1. **集群管理**：新建（或选择）集群，记下 **VIP** 与 **vip_port**。
+2. **节点配置 → 添加节点**：
+   - 节点 IP：本机 IP
+   - MariaDB 端口：本机实际端口（默认 3306）
+   - root 用户：`root`
+   - root 密码：节点 MariaDB 的 root 密码（自动写入 `ha_check.conf`，安装脚本据此设密）
+   - 节点类型：**MariaDB**
+   - 初始角色：第一台选「主库」，其余选「从库」
+   - MariaDB 版本：如 `12.3.3`（可留空，管理器会自动探测）
+3. 生成后，管理器在 `generated_nodes/<节点IP>/` 产出：`my.cnf`、`init_mariadb.sql`、`fix-node-creds.sql`、`docker-compose.yaml`（仅 keepalived 客户端）、`keepalived/`、`Install-ha-mariadb-Node.sh`（唯一安装脚本，自包含）、`Uninstall-mariadb-Node.sh`。
+4. 按第 1 节安装所有节点后，管理器监控线程（约 6–12s 一轮）自动：探测拓扑 → 提升主库 → 建立 GTID 复制 → 漂移 VIP。
 
-宝塔 / 编译安装的 MySQL 8.0 默认 `root` 仅限本机。登录节点 MySQL 后执行：
+---
 
+## 4. 手工准备（不使用一键脚本 / Docker 模式参考）
+
+> Docker MySQL 8.0 模式的节点无需本机安装 MariaDB；以下步骤仅用于理解参数或在特殊环境手工配置。
+
+### 4.1 开启内网登录权限
 ```sql
--- 允许来自任意内网主机的 root 连接（生产可改为具体管理器 IP，如 'root'@'192.168.1.10'）
-CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED WITH mysql_native_password BY '你的root密码';
+CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED VIA mysql_native_password BY '你的root密码';
 GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 ```
 
-> 提示：用 `mysql_native_password` 而非默认的 `caching_sha2_password`，可避免非 TLS 下的复制/连接兼容问题（管理器已做公钥兼容，但统一用 native 最稳）。
-
-### 2.2 监听所有网卡
-
-编辑 MySQL 配置（宝塔路径：`/www/server/mysql/my.cnf`；编译安装常见：`/etc/my.cnf`）的 `[mysqld]` 段：
-
+### 4.2 监听所有网卡
 ```ini
+# /etc/my.cnf [mysqld]
 bind-address = 0.0.0.0
 ```
 
-> 宝塔重启 MySQL 会重写 `my.cnf`，所以**关键复制参数务必写进配置文件**（不要只用 `SET GLOBAL`），否则重启后失效。
-
-### 2.3 写入 GTID / 复制参数
-
-在 `[mysqld]` 段追加（**server_id 每台不同**，建议用 IP 末段，如 192.168.1.203 → 203）：
-
+### 4.3 写入 GTID / 复制参数
 ```ini
 server-id = 203
-gtid_mode = ON
+gtid_domain_id = 203
+gtid_strict_mode = ON
 enforce_gtid_consistency = ON
 log_bin = mysql-bin
 log_slave_updates = ON
@@ -95,82 +121,31 @@ relay_log_recovery = ON
 sync_binlog = 1
 innodb_flush_log_at_trx_commit = 1
 read_only = ON
-slow_query_log = 1
-long_query_time = 0.5
-log_output = TABLE
-log_queries_not_using_indexes = 0
 ```
 
-> `read_only = ON` 是安全的：首台主库由管理器自动提升（`SET GLOBAL read_only=0`），节点重启后回到只读可避免脑裂，**无需手动取消**。
-
-### 2.4 重启 MySQL 并放行防火墙
-
+### 4.4 防火墙放行
 ```bash
-# 重启（按你的环境选其一）
-systemctl restart mysqld          # 通用
-/etc/init.d/mysqld restart        # 宝塔
-/www/server/mysql/support-files/mysql.server restart
-
-# 防火墙放行 MySQL 端口（下面以 3306 为例，按实际端口改）
 firewall-cmd --permanent --add-port=3306/tcp; firewall-cmd --reload      # firewalld
-ufw allow 3306/tcp                                                          # ufw
-
-# keepalived 漂移 VIP 需要 VRRP 协议（协议号 112，不是端口）
-firewall-cmd --permanent --add-protocol=vrrp; firewall-cmd --reload
-iptables -I INPUT -p vrrp -j ACCEPT
-```
-
-### 2.5 自检
-
-```bash
-mysql -uroot -p'密码' -h 127.0.0.1 -P 3306 -e "SELECT @@gtid_mode,@@read_only,@@server_id;"
-# 期望：gtid_mode=ON，server_id=你的取值
+iptables -I INPUT -p vrrp -j ACCEPT                                     # VRRP(112) 漂移所需
 ```
 
 ---
 
-## 3. 在管理器 Web 上添加节点并部署
-
-1. **集群管理**：新建（或选择）集群，记下 **VIP** 与 **vip_port**。裸机场景下建议 `vip_port` 与第 2 步的节点端口一致（如都是 3306），业务连接 `VIP:3306` 即可。
-2. **节点配置 → 添加节点**：
-   - 节点 IP：本机 IP
-   - MySQL 端口：本机实际端口（宝塔常见 3306；页内默认显示 3307，按需改）
-   - root 用户：`root`
-   - root 密码：第 2.1 步设置的密码
-   - 节点类型：**裸机**
-   - 初始角色：第一台选「主库」，其余选「从库」
-   - MySQL 版本：如 `8.0.36`（可留空，管理器会自动探测）
-3. 生成后，管理器会在 `generated_nodes/<节点IP>/` 下产出：
-   - `my.cnf.ha-fragment`（你已在第 2.3 步处理）
-   - `init_baremetal.sql`（创建 `ha_monitor` / `replication` / `app` 三个账号 + `ha_local` 库）
-   - `docker-compose.yaml` + `keepalived/`（仅 keepalived 客户端，MySQL 仍是宿主机实例）
-4. 把该目录拷到节点 `/home/docker/<节点IP>/`，然后：
-   ```bash
-   # 创建 HA 账号（若没在第 1 步用 -i 执行过）
-   mysql -uroot -p'密码' < /home/docker/<节点IP>/init_baremetal.sql
-
-   # 启动 keepalived 客户端（节点需已装 docker）
-   cd /home/docker/<节点IP>/ && docker compose up -d
-   ```
-5. 所有节点都准备好后，管理器监控线程（约 6–12s 一轮）会自动：探测拓扑 → 提升主库 → 建立 GTID 复制 → 漂移 VIP。也可在节点页点「重新生成」触发预检（连通性 / GTID / server_id 唯一性 / 版本一致性）。
-
----
-
-## 4. 常见问题排查
+## 5. 常见问题排查
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `2003 Can't connect` | `bind-address=127.0.0.1` 或防火墙未放行 | 第 2.2 / 2.4 步 |
-| `1130 Host not allowed` | 未建 `root@'%'` | 第 2.1 步 |
-| 复制起不来 / 预检 `gtid_mode != ON` | my.cnf 未加 GTID 片段或被宝塔重写 | 第 2.3 步，确认写在配置文件并重启 |
+| `2003 Can't connect` | `bind-address=127.0.0.1` 或防火墙未放行 | 第 4.2 / 4.4 步 |
+| `1130 Host not allowed` | 未建 `root@'%'` | 第 4.1 步 |
+| 复制起不来 / 预检 `gtid_mode != ON` | my.cnf 未加 GTID 参数 | 第 4.3 步，确认写在配置文件并重启 |
 | 配置巡检 `server_id` DRIFT | 两台 server_id 相同 | 改成各机唯一值后重启 |
 | VIP 不上浮 | 本机不是当前主 / read_only 未清 / keepalived 未运行 | 确认管理器已提升主库、keepalived 容器 `docker compose up -d` |
-| 节点列表端口对不上 | 页内默认 3307 与宝塔 3306 不一致 | 添加节点时端口填 3306 |
+| 重跑 Install 报「MariaDB 启动失败」 | 旧版脚本用免密 socket 探活，重装时已设密码导致误判 | 使用新版幂等脚本（先连旧密码再改密），直接重跑即可 |
 
 ---
 
-## 5. 前置依赖小结
+## 6. 前置依赖小结
 
-- 每台节点：MySQL 8.0（已按上文准备）、已安装 **docker**（供 keepalived 客户端容器，需 `NET_ADMIN`）。
-- 网络：管理器 ↔ 节点 MySQL 端口互通；节点间 MySQL 端口互通；VIP 所在网段放行 **VRRP(112)**。
+- 每台裸机 MariaDB 节点：目标机已装 `curl/tar/gzip/libaio`、已装 **docker**（供 keepalived 客户端容器，需 `NET_ADMIN`）。
+- 网络：管理器 ↔ 节点 MariaDB 端口互通；节点间 MariaDB 端口互通；VIP 所在网段放行 **VRRP(112)**。
 - 密码中尽量避免单引号，以免脚本 SQL 拼接异常。

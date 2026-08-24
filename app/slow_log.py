@@ -11,6 +11,7 @@ from .db import query, execute, get_setting
 from .ha_client import connect_robust
 from .clusters import get_cluster_creds
 from .node_gen import list_nodes
+from .config import SLOWLOG_ENABLED
 
 
 def _to_ms(val):
@@ -31,6 +32,10 @@ def collect_slow_log(cluster_id=None):
     导致空密码连不上节点被静默跳过，慢日志永远是空。改用 ha_monitor 后至少能连上。
     若节点未开启慢日志（mysql.slow_log 表不存在 / 账号无权限），仍静默跳过（best-effort）。
     """
+    if not SLOWLOG_ENABLED:
+        # 采集已暂停（默认）：避免 ha_monitor 无 DELETE 权限清空 mysql.slow_log 时
+        # 每周期报 1556 并重复采集。需开启时设置 SLOWLOG_ENABLED=1 并授权 DELETE。
+        return 0
     if cluster_id:
         clusters = [cluster_id]
     else:

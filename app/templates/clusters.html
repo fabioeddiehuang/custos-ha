@@ -35,7 +35,7 @@
       <label>节点类型（部署形态）
         <select name="node_type">
           <option value="docker" selected>Docker（默认，容器化 MySQL + keepalived）</option>
-          <option value="baremetal">裸机（宿主机既有 MySQL，仅 keepalived 客户端）</option>
+          <option value="mariadb">MariaDB（裸机全量安装，脱离宝塔，独立数据库）</option>
         </select>
         <span class="hint">创建后该集群所有节点须为同一类型（禁止混部）</span>
       </label>
@@ -192,7 +192,7 @@
             <label>节点类型
               <select name="node_type">
                 <option value="docker" {% if (c.node_type or 'docker') == 'docker' %}selected{% endif %}>Docker</option>
-                <option value="baremetal" {% if c.node_type == 'baremetal' %}selected{% endif %}>裸机</option>
+                <option value="mariadb" {% if c.node_type == 'mariadb' %}selected{% endif %}>MariaDB</option>
               </select>
             </label>
             <label>MySQL 版本

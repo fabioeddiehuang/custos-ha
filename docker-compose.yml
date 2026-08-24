@@ -36,15 +36,17 @@ services:
       #   - auto 会探测本机 IP，而本机没跑 MySQL，会导致「添加节点」时
       #     生成的节点连错管理库地址。
       #   - 若管理库与本管理器同机，填该机对外 IP（非 127.0.0.1）。
+      # ⚠ 管理库只供「管理器自身存储」使用，绝不作为集群节点，也不写入任何节点部署配置。
+      #   业务通信仅发生在「管理器服务端后台 IP」与「各节点」之间，管理库不在其列。
       # 默认用户/密码/库名统一为 ha（使用外部库时请按你的实际情况修改）。
-      MGMT_MYSQL_HOST: "192.168.1.88"   # 改成你的外部管理库 IP
+      MGMT_MYSQL_HOST: "192.168.1.88"   # 管理后台库地址（仅管理器内部存储，非集群节点）
       MGMT_MYSQL_PORT: "3306"
-      MGMT_MYSQL_USER: "ha"
-      MGMT_MYSQL_PASS: "ha"             # 含特殊字符请用引号包裹
-      MGMT_MYSQL_DB:   "ha"
+      MGMT_MYSQL_USER: "ha-manager"
+      MGMT_MYSQL_PASS: "zjsmdjxNtCscL2aj"             # 含特殊字符请用引号包裹
+      MGMT_MYSQL_DB:   "ha-manager"
       WEB_PORT: 28888
       WEB_USER: admin
-      WEB_PASS: admin  #留空则首次启动随机生成并打印到日志；填写则以该密码为准（可改密码，每次启动同步）
+      WEB_PASS: huangyiwei  #留空则首次启动随机生成并打印到日志；填写则以该密码为准（可改密码，每次启动同步）
       CHECK_INTERVAL: 3
       FAIL_THRESHOLD: 2
       NODES_DIR: /app/generated_nodes
@@ -53,6 +55,14 @@ services:
       #   可在下方设置，或在 Web「服务端配置」第三步填写（留空则添加节点时报错提示）。
       # VIP: 192.168.1.10
       VIP_PREFIX: "24"
+      # 管理器对外 IP（裸机节点实际看到的【连接来源 IP】，即跑 docker 那台机器的内网 IP）。
+      # 这是「服务端后台（管理器应用）」的 IP —— 节点只允许该 IP 连入；
+      # 它与「管理后台 MySQL（MGMT_MYSQL_HOST=192.168.1.88）」是**两回事**：
+      # 管理库仅供管理器自身存储，绝不参与集群、也不进节点配置。
+      # 已显式设为 docker 宿主机（服务端后台）IP 192.168.1.66：管理器从该 IP 连入各节点，
+      # 节点 ha_check.conf 的 MANAGER_IP、Install 的 root@'<IP>' 授权均对齐此值。
+      # 若你的服务端后台 IP 不同，请改为实际值；切勿填成管理库地址 192.168.1.88。
+      MANAGER_PUBLIC_IP: "192.168.1.66"
       INTERFACE: eth0
       VRID: "51"
       # SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / ALERT_EMAIL

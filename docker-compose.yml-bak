@@ -1,0 +1,74 @@
+version: "3.8"
+
+services:
+  # ============================================================
+  # 管理 MySQL（可选，默认关闭）
+  # 推荐：使用你已有的「独立 / 外部管理 MySQL」，只需在下方 ha-manager
+  # 的 environment 里填好 MGMT_MYSQL_* 即可，无需启动本服务。
+  # 若想让管理器自带一个管理库做演示，取消下面整段注释，并取消
+  # ha-manager 的 depends_on 注释即可（数据落在项目根下的 ./data/mysql-data）。
+  # ------------------------------------------------------------
+  # mgmt-mysql:
+  #   image: mysql:8.0
+  #   environment:
+  #     MYSQL_ROOT_PASSWORD: ha
+  #     MYSQL_DATABASE: ha
+  #   ports:
+  #     - "3306:3306"
+  #   volumes:
+  #     - ./data/mysql-data:/var/lib/mysql
+  #   healthcheck:
+  #     test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pha"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # MySQL HA 管理器（单容器：决策器 + Web + 节点一键部署生成）
+  ha-manager:
+    build: .
+    restart: always
+    # 若启用上面的 mgmt-mysql，取消下一行注释
+    # depends_on:
+    #   - mgmt-mysql
+    environment:
+      # ===== 管理库连接（指向你的独立 / 外部管理 MySQL）=====
+      # 重要：必须填外部库真实可达 IP，不要写 auto。
+      #   - auto 会探测本机 IP，而本机没跑 MySQL，会导致「添加节点」时
+      #     生成的节点连错管理库地址。
+      #   - 若管理库与本管理器同机，填该机对外 IP（非 127.0.0.1）。
+      # ⚠ 管理库只供「管理器自身存储」使用，绝不作为集群节点，也不写入任何节点部署配置。
+      #   业务通信仅发生在「管理器服务端后台 IP」与「各节点」之间，管理库不在其列。
+      # 默认用户/密码/库名统一为 ha（使用外部库时请按你的实际情况修改）。
+      MGMT_MYSQL_HOST: "192.168.1.88"   # 管理后台库地址（仅管理器内部存储，非集群节点）
+      MGMT_MYSQL_PORT: "3306"
+      MGMT_MYSQL_USER: "ha"
+      MGMT_MYSQL_PASS: "ha"             # 含特殊字符请用引号包裹
+      MGMT_MYSQL_DB:   "ha"
+      WEB_PORT: 28888
+      WEB_USER: admin
+      WEB_PASS: admin  #留空则首次启动随机生成并打印到日志；填写则以该密码为准（可改密码，每次启动同步）
+      CHECK_INTERVAL: 3
+      FAIL_THRESHOLD: 2
+      NODES_DIR: /app/generated_nodes
+      # VIP / 网络（供「添加节点」生成的 compose 使用；网卡/VRID 有默认值，VIP 必填）
+      # VIP 注意：需为节点同网段、当前空闲的 IP；系统无法自动探测，必须填写。
+      #   可在下方设置，或在 Web「服务端配置」第三步填写（留空则添加节点时报错提示）。
+      # VIP: 192.168.1.10
+      VIP_PREFIX: "24"
+      # 管理器对外 IP（裸机节点实际看到的【连接来源 IP】，即跑 docker 那台机器的内网 IP）。
+      # 这是「服务端后台（管理器应用）」的 IP —— 节点只允许该 IP 连入；
+      # 它与「管理后台 MySQL（MGMT_MYSQL_HOST=192.168.1.88）」是**两回事**：
+      # 管理库仅供管理器自身存储，绝不参与集群、也不进节点配置。
+      # 已显式设为 docker 宿主机（服务端后台）IP 192.168.1.66：管理器从该 IP 连入各节点，
+      # 节点 ha_check.conf 的 MANAGER_IP、Install 的 root@'<IP>' 授权均对齐此值。
+      # 若你的服务端后台 IP 不同，请改为实际值；切勿填成管理库地址 192.168.1.88。
+      MANAGER_PUBLIC_IP: "192.168.1.66"
+      INTERFACE: eth0
+      VRID: "51"
+      # SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / ALERT_EMAIL
+    ports:
+      - "28888:28888"
+    volumes:
+      # 持久化「添加节点」生成的部署文件，便于到目标主机 docker compose up。
+      # 统一收敛到项目根下的 ./generated_nodes（每个 <ip> 为自包含部署单元，可直接拷到 /home/docker/<ip>/）。
+      - ./generated_nodes:/app/generated_nodes

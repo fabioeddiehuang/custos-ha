@@ -12,14 +12,17 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 
-from .config import SECRET_KEY, WEB_USER, rand_secret
+from .config import SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_mgmt_host
 from .db import query, execute, get_conn, get_setting, upsert_setting
 from .state import get_current_master
 from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root
-from .node_gen import generate_node, list_nodes, delete_node, delete_node_dir, sync_node_creds
+from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
+                       sync_node_creds, render_fix_node_creds_sql)
 from .clusters import list_clusters, validate_node_version, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
 from .alerts import send_alert, last_error
-from .ha_client import heal_replication, heal_io_gtid_gap, get_status, make_slave_of
+from .ha_client import (heal_replication, heal_io_gtid_gap, get_status, make_slave_of,
+                       fix_node_mysql_params, reset_replication_creds_on_master,
+                       restart_slave_io)
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
 from . import precheck, audit, metrics, slow_log, config_drift
 
@@ -278,15 +281,40 @@ def api_vip_status(user=Depends(auth_required)):
         def probe(r):
             cid = r["id"]
             vip = r["vip"]
-            port = int(r["vip_port"]) if r.get("vip_port") else 3307
-            info = {"vip": vip, "vip_port": port, "online": _vip_online(vip, port), "nodes": []}
-            # 每节点端口可达性（管理器→节点 MySQL 端口 TCP 探活）
+            vip_port = int(r["vip_port"]) if r.get("vip_port") else 3307
+            # 候选探测端口：裸机节点原生 MySQL 仅监听「节点 MySQL 端口」（无容器端口映射），
+            # VIP 只能经节点端口访问；docker 节点 vip_port 与节点端口均可。
+            # 统一以「节点端口优先、vip_port 兜底」探测，避免裸机 VIP 被误报离线。
             nrows = query("SELECT ip, port, node_type FROM nodes WHERE cluster_id=%s", (cid,))
+            cand_ports = []
             for nr in nrows:
+                try:
+                    p = int(nr["port"])
+                except (TypeError, ValueError):
+                    p = 0
+                if p and p not in cand_ports:
+                    cand_ports.append(p)
+            if vip_port and vip_port not in cand_ports:
+                cand_ports.append(vip_port)
+            online = False
+            eff_port = None
+            for p in cand_ports:
+                if _vip_online(vip, p):
+                    online = True
+                    eff_port = p
+                    break
+            info = {"vip": vip, "vip_port": eff_port if eff_port else vip_port,
+                    "online": online, "nodes": []}
+            # 每节点端口可达性（管理器→节点 MySQL 端口 TCP 探活）
+            for nr in nrows:
+                try:
+                    p = int(nr["port"])
+                except (TypeError, ValueError):
+                    p = 0
                 info["nodes"].append({
-                    "host": nr["ip"], "port": int(nr["port"]),
+                    "host": nr["ip"], "port": p,
                     "node_type": nr.get("node_type") or "docker",
-                    "reachable": _port_online(nr["ip"], int(nr["port"])),
+                    "reachable": _port_online(nr["ip"], p) if p else False,
                 })
             return cid, info
 
@@ -301,6 +329,27 @@ def api_vip_status(user=Depends(auth_required)):
 
 
 # ---------------- v2.1：预检 / 历史趋势 / 慢日志 / 配置漂移 / 审计 ----------------
+
+@app.post("/api/fix_node")
+def api_fix_node(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(0),
+                 user=Depends(auth_required)):
+    """一键自愈单节点复制参数（gtid_mode/enforce_gtid_consistency/server_id）。
+
+    通过 SET PERSIST 写入 mysqld-auto.cnf，重启后仍生效，彻底解决裸机 my.cnf 片段
+    被面板/重启覆盖导致的反复 gtid_mode=OFF、server_id 默认 1 问题。仅在线修改动态参数。
+    """
+    try:
+        cid = int(cluster_id)
+        port = int(port)
+        ru, rp = node_root(host, cid)
+        row = query("SELECT server_id FROM nodes WHERE cluster_id=%s AND ip=%s AND port=%s",
+                    (cid, host, port))
+        sid = int(row[0]["server_id"]) if row and row[0].get("server_id") else None
+        ok, rep = fix_node_mysql_params(host, port, ru, rp, target_server_id=sid)
+        return _json_ok({"ok": ok, **rep})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
 
 @app.post("/api/precheck")
 def api_precheck(cluster_id: int = Form(...), host: str = Form(""), port: int = Form(0),
@@ -481,6 +530,26 @@ def api_heal(request: Request, user=Depends(auth_required),
                 steps.append("IO线程: " + msg_i)
             except Exception as e:
                 steps.append("IO线程自愈异常: %s" % e)
+
+            # 3.5) IO 仍失败且为「Access denied」——主库 replication 账号密码漂移。
+            # 从库侧密码是对的（make_slave_of 已用库存 repl_pass），问题在主库账号，
+            # 故到主库重置 replication 密码（mysql_native_password + 同密从库 IP 账号），
+            # 再重启从库 IO 线程立即重连。
+            try:
+                st_io = get_status(host, p, creds["ha_user"], creds["ha_pass"], ru, rp, timeout=10)
+                io_err_now = (st_io.get("slave_io_err") or "").strip()
+                if st_io.get("slave_io") != "Yes" and "Access denied for user" in io_err_now:
+                    mru, mrp = node_root(cur_h, cluster_id)
+                    rok, rmsg = reset_replication_creds_on_master(
+                        cur_h, cur_p, creds["ha_user"], creds["ha_pass"], mru, mrp,
+                        creds["repl_user"], creds["repl_pass"], slave_ip=host)
+                    steps.append("主库重置复制密码: " + rmsg)
+                    if rok:
+                        sok, smsg = restart_slave_io(
+                            host, p, creds["ha_user"], creds["ha_pass"], ru, rp)
+                        steps.append(smsg)
+            except Exception as e:
+                steps.append("复制密码重置异常: %s" % e)
 
         # 重新读取，给出最终状态与真实错误（而非掩盖为「复制正常」）
         st2 = live()
@@ -981,11 +1050,23 @@ def nodes_add(
     user=Depends(auth_required),
 ):
     initial_role = "master" if initial_role == "master" else "slave"
+    ip = (ip or "").strip()
+    # 防护：管理端后台 MySQL（MGMT_MYSQL_HOST）仅管理器自身存储使用，绝不能作为集群节点；
+    # 否则会把「管理库地址」误当节点 IP 写入集群配置（违反「1.88 的 MySQL 只负责服务端管理后台，
+    # 不参与集群」）。仅当管理库为外部真实 IP 时才拦截，回环/auto 不拦截（便于单机开发）。
+    try:
+        _mgmt = get_mgmt_host()
+        if _mgmt and _mgmt not in ("127.0.0.1", "localhost", "auto") and ip == _mgmt:
+            return RedirectResponse(
+                "/nodes?error=该地址是管理后台数据库（MGMT_MYSQL_HOST），不参与集群，不能作为节点添加",
+                status_code=303)
+    except Exception:
+        pass
     # 节点必须归属已有集群（新建集群仅在「集群管理」页面完成）
     cid = int(cluster_id) if cluster_id else None
     if not cid:
         return RedirectResponse("/nodes?error=请先在「集群管理」创建集群，再选择所属集群", status_code=303)
-    # 同集群「同构」校验：禁止 docker/baremetal 混部、主版本须一致
+    # 同集群「同构」校验：禁止 docker/mariadb 混部、主版本须一致
     try:
         validate_node_version(cid, node_type.strip() or "docker", mysql_version.strip() or None)
     except Exception as e:
@@ -1001,11 +1082,16 @@ def nodes_add(
     except Exception as e:
         return RedirectResponse(f"/nodes?error={e}", status_code=303)
     role_tip = "（已设为初始主库，VIP 将优先在此节点绑定）" if initial_role == "master" else ""
-    # 裸机节点需提示用户手工应用 init 文件
+    # 节点类型特定提示
     extra_tip = ""
-    if node_type.strip() == "baremetal":
-        extra_tip = ("（裸机节点：请先按 my.cnf.ha-fragment 配置并重启 MySQL，"
-                     "再在节点执行 init_baremetal.sql 创建账号，最后部署 keepalived 容器）")
+    nt = node_type.strip()
+    if nt == "baremetal":
+        extra_tip = ("（裸机 MySQL 节点已废弃，请改用 MariaDB 节点类型）")
+    elif nt == "mariadb":
+        extra_tip = ("（MariaDB 节点：把目录与 MariaDB 安装包 mariadb-*-linux-*.tar.gz 放同一目录，"
+                     "执行 sudo bash Install-ha-mariadb-Node.sh 全量安装；"
+                     "各节点就绪后管理器自动建复制/选主/VIP 漂移；"
+                     "卸载用 sudo bash Uninstall-mariadb-Node.sh，重装/改密直接重跑 Install 即可）")
     return RedirectResponse(
         f"/nodes?msg=已生成节点 {info['node_name']}{role_tip}{extra_tip}，到目标主机执行：{info['run_cmd']}",
         status_code=303,
@@ -1065,3 +1151,32 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
         })
     except Exception as e:
         return JSONResponse({"ok": False, "msg": f"重新生成失败: {e}"})
+
+
+@app.get("/nodes/{ip}/creds_sql")
+def node_creds_sql(ip: str, user=Depends(auth_required)):
+    """下载该节点的「账号/权限修复脚本」fix-node-creds.sql。
+
+    该文件含真实凭证（ha_monitor / replication / root 及管理器服务端后台 IP），
+    用于节点本机以真实 root 执行自愈：修正 ha_monitor 仅 GRANT USAGE、root@'<管理器IP>'
+    密码漂移、复制账号缺失等问题。业务通信仅发生在「管理器服务端后台 IP」与节点之间。
+    """
+    try:
+        row = query(
+            "SELECT n.root_user, n.root_pass, n.cluster_id FROM nodes n WHERE n.ip=%s", (ip,))
+        if not row:
+            return JSONResponse({"ok": False, "msg": f"未找到节点 {ip}"}, status_code=404)
+        n = row[0]
+        cid = int(n.get("cluster_id") or 0)
+        creds = get_cluster_creds(cid)
+        manager_ip = get_manager_public_ip()
+        sql = render_fix_node_creds_sql(
+            creds.get("ha_user") or "ha_monitor", creds.get("ha_pass") or "",
+            creds.get("repl_user") or "replication", creds.get("repl_pass") or "",
+            n.get("root_user") or "root", n.get("root_pass") or "",
+            manager_ip,
+        )
+        headers = {"Content-Disposition": f'attachment; filename="fix-node-creds-{ip}.sql"'}
+        return Response(content=sql, media_type="application/sql", headers=headers)
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"}, status_code=500)

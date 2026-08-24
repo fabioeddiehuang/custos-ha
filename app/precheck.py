@@ -31,17 +31,39 @@ def check_node(ip, port, user, password, role=None):
         return [{"level": "ERR", "var": "connectivity",
                  "message": f"管理器无法 TCP 连入 {ip}:{port}（manager→node 段不可达或凭据错误）"}]
     try:
+        # 判定风味：MariaDB 没有 gtid_mode 变量（用 gtid_domain_id），该项检查须跳过，
+        # 否则 MariaDB 节点永远报 gtid_mode=None（ERR），造成误报。
+        flavour = "mariadb"
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT VERSION()")
+            r = cur.fetchone()
+            v = (r[0] if r else "") or ""
+            if "mariadb" not in v.lower():
+                flavour = "mysql"
+        except Exception:
+            flavour = "mysql"
         gtid = _var(conn, "gtid_mode")
         logbin = _var(conn, "log_bin")
         fmt = _var(conn, "binlog_format")
         ro = _var(conn, "read_only")
         sid = _var(conn, "server_id")
-        if str(gtid).upper() != "ON":
-            findings.append({"level": "ERR", "var": "gtid_mode",
-                             "message": f"gtid_mode={gtid}（应为 ON，否则无法基于 GTID 复制/切换）"})
-        if str(logbin).upper() != "ON":
-            findings.append({"level": "ERR", "var": "log_bin",
-                             "message": f"log_bin={logbin}（应为 ON，否则无法复制）"})
+        if flavour == "mariadb":
+            # MariaDB：检查 gtid_domain_id 已设置（非 0 或已显式配置），log_bin 开启即可
+            dom = _var(conn, "gtid_domain_id")
+            if str(logbin).upper() != "ON":
+                findings.append({"level": "ERR", "var": "log_bin",
+                                 "message": f"log_bin={logbin}（应为 ON，否则无法复制）"})
+            if dom in (None, "", "0"):
+                findings.append({"level": "WARN", "var": "gtid_domain_id",
+                                 "message": f"gtid_domain_id={dom}（MariaDB 建议显式指定非 0 域，避免跨节点 GTID 冲突）"})
+        else:
+            if str(gtid).upper() != "ON":
+                findings.append({"level": "ERR", "var": "gtid_mode",
+                                 "message": f"gtid_mode={gtid}（应为 ON，否则无法基于 GTID 复制/切换）"})
+            if str(logbin).upper() != "ON":
+                findings.append({"level": "ERR", "var": "log_bin",
+                                 "message": f"log_bin={logbin}（应为 ON，否则无法复制）"})
         if str(fmt).upper() != "ROW":
             findings.append({"level": "WARN", "var": "binlog_format",
                              "message": f"binlog_format={fmt}（建议 ROW，Mixed/Statement 复制易出错）"})

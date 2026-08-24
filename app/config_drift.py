@@ -22,8 +22,8 @@ def _var(conn, name):
         return None
 
 
-def _fetch_all(ip, port, user, password):
-    conn = connect_robust(ip, port, user, password)
+def _fetch_all(ip, port, user, password, root_user="root", root_pass=""):
+    conn = connect_robust(ip, port, user, password, root_user=root_user, root_pass=root_pass)
     if not conn:
         return None
     out = {}
@@ -32,7 +32,15 @@ def _fetch_all(ip, port, user, password):
         cur.execute("SELECT VERSION()")
         r = cur.fetchone()
         out["version"] = r[0] if r else None
-        for v in ("server_id", "gtid_mode", "log_bin", "binlog_format", "read_only"):
+        is_maria = "mariadb" in (out["version"] or "").lower()
+        out["is_mariadb"] = is_maria
+        vars_to_fetch = ["server_id", "log_bin", "binlog_format", "read_only"]
+        # MariaDB 无 gtid_mode 变量（用 gtid_domain_id），不取 gtid_mode（避免 None 误报）
+        if not is_maria:
+            vars_to_fetch.append("gtid_mode")
+        else:
+            out["gtid_domain_id"] = _var(conn, "gtid_domain_id")
+        for v in vars_to_fetch:
             out[v] = _var(conn, v)
     finally:
         try:
@@ -48,10 +56,17 @@ def check_cluster(cluster_id):
         "SELECT n.ip, n.port, n.root_user, n.root_pass, h.role "
         "FROM nodes n LEFT JOIN hosts h ON h.host=n.ip AND h.cluster_id=n.cluster_id "
         "WHERE n.cluster_id=%s", (cluster_id,))
+    # 巡检只读监控，优先用各集群的 ha_monitor 账号（带 @'%'，可从管理器服务端后台 IP 连入），
+    # 仅在 ha_monitor 不可用时回退 root。避免依赖 root@'<管理器IP>' 这种易漂移的特定 host 账号
+    # （一旦节点上该账号密码与管理器库存不一致，就报 1045 'root'@'<管理器IP>'，误伤预检）。
+    from .clusters import get_cluster_creds
+    creds = get_cluster_creds(cluster_id) or {}
+    ha_user = creds.get("ha_user") or "ha_monitor"
+    ha_pass = creds.get("ha_pass") or ""
     snapshots = []
     for n in rows:
-        snap = _fetch_all(n["ip"], int(n["port"]), n.get("root_user") or "root",
-                          n.get("root_pass") or "")
+        snap = _fetch_all(n["ip"], int(n["port"]), ha_user, ha_pass,
+                          n.get("root_user") or "root", n.get("root_pass") or "")
         if snap is None:
             # 无法连接该节点，记为一条 DRIFT（连通性问题）
             execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
@@ -86,9 +101,19 @@ def check_cluster(cluster_id):
 
     # 2) 一致性参数
     for snap in snapshots:
-        for var, exp in (("gtid_mode", "ON"), ("log_bin", "ON"), ("binlog_format", "ROW")):
+        # MariaDB 无 gtid_mode（用 gtid_domain_id），跳过该项避免误报 DRIFT
+        if snap.get("is_mariadb"):
+            var_checks = (("log_bin", "ON"), ("binlog_format", "ROW"),
+                          ("gtid_domain_id", "0"))  # 期望非 0（由 my.cnf 指定）
+        else:
+            var_checks = (("gtid_mode", "ON"), ("log_bin", "ON"), ("binlog_format", "ROW"))
+        for var, exp in var_checks:
             actual = snap.get(var)
-            status = "OK" if str(actual).upper() == exp else "DRIFT"
+            if var == "gtid_domain_id":
+                # gtid_domain_id 期望非 0（0 为未显式指定，视为漂移）
+                status = "OK" if str(actual).upper() not in ("0", "NONE", "") else "DRIFT"
+            else:
+                status = "OK" if str(actual).upper() == exp else "DRIFT"
             if status == "DRIFT":
                 drift += 1
             execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "

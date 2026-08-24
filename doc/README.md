@@ -18,7 +18,7 @@
 | 多集群隔离管理 | 每个集群独立 HA 监控账号 / 复制账号 / 业务账号、VIP、网卡、VRID；切换与监控按 `cluster_id` 隔离。 |
 | 自动高可用与故障切换 | 探活主从、GTID 感知选主（`pick_best_master`）、VIP 漂移、脑裂保护；主库失联约 6s 触发切换（默认 `CHECK_INTERVAL=3` / `FAIL_THRESHOLD=2`）。 |
 | 复制自愈 | 在线修复 SQL（1007/1050/1061/1062/1396/1032/1146）与 IO（13114/1236）复制错误（注入空事务跳过冲突）；支持手动 `/api/heal` 重指向 + 自愈。 |
-| 节点一键部署 | Web「节点配置」填写即生成自包含节点目录（`docker-compose.yaml` + `keepalived/` + `init.sql`），整体拷到目标机 `docker compose up` 即可。 |
+| 节点一键部署 | 两种模式：① Docker 模式（MySQL 8.0 + keepalived 容器，`docker compose up -d`）；② 裸机 MariaDB 模式（MariaDB 12.x 全量安装，一条 `sudo bash Install-ha-mariadb-Node.sh` 完成 MariaDB 安装 + 账号初始化 + keepalived 启动）。账号/GTID 统一初始化，首次安装即可部署成功。 |
 | Web 控制台 | 仪表盘（实时拓扑 / 统计 / 刷新）、集群管理（单色系卡片 + SVG 图标 + 按集群配置凭证与 VIP）、节点配置（生成 / 重新生成 / 删除）、系统配置（SMTP 多收件人告警 + 按集群路由）。 |
 | 切换历史与告警 | 记录每次切换（from→to + 原因）；支持邮件告警与异常日志一键复制排错。 |
 | 安全 | 账号密码可自动生成、明文不回显；「同步密码到节点」用 root 自愈全部节点；`SECRET_KEY` / `WEB_PASS` 生产须改。 |
@@ -73,25 +73,20 @@ mysql-ha-manager/
 │   ├── VERSION                 # 版本号
 │   ├── templates/              # Web 页面（base/login/dashboard/clusters/nodes/settings/change_password）
 │   ├── static/                 # 样式与脚本
-│   └── node_assets/keepalived/ # 节点 keepalived 资源（生成时被复制到节点目录）
-├── node-template/              # 手动部署模板（容器方式）
-│   ├── docker-compose.yml      # 节点编排（MySQL + keepalived，host 网络 + NET_RAW）
-│   ├── init.sql.template       # 首启初始化账号模板（envsubst 渲染为 init.sql）
-│   └── keepalived/
-│       ├── keepalived.conf     # ✅ 可直接使用（示例值，按需改 IP/peer）
-│       ├── keepalived.conf.template     # 模板
-│       ├── ha_check.conf.template       # 模板（含 ha_monitor/repl 密码占位）
-│       ├── check_mysql_master.sh        # 本地主库判定脚本
-│       ├── entrypoint.sh                # 网卡探测 + 配置落地
-│       └── Dockerfile
+│   └── node_assets/            # 节点部署资源唯一来源（Web 生成节点目录时从这里渲染/复制）
+│       ├── keepalived/         # keepalived 资源（keepalived.conf / ha_check.conf / check_mysql_master.sh / entrypoint.sh / notify 脚本）
+│       ├── Install-ha-mariadb-Node.sh     # 节点一键安装脚本（裸机：自动应用 my.cnf 片段 + 初始化账号 + 起 keepalived）
+│       ├── Uninstall-mariadb-Node.sh   # 节点一键卸载脚本
+│       ├── init_mariadb.sql  # 裸机节点初始化 SQL（建账号 / 授权 / 启 GTID / 本地状态库）
+│       └── fix-node-creds.sql  # 节点账号/权限修复 SQL（节点本机真实 root 执行，校正漂移凭证）
 ├── generated_nodes/            # 一键生成的节点部署单元（已 gitignore，内容含敏感信息）
-│   └── <ip>/                   # 自包含：docker-compose.yaml / init.sql / keepalived/ / MySQL-data
+│   └── <ip>/                   # 自包含：Install-ha-mariadb-Node.sh / init_mariadb.sql / fix-node-creds.sql / docker-compose.yaml / keepalived/ / my.cnf.ha-fragment / ha_check.conf
 └── data/                       # 运行时产物（已 gitignore）
     └── mysql-data/             # （可选）服务端自带演示管理库数据
 ```
 
-> 命名规范：`node-template/` 为容器方式手动部署模板，`generated_nodes/<ip>/` 为 Web 一键生成的部署单元（自包含、可直接拷到目标主机 `/home/docker/<ip>/` 运行）。
-> 约定：凡是有 `.template` 的配置文件，需经 `envsubst` 渲染为同名文件（`keepalived.conf` 已附带可直接使用的示例，其余 `.template` 需渲染）。
+> **部署资源唯一来源**：所有节点侧文件（keepalived 配置、安装/卸载脚本、初始化 SQL）统一存放在 `app/node_assets/`，由 `node_gen.py` 在 Web 生成节点时渲染并写入 `generated_nodes/<ip>/`。历史遗留的 `node-template/`、`host-keepalived/` 目录已废弃删除，请勿再引用。
+> 生成的节点目录自包含，整体拷到目标主机 `/home/docker/<ip>/` 即可运行，**不会越级引用上级目录**。
 
 ---
 
@@ -101,7 +96,7 @@ mysql-ha-manager/
 - 每台节点机器：Linux + Docker + docker compose v2，且**节点机器到管理库 3306 端口网络可达**；
 - 一个**独立的外部管理 MySQL**（推荐），用户/密码/库名统一约定为 `ha`（也可自定义）；
 - 一个与节点同网段、**当前空闲**的 VIP（如 `192.168.1.10`），本工具无法自动探测，必须填写。
-- 节点机器的 Docker 必须允许给容器附加 `NET_ADMIN` / `NET_BROADCAST` / **`NET_RAW`** 能力（`keepalived` 用原始套接字发 VRRP 通告，缺 `NET_RAW` 会报 `Cant send advert ... Operation not permitted` 并导致双主/split-brain）。`node-template` 的 compose 已显式 `cap_add: - NET_RAW`。
+- 节点机器的 Docker 必须允许给容器附加 `NET_ADMIN` / `NET_BROADCAST` / **`NET_RAW`** 能力（`keepalived` 用原始套接字发 VRRP 通告，缺 `NET_RAW` 会报 `Cant send advert ... Operation not permitted` 并导致双主/split-brain）。节点 `docker-compose.yaml`（由 `app/node_assets` 渲染）已显式 `cap_add: - NET_RAW`。
 
 ---
 
@@ -150,60 +145,60 @@ docker compose up -d --build
 
 ---
 
-## 6. 添加被管节点（两种方式）
+## 6. 添加被管节点（两种部署模式）
 
-### 6.1 方式一：Web 一键生成（推荐）
+无论哪种模式，流程都是：Web「集群管理」建集群 →「节点配置」添加节点（选部署模式）→ 生成自包含节点目录 → 拷到目标机执行一条安装命令。
 
-1. 在「集群管理」先建好集群；
-2. 在「节点配置」填写：所属集群、节点 IP、MySQL 端口（默认 3307）、root 用户/密码、初始角色（主/从）；
-3. 提交后，管理器在 `generated_nodes/<ip>/` 生成完整、自包含的节点目录（含渲染好的 `docker-compose.yaml`、`keepalived.conf`、`ha_check.conf`、`init.sql`、`check_mysql_master.sh`、`entrypoint.sh`；MySQL 数据落在目录内 `./MySQL-data`）；
-4. 把该目录**整体**拷贝到目标节点机器（如 `/home/docker/<ip>/`），在节点机上执行：
+### 6.1 模式一：Docker 容器部署（MySQL 跑在容器里，推荐新环境）
+
+1. 「节点配置」选部署模式 `docker`，填：节点 IP、MySQL **容器端口**（默认 3307，避免与宿主机可能存在的 3306 冲突）、root 密码、初始角色；
+2. 生成目录 `generated_nodes/<ip>/`（含 `docker-compose.yaml`：MySQL + keepalived，host 网络 + `NET_RAW`；以及 `init.sql`、`keepalived/`、`MySQL-data` 数据卷）；
+3. 整体拷到目标机 `/home/docker/<ip>/`，执行：
 
    ```bash
    cd /home/docker/<ip>
    docker compose up -d
    ```
 
-   > 该目录自包含，所有路径相对本目录（MySQL 数据 `./MySQL-data`、配置 `./keepalived/`、初始化 `./init.sql`），拷贝后无需任何改动即可运行，**不会越级引用上级目录**。
+4. 节点启动后由 `init.sql` 初始化账号并启 GTID；管理端自动发现并纳入拓扑。
 
-5. 节点启动后，管理端会自动发现并将其纳入拓扑，开始探活与选主。
+> 该目录自包含，路径均相对本目录（`MySQL-data` / `keepalived/` / `init.sql`），拷贝后无需改动即可运行。
 
-> `generated_nodes/` 已挂载持久化（`docker-compose.yml` 中 `./generated_nodes:/app/generated_nodes`）。
+### 6.2 模式二：裸机部署（节点机已自带 MySQL，仅 keepalived 跑容器）
 
-### 6.2 方式二：手动部署（容器方式，使用 `node-template/`）
+适用于生产机已有 MySQL（如宝塔安装的 MySQL 8.0），希望复用宿主机 MySQL、只把 VIP/选主交给 keepalived 容器的场景。
 
-`node-template/` 仅 `keepalived.conf` 附带可直接使用的示例值，其余需从 `.template` 渲染：
+1. 「节点配置」选部署模式 `baremetal`，填：节点 IP、MySQL **端口**（如 3306）、root 用户/密码、初始角色；
+2. 生成目录 `generated_nodes/<ip>/`，内含：
+   - `Install-ha-mariadb-Node.sh` —— **一键安装脚本**（核心）；
+   - `init_mariadb.sql` —— 初始化账号/授权/启 GTID/建本地状态库；
+   - `fix-node-creds.sql` —— 账号/权限修复脚本（节点本机真实 root 执行，校正漂移凭证）；
+   - `my.cnf.ha-fragment` —— 需追加到宿主机 `my.cnf` 的 GTID/复制片段；
+   - `docker-compose.yaml`（仅 keepalived 容器）、`keepalived/`、`ha_check.conf`；
+3. 把目录整体拷到目标机 `/home/docker/<ip>/`，**只需一条命令**完成安装：
 
-```bash
-cd node-template
-# 1) 准备变量（二选一）：export 变量，或写入 .env 后 source
-export NODE_IP=192.168.1.203 NODE_PORT=3307 ROOT_PASS='xxx' SERVER_ID=1 \
-       PEER_IP=192.168.1.177 VIP=192.168.1.10 INTERFACE=eth0 VRID=51 \
-       HA_USER=ha_monitor HA_PASS='xxx' MGMT_HOST=192.168.1.50 MGMT_PASS='mgmt_pass'
-# 2) 渲染配置（ha_check.conf / init.sql 必须从模板渲染）
-envsubst < keepalived/keepalived.conf.template > keepalived/keepalived.conf
-envsubst < keepalived/ha_check.conf.template > keepalived/ha_check.conf
-envsubst < init.sql.template > init.sql
-# 3) 按集群在「集群管理」中设置的 ha_monitor / replication 密码，确保与上述 HA_PASS / 复制密码一致
-# 4) 启动
-docker compose up -d
-```
+   ```bash
+   cd /home/docker/<ip>
+   sudo bash Install-ha-mariadb-Node.sh
+   ```
 
-- 多节点：每台节点把 `keepalived.conf` 的 `unicast_src_ip` 与本机 IP 对应、`unicast_peer` 指向对端，`SERVER_ID` 各不相同，其余相同（或使用 `keepalived.conf.template` 重新渲染）。
+   安装脚本会自动完成：读取 `ha_check.conf` 的 `MANAGER_IP` / `LOCAL_ROOT_PASS` / `PORT` →
+   将 `my.cnf.ha-fragment` 追加到宿主机 `my.cnf`（带备份与 `HA-MYSQL-NODE-SETUP` 标记，幂等）→
+   重启 MySQL 使 GTID 持久生效 → 以真实 root 跑 `init_mariadb.sql`（建 `ha_monitor`/`replication`/`app`
+   账号，强制 `mysql_native_password`，避免 MySQL 8.0 `caching_sha2` 非 TLS 复制失败）→
+   跑 `fix-node-creds.sql` 校正账号 → `docker compose up -d` 起 keepalived（VIP 漂移）。
 
-### 6.3 方式三：宿主机直装 Keepalived（不使用容器）
+   > **统一初始化**：首次安装即可部署成功——账号、GTID、复制参数全部由安装脚本统一落地，无需手工改配置。
+   > 若日后出现账号漂移（如 `Access denied` / `caching_sha2` 报错），在节点本机重跑该脚本，或 Web
+   > 「节点配置」点「下载修复SQL」取 `fix-node-creds-<ip>.sql` 以真实 root 执行即可。
 
-适用于节点机已自带 MySQL、只想用 keepalived 做 VIP 漂移的场景：
+4. 卸载：`sudo bash Uninstall-mariadb-Node.sh`（还原 `my.cnf`、停 keepalived、保留 MySQL 数据与账号）。
 
-```bash
-sudo cp host-keepalived/keepalived.conf      /etc/keepalived/keepalived.conf
-sudo cp host-keepalived/ha_check.conf        /etc/keepalived/ha_check.conf
-sudo cp host-keepalived/check_mysql_master.sh /etc/keepalived/check_mysql_master.sh
-sudo chmod +x /etc/keepalived/check_mysql_master.sh
-sudo systemctl restart keepalived
-```
+### 6.3 账号与加密说明（重要）
 
-> 该方式仅负责 VIP 与选主脚本；MySQL 主从本身需你自行在宿主机 MySQL 上配置。
+- 所有服务账号（`ha_monitor` / `replication` / `app`）统一强制 `mysql_native_password`，以兼容 MySQL 8.0 默认 `caching_sha2_password` 在**非 TLS 复制**下报 `Authentication requires secure connection` 的问题。
+- 管理端每个周期对在线节点执行自愈（`ensure_ha_creds`）：优先 `ha_monitor` 校正账号，若 `ha_monitor` 缺 `CREATE/ALTER USER` 权限则回退 `root` 重做——确保复制账号密码与各节点始终与集群库存一致。
+- 节点「下载修复SQL」按钮导出的 `fix-node-creds.sql` 含真实凭证，仅限节点本机以真实 root 执行。
 
 ---
 
@@ -211,7 +206,7 @@ sudo systemctl restart keepalived
 
 | 路径 | 用途 |
 |------|------|
-| `generated_nodes/<ip>/` | 一键生成的节点部署单元（自包含，整体拷到目标主机 `/home/docker/<ip>/` 运行）；内含 `./MySQL-data` 数据卷 |
+| `generated_nodes/<ip>/` | 一键生成的节点部署单元（自包含，整体拷到目标主机 `/home/docker/<ip>/` 运行）。Docker 模式含 `./MySQL-data` 数据卷；裸机模式仅含 keepalived 容器与配置，MySQL 数据仍在宿主机 |
 | `data/mysql-data/` | （可选）服务端自带演示管理库数据 |
 
 `generated_nodes/` 与 `data/` 均已 gitignore，避免提交明文密码与业务数据。
@@ -230,9 +225,9 @@ sudo systemctl restart keepalived
 
 ## 9. 常见问题 / 排错
 
-**Q1. 节点 MySQL 首启报 `Permission denied`（init.sql）**
-- 原因：`init.sql` 以 `:ro` 挂载进容器，由容器内非 root 的 `mysql` 用户读取；若宿主机文件权限过严（如 `0600`）则无法读取。
-- 处理：确保 `init.sql` 权限为 `0644`（一键生成已默认 `0644`；手动方式渲染后 `chmod 0644 init.sql` 即可）。
+**Q1. 节点初始化账号/权限失败**
+- Docker 模式：`init.sql` 以 `:ro` 挂载进容器，由容器内 `mysql` 用户读取；若宿主机文件权限过严（`0600`）会报 `Permission denied`。处理：确保 `init.sql` 权限 `0644`（一键生成已默认 `0644`）。
+- 裸机模式：`init_mariadb.sql` / `fix-node-creds.sql` 由安装脚本以**真实 root** 通过 `mysql` 客户端执行，若出现 `Access denied`，请确认以节点真实 root 密码运行 `sudo bash Install-ha-mariadb-Node.sh` 或 `mysql -uroot -p < fix-node-creds.sql`。
 
 **Q2. keepalived 报 `sed: cannot rename ... Device or resource busy`**
 - 原因：`keepalived.conf` 以只读 `:ro` bind 挂载进容器，旧 `entrypoint.sh` 用 `sed -i` 就地改名会失败。
@@ -255,6 +250,6 @@ sudo systemctl restart keepalived
 
 ## 10. 安全提示
 
-- `node-template/keepalived/*.template`、`*/init.sql` 内含明文密码占位，仅作示例；生产请替换为强密码，并妥善保管节点目录。
+- 节点部署资源统一来自 `app/node_assets/`，生成的 `generated_nodes/<ip>/` 内含明文密码（含 `ha_check.conf`、`init_mariadb.sql`、`fix-node-creds.sql`），仅限目标节点本机使用；生产请使用强密码，并妥善保管节点目录，勿提交到版本库（`generated_nodes/` 已 gitignore）。
 - 管理端 `SECRET_KEY`、`WEB_PASS` 等务必在生产环境修改（默认 `admin`/`admin`）。
 - `data/` 已 gitignore，不会随仓库提交。

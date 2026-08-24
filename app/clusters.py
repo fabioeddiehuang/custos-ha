@@ -46,7 +46,7 @@ def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=N
 
 
 def validate_node_version(cluster_id, node_type, mysql_version):
-    """同集群「同构」校验：禁止 docker/baremetal 混部；同集群主版本须一致。
+    """同集群「同构」校验：禁止 docker/mariadb 混部；同集群主版本须一致。
 
     允许 mysql_version=None（老集群/自动探测）与已设版本共存，仅当两者都显式设置
     且主版本不一致时报错，避免跨大版本复制脆弱。
