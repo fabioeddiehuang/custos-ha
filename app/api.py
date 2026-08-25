@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 
-from .config import SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_mgmt_host
+from .config import SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_mgmt_host, MGMT
 from .db import query, execute, get_conn, get_setting, upsert_setting
 from .state import get_current_master
 from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root
@@ -1070,9 +1070,13 @@ def nodes_add(
     # 防护：管理端后台 MySQL（MGMT_MYSQL_HOST）仅管理器自身存储使用，绝不能作为集群节点；
     # 否则会把「管理库地址」误当节点 IP 写入集群配置（违反「1.88 的 MySQL 只负责服务端管理后台，
     # 不参与集群」）。仅当管理库为外部真实 IP 时才拦截，回环/auto 不拦截（便于单机开发）。
+    # 比对按「host:port」精确匹配——同机不同端口的节点（如 1.88:3308）仍允许添加，
+    # 只有「管理库本体」（如 1.88:3306）才被拦截。
     try:
         _mgmt = get_mgmt_host()
-        if _mgmt and _mgmt not in ("127.0.0.1", "localhost", "auto") and ip == _mgmt:
+        _mgmt_port = str(MGMT.get("port", 3306))
+        if (_mgmt and _mgmt not in ("127.0.0.1", "localhost", "auto")
+                and ip == _mgmt and str(port) == _mgmt_port):
             return RedirectResponse(
                 "/nodes?error=该地址是管理后台数据库（MGMT_MYSQL_HOST），不参与集群，不能作为节点添加",
                 status_code=303)
