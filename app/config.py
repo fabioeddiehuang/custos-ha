@@ -121,3 +121,32 @@ def get_manager_public_ip():
         "来源是宿主机 IP，请显式设置 MANAGER_PUBLIC_IP 为管理器宿主机的对外 IP，"
         "否则 root@'<IP>' / ha_monitor@'<IP>' 授权错位，管理器连不上节点。", ip)
     return ip
+
+
+def get_manager_docker_subnet_wildcard():
+    """探测管理器容器所在 docker 网络的子网通配符（如 '172.18.%'）。
+
+    用途：让「同机」节点（裸机 MariaDB / Docker 节点）允许管理器容器的连接来源
+    （docker 网关或容器 IP，均位于该子网），实现 c/s 同机；部署到任意主机时
+    自动适配，无需硬编码网段（解决「换台机器部署又不通」的问题）。
+
+    - 仅当管理器确在容器内（/.dockerenv 存在）才返回；裸机部署返回 None。
+    - 取本容器出口 IP 前两段拼 'a.b.%'：docker 默认 /16（或更小），网关与容器
+      IP 都在 'a.b.0.0/16' 内，通配前两段即可覆盖同机来源。
+    调用方据此在节点 root 授权中追加 root@'<该通配符>'，与 root@'<MANAGER_PUBLIC_IP>'
+    形成「双白名单」：跨机走真实 IP，同机走 docker 子网。
+    """
+    if not os.path.exists("/.dockerenv"):
+        return None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        s.close()
+    parts = (ip or "").split(".")
+    if len(parts) != 4:
+        return None
+    return f"{parts[0]}.{parts[1]}.%"

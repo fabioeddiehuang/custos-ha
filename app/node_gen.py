@@ -21,7 +21,7 @@ from pathlib import Path
 import pymysql
 
 from .db import get_setting, query, execute
-from .config import NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
+from .config import NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
 
@@ -273,6 +273,7 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         f"socket = {data_dir}/mysql.sock\n"
         f"pid_file = {data_dir}/mariadb.pid\n"
         "bind_address = 0.0.0.0\n"
+        "skip-name-resolve\n"
         "# 字符集\n"
         "character_set_server = utf8mb4\n"
         "collation_server = utf8mb4_general_ci\n"
@@ -367,6 +368,8 @@ def render_docker_my_cnf():
     """
     return (
         "[mysqld]\n"
+        "bind-address = 0.0.0.0\n"
+        "skip-name-resolve\n"
         "slow_query_log = 1\n"
         "long_query_time = 0.5\n"
         "log_output = TABLE\n"
@@ -427,7 +430,7 @@ def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
 def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_ip):
     """生成「节点账号/权限修复脚本」，当节点 ha_monitor 权限被面板/重装回退（只剩 USAGE）、
     或 root@'<管理器IP>' 密码漂移导致管理器连不上时使用。注入真实凭证。"""
-    return (
+    content = (
         "-- 节点账号/权限修复脚本（由管理器生成，已注入真实凭证）\n"
         "-- ⚠ 无需手动执行：Install-ha-mariadb-Node.sh 在节点准备阶段【自动重放】本文件，\n"
         "--   用于校正 ha_monitor 权限被面板/重装回退、或 root@'<管理器IP>' 密码漂移。\n"
@@ -468,6 +471,18 @@ def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user,
         root_user, manager_ip,
         repl_user, repl_pass, repl_user, repl_user, repl_pass,
     )
+    if manager_subnet:
+        # 同机（管理器容器与本节点同宿主机）场景：连接源是 docker 网关/容器 IP，
+        # 落在管理器所在 docker 子网，需额外放行 root@'<子网通配符>' 覆盖 c/s 同机。
+        content += (
+            "-- 同机场景额外放行：root@'<docker 子网>'（覆盖管理器容器连接源）\n"
+            "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+            "ALTER USER '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+            "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION;\n"
+        ) % (root_user, manager_subnet, root_pass,
+             root_user, manager_subnet, root_pass,
+             root_user, manager_subnet)
+    return content
 
 
 def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
@@ -515,6 +530,18 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
         root_user, manager_ip,
         repl_user, repl_pass, repl_user, repl_user, repl_pass,
     )
+    if manager_subnet:
+        # 同机（管理器容器与本节点同宿主机）场景：连接源是 docker 网关/容器 IP，
+        # 落在管理器所在 docker 子网，需额外放行 root@'<子网通配符>' 覆盖 c/s 同机。
+        content += (
+            "-- 同机场景额外放行：root@'<docker 子网>'（覆盖管理器容器连接源）\n"
+            "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+            "ALTER USER '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+            "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION;\n"
+        ) % (root_user, manager_subnet, root_pass,
+             root_user, manager_subnet, root_pass,
+             root_user, manager_subnet)
+    return content
 
 
 def _write(path: Path, text: str, mode=0o600):
@@ -701,6 +728,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     vrid = creds["vrid"] or VRID
     vip_port = creds.get("vip_port") or VIP_PORT
     manager_public_ip = get_manager_public_ip()
+    manager_subnet = get_manager_docker_subnet_wildcard()
     server_id = get_next_server_id()
     node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
     peers = _peer_ips(ip, cluster_id)
@@ -729,7 +757,8 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         _write(d / "my.cnf", my_cnf, mode=0o644)
         # 账号/权限修复脚本（MariaDB 语法，native 密码）
         fix_sql = render_fix_node_creds_sql_mariadb(
-            ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port)
+            ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port,
+            manager_subnet)
         _write(d / "fix-node-creds.sql", fix_sql, mode=0o644)
         extra_files["init_mariadb_sql"] = f"{NODES_HOST_BASE}/{ip}/init_mariadb.sql"
         extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/my.cnf"
@@ -887,6 +916,7 @@ def sync_node_creds(cluster_id=None):
         creds_map = {c["id"]: get_cluster_creds(c["id"]) for c in cls}
 
     manager_public_ip = get_manager_public_ip()
+    manager_subnet = get_manager_docker_subnet_wildcard()
 
     synced = 0
     for cid in clusters:
@@ -958,10 +988,12 @@ def sync_node_creds(cluster_id=None):
             # MariaDB 用 MariaDB 语法修复脚本（native 密码，无 MySQL8 专有特权）；其余用通用版。
             if node_type == "mariadb":
                 fix_sql = render_fix_node_creds_sql_mariadb(
-                    ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port)
+                    ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port,
+                    manager_subnet)
             else:
                 fix_sql = render_fix_node_creds_sql(
-                    ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip)
+                    ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip,
+                    manager_subnet)
             _write(_safe_node_path(ip) / "fix-node-creds.sql", fix_sql, mode=0o644)
             synced += 1
     return synced
