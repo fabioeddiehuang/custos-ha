@@ -1039,6 +1039,12 @@ def set_local_master_flag(host, port, user, password, master_str, root_user="roo
                 "CREATE TABLE IF NOT EXISTS ha_local.state "
                 "(k VARCHAR(32) PRIMARY KEY, v VARCHAR(255))"
             )
+            # 空闲优化：当前主库未变化时不再 REPLACE，避免每个监控周期都在所有节点产生
+            # 一次 InnoDB 提交（redo 强制刷盘 → 磁盘每秒写入）。仅值变化时写。
+            cur.execute("SELECT v FROM ha_local.state WHERE k='current_master'")
+            row = cur.fetchone()
+            if row and row[0] == master_str:
+                return True
             cur.execute(
                 "REPLACE INTO ha_local.state (k, v) VALUES ('current_master', %s)",
                 (master_str,),

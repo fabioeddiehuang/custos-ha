@@ -303,8 +303,24 @@ def api_vip_status(user=Depends(auth_required)):
                     online = True
                     eff_port = p
                     break
+            # 管理器可能不在 VIP 同一 L2 段（跨子网/跨机），TCP 直探 VIP 会失败，
+            # 但 VIP 实际由同段节点持有、节点侧可 ping 通。此时以「节点可达」兜底判定
+            # VIP 在线（避免误报离线），并标记 via_nodes 供前端提示。
+            via_nodes = False
+            if not online:
+                for nr in nrows:
+                    try:
+                        p = int(nr["port"])
+                    except (TypeError, ValueError):
+                        p = 0
+                    if p and _port_online(nr["ip"], p):
+                        online = True
+                        via_nodes = True
+                        if not eff_port:
+                            eff_port = p
+                        break
             info = {"vip": vip, "vip_port": eff_port if eff_port else vip_port,
-                    "online": online, "nodes": []}
+                    "online": online, "via_nodes": via_nodes, "nodes": []}
             # 每节点端口可达性（管理器→节点 MySQL 端口 TCP 探活）
             for nr in nrows:
                 try:

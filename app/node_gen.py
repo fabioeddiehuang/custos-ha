@@ -27,6 +27,14 @@ from .clusters import get_cluster_creds
 
 logger = logging.getLogger("node_gen")
 
+# 与 Web 后台 VERSION 文件、管理器镜像 tag 保持一致的版本号（用于构建节点 keepalived 镜像 tag）。
+def _pkg_version():
+    try:
+        return (Path(__file__).parent / "VERSION").read_text().strip() or "v2.0.1"
+    except Exception:
+        return "v2.0.1"
+PKG_VERSION = _pkg_version()
+
 # VIP 非法（如集群尚未设置 VIP）时，keepalived.conf 刷新会被跳过并告警。
 # 该告警每周期都打会刷屏，这里按 ip 做冷却（默认 5 分钟最多提示一次）。
 _vip_warn_ts = {}
@@ -174,6 +182,11 @@ services:
       - --innodb-buffer-pool-size=1G
       - --innodb-io-capacity=2000
       - --innodb-io-capacity-max=4000
+      # 并行复制：加快从库回放，避免高写入/大事务下复制延迟持续累积（如单节点长期滞后）。
+      # LOGICAL_CLOCK 保证提交顺序一致；preserve_commit_order=ON 维持从库提交序与主机一致。
+      - --slave-parallel-workers=4
+      - --slave-parallel-type=LOGICAL_CLOCK
+      - --slave-preserve-commit-order=ON
     ports:
 {port_lines}
     volumes:
@@ -190,11 +203,11 @@ services:
       retries: 10
 
   keepalived:
-    # 模板化镜像：优先使用已编译并导入的镜像 mysql-ha-keepalived:latest（无需联网编译）。
+    # 模板化镜像：优先使用已编译并导入的镜像 mysql-ha-keepalived:<VERSION>（无需联网编译）。
     # 若目标主机无法编译（如离线），可在可编译的机器上 `docker compose build keepalived`
     # 后 `docker save mysql-ha-keepalived:latest -o keepalived.tar` 拷贝过来
     # `docker load -i keepalived.tar`，再 `docker compose up --no-build` 启动。
-    image: mysql-ha-keepalived:latest
+    image: mysql-ha-keepalived:{PKG_VERSION}
     build: ./keepalived
     restart: always
     network_mode: host
@@ -241,6 +254,12 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         "innodb_flush_log_at_trx_commit = 1\n"
         "binlog_format = ROW\n"
         "read_only = ON\n"
+        "# 复制/性能（与 docker 节点保持一致，避免单节点复制延迟累积）\n"
+        "innodb_buffer_pool_size = 1G\n"
+        "innodb_io_capacity = 2000\n"
+        "innodb_io_capacity_max = 4000\n"
+        "slave_parallel_threads = 4\n"
+        "slave_parallel_mode = optimistic\n"
         "# 慢日志（供观测/排错）\n"
         "slow_query_log = 1\n"
         "long_query_time = 0.5\n"
@@ -317,7 +336,7 @@ def render_baremetal_compose(node_name, vip_port=None):
         "# 运行： cd 本目录 && docker compose up -d\n"
         "services:\n"
         "  keepalived:\n"
-        "    image: mysql-ha-keepalived:latest\n"
+        "    image: mysql-ha-keepalived:{PKG_VERSION}\n"
         "    build: ./keepalived\n"
         "    restart: always\n"
         "    network_mode: host\n"
@@ -357,13 +376,12 @@ def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
     （清空 MySQL-data 后 init.sql 重新执行）也不会因旧密码导致无法连接。
     """
     return (
-        # 启用 GTID（复制/切换必需）。gtid_mode 不能从 OFF 直接跳到 ON，必须按
-        # OFF→OFF_PERMISSIVE→ON_PERMISSIVE→ON 逐级过渡；已为 ON 时后续步会报无关错误
-        # （脚本继续，不影响）。持久化由 my.cnf 片段 + 重启 MySQL 保证。
+        # 启用 GTID 一致性（复制/切换必需）。gtid_mode 已在 compose 启动参数
+        # --gtid-mode=ON 中静态开启（MySQL 启动即 ON），此处不再做运行时逐级过渡——
+        # 否则节点已为 ON 时再执行 SET OFF_PERMISSIVE 会触发 1788（不可一步跳变）并报错，
+        # 导致 init.sql 在该行中断、后续账号创建语句不执行（节点连不上、长时间离线）。
+        # enforce_gtid_consistency 静态配置也已开启，这里仅做幂等确认（已 ON 时为 no-op）。
         "SET GLOBAL enforce_gtid_consistency=ON;\n"
-        "SET GLOBAL gtid_mode=OFF_PERMISSIVE;\n"
-        "SET GLOBAL gtid_mode=ON_PERMISSIVE;\n"
-        "SET GLOBAL gtid_mode=ON;\n"
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         # 注意：CREATE/ALTER/DROP USER 这三项**不能**写进静态 GRANT——MySQL 5.7 / MariaDB
         # 不认识这些动态权限名（GRANT 直接报 1064 语法错误），会导致 init 整段失败。
