@@ -62,7 +62,7 @@ services:
       # 已显式设为 docker 宿主机（服务端后台）IP 192.168.1.66：管理器从该 IP 连入各节点，
       # 节点 ha_check.conf 的 MANAGER_IP、Install 的 root@'<IP>' 授权均对齐此值。
       # 若你的服务端后台 IP 不同，请改为实际值；切勿填成管理库地址 192.168.1.88。
-      MANAGER_PUBLIC_IP: "192.168.1.100"
+      MANAGER_PUBLIC_IP: "192.168.1.66"
       INTERFACE: eth0
       VRID: "51"
       # SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / ALERT_EMAIL

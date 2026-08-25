@@ -32,6 +32,7 @@ from .mysql_compat import (detect_syntax, detect_flavour, flavour_from_node_type
                            start_replication_sql,
                            stop_replication_sql, reset_replica_sql, show_replica_status_sql,
                            F_MYSQL8, F_MARIADB)
+from .config import get_manager_public_ip
 
 
 # 可安全做「空事务跳过」的复制错误码集合（均为幂等类冲突：对象/记录已存在或已不存在，
@@ -497,6 +498,20 @@ def restart_slave_io(host, port, user, password, root_user="root", root_pass="",
             pass
 
 
+# 同机部署（节点 IP == 管理器宿主机 IP）时，把连接目标从物理 IP 改写为 docker 网关，
+# 绕开「管理器容器经 docker 桥连宿主机物理 IP 的数据库端口被 firewalld/docker iptables
+# 拦截（No route to host）」的问题。网关 host.docker.internal 由 compose 的
+# extra_hosts: host.docker.internal:host-gateway 注入（解析为 docker0 网关），
+# 数据库默认监听 0.0.0.0，可经网关可达。
+_MANAGER_LOCAL_IP = None
+def _manager_local_ip():
+    global _MANAGER_LOCAL_IP
+    if _MANAGER_LOCAL_IP is None:
+        ip = get_manager_public_ip()
+        _MANAGER_LOCAL_IP = ip if ip and ip not in ("127.0.0.1", "localhost") else None
+    return _MANAGER_LOCAL_IP
+
+
 def connect(host, port, user, password, timeout=5):
     """建立连接；失败时抛 RuntimeError（带原始异常信息）。
 
@@ -505,6 +520,9 @@ def connect(host, port, user, password, timeout=5):
     光靠版本号判断不可靠。故：先按版本守卫尝试携带该参数；若仍抛 TypeError
     （无论版本号怎么报），去掉该参数重试，保证原生密码等常规连接不受影响。
     """
+    # 同机部署：节点 IP 与管理器宿主机 IP 相同 → 改用 docker 网关连接（见模块顶部说明）。
+    if host and host == _manager_local_ip():
+        host = "host.docker.internal"
     base = dict(
         host=host, port=int(port), user=user, password=password,
         connect_timeout=timeout, autocommit=True,
