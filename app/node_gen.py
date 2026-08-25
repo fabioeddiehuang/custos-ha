@@ -166,6 +166,9 @@ services:
     restart: always
     environment:
       MYSQL_ROOT_PASSWORD: "{root_pass}"
+      # 跳过官方镜像在初始化阶段对 /usr/share/zoneinfo 的全量装载（耗时数秒且会刷一堆
+      # "Unable to load ... as time zone" 警告；应用用 UTC/数字偏移即可，无需时区表）。
+      MYSQL_INITDB_SKIP_TZINFO: "1"
     command:
       - --server-id={server_id}
       - --gtid-mode=ON
@@ -296,7 +299,10 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
     return (
         # MariaDB 默认已开启 GTID（gtid_domain_id 在 my.cnf 指定），无需 SET gtid_mode。
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
-        "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
+        # 注：MariaDB 12.x 把用户管理权限拆成 CREATE USER / ALTER USER / DROP USER 三个
+        # 独立动态权限（10.5 仅 CREATE USER 即够执行 ALTER/DROP USER；12.x 单 CREATE USER
+        # 已不够 ALTER USER，自愈改密会报 1227）。故三个一起授，兼容 10.5+ 与 12.x。
+        "GRANT CREATE USER, ALTER USER, DROP USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
         "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, REPLICATION CLIENT, PROCESS, "
         "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"

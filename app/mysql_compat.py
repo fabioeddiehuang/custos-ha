@@ -189,10 +189,17 @@ def show_replicas_sql(flavour):
     return "SHOW REPLICAS" if syn == "new" else "SHOW SLAVE HOSTS"
 
 
-def change_replication_filter_sql(ignore_dbs, channel=None):
-    """REPLICATE_IGNORE_DB 新旧语法通用。"""
+def change_replication_filter_sql(ignore_dbs, channel=None, flavour=None):
+    """REPLICATE_IGNORE_DB 新旧语法通用。
+
+    关键差异：
+      - MariaDB 12.x：语法为 ``REPLICATE_IGNORE_DB=(db)``（**无空格**，有空格报 1064）。
+      - MySQL 8.0：语法为 ``REPLICATE_IGNORE_DB = (db)``（**有空格**，与官方文档一致）。
+    故必须按 flavour 区分等号两侧空格，否则另一系会报语法错。
+    """
+    sep = "=" if flavour == F_MARIADB else " = "
     dbs = ",".join(f"({d})" for d in (ignore_dbs or []))
-    return f"CHANGE REPLICATION FILTER REPLICATE_IGNORE_DB={dbs}{_ch(channel)}"
+    return f"CHANGE REPLICATION FILTER REPLICATE_IGNORE_DB{sep}{dbs}{_ch(channel)}"
 
 
 def parse_gtid_set(gtid_text, flavour=None):

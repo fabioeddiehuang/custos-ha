@@ -11,6 +11,7 @@
 """
 import re
 import time
+import hashlib
 import pymysql
 from pymysql import OperationalError, ProgrammingError, DatabaseError
 
@@ -27,7 +28,8 @@ def _pymysql_at_least(major, minor):
 
 _PYMYSQL_SUPPORTS_PUBKEY = _pymysql_at_least(1, 0)
 from .mysql_compat import (detect_syntax, detect_flavour, flavour_from_node_type,
-                           change_replication_sql, start_replication_sql,
+                           change_replication_sql, change_replication_filter_sql,
+                           start_replication_sql,
                            stop_replication_sql, reset_replica_sql, show_replica_status_sql,
                            F_MYSQL8, F_MARIADB)
 
@@ -812,8 +814,10 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                         f"compat:{e2})")
         # 双保险：ha_local 是节点本地状态表，不参与复制（写时已 SET sql_log_bin=0）。
         # 再从库侧加复制过滤，确保即便有遗漏也不会因 ha_local 事件 1062 卡死复制。
+        # 注意：MySQL 8.0 语法为 `REPLICATE_IGNORE_DB = (db)`，MariaDB 12.x 为
+        # `REPLICATE_IGNORE_DB=(db)`（无空格），必须走 mysql_compat 分支函数，不可硬编码。
         try:
-            cur.execute("CHANGE REPLICATION FILTER REPLICATE_IGNORE_DB = (ha_local)")
+            cur.execute(change_replication_filter_sql(["ha_local"], channel=channel, flavour=flavour))
         except Exception as e_flt:
             print(f"[repl] 设置 REPLICATE_IGNORE_DB=ha_local 失败(可忽略): {e_flt}")
         cur.execute(start_replication_sql(flavour))
@@ -1085,6 +1089,66 @@ def alter_user_pass(host, port, user, password, target_user, target_pass,
             pass
 
 
+def _native_password_hash(password):
+    """计算 MySQL mysql_native_password 存储的 authentication_string（*+SHA1(SHA1(pwd))）。
+
+    用于自愈时比对「当前密码哈希」与「期望密码哈希」：仅当不一致才 ALTER USER，
+    避免每周期无条件重写密码 -> 进 binlog -> 副本重放+再写自身 binlog -> 空闲也持续写盘。
+    """
+    if password is None:
+        return None
+    s1 = hashlib.sha1(password.encode("utf-8")).digest()
+    s2 = hashlib.sha1(s1).digest()
+    return "*" + s2.hexdigest().upper()
+
+
+def _parse_grant_privs(grant_sql):
+    """从 GRANT 语句里解析出权限集合（用于与账号已有权限比对，判断是否需重授权）。"""
+    if not grant_sql:
+        return set()
+    m = re.match(r"\s*GRANT\s+(.+?)\s+ON\s", grant_sql, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return set()
+    return {p.strip().upper() for p in m.group(1).split(",") if p.strip()}
+
+
+def _granted_privs(cur, user, host):
+    """读取账号当前已授予的全局权限集合（用于幂等判断，避免重复 GRANT 写 binlog）。"""
+    try:
+        cur.execute("SHOW GRANTS FOR %s@%s", (user, host))
+    except Exception:
+        return set()
+    privs = set()
+    for (g,) in cur.fetchall():
+        privs |= _parse_grant_privs(g)
+    return privs
+
+
+def _ensure_account(cur, user, host, passwd, idn_expr, grant_sql=None):
+    """幂等确保账号存在、密码正确、权限正确；无变化时完全不执行写操作（不产生 binlog）。
+
+    这是根治「主库每周期被 ALTER/GRANT 刷写、副本经复制持续写盘」的关键：
+    稳定态下本函数只做 SELECT 比对，0 条写语句 -> 主库 binlog 静默 -> 副本空闲即静默。
+    """
+    cur.execute("SELECT authentication_string FROM mysql.user WHERE user=%s AND host=%s",
+                (user, host))
+    row = cur.fetchone()
+    want = _native_password_hash(passwd)
+    if row is None:
+        # 账号不存在：创建（CREATE 同时设密码），随后跳过 ALTER
+        cur.execute("CREATE USER IF NOT EXISTS %s@%s " + idn_expr, (user, host, passwd))
+        cur_hash = want
+    else:
+        cur_hash = row[0]
+    if cur_hash != want:
+        cur.execute("ALTER USER %s@%s " + idn_expr, (user, host, passwd))
+    if grant_sql:
+        want_privs = _parse_grant_privs(grant_sql)
+        have = _granted_privs(cur, user, host)
+        if want_privs and not want_privs.issubset(have):
+            cur.execute(grant_sql)
+
+
 def ensure_ha_creds(host, port, root_user, root_pass,
                     ha_user, ha_pass, repl_user, repl_pass,
                     app_user="", app_pass="", manager_ip=""):
@@ -1157,10 +1221,10 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                          f"REFERENCES, EXECUTE, SHOW VIEW, CREATE TEMPORARY TABLES ON *.* "
                          f"TO '{app_user}'@'%'")
             accts.append((app_user, app_pass, app_grant))
+        # 幂等：账号/密码/权限无变化则不写任何语句（见 _ensure_account），
+        # 彻底消除「主库每周期 ALTER/GRANT -> binlog -> 副本重放再写盘」的空闲写盘。
         for u, p, grant_sql in accts:
-            cur.execute("CREATE USER IF NOT EXISTS %s@'%%' " + idn, (u, p))
-            cur.execute("ALTER USER %s@'%%' " + idn, (u, p))
-            cur.execute(grant_sql)
+            _ensure_account(cur, u, "%", p, idn, grant_sql)
         # 关键：把 root@'<管理器IP>' 与 root@'%' 密码校正为管理器库存 root_pass。
         #  - manager_ip 的 root 用于管理器自愈回退；
         #  - root@'%' 用于内网 Navicat/其它主机远程连接（用户要求可远程登录）。
@@ -1170,22 +1234,21 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             root_targets.append(manager_ip)
         root_targets.append("%")  # 内网远程访问
         for rh in root_targets:
-            cur.execute("CREATE USER IF NOT EXISTS %s@%s " + idn_root, (root_user, rh, root_pass))
-            cur.execute("ALTER USER %s@%s " + idn_root, (root_user, rh, root_pass))
-        # 授予 ha_monitor CREATE USER 权限，使其能持续自愈账号（CREATE USER 特权同时隐含
-        # 允许 ALTER/DROP USER）。8.0 部分小版本不认 ALTER USER/DROP USER 作为可授予权限名
-        # （GRANT 报 1064），故只授 CREATE USER 这一稳定有效的特权；5.7/MariaDB 同样支持。
-        try:
-            cur.execute("GRANT CREATE USER ON *.* TO '%s'@'%%'" % ha_user)
-        except Exception:
-            pass
-        # MariaDB 10.11+（含 11/12.x）执行 SET GLOBAL read_only=0/1 需要 READ_ONLY ADMIN
-        # 特权（旧版仅 SUPER 即可，12.x 强化后缺它会 1227 导致手动/自动切换失败）。
-        # 该特权在 10.11 之前不存在，GRANT 会报 1064，故 try/except 忽略以兼容旧版。
-        try:
-            cur.execute("GRANT READ_ONLY ADMIN ON *.* TO '%s'@'%%'" % ha_user)
-        except Exception:
-            pass
+            _ensure_account(cur, root_user, rh, root_pass, idn_root)
+        # 补授 ha_monitor 的额外特权（已授权时跳过，避免每周期重复 GRANT 写 binlog）。
+        #  - CREATE USER / READ_ONLY ADMIN：MySQL 8.0 与 MariaDB 10.11+ 需要。
+        #  - MariaDB 12.x 把用户管理拆成 CREATE USER / ALTER USER / DROP USER 三个独立动态权限，
+        #    单 CREATE USER 不够 ALTER USER，故 MariaDB 分支额外补 ALTER USER / DROP USER，
+        #    否则账号漂移后自愈改密会报 1227（这是 177 账号自愈失败的根因）。
+        extra_privs = ["CREATE USER", "READ_ONLY ADMIN"]
+        if flavour == F_MARIADB:
+            extra_privs += ["ALTER USER", "DROP USER"]
+        for extra in extra_privs:
+            try:
+                if extra.upper() not in _granted_privs(cur, ha_user, "%"):
+                    cur.execute("GRANT %s ON *.* TO '%s'@'%%'" % (extra, ha_user))
+            except Exception:
+                pass
 
     cur = conn.cursor()
     used = used_for_connect

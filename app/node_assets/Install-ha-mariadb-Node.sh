@@ -275,7 +275,9 @@ hash -r 2>/dev/null || true
 log "已创建 /usr/local/bin/mysql 等软链 + socket 软链（执行 mysql -uroot -p 即可登录）"
 
 # ---------- 7) 跑 init_mariadb.sql + fix-node-creds.sql ----------
-MYSQL=("$INSTALL_DIR/bin/mysql" -uroot -p"$ROOT_PASS" -h127.0.0.1)
+# 注意：必须用本地 socket 连接（VIP 此刻可能尚未上浮/由 keepalived 接管），
+# 切勿用 -h127.0.0.1（会解析到 VIP 网卡），否则连不到本机 MariaDB。
+MYSQL=("$INSTALL_DIR/bin/mysql" -uroot -p"$ROOT_PASS" --socket="$DATA_DIR/mysql.sock")
 if [[ -f "$SCRIPT_DIR/init_mariadb.sql" ]]; then
   log "执行 init_mariadb.sql（创建 ha_monitor/replication/app + ha_local）..."
   "${MYSQL[@]}" < "$SCRIPT_DIR/init_mariadb.sql" || warn "init_mariadb.sql 执行有告警，请检查"

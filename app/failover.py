@@ -11,6 +11,12 @@ import time
 from .alerts import send_alert
 from .clusters import get_cluster_creds
 
+# 账号自愈限频：稳定态下 ensure_ha_creds 已幂等（无变化零写操作），
+# 此处再按 CRED_SELFHEAL_INTERVAL 限制每集群调用频率，避免每监控周期（~2s）都
+# 对主库建连比对账号，进一步降低管理器开销与主库 SELECT 压力。
+CRED_SELFHEAL_INTERVAL = 300
+_SELFHEAL_CRED_TS = {}
+
 # 节点重指向失败的告警按 (host, port) 做冷却（默认 5 分钟最多提示一次），
 # 避免 gtid_mode=OFF 等根因未解时，monitor 每个周期都刷同样的失败日志。
 _repoint_fail_ts = {}
@@ -364,16 +370,20 @@ def _selfheal_cluster(cluster_id):
             print(f"[selfheal] {ip}:{port} 自愈失败: {rep.get('error')}")
         for w in (rep.get("warns") or []):
             print(f"[selfheal] {ip}:{port} 警告: {w}")
-        # 账号自愈（防 1130「Host ... not allowed」）：CREATE IF NOT EXISTS + 改密 + 授权。
+        # 账号自愈限频：每 CRED_SELFHEAL_INTERVAL 秒最多一次（稳定态 ensure_ha_creds 已幂等
+        # 无写操作，限频仅为降低每监控周期对主库建连比对的额外开销）。
         # 优先用 ha_monitor（已知正确）连接，并把 root@'<管理器IP>' 密码校正为库存值，
         # 打破「root 密码漂移 -> 连不上 -> 自愈不跑」死循环。
-        cok, cmsg = ensure_ha_creds(ip, port, ru, rp,
-                                    creds["ha_user"], creds["ha_pass"],
-                                    creds["repl_user"], creds["repl_pass"],
-                                    creds.get("app_user", ""), creds.get("app_pass", ""),
-                                    manager_ip=get_manager_public_ip())
-        if not cok:
-            print(f"[selfheal] {ip}:{port} 账号自愈失败: {cmsg}")
+        _ts = _SELFHEAL_CRED_TS.get(cluster_id)
+        if _ts is None or (time.time() - _ts) >= CRED_SELFHEAL_INTERVAL:
+            cok, cmsg = ensure_ha_creds(ip, port, ru, rp,
+                                        creds["ha_user"], creds["ha_pass"],
+                                        creds["repl_user"], creds["repl_pass"],
+                                        creds.get("app_user", ""), creds.get("app_pass", ""),
+                                        manager_ip=get_manager_public_ip())
+            _SELFHEAL_CRED_TS[cluster_id] = time.time()
+            if not cok:
+                print(f"[selfheal] {ip}:{port} 账号自愈失败: {cmsg}")
 
 
 def ensure_topology(cluster_id):
