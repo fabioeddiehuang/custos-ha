@@ -6,7 +6,7 @@ from .ha_client import (set_read_only, promote_to_master, make_slave_of,
                         set_local_master_flag, is_stale_master, get_status,
                         heal_replication, heal_io_gtid_gap, get_gtid_executed,
                         parse_gtid_set, fix_node_mysql_params, ensure_ha_creds,
-                        heal_anonymous_gtid_io)
+                        heal_anonymous_gtid_io, is_read_only)
 import time
 from .alerts import send_alert
 from .clusters import get_cluster_creds
@@ -350,6 +350,12 @@ def _selfheal_cluster(cluster_id):
     for h in hosts:
         ip, port = h["host"], int(h["port"])
         ru, rp = node_root(ip, cluster_id)
+        # 只读副本：账号(ha_monitor/replication/root)与全局参数(gtid_mode/server_id)均来自
+        # 主库经复制同步，管理器不应在副本上直接执行改账号/改全局参数的 DDL——会与其复制来的
+        # 同名语句争用元数据锁并漂权限(表现为 1045/1227 告警)。副本账号由主库 ensure_ha_creds
+        # 周期性 binlog 出去自动纠正；server_id 已在节点初始化时设为唯一值。故直接跳过。
+        if is_read_only(ip, port, creds["ha_user"], creds["ha_pass"], ru, rp):
+            continue
         ok, rep = fix_node_mysql_params(ip, port, ru, rp,
                                         target_server_id=want_sid.get((ip, port)))
         if ok and rep.get("changes"):

@@ -550,6 +550,34 @@ def connect_robust(host, port, user, password, root_user="root", root_pass="", t
     raise ha_err
 
 
+def is_read_only(host, port, ha_user, ha_pass, root_user="root", root_pass="", timeout=5):
+    """判断节点是否只读（副本）。
+
+    用于自愈时跳过只读副本上的「直接账号 DDL / 改全局参数 DDL」：副本的账号与
+    gtid_mode/server_id 均来自主库经复制同步，管理器在副本上直接执行这些 DDL 会与其
+    复制来的同名语句争用元数据锁并漂权限（表现为 1045/1227 告警）。副本账号由主库
+    ensure_ha_creds 周期性 binlog 出去自动纠正。
+    """
+    try:
+        conn = connect_robust(host, port, ha_user, ha_pass, root_user, root_pass, timeout)
+    except Exception:
+        return False
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT @@global.read_only")
+        row = cur.fetchone()
+        return bool(row and row[0])
+    except Exception:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def get_status(host, port, user, password, root_user="root", root_pass="", timeout=3):
     """探活并返回节点状态字典（供 monitor/failover 使用）。
 
@@ -823,13 +851,15 @@ def fix_node_mysql_params(host, port, root_user="root", root_pass="",
 
     返回 (ok, report_dict)。report_dict: {changes:[...], warns:[...], before:{...}, error:...}
     """
-    # 自愈是特权操作（SET PERSIST），优先用 root；root 连不上（如 root@'<IP>' 未建）
-    # 再回退 ha_monitor（docker 模板已授予 SYSTEM_VARIABLES_ADMIN/SUPER）。
+    # 自愈是特权操作（SET PERSIST server_id/gtid_mode），需 SYSTEM_VARIABLES_ADMIN/SUPER。
+    # 优先用 ha_monitor（节点模板已授予该特权，主库与副本均具备）；仅在 ha_monitor 不可用
+    # （账号缺失/漂移）时回退 root（容器 root 密码固定，不随 HA_PASS 漂移）。
     conn = None
-    try:
-        conn = connect(host, port, root_user, root_pass, timeout=5)
-    except Exception:
-        conn = None
+    if ha_pass:
+        try:
+            conn = connect(host, port, ha_user or "root", ha_pass, timeout=5)
+        except Exception:
+            conn = None
     if conn is None:
         conn = connect_robust(host, port, ha_user or "root", ha_pass or "",
                               root_user, root_pass)
