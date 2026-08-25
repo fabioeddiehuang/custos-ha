@@ -1,0 +1,68 @@
+# MySQL HA 管理器 —— docker-compose 通用模板
+#
+# 部署前请将下列“示例 IP”（RFC 5737 文档保留段 192.0.2.0/24，仅占位、不可直连）
+# 替换为你的真实网络地址，三者必须互不相同：
+#   MANAGER_PUBLIC_IP  → 运行 docker 的管理器服务端内网 IP（节点看到的连接来源）
+#   MGMT_MYSQL_HOST    → 独立/外部管理库主机 IP（仅管理器自身存储，非集群节点）
+#   VIP                → 与节点同网段、当前空闲的虚拟 IP
+
+services:
+  # ---- 本地管理库（可选参考，默认关闭）----
+  # 生产推荐用你已有的外部管理 MySQL，仅需在下方的 ha-manager.environment
+  # 填好 MGMT_MYSQL_* 即可，无需启用本服务。
+  # 若想自带演示库：取消本段注释，并取消 ha-manager 的 depends_on 注释。
+  # 启用后须确保库内存在用户 ha@'%'（密码=MGMT_MYSQL_PASS）且已授权 ha.*。
+  # mgmt-mysql:
+  #   image: mysql:8.0
+  #   environment:
+  #     MYSQL_ROOT_PASSWORD: change_me
+  #     MYSQL_DATABASE: ha                  # 须与 MGMT_MYSQL_DB 一致
+  #   ports:
+  #     - "3306:3306"
+  #   volumes:
+  #     - ./data/mysql-data:/var/lib/mysql
+  #   healthcheck:
+  #     test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pchange_me"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # ---- MySQL HA 管理器（决策 + Web + 节点部署生成）----
+  ha-manager:
+    build: .
+    restart: always
+    # 启用上方 mgmt-mysql 时取消下一行注释
+    # depends_on:
+    #   - mgmt-mysql
+    environment:
+      # 管理库连接（指向外部/独立管理 MySQL；切勿填 auto 或 127.0.0.1）
+      MGMT_MYSQL_HOST: "192.0.2.20"   # 管理库主机 IP（示例，部署前替换）
+      MGMT_MYSQL_PORT: "3306"
+      MGMT_MYSQL_USER: "ha"
+      MGMT_MYSQL_PASS: "change_me"    # 含特殊字符请加引号
+      MGMT_MYSQL_DB:   "ha"
+
+      # Web 访问
+      WEB_PORT: 28888
+      WEB_USER: admin
+      WEB_PASS: ""   # 留空=首次启动随机生成并打印到日志；填写=固定密码
+
+      # 监控节奏（秒）
+      CHECK_INTERVAL: 3
+      FAIL_THRESHOLD: 2
+
+      # 生成的节点部署文件持久化目录
+      NODES_DIR: /app/generated_nodes
+
+      # 网络 / VIP（供“添加节点”生成的 compose 使用）
+      VIP_PREFIX: "24"                # 子网掩码位数，按你的网段调整
+      VIP: "192.0.2.30"               # 虚拟 IP（示例，部署前替换）
+      MANAGER_PUBLIC_IP: "192.0.2.10" # 管理器服务端内网 IP（示例，部署前替换）
+      INTERFACE: eth0                 # keepalived 网卡，按节点实际调整
+      VRID: "51"                      # keepalived 虚拟路由 ID，同集群需唯一
+
+      # 邮件告警（可选）：SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / ALERT_EMAIL
+    ports:
+      - "28888:28888"
+    volumes:
+      - ./generated_nodes:/app/generated_nodes

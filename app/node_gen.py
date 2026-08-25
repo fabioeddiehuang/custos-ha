@@ -18,6 +18,8 @@ import shutil
 import time
 from pathlib import Path
 
+import pymysql
+
 from .db import get_setting, query, execute
 from .config import NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
 from .ha_client import get_status, ensure_ha_creds
@@ -167,6 +169,11 @@ services:
       - --sync-binlog=1
       - --innodb-flush-log-at-trx-commit=1
       - --read-only=ON
+      # I/O 相关（避免沿用 mysql:8.0 镜像 128MB buffer pool / 200 io_capacity 的默认极小值，
+      # 否则副本追日志、主库刷脏时会把磁盘 util 打满）。buffer pool 可按宿主机内存再调大。
+      - --innodb-buffer-pool-size=1G
+      - --innodb-io-capacity=2000
+      - --innodb-io-capacity-max=4000
     ports:
 {port_lines}
     volumes:
@@ -804,6 +811,40 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     )
 
 
+def _node_is_read_only(ip, port, root_user, root_pass, ha_user, ha_pass):
+    """检测节点当前是否为只读副本（read_only / super_read_only = ON）。
+
+    只读副本的 ha_monitor / replication / app / root 账号密码由主库经复制自动同步，
+    **不应**在本节点直接执行 CREATE/ALTER USER。否则会与复制线程争用 mysql.* 系统表
+    的元数据锁，导致复制线程死锁 / 长时间等待
+    （'Waiting for dependent transaction to commit'），复制卡死、Seconds_Behind_Source
+    持续增大、磁盘 I/O 居高不下。返回 True 表示应跳过直接账号同步。
+    """
+    last_err = None
+    for (u, p) in ((root_user, root_pass), (ha_user, ha_pass)):
+        try:
+            c = pymysql.connect(host=ip, port=int(port), user=u, password=p,
+                                connect_timeout=4, cursorclass=pymysql.cursors.DictCursor)
+        except Exception as e:  # 账号不可达，尝试下一个
+            last_err = e
+            continue
+        try:
+            cur = c.cursor()
+            cur.execute("SELECT @@read_only AS ro, @@super_read_only AS sro")
+            r = cur.fetchone()
+            return bool(r and (r.get("ro") or r.get("sro")))
+        except Exception as e:
+            last_err = e
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+    if last_err:
+        logger.warning("只读副本检测失败 %s:%s: %s", ip, port, last_err)
+    return False
+
+
 def sync_node_creds(cluster_id=None):
     """把指定集群（或全局）的 HA/复制/业务账号密码同步到其在线节点。
 
@@ -845,14 +886,22 @@ def sync_node_creds(cluster_id=None):
             root_pass = n.get("root_pass") or ""
             node_type = n.get("node_type") or "docker"
 
-            # 优先用 ha_monitor（已知正确）自愈账号密码，并把 root@'<管理器IP>' 密码
-            # 校正为库存值，打破「root 密码漂移 -> 连不上 -> 自愈不跑」死循环。
-            ok, msg = ensure_ha_creds(
-                ip, port, root_user, root_pass,
-                ha_user, ha_pass, repl_user, repl_pass,
-                app_user, app_pass,
-                manager_ip=manager_public_ip,
-            )
+            # 只读副本：账号密码由主库经复制自动同步，严禁在副本上直接执行
+            # CREATE/ALTER USER —— 否则会与复制线程争用 mysql.* 元数据锁，造成复制线程
+            # 死锁 / 长时间等待（'Waiting for dependent transaction to commit'），
+            # 复制卡死、Seconds_Behind_Source 持续增大、磁盘 I/O 居高不下。
+            if _node_is_read_only(ip, port, root_user, root_pass, ha_user, ha_pass):
+                logger.info("节点 %s:%s 为只读副本，跳过直接账号同步（凭证由复制同步）", ip, port)
+                ok, msg = True, "replica-skip"
+            else:
+                # 优先用 ha_monitor（已知正确）自愈账号密码，并把 root@'<管理器IP>' 密码
+                # 校正为库存值，打破「root 密码漂移 -> 连不上 -> 自愈不跑」死循环。
+                ok, msg = ensure_ha_creds(
+                    ip, port, root_user, root_pass,
+                    ha_user, ha_pass, repl_user, repl_pass,
+                    app_user, app_pass,
+                    manager_ip=manager_public_ip,
+                )
             if not ok:
                 # root 与 ha_monitor 均不可达（节点离线），跳过（恢复后重新生成部署文件）
                 continue
