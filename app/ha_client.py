@@ -1236,14 +1236,11 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         for rh in root_targets:
             _ensure_account(cur, root_user, rh, root_pass, idn_root)
         # 补授 ha_monitor 的额外特权（已授权时跳过，避免每周期重复 GRANT 写 binlog）。
-        #  - CREATE USER / READ_ONLY ADMIN：MySQL 8.0 与 MariaDB 10.11+ 需要。
-        #  - MariaDB 12.x 把用户管理拆成 CREATE USER / ALTER USER / DROP USER 三个独立动态权限，
-        #    单 CREATE USER 不够 ALTER USER，故 MariaDB 分支额外补 ALTER USER / DROP USER，
-        #    否则账号漂移后自愈改密会报 1227（这是 177 账号自愈失败的根因）。
-        extra_privs = ["CREATE USER", "READ_ONLY ADMIN"]
-        if flavour == F_MARIADB:
-            extra_privs += ["ALTER USER", "DROP USER"]
-        for extra in extra_privs:
+        #  - CREATE USER：MySQL 8.0 与 MariaDB 均需要（MariaDB 中 CREATE USER 特权即隐含
+        #    覆盖 ALTER USER / DROP USER，无需也不能单独 GRANT ALTER/DROP USER——后者在
+        #    MariaDB 不是可授权权限，GRANT 会报 1064）。
+        #  - READ_ONLY ADMIN：MariaDB 10.11+ / MySQL 8.0 需要，提升主库时关 read_only 用。
+        for extra in ("CREATE USER", "READ_ONLY ADMIN"):
             try:
                 if extra.upper() not in _granted_privs(cur, ha_user, "%"):
                     cur.execute("GRANT %s ON *.* TO '%s'@'%%'" % (extra, ha_user))

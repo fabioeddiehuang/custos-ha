@@ -299,10 +299,10 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
     return (
         # MariaDB 默认已开启 GTID（gtid_domain_id 在 my.cnf 指定），无需 SET gtid_mode。
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
-        # 注：MariaDB 12.x 把用户管理权限拆成 CREATE USER / ALTER USER / DROP USER 三个
-        # 独立动态权限（10.5 仅 CREATE USER 即够执行 ALTER/DROP USER；12.x 单 CREATE USER
-        # 已不够 ALTER USER，自愈改密会报 1227）。故三个一起授，兼容 10.5+ 与 12.x。
-        "GRANT CREATE USER, ALTER USER, DROP USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
+        # 注意：MariaDB 中 ALTER USER / DROP USER **不是**可授权权限——它们由 CREATE USER 权限
+        # 隐含覆盖（CREATE USER 特权即允许对任意用户 CREATE/ALTER/DROP USER）。若把它们写进
+        # GRANT 会直接报 1064 语法错误，导致 init 整段失败。故只授 CREATE USER。
+        "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
         "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, REPLICATION CLIENT, PROCESS, "
         "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
@@ -356,7 +356,7 @@ def render_baremetal_compose(node_name, vip_port=None):
         "      - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro\n"
         "      - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro\n"
         "      - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro\n"
-    )
+    ).replace("{PKG_VERSION}", PKG_VERSION)
 
 
 def render_docker_my_cnf():
