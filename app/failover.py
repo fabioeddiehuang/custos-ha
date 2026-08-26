@@ -1,6 +1,6 @@
 """自动/手动故障切换核心逻辑（多集群：所有操作均按 cluster_id 隔离）。"""
 from .db import query, execute
-from .config import get_manager_public_ip
+from .config import get_manager_public_ip, get_manager_docker_subnet_wildcard
 from .state import get_current_master, set_current_master
 from .ha_client import (set_read_only, promote_to_master, make_slave_of,
                         set_local_master_flag, is_stale_master, get_status,
@@ -380,7 +380,8 @@ def _selfheal_cluster(cluster_id):
                                         creds["ha_user"], creds["ha_pass"],
                                         creds["repl_user"], creds["repl_pass"],
                                         creds.get("app_user", ""), creds.get("app_pass", ""),
-                                        manager_ip=get_manager_public_ip())
+                                        manager_ip=get_manager_public_ip(),
+                                        manager_subnet=get_manager_docker_subnet_wildcard())
             _SELFHEAL_CRED_TS[cluster_id] = time.time()
             if not cok:
                 print(f"[selfheal] {ip}:{port} 账号自愈失败: {cmsg}")

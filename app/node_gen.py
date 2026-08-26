@@ -955,6 +955,7 @@ def sync_node_creds(cluster_id=None):
                     ha_user, ha_pass, repl_user, repl_pass,
                     app_user, app_pass,
                     manager_ip=manager_public_ip,
+                    manager_subnet=manager_subnet,
                 )
             if not ok:
                 # root 与 ha_monitor 均不可达（节点离线），跳过（恢复后重新生成部署文件）

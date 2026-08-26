@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 
-from .config import SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_mgmt_host, MGMT
+from .config import SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT
 from .db import query, execute, get_conn, get_setting, upsert_setting
 from .state import get_current_master
 from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root
@@ -1190,11 +1190,13 @@ def node_creds_sql(ip: str, user=Depends(auth_required)):
         cid = int(n.get("cluster_id") or 0)
         creds = get_cluster_creds(cid)
         manager_ip = get_manager_public_ip()
+        manager_subnet = get_manager_docker_subnet_wildcard()
         sql = render_fix_node_creds_sql(
             creds.get("ha_user") or "ha_monitor", creds.get("ha_pass") or "",
             creds.get("repl_user") or "replication", creds.get("repl_pass") or "",
             n.get("root_user") or "root", n.get("root_pass") or "",
             manager_ip,
+            manager_subnet,
         )
         headers = {"Content-Disposition": f'attachment; filename="fix-node-creds-{ip}.sql"'}
         return Response(content=sql, media_type="application/sql", headers=headers)

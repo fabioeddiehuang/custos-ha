@@ -25,7 +25,15 @@ services:
 
   # MySQL HA 管理器（单容器：决策器 + Web + 节点一键部署生成）
   ha-manager:
-    build: .
+    # 镜像标签使用语义化版本号（MAJOR.MINOR.PATCH），【不再使用 latest】。
+    # 手动修改版本号：将下方两处的 v2.0.2 改为目标版本；或用环境变量 VERSION 覆盖
+    #   （如：VERSION=v2.1.0 docker compose up -d --build）。
+    # 涉及大版本(MAJOR)变更需人工确认。升版请同步修改 app/VERSION。
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-v2.0.2}
+    image: mysql-ha-manager:${VERSION:-v2.0.2}
     restart: always
     # 若启用上面的 mgmt-mysql，取消下一行注释
     # depends_on:
@@ -72,3 +80,14 @@ services:
       # 持久化「添加节点」生成的部署文件，便于到目标主机 docker compose up。
       # 统一收敛到项目根下的 ./generated_nodes（每个 <ip> 为自包含部署单元，可直接拷到 /home/docker/<ip>/）。
       - ./generated_nodes:/app/generated_nodes
+    networks:
+      - ha_net
+
+# 固定管理器网络子网，使 c/s 同机时源 IP(172.28.0.1) 稳定，
+# 节点 root@'172.28.%' 双白名单不再随 docker 默认网段漂移失效。
+networks:
+  ha_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

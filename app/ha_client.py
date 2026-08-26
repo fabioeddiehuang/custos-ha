@@ -498,20 +498,10 @@ def restart_slave_io(host, port, user, password, root_user="root", root_pass="",
             pass
 
 
-# 同机部署（节点 IP == 管理器宿主机 IP）时，把连接目标从物理 IP 改写为 docker 网关，
-# 绕开「管理器容器经 docker 桥连宿主机物理 IP 的数据库端口被 firewalld/docker iptables
-# 拦截（No route to host）」的问题。网关 host.docker.internal 由 compose 的
-# extra_hosts: host.docker.internal:host-gateway 注入（解析为 docker0 网关），
-# 数据库默认监听 0.0.0.0，可经网关可达。
-_MANAGER_LOCAL_IP = None
-def _manager_local_ip():
-    global _MANAGER_LOCAL_IP
-    if _MANAGER_LOCAL_IP is None:
-        ip = get_manager_public_ip()
-        _MANAGER_LOCAL_IP = ip if ip and ip not in ("127.0.0.1", "localhost") else None
-    return _MANAGER_LOCAL_IP
-
-
+# c/s 同机：始终用节点真实 IP 连接。管理器容器连同机节点时源 IP 是 docker 网桥网关
+# (172.x.x.x)，节点侧已授权 root@'<MANAGER_PUBLIC_IP>' + root@'<docker子网通配符>'
+# 双白名单，且防火墙放行 docker 网段到 MySQL 端口，故无需改写 host（摒弃
+# host.docker.internal + extra_hosts 临时方案，裸机 MariaDB 上该主机名无法解析）。
 def connect(host, port, user, password, timeout=5):
     """建立连接；失败时抛 RuntimeError（带原始异常信息）。
 
@@ -520,9 +510,6 @@ def connect(host, port, user, password, timeout=5):
     光靠版本号判断不可靠。故：先按版本守卫尝试携带该参数；若仍抛 TypeError
     （无论版本号怎么报），去掉该参数重试，保证原生密码等常规连接不受影响。
     """
-    # 同机部署：节点 IP 与管理器宿主机 IP 相同 → 改用 docker 网关连接（见模块顶部说明）。
-    if host and host == _manager_local_ip():
-        host = "host.docker.internal"
     base = dict(
         host=host, port=int(port), user=user, password=password,
         connect_timeout=timeout, autocommit=True,
@@ -1169,7 +1156,7 @@ def _ensure_account(cur, user, host, passwd, idn_expr, grant_sql=None):
 
 def ensure_ha_creds(host, port, root_user, root_pass,
                     ha_user, ha_pass, repl_user, repl_pass,
-                    app_user="", app_pass="", manager_ip=""):
+                    app_user="", app_pass="", manager_ip="", manager_subnet=None):
     """
     将节点上的 ha_monitor / replication / app / root@'<管理器IP>' 账号**完整自愈**为当前设定值。
 
@@ -1250,6 +1237,10 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         root_targets = []
         if manager_ip:
             root_targets.append(manager_ip)
+        if manager_subnet:
+            # c/s 同机：管理器容器连【同机】节点时源 IP 是 docker 网关/容器网段，
+            # 并非 manager_ip（真实宿主机 IP），故追加 docker 子网通配符白名单。
+            root_targets.append(manager_subnet)
         root_targets.append("%")  # 内网远程访问
         for rh in root_targets:
             _ensure_account(cur, root_user, rh, root_pass, idn_root)
