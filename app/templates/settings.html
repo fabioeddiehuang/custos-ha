@@ -10,7 +10,8 @@
   .setting-input{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}
   .setting-input input{max-width:160px;font-family:var(--mono)}
   .srv-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
-  .srv-actions{display:flex;align-items:center;gap:8px}
+  .srv-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .srv-actions .btn{flex:0 0 auto;white-space:nowrap}
   .srv-log{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:12px;max-height:420px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.6;white-space:pre-wrap;margin:0}
 </style>
 
@@ -39,7 +40,7 @@
 <div class="card">
   <h3>服务端容器日志</h3>
   <div class="srv-head">
-    <div class="note">用于排查管理器自身故障，日志由容器内 systemd 收集</div>
+    <div class="note">用于排查管理器自身故障，日志由管理器写入本地文件（容器内通常无 docker.sock，因此不依赖 docker logs）；切换服务可查看对应运行日志。</div>
     <div class="srv-actions">
       <select id="srvUnit" class="mini-sel">
         <option value="ha_manager">mysql-ha-manager</option>
@@ -50,6 +51,7 @@
       <button class="btn btn-sm" onclick="loadSrvLog()">读取日志</button>
       <button class="btn btn-sm btn-ghost" onclick="toggleFull()">全屏</button>
       <button class="btn btn-sm btn-ghost" onclick="clearSrvLog()">清空</button>
+      <button class="btn btn-sm btn-ghost" onclick="exportSrvLog()">导出TXT</button>
     </div>
   </div>
   <pre class="srv-log" id="srvLog">日志加载中…</pre>
@@ -83,11 +85,11 @@
     var close=document.getElementById("fullClose");
     _full=!_full;
     if(_full){
-      log.style.cssText+=";position:fixed;inset:60px 20px 20px;z-index:150;max-height:none;background:#0f172a;border-radius:12px;";
-      close.style.display="inline-block";
+      log.style.cssText="position:fixed;inset:56px 16px 56px;z-index:150;max-height:none;background:#0f172a;border-radius:12px;overflow:auto;color:#e2e8f0;padding:14px;white-space:pre-wrap;font-family:var(--mono);font-size:12.5px";
+      close.style.cssText="position:fixed;top:16px;right:20px;z-index:200;display:inline-block;cursor:pointer;color:#fff;background:#b91c1c;border:none;border-radius:8px;padding:6px 12px;font-size:13px";
     }else{
       log.style.cssText="background:#0f172a;color:#e2e8f0;padding:14px;border-radius:12px;max-height:420px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.6;white-space:pre-wrap;margin:0;";
-      close.style.display="none";
+      close.style.cssText="display:none";
     }
   }
   function loadSrvLog(){
@@ -103,6 +105,14 @@
       .catch(function(e){log.textContent="请求失败: "+e;});
   }
   function clearSrvLog(){document.getElementById("srvLog").textContent="";}
+  function exportSrvLog(){
+    var txt=document.getElementById("srvLog").textContent;
+    if(!txt.trim()||txt==="日志加载中…"){toast("暂无日志可导出","err");return;}
+    var blob=new Blob([txt],{type:"text/plain;charset=utf-8"});
+    var a=document.createElement("a");a.href=URL.createObjectURL(blob);
+    a.download="srv_log_"+document.getElementById("srvUnit").value+"_24h.txt";a.click();
+    URL.revokeObjectURL(a.href);
+  }
 
   loadSrvLog();
 </script>

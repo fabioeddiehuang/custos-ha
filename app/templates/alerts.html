@@ -60,8 +60,8 @@
     <span class="email-chip" data-id="{{ e.id }}">
       <span>{{ e.email }}</span>
       {% if e.is_default %}<span class="tag ok">默认</span>{% endif %}
-      <span class="tag sky">{{ e.clusters|join('、') if e.clusters else '全部集群' }}</span>
-      <button class="mini" onclick="mapCluster('{{ e.id }}')">映射集群</button>
+      {% if e.clusters %}<span class="tag sky">{{ e.clusters|join('、') }}</span>{% else %}<span class="tag" style="background:#fee2e2;color:#b91c1c">未绑定集群·不接收</span>{% endif %}
+      <button class="mini" onclick="mapCluster('{{ e.id }}','{{ e.clusters|join('、') }}')">映射集群</button>
       <button class="mini" onclick="setDefault('{{ e.id }}')">设为默认</button>
       <button class="del" onclick="delEmail('{{ e.id }}')">×</button>
     </span>
@@ -69,6 +69,22 @@
     <span style="color:#9ca3af;font-size:13px;">暂无提醒邮箱</span>
     {% endfor %}
   </div>
+
+  <!-- 映射集群到邮箱（可勾选；不勾选则不会收到该集群告警） -->
+  <div class="overlay" id="emapOverlay" onclick="if(event.target===this)closeEmap()">
+    <div class="modal">
+      <header><b>映射集群到该邮箱</b><span class="close" onclick="closeEmap()">×</span></header>
+      <div class="body">
+        <p class="note" style="margin-top:0">勾选该邮箱要接收告警的集群；<b style="color:#b91c1c">不勾选任何集群，则该邮箱不会收到任何集群告警邮件</b>。</p>
+        <div id="emapList" style="display:flex;flex-direction:column;gap:8px;margin-top:6px"></div>
+      </div>
+      <footer>
+        <button class="btn" onclick="closeEmap()">取消</button>
+        <button class="btn btn-primary" onclick="saveEmap()">保存</button>
+      </footer>
+    </div>
+  </div>
+
   <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
     <input id="newEmail" placeholder="收件邮箱，如 admin@example.com" style="max-width:280px">
     <select id="emailCluster" class="mini-sel" style="width:auto">
@@ -168,12 +184,30 @@
       if(d.ok)setTimeout(function(){location.reload();},600);
     });
   }
-  function mapCluster(id){
-    var cids=prompt("输入集群 ID（逗号分隔多个；留空=全部集群）：","");
-    if(cids===null)return;
-    apiPost("/settings/email/map",{id:id,cluster_ids:cids||""},function(d){
-      toast(d.msg||(d.ok?"已映射":"操作失败"),d.ok?"ok":"err");
-      if(d.ok)setTimeout(function(){location.reload();},600);
+  var __clusters = {{ clusters|tojson }};
+  var _emapId = null;
+  function mapCluster(id, clustersStr){
+    _emapId = id;
+    var list = document.getElementById("emapList");
+    var mapped = (clustersStr||"").split("、").map(function(x){return x.trim();}).filter(Boolean);
+    if(!__clusters.length){
+      list.innerHTML = '<div class="note">当前没有任何集群可绑定。</div>';
+    } else {
+      list.innerHTML = __clusters.map(function(c){
+        var cid = String(c.id);
+        var checked = mapped.indexOf(cid) >= 0 ? "checked" : "";
+        return '<label style="display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;cursor:pointer" class="emap-item">'
+             + '<input type="checkbox" value="'+cid+'" '+checked+'> '+esc(c.name)+'</label>';
+      }).join("");
+    }
+    document.getElementById("emapOverlay").classList.add("show");
+  }
+  function closeEmap(){document.getElementById("emapOverlay").classList.remove("show");}
+  function saveEmap(){
+    var ids = Array.prototype.map.call(document.querySelectorAll("#emapList input:checked"), function(i){return i.value;});
+    apiPost("/settings/email/map",{id:_emapId, cluster_ids:ids.join(",")},function(d){
+      toast(d.msg||(d.ok?"已保存":"操作失败"),d.ok?"ok":"err");
+      if(d.ok){closeEmap();setTimeout(function(){location.reload();},600);}
     });
   }
 

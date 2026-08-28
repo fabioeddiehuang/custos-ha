@@ -9,11 +9,24 @@
   .grid2 .full{grid-column:1/-1}
   .form-foot{grid-column:1/-1;display:flex;justify-content:flex-end;gap:10px}
   .hint{font-weight:400;font-size:11.5px;color:#94a3b8}
-  .term-sql{width:100%;height:90px;border:1px solid var(--border);border-radius:10px;padding:10px;font-family:var(--mono);font-size:13px;resize:vertical}
-  .term-table{border-collapse:collapse;width:100%;font-size:12px;margin-top:8px}
-  .term-table th,.term-table td{border:1px solid var(--border);padding:5px 8px;text-align:left;vertical-align:top}
-  .term-table th{background:#f8fafc}
-  .term-result{max-height:340px;overflow:auto}
+  /* 数据库终端：黑屏交互（参考 V3 设计稿） */
+  .term-modal{max-width:880px;width:94vw}
+  .term-modal .body{display:flex;flex-direction:column}
+  .term-modal.term-full{width:100vw;height:100vh;max-width:none;border-radius:0;margin:0;display:flex;flex-direction:column}
+  .term-modal.term-full .body{flex:1;min-height:0}
+  .term-modal.term-full .term{flex:1;height:auto;min-height:0}
+  .term-full-btn{cursor:pointer;margin-left:14px;font-size:17px;color:var(--muted);user-select:none}
+  .term-full-btn:hover{color:var(--primary)}
+  .term{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;height:52vh;overflow:auto;font-family:var(--mono);font-size:13px;line-height:1.55}
+  .term-output{white-space:pre-wrap;word-break:break-word}
+  .term-output>div{padding:1px 0}
+  .term-head{color:#7dd3fc;font-weight:700}
+  .term-err{color:#fca5a5}
+  .term-busy{color:#94a3b8}
+  .term-input-line{display:flex;align-items:center;gap:6px;margin-top:6px}
+  .term-prompt{color:#34d399;font-family:var(--mono);font-weight:700;white-space:nowrap}
+  .term-input{flex:1;background:transparent;border:none;outline:none;color:#e2e8f0;font-family:var(--mono);font-size:13px}
+  .term-input::placeholder{color:#475569}
   .ok-note{color:#16a34a;padding:10px}
   .err-cell{color:#b91c1c;font-size:13px}
   .kv-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
@@ -67,8 +80,8 @@
           <td class="mono">{{ r.host }}:{{ r.port }}</td>
           <td><span class="role {{ 'role-master' if r.role == '主库' else 'role-slave' }}">{{ r.role }}</span></td>
           <td>{% if r.status == 'up' %}<span class="badge up">在线</span>{% else %}<span class="badge down">离线</span>{% endif %}</td>
-          <td>{% if r.role == '主库' %}<span class="badge ok">正常</span>{% elif r.bad %}<span class="badge warn">异常</span>{% else %}<span class="badge ok">正常</span>{% endif %}</td>
-          <td>{{ r.slave_io }}/{{ r.slave_sql }}</td>
+          <td>{% if r.role == '主库' %}<span class="badge ok">正常</span>{% elif r.status != 'up' %}<span class="badge down">未启动</span>{% elif r.bad %}<span class="badge warn">异常</span>{% else %}<span class="badge ok">正常</span>{% endif %}</td>
+          <td class="mono">{% if r.role == '主库' %}—{% else %}{{ r.seconds_behind if r.seconds_behind is not none else '—' }}s{% endif %}</td>
           <td><button class="btn btn-sm" onclick="openNodeDetail({{ c.id }}, '{{ r.host }}', {{ r.port }})">详情</button></td>
         </tr>
         {% endfor %}
@@ -89,13 +102,13 @@
       {% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
     </select>
     <span class="badge sky" id="logSrc">来源：mysql.error_log</span>
-    <button class="btn btn-sm" onclick="exportLog()">导出</button>
+    <button class="btn btn-sm" onclick="exportLog()">导出TXT</button>
   </div>
   <table class="tbl">
     <thead><tr><th>时间</th><th>节点</th><th>级别</th><th>内容</th></tr></thead>
     <tbody id="logBody"><tr><td colspan="4" style="color:#9ca3af;text-align:center;">点击上方标签加载…</td></tr></tbody>
   </table>
-  <div class="note">错误日志读取 mysql.error_log 表（不使用 SSH）；慢日志读取 mysql.slow_log 表，默认近 24h，支持导出 CSV。</div>
+  <div class="note">错误日志读取 mysql.error_log 表（不使用 SSH）；慢日志读取 mysql.slow_log 表，默认近 24h，支持导出 TXT。</div>
 </div>
 
 <div class="toolbar" style="margin-top:4px">
@@ -146,19 +159,26 @@
 
 <!-- 数据库终端 modal -->
 <div class="overlay" id="termOverlay" onclick="if(event.target===this)closeTerm()">
-  <div class="modal">
-    <header><b>数据库终端</b><span class="badge sky" style="margin-left:auto">账号 ha_monitor（只读）</span><span class="close" onclick="closeTerm()">×</span></header>
+  <div class="modal term-modal" id="termModal">
+    <header><b>数据库终端</b>
+      <span class="badge sky" style="margin-left:auto">账号 ha_monitor（只读）</span>
+      <span class="term-full-btn" id="termFullBtn" onclick="toggleTermFull()" title="全屏">⛶</span>
+      <span class="close" onclick="closeTerm()">×</span>
+    </header>
     <div class="body">
       <div class="toolbar">
         <select id="termCluster" class="mini-sel" style="width:auto" onchange="fillTermNodes()">
           {% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
         </select>
         <select id="termNode" style="width:220px"></select>
+        <span style="flex:1"></span>
+        <button class="btn btn-sm" onclick="clearTerm()">清空</button>
       </div>
-      <textarea id="termSql" class="term-sql" placeholder="输入只读 SQL，如 SELECT * FROM ..."></textarea>
-      <div style="margin:8px 0"><button class="btn btn-sm btn-primary" onclick="runTerm()">执行</button></div>
-      <div id="termResult" class="term-result"></div>
-      <div class="note">终端内直接输入 SQL，回车执行；默认仅允许 SELECT 类只读语句，执行记录写入审计日志。</div>
+      <div class="term" id="termScreen">
+        <div class="term-output" id="termOutput"></div>
+        <div class="term-input-line"><span class="term-prompt">mysql&gt;</span><input id="termInput" class="term-input" onkeydown="runTerm(event)" autocomplete="off" spellcheck="false" placeholder="输入只读 SQL，回车执行（无需点击执行）"></div>
+      </div>
+      <div class="note">黑屏内直接输入 SQL，回车执行；默认仅允许 SELECT / SHOW / EXPLAIN / DESCRIBE 类只读语句，执行记录写入审计日志。</div>
     </div>
     <footer><button class="btn" onclick="closeTerm()">关闭</button></footer>
   </div>
@@ -364,17 +384,17 @@
   function exportLog(){
     var body=document.getElementById("logBody");
     var txt=Array.prototype.map.call(body.querySelectorAll("tr"),function(tr){
-      return Array.prototype.map.call(tr.querySelectorAll("td"),function(td){return td.textContent.trim();}).join(",");
-    }).join("\n");
-    var blob=new Blob([txt],{type:"text/csv;charset=utf-8"});
+      return Array.prototype.map.call(tr.querySelectorAll("td"),function(td){return td.textContent.trim();}).join("\t");
+    }).filter(Boolean).join("\n");
+    var blob=new Blob([txt],{type:"text/plain;charset=utf-8"});
     var a=document.createElement("a");
     a.href=URL.createObjectURL(blob);
-    a.download="cluster_"+curCid()+"_"+_logTab+".csv";
+    a.download="cluster_"+curCid()+"_"+_logTab+".txt";
     a.click();
     URL.revokeObjectURL(a.href);
   }
 
-  // ---- 数据库终端 ----
+  // ---- 数据库终端（黑屏交互） ----
   function fillTermNodes(){
     var sel=document.getElementById("termNode");
     sel.innerHTML="";
@@ -386,22 +406,57 @@
     });
     if(!sel.options.length){var o=document.createElement("option");o.value="";o.textContent="无节点";sel.appendChild(o);}
   }
-  function openTerm(){document.getElementById("termOverlay").classList.add("show");fillTermNodes();}
-  function closeTerm(){document.getElementById("termOverlay").classList.remove("show");}
-  function runTerm(){
+  function openTerm(){
+    document.getElementById("termOverlay").classList.add("show");
+    fillTermNodes();
+    setTimeout(function(){var i=document.getElementById("termInput");if(i)i.focus();},60);
+  }
+  function closeTerm(){
+    document.getElementById("termOverlay").classList.remove("show");
+    var m=document.getElementById("termModal");if(m)m.classList.remove("term-full");
+    var fb=document.getElementById("termFullBtn");if(fb)fb.textContent="⛶";
+  }
+  function toggleTermFull(){
+    var m=document.getElementById("termModal"),fb=document.getElementById("termFullBtn");
+    if(!m)return;
+    var fs=m.classList.toggle("term-full");
+    if(fb)fb.textContent=fs?"✕":"⛶";
+    var i=document.getElementById("termInput");if(i&&fs)i.focus();
+  }
+  function termAppend(text,cls){
+    var o=document.getElementById("termOutput");
+    var d=document.createElement("div");
+    if(cls)d.className=cls;
+    d.textContent=text;
+    o.appendChild(d);
+    o.scrollTop=o.scrollHeight;
+  }
+  function clearTerm(){var o=document.getElementById("termOutput");if(o)o.innerHTML="";}
+  function runTerm(e){
+    if(e&&e.type==="keydown"){ if(e.key!=="Enter")return; e.preventDefault(); }
     var cid=document.getElementById("termCluster").value;
-    var hp=document.getElementById("termNode").value.split(":");
-    var sql=document.getElementById("termSql").value;
-    if(!sql.trim()){toast("请输入 SQL","err");return;}
-    var box=document.getElementById("termResult");
-    box.innerHTML='<div class="obs-empty">执行中…</div>';
+    var nv=document.getElementById("termNode").value;
+    if(!nv){toast("请先选择节点","err");return;}
+    var hp=nv.split(":");
+    var i=document.getElementById("termInput");
+    var sql=i.value;
+    if(!sql.trim())return;
+    termAppend("mysql> "+sql);
+    i.value="";
+    var busy=document.createElement("div");
+    busy.textContent="…执行中";
+    busy.className="term-busy";
+    document.getElementById("termOutput").appendChild(busy);
+    document.getElementById("termOutput").scrollTop=document.getElementById("termOutput").scrollHeight;
     apiPost("/api/term",{cluster_id:cid,host:hp[0],port:hp[1],sql:sql},function(d){
-      if(!d.ok){box.innerHTML='<div class="err-cell">'+esc(d.error||"执行失败")+'</div>';return;}
-      if(!d.cols||!d.cols.length){box.innerHTML='<div class="ok-note">'+(d.info||"执行成功（无结果集）")+'</div>';return;}
-      var h="<table class='term-table'><thead><tr>"+d.cols.map(function(c){return "<th>"+esc(c)+"</th>";}).join("")+"</tr></thead><tbody>";
-      h+=d.rows.map(function(r){return "<tr>"+r.map(function(v){return "<td>"+esc(v)+"</td>";}).join("")+"</tr>";}).join("");
-      h+="</tbody></table><div class='note'>"+d.count+" 行</div>";
-      box.innerHTML=h;
+      if(busy.parentNode)busy.parentNode.removeChild(busy);
+      if(!d.ok){termAppend("错误: "+(d.error||"执行失败"),"term-err");return;}
+      if(!d.cols||!d.cols.length){termAppend(d.info||"OK, 0 rows affected","");return;}
+      termAppend(d.cols.join(" | "),"term-head");
+      d.rows.forEach(function(r){
+        termAppend(r.map(function(v){return v===null?"NULL":v;}).join(" | "),"");
+      });
+      termAppend("("+d.count+" 行)","");
     });
   }
 

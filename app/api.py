@@ -13,6 +13,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from itsdangerous import URLSafeTimedSerializer, BadSignature
+import os
+import logging
+from logging.handlers import RotatingFileHandler
 
 from .config import SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT
 from .db import query, execute, get_conn, get_setting, upsert_setting
@@ -22,11 +25,34 @@ from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
                        sync_node_creds, render_fix_node_creds_sql)
 from .clusters import list_clusters, validate_node_version, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
 from .alerts import send_alert, last_error
-from .ha_client import (heal_replication, heal_io_gtid_gap, get_status, make_slave_of,
+from .ha_client import (connect, heal_replication, heal_io_gtid_gap, get_status, make_slave_of,
                        fix_node_mysql_params, reset_replication_creds_on_master,
                        restart_slave_io, connect_robust)
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
 from . import precheck, audit, metrics, slow_log, config_drift
+
+# ---------------------------------------------------------------------------
+# 管理器运行日志（「系统设置 → 服务端容器日志」读取此文件）
+# 容器内通常不挂载 docker.sock，故改为将运行日志写入本地文件，便于查看。
+# ---------------------------------------------------------------------------
+_LOG_DIR = os.environ.get("LOG_DIR", "/app/data/logs")
+try:
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    _MANAGER_LOG = os.path.join(_LOG_DIR, "ha-manager.log")
+    _fh = RotatingFileHandler(_MANAGER_LOG, maxBytes=5 * 1024 * 1024,
+                              backupCount=3, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _fh.setLevel(logging.INFO)
+    _root = logging.getLogger()
+    _already = any(getattr(h, "baseFilename", "").endswith("ha-manager.log")
+                   for h in _root.handlers)
+    if not _already:
+        _root.addHandler(_fh)
+        if _root.level == logging.NOTSET:
+            _root.setLevel(logging.INFO)
+except Exception:
+    _MANAGER_LOG = os.environ.get("LOG_DIR", "/app/data/logs") + "/ha-manager.log"
 
 app = FastAPI()
 TEMPLATES = Environment(
@@ -917,8 +943,10 @@ def clusters_page(request: Request, user=Depends(auth_required), msg: str = "", 
     cms = {r["cluster_id"]: f"{r['host']}:{r['port']}"
            for r in query("SELECT cluster_id, host, port FROM current_master")}
     hosts_all = query(
-        "SELECT cluster_id, host, port, status, role, slave_io, slave_sql, err "
-        "FROM hosts")
+        "SELECT cluster_id, host, port, status, role, slave_io, slave_sql, err, "
+        "(SELECT m.seconds_behind FROM metric_history m WHERE m.host=h.host AND m.port=h.port "
+        "ORDER BY m.id DESC LIMIT 1) AS seconds_behind "
+        "FROM hosts h")
     by_cluster = {}
     for h in hosts_all:
         by_cluster.setdefault(h["cluster_id"], []).append(h)
@@ -946,6 +974,7 @@ def clusters_page(request: Request, user=Depends(auth_required), msg: str = "", 
                 "slave_io": h.get("slave_io") or "—",
                 "slave_sql": h.get("slave_sql") or "—",
                 "err": (h.get("err") or "").strip(),
+                "seconds_behind": h.get("seconds_behind"),
                 "bad": bool(repl_bad or down),
             })
         has_issue = (online != counts.get(cid, 0)) or any(r["bad"] for r in host_rows)
@@ -1484,15 +1513,15 @@ def nodes_add(
 
 
 @app.post("/nodes/delete")
-def nodes_delete(request: Request, ip: str = Form(...), user=Depends(auth_required)):
+def nodes_delete(ip: str = Form(...), user=Depends(auth_required)):
     try:
         delete_node(ip)
         # 同步删除项目目录下已生成的同名部署单元（generated_nodes/<ip>）
         deleted = delete_node_dir(ip)
     except Exception as e:
-        return RedirectResponse(f"/nodes?error={e}", status_code=303)
+        return JSONResponse({"ok": False, "msg": f"删除失败：{e}"})
     extra = f"，并清理项目目录 {deleted} 个文件" if deleted else ""
-    return RedirectResponse(f"/nodes?msg=已删除节点{extra}", status_code=303)
+    return JSONResponse({"ok": True, "msg": "已删除节点" + extra})
 
 
 @app.post("/nodes/{ip}/regen")
@@ -1605,13 +1634,27 @@ def api_node_creds_sql(cluster_id: int = 0, host: str = "", port: int = 0,
 
 @app.get("/api/srv_log")
 def api_srv_log(svc: str = "ha_manager", user=Depends(auth_required)):
-    """读取服务端容器日志（默认最近 15 行），供前端「服务端容器日志」按需拉取，降低常驻压力。"""
+    """读取服务端容器日志：容器内通常无 docker.sock，优先 docker logs，失败则回退到本地日志文件。"""
+    # 1) 优先 docker logs（若宿主已挂载 docker.sock 并可用）
     try:
-        r = subprocess.run(["docker", "logs", "--tail", "15", svc],
+        r = subprocess.run(["docker", "logs", "--tail", "1500", svc],
                            capture_output=True, text=True, timeout=8)
-        log = (r.stdout + r.stderr).strip()
-        return JSONResponse({"ok": True, "log": log or "(无输出)"})
-    except FileNotFoundError:
-        return JSONResponse({"ok": False, "msg": "未找到 docker 命令（请在管理器宿主机运行）"})
-    except Exception as e:
-        return JSONResponse({"ok": False, "msg": str(e)})
+        out = (r.stdout + r.stderr).strip()
+        if r.returncode == 0 and out:
+            return JSONResponse({"ok": True, "svc": svc, "source": "docker", "log": out})
+    except Exception:
+        pass
+    # 2) 回退到管理器本地日志文件（最可靠）
+    log_path = _MANAGER_LOG
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.read().splitlines()[-1500:]
+            note = "" if svc == "ha_manager" else (
+                f"# 当前展示的是管理器运行日志；节点服务「{svc}」的日志需在对应节点查看。\n")
+            return JSONResponse({"ok": True, "svc": svc, "source": "file",
+                                  "log": note + "\n".join(lines)})
+        except Exception as e:
+            return JSONResponse({"ok": False, "svc": svc, "error": f"读取日志文件失败: {e}"})
+    return JSONResponse({"ok": False, "svc": svc,
+                         "error": f"无法获取「{svc}」日志：容器内无 docker.sock，且日志文件 {log_path} 不存在。"})
