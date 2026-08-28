@@ -1,8 +1,10 @@
 """FastAPI Web 管理后台：登录鉴权、拓扑展示、手动切换、配置管理、历史、节点一键部署、改密码。"""
 import hashlib
 import json
+import subprocess
 import socket
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, date, time
@@ -22,7 +24,7 @@ from .clusters import list_clusters, validate_node_version, get_cluster, create_
 from .alerts import send_alert, last_error
 from .ha_client import (heal_replication, heal_io_gtid_gap, get_status, make_slave_of,
                        fix_node_mysql_params, reset_replication_creds_on_master,
-                       restart_slave_io)
+                       restart_slave_io, connect_robust)
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
 from . import precheck, audit, metrics, slow_log, config_drift
 
@@ -571,6 +573,13 @@ def api_heal(request: Request, user=Depends(auth_required),
         st2 = live()
         io2, sql2 = st2.get("slave_io"), st2.get("slave_sql")
         if io2 == "Yes" and sql2 == "Yes":
+            # 自愈成功：记录「已自愈」状态（供告警列表状态标记）
+            try:
+                execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) "
+                        "VALUES(%s,%s,%s,'selfheal','healed',%s,NOW())",
+                        (cluster_id, host, int(port), "；".join(steps) if steps else "复制已修复"))
+            except Exception:
+                pass
             return JSONResponse({"ok": True, "msg": "复制已修复。" + ("；".join(steps) if steps else "")})
         io_err = (st2.get("slave_io_err") or "").strip()
         sql_err = (st2.get("slave_sql_err") or "").strip()
@@ -580,6 +589,13 @@ def api_heal(request: Request, user=Depends(auth_required),
         else:
             tail = "真实错误未知（建议检查 %s → %s 的网络连通、复制账号(%s)权限与 GTID 集合）" % (
                 host, cur_h, creds.get("repl_user"))
+        # 自愈失败：记录「未恢复」状态
+        try:
+            execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) "
+                    "VALUES(%s,%s,%s,'selfheal','unresolved',%s,NOW())",
+                    (cluster_id, host, int(port), tail))
+        except Exception:
+            pass
         return JSONResponse({"ok": False,
                               "msg": "复制仍未恢复（IO=%s, SQL=%s）。%s [%s]" % (
                                   io2, sql2, tail, "；".join(steps))})
@@ -598,6 +614,8 @@ def api_failover(cluster_id: int = Form(...), user=Depends(auth_required)):
         msg = "已触发手动切换" if ok else "切换未执行(检查配置/日志)"
     except Exception as e:
         ok, msg = False, f"切换失败: {e}"
+    audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                    "failover", f"cluster={cluster_id}", msg, cluster_id)
     try:
         run_once()  # 切换后立即重建拓扑并回写状态，使仪表盘即时刷新
     except Exception:
@@ -661,7 +679,9 @@ def settings_page(request: Request, user=Depends(auth_required), msg: str = "", 
     clusters = [{"id": c["id"], "name": c.get("name") or f"集群{c['id']}"}
                 for c in list_clusters()]
     return render("settings.html", request, user=user, cfg=cfg, msg=msg, error=error,
-                  alert_emails=alert_emails, clusters=clusters)
+                  alert_emails=alert_emails, clusters=clusters,
+                  check_interval=get_setting("CHECK_INTERVAL", "2"),
+                  manager_ip=get_setting("MANAGER_PUBLIC_IP", ""))
 
 
 @app.post("/settings")
@@ -671,6 +691,8 @@ def settings_save(
     smtp_port: str = Form(""),
     smtp_user: str = Form(""),
     smtp_pass: str = Form(""),
+    check_interval: str = Form(""),
+    manager_ip: str = Form(""),
     user=Depends(auth_required),
 ):
     upsert_setting("SMTP_HOST", smtp_host.strip())
@@ -678,7 +700,116 @@ def settings_save(
     upsert_setting("SMTP_USER", smtp_user.strip())
     if smtp_pass.strip():
         upsert_setting("SMTP_PASS", smtp_pass.strip())
-    return JSONResponse({"ok": True, "msg": "✓ 已保存 SMTP 配置"})
+    # 监控轮询间隔（秒）：动态生效，monitor 循环每次读取
+    ci = (check_interval or "").strip()
+    if ci:
+        try:
+            iv = int(ci)
+            if iv >= 1:
+                upsert_setting("CHECK_INTERVAL", str(iv))
+        except ValueError:
+            pass
+    # 管理器内网 IP（记录用；运行时以环境变量 MANAGER_PUBLIC_IP 为准）
+    if manager_ip.strip():
+        upsert_setting("MANAGER_PUBLIC_IP", manager_ip.strip())
+    return JSONResponse({"ok": True, "msg": "✓ 已保存配置"})
+
+
+@app.get("/api/node_resources")
+def api_node_resources(cluster_id: int = 0, host: str = "", port: int = 0,
+                       user=Depends(auth_required)):
+    """返回某节点 MySQL 视角的资源指标（连接/缓冲池/数据量/QPS）。
+
+    说明：远程节点无 SSH/agent，OS 级 CPU/内存/磁盘使用率不可得，
+    故用 MySQL 可观测指标近似：连接数%、InnoDB 缓冲池使用%、数据量(字节)、QPS。
+    """
+    try:
+        creds = get_cluster_creds(cluster_id)
+        if not creds:
+            return _json_ok({"ok": False, "error": "集群不存在或无凭证"})
+        ru, rp = node_root(host, int(cluster_id))
+        conn = connect_robust(host, int(port), creds["ha_user"], creds["ha_pass"], ru, rp, timeout=3)
+        if conn is None:
+            return _json_ok({"ok": False, "error": "无法连接节点"})
+        try:
+            cur = conn.cursor()
+
+            def _val(sql):
+                try:
+                    cur.execute(sql)
+                    row = cur.fetchone()
+                    return row[1] if row else None
+                except Exception:
+                    return None
+
+            connections = _val("SHOW GLOBAL STATUS LIKE 'Threads_connected'")
+            max_conn = _val("SHOW VARIABLES LIKE 'max_connections'")
+            buf_data = _val("SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_bytes_data'")
+            buf_size = _val("SHOW VARIABLES LIKE 'innodb_buffer_pool_size'")
+            data_bytes = _val("SELECT SUM(DATA_LENGTH+INDEX_LENGTH) FROM information_schema.TABLES")
+            queries = _val("SHOW GLOBAL STATUS LIKE 'Queries'")
+            uptime = _val("SHOW GLOBAL STATUS LIKE 'Uptime'")
+            try:
+                conn_pct = round(int(connections) / int(max_conn) * 100, 1) if (connections and max_conn) else None
+            except Exception:
+                conn_pct = None
+            try:
+                buf_pct = round(int(buf_data) / int(buf_size) * 100, 1) if (buf_data and buf_size) else None
+            except Exception:
+                buf_pct = None
+            try:
+                qps = round(int(queries) / int(uptime), 1) if (queries and uptime) else None
+            except Exception:
+                qps = None
+            return _json_ok({
+                "ok": True,
+                "host": host, "port": int(port),
+                "connections": int(connections) if connections is not None else None,
+                "max_connections": int(max_conn) if max_conn is not None else None,
+                "conn_pct": conn_pct,
+                "buf_data": int(buf_data) if buf_data is not None else None,
+                "buf_size": int(buf_size) if buf_size is not None else None,
+                "buf_pct": buf_pct,
+                "data_bytes": int(data_bytes) if data_bytes else 0,
+                "qps": qps,
+            })
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/activity_feed")
+def api_activity_feed(limit: int = 12, user=Depends(auth_required)):
+    """聚合实时活动：故障切换(switch_history) + 操作审计(audit_log)，按时间倒序。"""
+    try:
+        events = []
+        for r in query(
+            "SELECT h.created_at, h.from_host, h.from_port, h.to_host, h.to_port, h.reason, "
+            "h.cluster_id, c.name AS cluster_name "
+            "FROM switch_history h LEFT JOIN clusters c ON c.id=h.cluster_id "
+            "ORDER BY h.created_at DESC LIMIT %s", (int(limit),)):
+            events.append({
+                "ts": r["created_at"], "type": "failover", "level": "warn",
+                "cluster_id": r["cluster_id"], "cluster_name": r["cluster_name"] or "—",
+                "text": "主库切换 " + (f"{r['from_host']}:{r['from_port']}" if r["from_host"] else "—")
+                        + f" → {r['to_host']}:{r['to_port']}（{r['reason'] or ''}）",
+            })
+        for a in query(
+            "SELECT actor, action, target, detail, cluster_id, created_at "
+            "FROM audit_log ORDER BY created_at DESC LIMIT %s", (int(limit),)):
+            events.append({
+                "ts": a["created_at"], "type": a["action"], "level": "info",
+                "cluster_id": a["cluster_id"], "cluster_name": "—",
+                "text": (f"{a['actor']} {a['action']} {a['target'] or ''} {a['detail'] or ''}").strip(),
+            })
+        events.sort(key=lambda e: (e["ts"] or ""), reverse=True)
+        return _json_ok({"ok": True, "events": events[:int(limit)]})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
 @app.post("/settings/test_email")
@@ -839,7 +970,241 @@ def clusters_page(request: Request, user=Depends(auth_required), msg: str = "", 
         active = clusters[0]
     creds = active.get("creds") if active else None
     return render("clusters.html", request, user=user, clusters=clusters,
-                  active=active, creds=creds, msg=msg, error=error)
+                  active=active, creds=creds, msg=msg, error=error,
+                  auto_failover=get_setting("AUTO_FAILOVER", "1") == "1",
+                  auto_repair=get_setting("AUTO_REPAIR", "1") == "1")
+
+
+@app.post("/api/setting_set")
+def api_setting_set(key: str = Form(...), value: str = Form(...),
+                    user=Depends(auth_required)):
+    """保存一个开关/配置项（如 AUTO_FAILOVER / AUTO_REPAIR）。"""
+    allowed = {"AUTO_FAILOVER", "AUTO_REPAIR", "ALERT_COOLDOWN_SEC",
+               "ALERT_MERGE", "ALERT_LAG_THRESHOLD", "ALERT_RECEIVERS"}
+    if key not in allowed:
+        return JSONResponse({"ok": False, "error": "不允许修改该项"})
+    upsert_setting(key, value)
+    audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                    "setting_set", key, value, None)
+    return JSONResponse({"ok": True, "msg": "已保存"})
+
+
+def _jsonable(v):
+    from datetime import datetime as _dt, date as _d, time as _t, timedelta as _td
+    from decimal import Decimal as _Dec
+    if isinstance(v, (bytes,)):
+        return v.decode("utf-8", "replace")
+    if isinstance(v, (_dt, _d, _t, _td)):
+        return v.isoformat()
+    if isinstance(v, _Dec):
+        return str(v)
+    return v
+_READONLY_RE = re.compile(r"^\s*(SELECT|SHOW|EXPLAIN|DESCRIBE|DESC|WITH|USE|HELP)\b", re.IGNORECASE)
+
+
+@app.post("/api/node_error_log")
+def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(...),
+                       limit: int = Form(500), user=Depends(auth_required)):
+    """读取节点 MySQL 错误日志（mysql.error_log）。尽力而为：用节点 root 连入，
+    查 @@log_error 路径，尝试 LOAD_FILE 读取最近 limit 行；无 FILE 权限则降级返回路径提示。"""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "端口无效"})
+    node = query("SELECT root_user, root_pass FROM nodes WHERE cluster_id=%s AND ip=%s AND port=%s",
+                 (cluster_id, host, port))
+    ru = (node[0]["root_user"] if node else "root") or "root"
+    rp = node[0]["root_pass"] if node else ""
+    try:
+        conn = connect(host, port, ru, rp, timeout=5)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "无法连接节点: " + str(e)})
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT @@log_error")
+        path = (cur.fetchone() or ("",))[0] or ""
+        lines = []
+        if path:
+            try:
+                cur.execute("SELECT LOAD_FILE(%s)", (path,))
+                blob = (cur.fetchone() or ("",))[0] or ""
+                if blob:
+                    lines = [l for l in blob.split("\n") if l.strip()]
+                    lines = lines[-int(limit):]
+            except Exception as e2:
+                return JSONResponse({"ok": False, "path": path,
+                                      "error": "读取错误日志失败(可能无 FILE 权限): " + str(e2)})
+        return JSONResponse({"ok": True, "path": path, "lines": lines})
+    finally:
+        conn.close()
+
+
+@app.post("/api/term")
+def api_term(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(...),
+             sql: str = Form(...), user=Depends(auth_required)):
+    """只读 SQL 终端：复用 ha_monitor 账号，仅允许 SELECT/SHOW/EXPLAIN/DESCRIBE/DESC/WITH/USE/HELP。"""
+    if not _READONLY_RE.match(sql or ""):
+        return JSONResponse({"ok": False,
+                              "error": "仅允许只读语句 (SELECT/SHOW/EXPLAIN/DESCRIBE/DESC/WITH/USE/HELP)"})
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "端口无效"})
+    creds = get_cluster_creds(cluster_id) or {}
+    ha_user = creds.get("ha_user")
+    ha_pass = creds.get("ha_pass")
+    if not ha_user:
+        return JSONResponse({"ok": False, "error": "集群缺少 ha_monitor 凭证"})
+    try:
+        conn = connect(host, port, ha_user, ha_pass, timeout=5)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "无法连接节点: " + str(e)})
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        if cur.description:
+            cols = [d[0] for d in cur.description]
+            rows = [[_jsonable(v) for v in r] for r in cur.fetchall()]
+            return JSONResponse({"ok": True, "cols": cols, "rows": rows, "count": len(rows)})
+        conn.commit()
+        return JSONResponse({"ok": True, "cols": [], "rows": [], "count": 0, "info": "执行成功（无结果集）"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+    finally:
+        conn.close()
+
+
+@app.get("/alerts")
+def alerts_page(request: Request, user=Depends(auth_required), msg: str = "", error: str = ""):
+    """告警设置：SMTP 状态、告警规则、收件人、当前告警集中管理。"""
+    cfg = dict(
+        smtp_host=get_setting("SMTP_HOST") or "",
+        smtp_port=get_setting("SMTP_PORT") or "",
+        smtp_user=get_setting("SMTP_USER") or "",
+    )
+    alert_emails = _load_alert_emails()
+    clusters = [{"id": c["id"], "name": c.get("name") or f"集群{c['id']}"} for c in list_clusters()]
+    rules = {
+        "cooldown": get_setting("ALERT_COOLDOWN_SEC", "300"),
+        "merge": get_setting("ALERT_MERGE", "1"),
+        "lag_threshold": get_setting("ALERT_LAG_THRESHOLD", "30"),
+        "receivers": get_setting("ALERT_RECEIVERS", ""),
+    }
+    return render("alerts.html", request, user=user, cfg=cfg, alert_emails=alert_emails,
+                  clusters=clusters, rules=rules, msg=msg, error=error)
+
+
+@app.get("/api/active_alerts")
+def api_active_alerts(user=Depends(auth_required)):
+    """聚合当前未恢复告警：探活失败(hosts.err)、配置漂移(config_drift)、复制延迟超阈值(metric_history)。"""
+    cname = {c["id"]: (c.get("name") or f"集群{c['id']}") for c in list_clusters()}
+
+    def enrich(a):
+        a["cluster_name"] = cname.get(a["cluster_id"], f"集群{a['cluster_id']}")
+        # 自愈状态覆盖层：若该节点近期有成功的自愈记录，标记为「已自愈」，否则「未恢复」
+        try:
+            hr = query("SELECT status, message FROM alerts WHERE cluster_id=%s AND host=%s AND port=%s "
+                       "ORDER BY id DESC LIMIT 1", (a["cluster_id"], a["host"], int(a["port"])))
+            if hr and hr[0]["status"] == "healed":
+                a["status"] = "healed"
+                a["heal_msg"] = hr[0]["message"]
+            else:
+                a["status"] = "open"
+        except Exception:
+            a["status"] = "open"
+        return a
+
+    alerts = []
+    for h in query("SELECT cluster_id, host, port, err FROM hosts WHERE err IS NOT NULL AND err <> ''"):
+        alerts.append(enrich({"cluster_id": h["cluster_id"], "host": h["host"], "port": h["port"],
+                       "type": "探活失败", "level": "error", "msg": h["err"], "heal": True}))
+    for d in query(
+        "SELECT d.cluster_id, d.host, d.port, d.var_name, d.expected, d.actual FROM config_drift d "
+        "INNER JOIN (SELECT cluster_id, host, var_name, MAX(id) AS mx FROM config_drift WHERE status='drift' "
+        "GROUP BY cluster_id, host, var_name) t ON t.mx=d.id WHERE d.status='drift'"):
+        alerts.append(enrich({"cluster_id": d["cluster_id"], "host": d["host"], "port": d["port"],
+                       "type": "配置漂移", "level": "warn",
+                       "msg": f"{d['var_name']} 期望 {d['expected']} 实际 {d['actual']}", "heal": False}))
+    lag = int(get_setting("ALERT_LAG_THRESHOLD", "30") or 30)
+    try:
+        for r in query(
+            "SELECT m.cluster_id, m.host, m.port, m.seconds_behind FROM metric_history m "
+            "INNER JOIN (SELECT cluster_id, host, port, MAX(id) AS mx FROM metric_history "
+            "GROUP BY cluster_id, host, port) t ON t.cluster_id=m.cluster_id AND t.host=m.host "
+            "AND t.port=m.port AND t.mx=m.id WHERE m.seconds_behind > %s", (lag,)):
+            alerts.append(enrich({"cluster_id": r["cluster_id"], "host": r["host"], "port": r["port"],
+                           "type": "复制延迟", "level": "warn",
+                           "msg": f"延迟 {r['seconds_behind']}s > 阈值 {lag}s", "heal": True}))
+    except Exception:
+        pass
+    # 严重(error)优先，其次按集群号
+    alerts.sort(key=lambda a: (0 if a["level"] == "error" else 1, a["cluster_id"]))
+    return JSONResponse({"ok": True, "alerts": alerts})
+
+
+@app.post("/api/alert_rules")
+def api_alert_rules(cooldown: str = Form(""), merge: str = Form(""),
+                    lag_threshold: str = Form(""), receivers: str = Form(""),
+                    user=Depends(auth_required)):
+    """保存告警规则（冷却/合并/延迟阈值/额外收件人）。"""
+    upsert_setting("ALERT_COOLDOWN_SEC", cooldown)
+    upsert_setting("ALERT_MERGE", merge)
+    upsert_setting("ALERT_LAG_THRESHOLD", lag_threshold)
+    upsert_setting("ALERT_RECEIVERS", receivers)
+    return JSONResponse({"ok": True, "msg": "✓ 已保存告警规则"})
+
+
+@app.post("/api/node_detail")
+def api_node_detail(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(...),
+                    user=Depends(auth_required)):
+    """单节点详情：实时连节点取运行时变量（server_id/datadir/gtid/read_only）
+    + 账号清单（节点级 root 本地密码 + 集群级 ha/repl/app）。供集群页「详情」抽屉使用。"""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "端口无效"})
+    node = query(
+        "SELECT root_user, root_pass FROM nodes WHERE cluster_id=%s AND ip=%s AND port=%s",
+        (cluster_id, host, port))
+    root_user = (node[0]["root_user"] if node else "root") or "root"
+    root_pass = node[0]["root_pass"] if node else ""
+    creds = {}
+    try:
+        creds = get_cluster_creds(cluster_id) or {}
+    except Exception:
+        creds = {}
+    out = {
+        "ok": True, "host": host, "port": port, "cluster_id": cluster_id,
+        "root_user": root_user, "root_pass": root_pass,
+        "ha_user": creds.get("ha_user"), "ha_pass": creds.get("ha_pass"),
+        "repl_user": creds.get("repl_user"), "repl_pass": creds.get("repl_pass"),
+        "app_user": creds.get("app_user"), "app_pass": creds.get("app_pass"),
+        "server_id": None, "datadir": None, "gtid_mode": None,
+        "read_only": None, "enforce_gtid_consistency": None,
+    }
+    try:
+        conn = connect(host, port, root_user, root_pass, timeout=5)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SHOW VARIABLES WHERE Variable_name IN "
+                    "('server_id','datadir','gtid_mode','read_only','enforce_gtid_consistency')")
+                for name, val in cur.fetchall():
+                    if name == "server_id":
+                        out["server_id"] = val
+                    elif name == "datadir":
+                        out["datadir"] = val
+                    elif name == "gtid_mode":
+                        out["gtid_mode"] = val
+                    elif name == "read_only":
+                        out["read_only"] = val
+                    elif name == "enforce_gtid_consistency":
+                        out["enforce_gtid_consistency"] = val
+        finally:
+            conn.close()
+    except Exception as e:
+        out["conn_error"] = f"{type(e).__name__}: {e}"
+    return JSONResponse(out)
 
 
 @app.post("/clusters")
@@ -1202,3 +1567,51 @@ def node_creds_sql(ip: str, user=Depends(auth_required)):
         return Response(content=sql, media_type="application/sql", headers=headers)
     except Exception as e:
         return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.get("/api/node_creds_sql")
+def api_node_creds_sql(cluster_id: int = 0, host: str = "", port: int = 0,
+                       download: int = 0, user=Depends(auth_required)):
+    """按 cluster_id+host+port 返回节点的 fix-node-creds.sql（查看或下载）。
+
+    复用与 /nodes/<ip>/creds_sql 相同的渲染逻辑，供集群节点详情抽屉中
+    「查看/下载自愈 SQL」按钮调用（抽屉只有 cluster_id+host+port，无独立 IP 入口）。
+    """
+    try:
+        row = query(
+            "SELECT n.root_user, n.root_pass, n.cluster_id FROM nodes n "
+            "WHERE n.cluster_id=%s AND n.ip=%s AND n.port=%s", (int(cluster_id), host, int(port)))
+        if not row:
+            return _json_ok({"ok": False, "error": f"未找到节点 {host}:{port}"})
+        n = row[0]
+        cid = int(n.get("cluster_id") or 0)
+        creds = get_cluster_creds(cid)
+        manager_ip = get_manager_public_ip()
+        manager_subnet = get_manager_docker_subnet_wildcard()
+        sql = render_fix_node_creds_sql(
+            creds.get("ha_user") or "ha_monitor", creds.get("ha_pass") or "",
+            creds.get("repl_user") or "replication", creds.get("repl_pass") or "",
+            n.get("root_user") or "root", n.get("root_pass") or "",
+            manager_ip,
+            manager_subnet,
+        )
+        if download:
+            headers = {"Content-Disposition": f'attachment; filename="fix-node-creds-{host}.sql"'}
+            return Response(content=sql, media_type="application/sql", headers=headers)
+        return _json_ok({"ok": True, "sql": sql})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/srv_log")
+def api_srv_log(svc: str = "ha_manager", user=Depends(auth_required)):
+    """读取服务端容器日志（默认最近 15 行），供前端「服务端容器日志」按需拉取，降低常驻压力。"""
+    try:
+        r = subprocess.run(["docker", "logs", "--tail", "15", svc],
+                           capture_output=True, text=True, timeout=8)
+        log = (r.stdout + r.stderr).strip()
+        return JSONResponse({"ok": True, "log": log or "(无输出)"})
+    except FileNotFoundError:
+        return JSONResponse({"ok": False, "msg": "未找到 docker 命令（请在管理器宿主机运行）"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})

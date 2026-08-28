@@ -119,10 +119,11 @@ def check_cluster(cluster_id):
             execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
                     "VALUES (%s,%s,%s,%s,%s,%s,%s)",
                     (cluster_id, snap["_ip"], snap["_port"], var, exp, str(actual), status))
-        # 3) read_only 与角色匹配
+        # 3) read_only 与角色匹配（SHOW VARIABLES 返回 ON/OFF，需归一化为 0/1 再比对）
         ro = snap.get("read_only")
         exp_ro = "0" if snap["_role"] == "master" else "1"
-        status = "OK" if str(ro) == exp_ro else "DRIFT"
+        ro_norm = "1" if str(ro).strip().upper() in ("ON", "1", "TRUE", "YES") else "0"
+        status = "OK" if ro_norm == exp_ro else "DRIFT"
         if status == "DRIFT":
             drift += 1
         execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "

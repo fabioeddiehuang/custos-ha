@@ -1,296 +1,415 @@
 {% extends "base.html" %}
-{% macro cred_row(label, name, value, is_pw=false) %}
-<div class="cred-row">
-  <span class="k">{{ label }}</span>
-  <div class="cred-ctl">
-    <input class="inp {{ 'pw' if is_pw else '' }}" type="{{ 'password' if is_pw else 'text' }}"
-           name="{{ name }}" value="{{ value or '' }}" placeholder="留空则不修改">
-    <button type="button" class="btn-ico" title="显示/隐藏" onclick="togglePw(this)">👁</button>
-    <button type="button" class="btn-ico" title="复制" onclick="copyWithFeedback(this)">⧉</button>
-  </div>
-</div>
-{% endmacro %}
 {% block title %}集群管理{% endblock %}
 {% block content %}
-<div class="page-head">
-  <h1>集群管理</h1>
-  <p class="muted">每个集群独立管理账号、复制账号与 VIP；切换与监控按集群隔离。</p>
+<style>
+  /* 新建集群表单（mockup modal 内） */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px}
+  .grid2 label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);font-weight:600}
+  .grid2 label input,.grid2 label select{font-weight:400}
+  .grid2 .full{grid-column:1/-1}
+  .form-foot{grid-column:1/-1;display:flex;justify-content:flex-end;gap:10px}
+  .hint{font-weight:400;font-size:11.5px;color:#94a3b8}
+  .term-sql{width:100%;height:90px;border:1px solid var(--border);border-radius:10px;padding:10px;font-family:var(--mono);font-size:13px;resize:vertical}
+  .term-table{border-collapse:collapse;width:100%;font-size:12px;margin-top:8px}
+  .term-table th,.term-table td{border:1px solid var(--border);padding:5px 8px;text-align:left;vertical-align:top}
+  .term-table th{background:#f8fafc}
+  .term-result{max-height:340px;overflow:auto}
+  .ok-note{color:#16a34a;padding:10px}
+  .err-cell{color:#b91c1c;font-size:13px}
+  .kv-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+  .kv-row .k{color:var(--muted)}
+  .kv-row .v{font-family:var(--mono);font-weight:600}
+  .cred-row2{padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:#fafbff;margin-top:8px}
+  .cr-label{font-size:12px;color:#7C2D52;font-weight:700;margin-bottom:4px}
+  .cr-line{font-size:13px;padding:2px 0;color:var(--text)}
+  .cr-line .pw{font-family:var(--mono);background:#f1f5f9;padding:1px 6px;border-radius:6px}
+  .btn-ico{background:none;border:none;cursor:pointer;font-size:15px;color:var(--muted)}
+  .btn-ico:hover{color:var(--primary)}
+</style>
+
+{% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
+{% if error %}<div class="banner err">⚠ {{ error }}</div>{% endif %}
+
+<div class="toolbar">
+  <button class="btn btn-primary" onclick="openCreate()">＋ 新增集群</button>
+  <select id="ctlCluster" class="mini-sel" style="width:auto" onchange="rebuildMenus()">
+    {% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+  </select>
+  <button class="btn" onclick="location.reload()">⟳ 刷新状态</button>
+  <div class="menu-wrap"><button class="btn" onclick="toggleMenu('switchMenu',event)">⇄ 手动切换主从 ▾</button>
+    <div class="menu" id="switchMenu"></div>
+  </div>
+  <span style="display:flex;align-items:center;gap:8px">自动切换<label class="switch"><input type="checkbox" id="swFailover" {% if auto_failover %}checked{% endif %} onchange="toggleAuto('AUTO_FAILOVER', this)"><span class="slider"></span></label></span>
+  <span style="display:flex;align-items:center;gap:8px">自动修复<label class="switch"><input type="checkbox" id="swRepair" {% if auto_repair %}checked{% endif %} onchange="toggleAuto('AUTO_REPAIR', this)"><span class="slider"></span></label></span>
+  <div class="menu-wrap"><button class="btn green" onclick="toggleMenu('fixMenu',event)">🛠 一键修复 ▾</button>
+    <div class="menu" id="fixMenu">
+      <a onclick="doRepair('heal_io')">修复复制延迟<span class="d">高延迟</span></a>
+      <a onclick="doRepair('heal_sql')">修复复制中断<span class="d">IO/SQL 报错</span></a>
+      <a onclick="doRepair('sync')">同步账号凭证<span class="d">支持自动</span></a>
+      <a onclick="doRepair('push')">重新下发配置<span class="d">支持自动</span></a>
+    </div>
+  </div>
+  <span class="spacer"></span><span class="badge ok">复制正常</span>
 </div>
 
-{% if msg %}<div class="banner ok">{{ msg }}</div>{% endif %}
-{% if error %}<div class="banner err">{{ error }}</div>{% endif %}
+<div class="banner info">自动化说明：开启「自动修复」后，账号凭证密码漂移与节点配置漂移由管理器在轮询中自动校正（复用 ensure_ha_creds / 配置下发），无需登录节点手动操作。一键修复用于立即触发。</div>
 
-<!-- 新建集群（默认收起） -->
-<div class="panel">
-  <button type="button" class="panel-toggle" onclick="togglePanel(this)">＋ 新建集群</button>
-  <div class="panel-body" style="display:none">
-    <form method="post" action="/clusters" class="grid-2">
-      <label>集群名称<input class="inp" name="name" placeholder="如 prod-bj" required></label>
-      <label>VIP 地址<input class="inp" name="vip" placeholder="192.168.1.10"></label>
-      <label>VIP 掩码位<input class="inp" name="vip_prefix" value="24" placeholder="24">
-        <span class="hint">keepalived 虚拟 IP 的子网掩码位（如 24）</span></label>
-      <label>网卡<input class="inp" name="interface" placeholder="eth0"></label>
-      <label>VRID<input class="inp" name="vrid" placeholder="51"></label>
-      <label>VIP 端口<input class="inp" name="vip_port" type="number" min="1" max="65535" value="3307"></label>
-      <label>节点类型（部署形态）
-        <select name="node_type">
-          <option value="docker" selected>Docker（默认，容器化 MySQL + keepalived）</option>
-          <option value="mariadb">MariaDB（裸机全量安装，脱离宝塔，独立数据库）</option>
-        </select>
-        <span class="hint">创建后该集群所有节点须为同一类型（禁止混部）</span>
-      </label>
-      <label>MySQL 版本（可选）
-        <input class="inp" name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=沿用旧语法）">
-        <span class="hint">同集群主版本须一致；影响复制 SQL 语法（8.0.22+/8.4 走新语法）</span>
-      </label>
-      <label>HA 监控账号<input class="inp" name="ha_user" placeholder="ha_monitor"></label>
-      <label>HA 监控密码<input class="inp pw" type="password" name="ha_pass" placeholder="留空则自动生成"></label>
-      <label>复制账号<input class="inp" name="repl_user" placeholder="replication"></label>
-      <label>复制密码<input class="inp pw" type="password" name="repl_pass" placeholder="留空则自动生成"></label>
-      <label>业务账号<input class="inp" name="app_user" placeholder="app"></label>
-      <label>业务密码<input class="inp pw" type="password" name="app_pass" placeholder="留空则自动生成"></label>
-      <div class="form-foot"><button class="btn" type="submit">创建集群</button></div>
-    </form>
+<div class="card">
+  <h3>节点状态</h3>
+  <table class="tbl">
+    <thead>
+      <tr><th>节点</th><th>角色</th><th>在线状态</th><th>复制</th><th>延迟</th><th>操作</th></tr>
+    </thead>
+    <tbody>
+      {% for c in clusters %}
+        {% for r in c.host_rows %}
+        <tr data-host="{{ r.host }}:{{ r.port }}" data-role="{{ 'master' if r.role == '主库' else 'slave' }}" data-cluster="{{ c.id }}">
+          <td class="mono">{{ r.host }}:{{ r.port }}</td>
+          <td><span class="role {{ 'role-master' if r.role == '主库' else 'role-slave' }}">{{ r.role }}</span></td>
+          <td>{% if r.status == 'up' %}<span class="badge up">在线</span>{% else %}<span class="badge down">离线</span>{% endif %}</td>
+          <td>{% if r.role == '主库' %}<span class="badge ok">正常</span>{% elif r.bad %}<span class="badge warn">异常</span>{% else %}<span class="badge ok">正常</span>{% endif %}</td>
+          <td>{{ r.slave_io }}/{{ r.slave_sql }}</td>
+          <td><button class="btn btn-sm" onclick="openNodeDetail({{ c.id }}, '{{ r.host }}', {{ r.port }})">详情</button></td>
+        </tr>
+        {% endfor %}
+      {% else %}
+        <tr><td colspan="6" style="color:#9ca3af;text-align:center;padding:24px;">暂无节点。请先在「＋ 新增集群」创建集群，再前往「节点管理」添加节点。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>最近 24 小时数据库日志</h3>
+  <div class="history-tabs">
+    <div class="tab active" onclick="switchLogTab(this,'err')">错误日志</div>
+    <div class="tab" onclick="switchLogTab(this,'slow')">慢日志</div>
+    <span style="flex:1"></span>
+    <select id="logCluster" class="mini-sel" onchange="loadCurrentLog()">
+      {% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+    </select>
+    <span class="badge sky" id="logSrc">来源：mysql.error_log</span>
+    <button class="btn btn-sm" onclick="exportLog()">导出</button>
+  </div>
+  <table class="tbl">
+    <thead><tr><th>时间</th><th>节点</th><th>级别</th><th>内容</th></tr></thead>
+    <tbody id="logBody"><tr><td colspan="4" style="color:#9ca3af;text-align:center;">点击上方标签加载…</td></tr></tbody>
+  </table>
+  <div class="note">错误日志读取 mysql.error_log 表（不使用 SSH）；慢日志读取 mysql.slow_log 表，默认近 24h，支持导出 CSV。</div>
+</div>
+
+<div class="toolbar" style="margin-top:4px">
+  <button class="btn btn-primary" onclick="openTerm()">▷ 数据库终端</button>
+  <span class="spacer"></span><span class="badge sky">终端复用 ha_monitor（只读）</span>
+</div>
+
+<!-- 新增集群 modal -->
+<div class="overlay" id="createOverlay" onclick="if(event.target===this)closeCreate()">
+  <div class="modal">
+    <header><b>＋ 新增集群</b><span class="close" onclick="closeCreate()">×</span></header>
+    <div class="body">
+      <form method="post" action="/clusters" class="grid2">
+        <label>集群名称<input name="name" placeholder="如 prod-bj" required></label>
+        <label>VIP 地址<input name="vip" placeholder="192.168.1.10"></label>
+        <label>VIP 掩码位<input name="vip_prefix" value="24" placeholder="24"><span class="hint">keepalived 虚拟 IP 的子网掩码位</span></label>
+        <label>网卡<input name="interface" placeholder="eth0"></label>
+        <label>VRID<input name="vrid" placeholder="51"></label>
+        <label>VIP 端口<input name="vip_port" type="number" min="1" max="65535" value="3307"></label>
+        <label>节点类型（部署形态）
+          <select name="node_type">
+            <option value="docker" selected>Docker（容器化 MySQL + keepalived）</option>
+            <option value="mariadb">MariaDB（裸机全量安装，脱离宝塔）</option>
+          </select>
+          <span class="hint">创建后该集群所有节点须为同一类型（禁止混部）</span>
+        </label>
+        <label>MySQL 版本（可选）<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0"></label>
+        <label>HA 监控账号<input name="ha_user" placeholder="ha_monitor"></label>
+        <label>HA 监控密码<input class="pw" type="password" name="ha_pass" placeholder="留空则自动生成"></label>
+        <label>复制账号<input name="repl_user" placeholder="replication"></label>
+        <label>复制密码<input class="pw" type="password" name="repl_pass" placeholder="留空则自动生成"></label>
+        <label>业务账号<input name="app_user" placeholder="app"></label>
+        <label>业务密码<input class="pw" type="password" name="app_pass" placeholder="留空则自动生成"></label>
+        <div class="form-foot">
+          <button type="button" class="btn" onclick="closeCreate()">取消</button>
+          <button type="submit" class="btn btn-primary">创建集群</button>
+        </div>
+      </form>
+    </div>
   </div>
 </div>
 
-<!-- 已有集群（默认收起） -->
-<div class="panel">
-  <button type="button" class="panel-toggle" onclick="togglePanel(this)">▾ 已有集群（{{ clusters|length }}）</button>
-  <div class="panel-body cluster-grid" style="display:none">
-    {% for c in clusters %}
-    {% set cr = c.creds or {} %}
-    <div class="card cluster-card cc-theme-{{ loop.index0 % 6 }} {{ 'ok' if c.online == c.node_count else 'issue' }}" id="card{{ c.id }}">
-      <div class="cc-top">
-        <div class="cc-id">
-          <span class="cc-ico" title="集群" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <ellipse cx="12" cy="5" rx="8" ry="3"/>
-              <path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/>
-              <path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/>
-            </svg>
-          </span>
-          <div class="cc-id-text">
-            <div class="cluster-name">{{ c.name }}</div>
-            <div class="cc-sub">集群 #{{ c.id }}</div>
-          </div>
-        </div>
-        <div class="cluster-actions head-actions">
-          <span class="status-pill {{ 'green' if c.online == c.node_count else 'amber' }}">{{ '运行正常' if c.online == c.node_count else '存在异常' }}</span>
-          <button type="button" class="btn btn-sm" onclick="toggleEdit('edit{{ c.id }}', this)">编辑</button>
-        </div>
+<!-- 节点详情 drawer -->
+<div class="drawer" id="nodeDrawer">
+  <header><b id="dHost">节点详情</b><span class="close" onclick="closeDrawer()">×</span></header>
+  <div class="body" id="dBody"><div class="obs-empty">加载中…</div></div>
+</div>
+
+<!-- 数据库终端 modal -->
+<div class="overlay" id="termOverlay" onclick="if(event.target===this)closeTerm()">
+  <div class="modal">
+    <header><b>数据库终端</b><span class="badge sky" style="margin-left:auto">账号 ha_monitor（只读）</span><span class="close" onclick="closeTerm()">×</span></header>
+    <div class="body">
+      <div class="toolbar">
+        <select id="termCluster" class="mini-sel" style="width:auto" onchange="fillTermNodes()">
+          {% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+        </select>
+        <select id="termNode" style="width:220px"></select>
       </div>
-      <div class="cc-body">
-        <ul class="info-grid">
-          <li class="info-item tier-vip">
-            <span class="ii-ico" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="10"/>
-                <line x1="2" y1="12" x2="22" y2="12"/>
-                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-              </svg>
-            </span>
-            <div class="ii-text">
-              <span class="il">VIP</span>
-              <span class="vip-badge">{{ c.vip or '—' }}:{{ c.vip_port or 3307 }}</span>
-            </div>
-          </li>
-          <li class="info-item tier-node">
-            <span class="ii-ico" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect width="20" height="8" x="2" y="2" rx="2"/>
-                <rect width="20" height="8" x="2" y="14" rx="2"/>
-                <line x1="6" x2="6.01" y1="6" y2="6"/>
-                <line x1="6" x2="6.01" y1="18" y2="18"/>
-              </svg>
-            </span>
-            <div class="ii-text">
-              <span class="il">节点数</span>
-              <span class="info-num">{{ c.node_count }}</span>
-            </div>
-          </li>
-          <li class="info-item tier-online">
-            <span class="ii-ico" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-              </svg>
-            </span>
-            <div class="ii-text">
-              <span class="il">在线</span>
-              <span class="online-badge {{ 'up' if c.online == c.node_count else 'warn' }}">
-                <span class="dot-mini {{ 'green' if c.online == c.node_count else 'red' }}"></span>
-                {{ c.online }}/{{ c.node_count }}
-              </span>
-            </div>
-          </li>
-          <li class="info-item full tier-master">
-            <span class="ii-ico" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
-                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
-              </svg>
-            </span>
-            <div class="ii-text">
-              <span class="il">当前主库</span>
-              <span class="role-badge master">{{ c.current_master }}</span>
-            </div>
-          </li>
-          <li class="info-item full tier-slave">
-            <span class="ii-ico" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="18" cy="5" r="3"/>
-                <circle cx="6" cy="12" r="3"/>
-                <circle cx="18" cy="19" r="3"/>
-                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
-                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
-              </svg>
-            </span>
-            <div class="ii-text">
-              <span class="il">当前从库</span>
-              <span class="role-badge slave">{{ c.slaves|join('、 ') or '—' }}</span>
-            </div>
-          </li>
-        </ul>
-      </div>
-      {% if c.has_issue %}
-      <div class="cluster-anomaly">
-        <button type="button" class="anomaly-toggle" onclick="toggleAnomaly('anom{{ c.id }}', this)">
-          ⚠ 展开异常详情 / 复制日志排错
-        </button>
-        <div id="anom{{ c.id }}" class="anomaly-body" style="display:none">
-          <div class="anomaly-bar">
-            <span class="muted">以下节点存在异常，可复制后提交排错：</span>
-            <button class="btn btn-sm btn-ghost" type="button" onclick="copyAnomaly('anom{{ c.id }}', '{{ c.name }}')">复制异常</button>
-          </div>
-          <div class="anom-scroll">
-            <table class="anom-table">
-              <thead><tr><th>节点</th><th>角色</th><th>状态</th><th>IO</th><th>SQL</th><th>错误</th></tr></thead>
-              <tbody>
-              {% for r in c.host_rows if r.bad %}
-                <tr class="bad-row">
-                  <td class="mono">{{ r.host }}:{{ r.port }}</td>
-                  <td>{{ r.role }}</td>
-                  <td>{{ '在线' if r.status == 'up' else '离线' }}</td>
-                  <td>{{ r.slave_io }}</td>
-                  <td>{{ r.slave_sql }}</td>
-                  <td class="err-cell">{{ r.err or '—' }}</td>
-                </tr>
-              {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-      {% endif %}
-      <div id="edit{{ c.id }}" class="edit-body" style="display:none">
-        <form method="post" action="/clusters/{{ c.id }}" class="cluster-form">
-          <div class="form-grid2">
-            <label>VIP 地址<input class="inp" name="vip" value="{{ c.vip or '' }}"></label>
-            <label>VIP 掩码位<input class="inp" name="vip_prefix" value="{{ c.vip_prefix or '24' }}" placeholder="24"></label>
-            <label>网卡<input class="inp" name="interface" value="{{ c.interface or '' }}"></label>
-            <label>VRID<input class="inp" name="vrid" value="{{ c.vrid or '' }}"></label>
-            <label>VIP 端口<input class="inp" name="vip_port" type="number" min="1" max="65535" value="{{ c.vip_port or 3307 }}"></label>
-            <label>节点类型
-              <select name="node_type">
-                <option value="docker" {% if (c.node_type or 'docker') == 'docker' %}selected{% endif %}>Docker</option>
-                <option value="mariadb" {% if c.node_type == 'mariadb' %}selected{% endif %}>MariaDB</option>
-              </select>
-            </label>
-            <label>MySQL 版本
-              <input class="inp" name="mysql_version" value="{{ c.mysql_version or '' }}" placeholder="如 8.0.36 / 8.4.0（留空=沿用旧语法）">
-            </label>
-          </div>
-          <div class="cred-head">
-            <span>访问凭证</span>
-            <button type="button" class="btn btn-sm" onclick="toggleAllPw(this)">显示全部密码</button>
-          </div>
-          {{ cred_row("HA 监控账号", "ha_user", cr.ha_user) }}
-          {{ cred_row("HA 监控密码", "ha_pass", cr.ha_pass, true) }}
-          {{ cred_row("复制账号", "repl_user", cr.repl_user) }}
-          {{ cred_row("复制密码", "repl_pass", cr.repl_pass, true) }}
-          {{ cred_row("业务账号", "app_user", cr.app_user) }}
-          {{ cred_row("业务密码", "app_pass", cr.app_pass, true) }}
-          <div class="edit-actions">
-            <button class="btn" type="submit">保存修改</button>
-            <button type="button" class="btn btn-ghost" onclick="delCluster({{ c.id }})">删除集群</button>
-            <button type="button" class="btn btn-ghost" onclick="syncCreds({{ c.id }})">同步密码到节点</button>
-            <a class="btn btn-ghost" href="/nodes?cluster_id={{ c.id }}">节点部署 →</a>
-          </div>
-        </form>
-      </div>
+      <textarea id="termSql" class="term-sql" placeholder="输入只读 SQL，如 SELECT * FROM ..."></textarea>
+      <div style="margin:8px 0"><button class="btn btn-sm btn-primary" onclick="runTerm()">执行</button></div>
+      <div id="termResult" class="term-result"></div>
+      <div class="note">终端内直接输入 SQL，回车执行；默认仅允许 SELECT 类只读语句，执行记录写入审计日志。</div>
     </div>
-    {% endfor %}
+    <footer><button class="btn" onclick="closeTerm()">关闭</button></footer>
   </div>
 </div>
 
 <script>
-  function togglePanel(btn) {
-    var body = btn.nextElementSibling;
-    var open = body.style.display !== "none";
-    body.style.display = open ? "none" : "block";
-    btn.classList.toggle("open", !open);
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+  function escAttr(s){return String(s==null?"":s).replace(/"/g,"&quot;");}
+  function toast(msg,kind){
+    var t=document.getElementById("toastBox");
+    if(!t){t=document.createElement("div");t.id="toastBox";t.style.cssText="position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:2000;display:flex;flex-direction:column;gap:8px";document.body.appendChild(t);}
+    var el=document.createElement("div");
+    el.textContent=msg;
+    el.style.cssText="background:"+(kind==="err"?"#ef4444":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
+    t.appendChild(el);setTimeout(function(){el.remove();},2600);
   }
-  function toggleEdit(id, btn) {
-    var el = document.getElementById(id);
-    var open = el.style.display !== "none";
-    el.style.display = open ? "none" : "block";
-    btn.textContent = open ? "编辑" : "收起";
+  function apiPost(url,body,cb){
+    fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams(body)})
+      .then(function(r){return r.json();}).then(cb)
+      .catch(function(e){toast("请求失败: "+e,"err");});
   }
-  function toggleAllPw(btn) {
-    var form = btn.closest("form");
-    var show = btn.dataset.show !== "1";
-    form.querySelectorAll("input.pw").forEach(function (i) { i.type = show ? "text" : "password"; });
-    btn.dataset.show = show ? "1" : "0";
-    btn.textContent = show ? "隐藏全部密码" : "显示全部密码";
-  }
-  function apiPost(url, body, cb) {
-    fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams(body) })
-      .then(function (r) { return r.json(); })
-      .then(cb)
-      .catch(function (e) { toast("请求失败: " + e, "err"); });
-  }
-  function delCluster(id) {
-    if (!confirm("确认删除该集群及其所有节点？此操作不可恢复。")) return;
-    apiPost("/clusters/" + id + "/delete", {}, function (d) {
-      toast(d.msg || (d.ok ? "已删除" : "删除失败"), d.ok ? "ok" : "err");
-      if (d.ok) { var card = document.getElementById("card" + id); if (card) card.remove(); }
+  function toggleMenu(id,e){e.stopPropagation();var m=document.getElementById(id);m.classList.toggle("show");}
+  document.addEventListener("click",function(){document.querySelectorAll(".menu").forEach(function(m){m.classList.remove("show");});});
+
+  // ---- 新增集群 ----
+  function openCreate(){document.getElementById("createOverlay").classList.add("show");}
+  function closeCreate(){document.getElementById("createOverlay").classList.remove("show");}
+
+  // ---- 手动切换主从 ----
+  function curCid(){return document.getElementById("ctlCluster").value;}
+  function clusterRows(){
+    var cid=curCid();
+    return Array.prototype.filter.call(document.querySelectorAll('.tbl tbody tr[data-host]'),function(r){
+      return r.getAttribute("data-cluster")===cid;
     });
   }
-  function syncCreds(id) {
-    apiPost("/clusters/" + id + "/sync", {}, function (d) {
-      toast(d.msg || (d.ok ? "已同步" : "同步失败"), d.ok ? "ok" : "err");
+  function rebuildMenus(){
+    var m=document.getElementById("switchMenu");
+    if(!m)return;
+    var rows=clusterRows();
+    var items=[];
+    rows.forEach(function(r){
+      var host=r.getAttribute("data-host");
+      var role=r.getAttribute("data-role");
+      if(role==="slave") items.push('<a onclick="doManualSwitch(\''+host+'\')">提升 '+esc(host)+' 为主<span class="d">当前为从</span></a>');
+      else items.push('<a onclick="alert(\''+esc(host)+' 已是当前主库\')">保持 '+esc(host)+' 为主<span class="d">当前为主</span></a>');
+    });
+    m.innerHTML=items.join("")||'<a style="color:#9ca3af;cursor:default">暂无节点</a>';
+  }
+  function doManualSwitch(hp){
+    var p=hp.split(":");
+    apiPost("/api/failover/to",{host:p[0],port:p[1],cluster_id:curCid()},function(d){
+      toast(d.msg||(d.ok?"已切换为主":"切换失败"),d.ok?"ok":"err");
+      if(d.ok)setTimeout(function(){location.reload();},1200);
     });
   }
-  function toggleAnomaly(id, btn) {
-    var el = document.getElementById(id);
-    var open = el.style.display !== "none";
-    el.style.display = open ? "none" : "block";
-    btn.classList.toggle("open", !open);
-  }
-  function copyAnomaly(id, clusterName) {
-    var el = document.getElementById(id);
-    if (!el) return;
-    var lines = ["集群: " + (clusterName || ""), "时间: " + new Date().toLocaleString()];
-    el.querySelectorAll("table.anom-table tr").forEach(function (tr) {
-      var cells = Array.prototype.map.call(tr.querySelectorAll("th,td"),
-        function (c) { return c.textContent.trim(); });
-      lines.push(cells.join(" | "));
+
+  // ---- 自动切换/修复开关 ----
+  function toggleAuto(key,el){
+    apiPost("/api/setting_set",{key:key,value:el.checked?"1":"0"},function(d){
+      toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");
     });
-    var text = lines.join("\n");
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(function () {
-        toast("异常日志已复制", "ok");
-      }, function () { fallbackCopy(text); });
-    } else {
-      fallbackCopy(text);
+  }
+
+  // ---- 一键修复 ----
+  function doRepair(act){
+    var cid=curCid();
+    if(act==="sync"){apiPost("/clusters/"+cid+"/sync",{},function(d){toast(d.msg||(d.ok?"已同步凭证":"同步失败"),d.ok?"ok":"err");});return;}
+    if(act==="push"){toast("下发配置：请在目标节点执行 docker compose -f /opt/mysql/compose.yml up -d 重新加载 keepalived","ok");return;}
+    var rows=Array.prototype.filter.call(document.querySelectorAll('.tbl tbody tr[data-host][data-role="slave"]'),function(r){
+      return r.getAttribute("data-cluster")===cid;
+    });
+    var n=0;
+    rows.forEach(function(r){
+      var hp=r.getAttribute("data-host").split(":");
+      (function(host,port){apiPost("/api/heal",{host:host,port:port,cluster_id:cid},function(d){toast(host+":"+port+" "+(d.msg||(d.ok?"已修复":"失败")),d.ok?"ok":"err");});})(hp[0],hp[1]);
+      n++;
+    });
+    if(n===0)toast("该集群无可用从库","err");
+  }
+
+  // ---- 节点详情 drawer ----
+  function openNodeDetail(cid,host,port){
+    var d=document.getElementById("nodeDrawer");
+    document.getElementById("dHost").textContent="节点详情 · "+host+":"+port;
+    document.getElementById("dBody").innerHTML='<div class="obs-empty">加载中…</div>';
+    d.classList.add("show");
+    fetch("/api/node_detail",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:new URLSearchParams({cluster_id:cid,host:host,port:port})})
+      .then(function(r){return r.json();})
+      .then(function(d){renderNodeDetail(d,cid);})
+      .catch(function(e){document.getElementById("dBody").innerHTML='<div class="err-cell">请求失败: '+esc(e)+'</div>';});
+  }
+  function closeDrawer(){document.getElementById("nodeDrawer").classList.remove("show");}
+  function credBlock(label,user,pw){
+    if(!user&&!pw)return "";
+    return '<div class="cred-row2"><div class="cr-label">'+esc(label)+'</div>'
+      +'<div class="cr-line">用户 <b>'+esc(user||"—")+'</b></div>'
+      +'<div class="cr-line">密码 <span class="pw">'+esc(pw||"—")+'</span>'
+      +' <button class="btn-ico" type="button" data-copy="'+escAttr(pw||"")+'" onclick="copyAttr(this)">⧉</button></div></div>';
+  }
+  function copyAttr(b){
+    var t=b.getAttribute("data-copy");
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){toast("已复制","ok");},function(){toast("复制失败","err");});}
+  }
+  function chip(t,c){return '<span class="badge '+c+'">'+esc(t)+'</span>';}
+  function renderNodeDetail(d,cid){
+    var body=document.getElementById("dBody");
+    if(!d.ok){body.innerHTML='<div class="err-cell">'+esc(d.error||"加载失败")+'</div>';return;}
+    var ro=(d.read_only==="ON"||d.read_only==="1"||d.read_only===true);
+    var gm=(d.gtid_mode==="ON");
+    var html="";
+    if(d.conn_error)html+='<div class="banner err">无法连接节点：'+esc(d.conn_error)+'</div>';
+    html+='<div class="kv-row"><span class="k">server_id</span><span class="v">'+esc(d.server_id||"—")+'</span></div>';
+    html+='<div class="kv-row"><span class="k">数据目录</span><span class="v">'+esc(d.datadir||"—")+'</span></div>';
+    html+='<div class="kv-row"><span class="k">GTID 模式</span>'+chip(gm?"ON":"OFF",gm?"ok":"down")+'</div>';
+    html+='<div class="kv-row"><span class="k">read_only</span>'+chip(d.read_only||"—",ro?"warn":"ok")+'</div>';
+    html+='<div class="kv-row"><span class="k">enforce_gtid_consistency</span><span class="v">'+esc(d.enforce_gtid_consistency||"—")+'</span></div>';
+    html+='<div class="sub">数据库账号<span class="dd-note"> 仅管理员可见</span></div>';
+    html+=credBlock("节点 root（本地独立密码）",d.root_user,d.root_pass);
+    html+=credBlock("HA 监控账号",d.ha_user,d.ha_pass);
+    html+=credBlock("复制账号",d.repl_user,d.repl_pass);
+    html+=credBlock("业务账号",d.app_user,d.app_pass);
+    html+='<div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;">'
+      +'<button class="btn btn-sm" onclick="showSelfhealSql('+cid+",'"+d.host+"',"+d.port+')">查看自愈 SQL</button>'
+      +'<a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+"&host="+encodeURIComponent(d.host)+"&port="+d.port+'&download=1" download="fix-node-creds.sql">下载修复 SQL</a>'
+      +'</div>';
+    body.innerHTML=html;
+  }
+  function showSelfhealSql(cid,host,port){
+    var existing=document.getElementById("sqlModal");
+    if(existing)existing.parentNode.removeChild(existing);
+    var box=document.createElement("div");
+    box.id="sqlModal";
+    box.style.cssText="position:fixed;inset:0;background:rgba(15,23,42,.5);z-index:200;display:flex;align-items:center;justify-content:center;";
+    box.innerHTML='<div style="background:#fff;width:min(720px,92vw);max-height:84vh;overflow:auto;border-radius:14px;padding:16px 18px;box-shadow:0 20px 60px rgba(0,0,0,.25);">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+      +'<h3 style="margin:0;">节点自愈 / 修复 SQL</h3>'
+      +'<button class="btn btn-sm" onclick="closeSqlModal()">✕</button></div>'
+      +'<pre id="sqlModalBody" style="white-space:pre-wrap;max-height:58vh;overflow:auto;background:#0f172a;color:#e2e8f0;padding:14px;border-radius:10px;font-size:12.5px;margin:0;"></pre>'
+      +'<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end;">'
+      +'<button class="btn btn-sm" onclick="copySql()">复制</button>'
+      +'<a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+'&host='+encodeURIComponent(host)+'&port='+port+'&download=1" download="fix-node-creds.sql">下载</a>'
+      +'</div></div>';
+    box.onclick=function(e){if(e.target===box)closeSqlModal();};
+    document.body.appendChild(box);
+    var pre=box.querySelector("#sqlModalBody");
+    pre.textContent="加载中…";
+    fetch("/api/node_creds_sql?cluster_id="+cid+"&host="+encodeURIComponent(host)+"&port="+port)
+      .then(function(r){return r.json();}).then(function(d){
+        pre.textContent=d.ok?(d.sql||"(无内容)"):("加载失败: "+(d.error||""));
+      }).catch(function(e){pre.textContent="请求失败: "+e;});
+  }
+  function closeSqlModal(){var m=document.getElementById("sqlModal");if(m)m.parentNode.removeChild(m);}
+  function copySql(){var t=document.getElementById("sqlModalBody");if(t&&navigator.clipboard)navigator.clipboard.writeText(t.textContent);}
+
+  // ---- 最近 24h 日志 ----
+  var _logTab="err";
+  function masterOfCluster(cid){
+    // 通过页面内嵌的 current_master 数据映射
+    return window._cmMap ? (window._cmMap[cid]||null) : null;
+  }
+  function switchLogTab(el,kind){
+    document.querySelectorAll(".history-tabs .tab").forEach(function(t){t.classList.remove("active");});
+    el.classList.add("active");
+    _logTab=kind;
+    var src=document.getElementById("logSrc");
+    src.textContent=kind==="slow"?"来源：mysql.slow_log":"来源：mysql.error_log";
+    loadCurrentLog();
+  }
+  function loadCurrentLog(){
+    var cid=document.getElementById("logCluster").value;
+    var cm=masterOfCluster(cid);
+    var body=document.getElementById("logBody");
+    body.innerHTML='<tr><td colspan="4" style="color:#9ca3af;text-align:center;">加载中…</td></tr>';
+    if(!cm){body.innerHTML='<tr><td colspan="4" style="color:#9ca3af;text-align:center;">该集群无主库，无法读取日志</td></tr>';return;}
+    var p=cm.split(":");
+    if(_logTab==="slow"){
+      fetch("/api/slow_log?cluster_id="+cid+"&host="+encodeURIComponent(p[0])+"&port="+p[1]+"&limit=200")
+        .then(function(r){return r.json();}).then(function(d){
+          var rows=(d.rows||[]).slice(0,50);
+          if(!rows.length){body.innerHTML='<tr><td colspan="4" style="color:#9ca3af;text-align:center;">慢日志为空（采集可能未开启）</td></tr>';return;}
+          body.innerHTML=rows.map(function(r){
+            return '<tr><td>'+(r.ts||"—")+'</td><td class="mono">'+esc(cm)+'</td>'
+              +'<td><span class="badge sky">Slow</span></td>'
+              +'<td style="white-space:normal;word-break:break-word;">'+esc((r.sql_text||"").slice(0,300))+'</td></tr>';
+          }).join("");
+        }).catch(function(e){body.innerHTML='<tr><td colspan="4" style="color:#b91c1c;">请求失败：'+esc(e)+'</td></tr>';});
+    }else{
+      apiPost("/api/node_error_log",{cluster_id:cid,host:p[0],port:p[1],limit:100},function(d){
+        if(!d.ok){body.innerHTML='<tr><td colspan="4" style="color:#b91c1c;">'+(d.path?"路径: "+esc(d.path)+"<br>":"")+esc(d.error||"加载失败")+'</td></tr>';return;}
+        var lines=(d.lines||[]).slice(-50);
+        if(!lines.length){body.innerHTML='<tr><td colspan="4" style="color:#9ca3af;text-align:center;">错误日志为空</td></tr>';return;}
+        body.innerHTML=lines.map(function(l){
+          var level=/error|aborted|GLIBCXX/i.test(l)?"down":(/warn/i.test(l)?"warn":"sky");
+          return '<tr><td>'+esc(l.slice(0,19))+'</td><td class="mono">'+esc(cm)+'</td>'
+            +'<td><span class="badge '+level+'">'+(level==="down"?"Error":(level==="warn"?"Warn":"Info"))+'</span></td>'
+            +'<td style="white-space:normal;word-break:break-word;">'+esc(l.slice(19))+'</td></tr>';
+        }).join("");
+      });
     }
   }
-  function fallbackCopy(text) {
-    var ta = document.createElement("textarea");
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    try { document.execCommand("copy"); toast("异常日志已复制", "ok"); }
-    catch (e) { toast("复制失败，请手动选择", "err"); }
-    document.body.removeChild(ta);
+  function exportLog(){
+    var body=document.getElementById("logBody");
+    var txt=Array.prototype.map.call(body.querySelectorAll("tr"),function(tr){
+      return Array.prototype.map.call(tr.querySelectorAll("td"),function(td){return td.textContent.trim();}).join(",");
+    }).join("\n");
+    var blob=new Blob([txt],{type:"text/csv;charset=utf-8"});
+    var a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download="cluster_"+curCid()+"_"+_logTab+".csv";
+    a.click();
+    URL.revokeObjectURL(a.href);
   }
+
+  // ---- 数据库终端 ----
+  function fillTermNodes(){
+    var sel=document.getElementById("termNode");
+    sel.innerHTML="";
+    document.querySelectorAll('.tbl tbody tr[data-host]').forEach(function(r){
+      var o=document.createElement("option");
+      o.value=r.getAttribute("data-host");
+      o.textContent=r.getAttribute("data-host")+(r.getAttribute("data-role")==="master"?"（主）":"（从）");
+      sel.appendChild(o);
+    });
+    if(!sel.options.length){var o=document.createElement("option");o.value="";o.textContent="无节点";sel.appendChild(o);}
+  }
+  function openTerm(){document.getElementById("termOverlay").classList.add("show");fillTermNodes();}
+  function closeTerm(){document.getElementById("termOverlay").classList.remove("show");}
+  function runTerm(){
+    var cid=document.getElementById("termCluster").value;
+    var hp=document.getElementById("termNode").value.split(":");
+    var sql=document.getElementById("termSql").value;
+    if(!sql.trim()){toast("请输入 SQL","err");return;}
+    var box=document.getElementById("termResult");
+    box.innerHTML='<div class="obs-empty">执行中…</div>';
+    apiPost("/api/term",{cluster_id:cid,host:hp[0],port:hp[1],sql:sql},function(d){
+      if(!d.ok){box.innerHTML='<div class="err-cell">'+esc(d.error||"执行失败")+'</div>';return;}
+      if(!d.cols||!d.cols.length){box.innerHTML='<div class="ok-note">'+(d.info||"执行成功（无结果集）")+'</div>';return;}
+      var h="<table class='term-table'><thead><tr>"+d.cols.map(function(c){return "<th>"+esc(c)+"</th>";}).join("")+"</tr></thead><tbody>";
+      h+=d.rows.map(function(r){return "<tr>"+r.map(function(v){return "<td>"+esc(v)+"</td>";}).join("")+"</tr>";}).join("");
+      h+="</tbody></table><div class='note'>"+d.count+" 行</div>";
+      box.innerHTML=h;
+    });
+  }
+
+  // 当前主库映射（日志读取用）
+  window._cmMap = {};
+  {% for c in clusters %}{% if c.current_master and c.current_master != "未选举" %}window._cmMap[{{ c.id }}] = "{{ c.current_master }}";{% endif %}{% endfor %}
+
+  rebuildMenus();
+  if(document.getElementById("logCluster") && document.getElementById("logCluster").value) loadCurrentLog();
 </script>
 {% endblock %}

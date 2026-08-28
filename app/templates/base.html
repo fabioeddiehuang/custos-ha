@@ -3,114 +3,102 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}MySQL HA 管理器{% endblock %}</title>
+  <title>{% block title %}MySQL 高可用管理平台{% endblock %}</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/v3.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="topbar-inner">
-      <a class="brand" href="/">
-        <span class="logo">◈</span><span class="brand-text">MySQL HA 管理器</span>
-      </a>
-      <nav class="nav">
-        <a href="/" class="{% if request.url.path == '/' %}active{% endif %}">仪表盘</a>
-        <a href="/nodes"{% if request.url.path.startswith('/nodes') %} class="active"{% endif %}>节点配置</a>
-        <a href="/clusters"{% if request.url.path.startswith('/clusters') %} class="active"{% endif %}>集群管理</a>
-        <a href="/settings"{% if request.url.path.startswith('/settings') %} class="active"{% endif %}>系统配置</a>
-        <a href="/audit"{% if request.url.path.startswith('/audit') %} class="active"{% endif %}>审计日志</a>
-        <a href="/logout" class="nav-logout">退出</a>
-      </nav>
+<div class="app">
+  <!-- 左菜单（v3 · 浅色紫调） -->
+  <aside class="sidebar">
+    <div class="brand"><span class="logo">◈</span><div><b>MySQL HA</b><small>高可用管理平台</small></div></div>
+    <nav class="side">
+      <a class="nav1" href="/" data-path="/"><span class="ic">◧</span>仪表盘</a>
+      <div class="nav-group" id="navClusterGroup">
+        <a class="nav1" href="/clusters" data-path="/clusters"><span class="ic">▦</span>集群管理<span class="caret" onclick="toggleCluster(event)">▶</span></a>
+        <div class="sub" id="clusterSub"><!-- 由 /api/status 动态填充 --></div>
+      </div>
+      <a class="nav1" href="/nodes" data-path="/nodes"><span class="ic">⛁</span>节点管理</a>
+      <a class="nav1" href="/alerts" data-path="/alerts"><span class="ic">✦</span>告警设置</a>
+      <a class="nav1" href="/settings" data-path="/settings"><span class="ic">⚙</span>系统设置</a>
+    </nav>
+    <div class="side-foot">
+      <span class="ver">v2.1.0</span>
+      <span class="be"><span class="be-dot" id="beDot"></span><span id="beTxt">后端连接中…</span></span>
+      <a class="logout" href="/logout">退出登录</a>
     </div>
-  </header>
+  </aside>
 
-  <main class="container">
-    {% if msg %}<div class="banner ok">✓ <div>{{ msg }}</div></div>{% endif %}
-    {% if error %}<div class="banner err">⚠ <div>{{ error }}</div></div>{% endif %}
-    {% block content %}{% endblock %}
-  </main>
+  <div class="main">
+    <div class="topbar">
+      <h1 id="pageTitle">仪表盘</h1>
+      <div class="user"><span>admin@internal</span><span class="avatar">A</span></div>
+    </div>
+    <div class="content">
+      <div class="container">
+        {% block content %}{% endblock %}
+      </div>
+    </div>
+  </div>
+</div>
 
-  <footer class="footer">MySQL HA 管理器 · 基于 Keepalived + GTID 的高可用方案</footer>
+{% block scripts %}{% endblock %}
+<script>
+(function(){
+  var _p = location.pathname;
+  function applyActive(){
+    var act = null;
+    document.querySelectorAll('.side .nav1').forEach(function(a){
+      var p = a.dataset.path; if(!p) return;
+      var on = (p==='/' ? _p==='/' : _p.indexOf(p)===0);
+      a.classList.toggle('active', on);
+      if(on) act = a;
+    });
+    var g = document.getElementById('navClusterGroup'), s = document.getElementById('clusterSub');
+    if(g && s && _p.indexOf('/clusters')===0){
+      g.classList.add('open');
+      var g1 = g.querySelector('.nav1'); if(g1) g1.classList.add('open');
+      s.classList.add('show');
+    }
+    var t = document.getElementById('pageTitle');
+    if(act && t){ t.textContent = act.textContent.replace('▶','').trim(); }
+  }
+  applyActive();
 
-  <script>
-    // 密码显隐切换（服务端配置 / 集群管理等页面的密码框）
-    function togglePw(btn) {
-      var input = btn.parentElement.querySelector("input");
-      if (!input) return;
-      if (input.type === "password") { input.type = "text"; btn.textContent = "🙈"; }
-      else { input.type = "password"; btn.textContent = "👁"; }
-    }
-    function copyText(t) {
-      if (navigator.clipboard) navigator.clipboard.writeText(t);
-    }
-    // 一键复制（带反馈）：用于集群管理页的账号/密码复制
-    // 不传 text 时，自动复制同一控件组内的输入框值（避免密码含特殊字符注入 JS 出错）
-    function copyWithFeedback(btn, text) {
-      var t = text;
-      if (t === undefined || t === null) {
-        var inp = btn.parentElement ? btn.parentElement.querySelector("input") : null;
-        t = inp ? inp.value : "";
-      }
-      var done = function () {
-        var old = btn.textContent;
-        btn.textContent = "已复制✓";
-        btn.classList.add("copied");
-        setTimeout(function () { btn.textContent = old; btn.classList.remove("copied"); }, 1200);
-      };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(t).then(done, done);
-      } else {
-        var ta = document.createElement("textarea");
-        ta.value = t; document.body.appendChild(ta); ta.select();
-        try { document.execCommand("copy"); } catch (e) {}
-        document.body.removeChild(ta); done();
-      }
-    }
-    // 页面顶部浮层提示（替代浏览器 alert 弹窗）
-    function toast(msg, type) {
-      var el = document.createElement("div");
-      el.className = "toast " + (type === "err" ? "toast-err" : "toast-ok");
-      el.textContent = msg;
-      document.body.appendChild(el);
-      setTimeout(function () { el.classList.add("show"); }, 10);
-      setTimeout(function () {
-        el.classList.remove("show");
-        setTimeout(function () { el.remove(); }, 300);
-      }, 2800);
-    }
-    // 通用：发起手动切换并提示结果
-    function doFailover(url, body, btn) {
-      if (!confirm("确认执行该切换操作？")) return;
-      var old = btn ? btn.textContent : "";
-      if (btn) btn.disabled = true;
-      fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: body }).then(function (r) {
-        // 先 text 再 JSON.parse：避免后端返回非 JSON（如 500 裸 HTML）时
-        // 抛晦涩的「SyntaxError: JSON.parse」原生错误，改为可读的错误提示
-        return r.text().then(function (t) {
-          try { return JSON.parse(t); }
-          catch (e) { throw new Error("HTTP " + r.status + " 非JSON响应: " + t.slice(0, 300)); }
-        });
-      }).then(function (d) {
-        toast(d.msg || (d.ok ? "操作成功" : "操作失败"), d.ok ? "ok" : "err");
-        setTimeout(function () { location.reload(); }, 700);
-      }).catch(function (e) {
-        toast("请求失败: " + e, "err");
-        if (btn) { btn.disabled = false; btn.textContent = old; }
-      });
-    }
-    // 手动触发某节点复制自愈（SQL 线程冲突跳过 / IO 线程 GTID 缺口补齐）
-    function healNode(host, port, cid, btn) {
-      if (btn) { btn.disabled = true; btn.textContent = "修复中…"; }
-      var body = "host=" + encodeURIComponent(host) + "&port=" + port + "&cluster_id=" + cid;
-      fetch("/api/heal", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
-        .then(function (r) { return r.json(); })
-        .then(function (d) {
-          toast(d.msg || (d.ok ? "复制已修复" : "修复失败"), d.ok ? "ok" : "err");
-          setTimeout(function () { refreshStatus(true); }, 600);
-        })
-        .catch(function (e) { toast("请求失败: " + e, "err"); })
-        .finally(function () { if (btn) { btn.disabled = false; btn.textContent = "修复复制"; } });
-    }
-  </script>
+  window.toggleCluster = function(e){
+    if(e){ e.stopPropagation(); e.preventDefault(); }
+    var g = document.getElementById('navClusterGroup'), s = document.getElementById('clusterSub');
+    if(g){ g.classList.toggle('open'); var g1 = g.querySelector('.nav1'); if(g1) g1.classList.toggle('open'); }
+    if(s) s.classList.toggle('show');
+  };
+
+  // 后端连通性指示
+  function pingBackend(){
+    var dot = document.getElementById('beDot'), txt = document.getElementById('beTxt');
+    if(!dot) return;
+    fetch('/api/status', {cache:'no-store'}).then(function(r){ return r.ok; }).then(function(ok){
+      dot.className = 'be-dot ' + (ok?'on':'off');
+      txt.textContent = ok ? '后端已连接' : '后端异常';
+    }).catch(function(){
+      dot.className = 'be-dot off'; txt.textContent = '后端异常';
+    });
+  }
+  pingBackend();
+
+  // 集群子菜单（来自真实集群列表）
+  function loadClusterSub(){
+    var s = document.getElementById('clusterSub'); if(!s) return;
+    fetch('/api/status', {cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+      var cs = (d && d.clusters) || [];
+      if(!cs.length){ s.innerHTML = '<a class="empty">（暂无集群）</a>'; return; }
+      s.innerHTML = cs.map(function(c){
+        var name = c.name || c.cluster_id || c.id || 'cluster';
+        return '<a href="/clusters">'+name+'</a>';
+      }).join('');
+    }).catch(function(){ s.innerHTML = ''; });
+  }
+  loadClusterSub();
+})();
+</script>
 </body>
 </html>

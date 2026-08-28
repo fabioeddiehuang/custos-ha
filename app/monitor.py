@@ -3,7 +3,7 @@ import concurrent.futures as _cf
 import threading
 import time
 from .config import CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENABLED
-from .db import query, execute
+from .db import query, execute, get_setting
 from .ha_client import get_status, heal_replication, heal_io_gtid_gap
 from .state import get_current_master
 from .failover import do_failover, ensure_topology, load_creds, node_root, _repoint_slave, promote_to_master
@@ -314,10 +314,15 @@ def _act_once():
             # 复制 SQL 线程中断（多为幂等冲突导致的 1007/1062），尝试自愈跳过冲突事务。
             # 仅当 SQL 线程明确为 "No"（非 None/空，即确有复制通道且停了）才触发，
             # 避免无复制通道节点（slave_sql=None）被误判为「需自愈」刷日志。
-            if not is_master and st.get("slave_sql") == "No":
+            if not is_master and st.get("slave_sql") == "No" and get_setting("AUTO_REPAIR", "1") == "1":
                 ok, msg = heal_replication(h_host, h_port, creds["ha_user"], creds["ha_pass"], ru, rp)
                 if ok:
                     print(f"[monitor] 自愈 {h_host}:{h_port} 成功: {msg}")
+                    try:
+                        if not query("SELECT 1 FROM alerts WHERE cluster_id=%s AND host=%s AND port=%s AND status='healed' AND created_at > NOW()-INTERVAL 10 MINUTE LIMIT 1", (cid, h_host, int(h_port))):
+                            execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) VALUES(%s,%s,%s,'selfheal','healed',%s,NOW())", (cid, h_host, int(h_port), msg))
+                    except Exception:
+                        pass
                 else:
                     print(f"[monitor] 自愈 {h_host}:{h_port} 失败: {msg}")
             # 复制 IO 线程中断，分两类处理：
@@ -327,7 +332,7 @@ def _act_once():
             #      （从库侧把匿名事务当本地 GTID 接收），故走 _repoint_slave（内部 make_slave_of 已带该选项）。
             #  (B) 缺 GTID 1236/13114（源端主库丢失从库已执行的 GTID）：在源端主库注入空事务，
             #      走 heal_io_gtid_gap。
-            if not is_master and st.get("slave_io") == "No":
+            if not is_master and st.get("slave_io") == "No" and get_setting("AUTO_REPAIR", "1") == "1":
                 io_err = st.get("slave_io_err") or ""
                 if "anonymous transaction" in io_err and cur_h:
                     # (A) 匿名事务 1236：强制重挂载（带 ASSIGN_GTIDS），不治本则永久循环
@@ -336,6 +341,11 @@ def _act_once():
                         cur_h, cur_p, creds)
                     if ok_r:
                         print(f"[monitor] 匿名事务1236 自愈(重挂载) {h_host}:{h_port}: {msg_r}")
+                        try:
+                            if not query("SELECT 1 FROM alerts WHERE cluster_id=%s AND host=%s AND port=%s AND status='healed' AND created_at > NOW()-INTERVAL 10 MINUTE LIMIT 1", (cid, h_host, int(h_port))):
+                                execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) VALUES(%s,%s,%s,'selfheal','healed',%s,NOW())", (cid, h_host, int(h_port), msg_r))
+                        except Exception:
+                            pass
                     else:
                         print(f"[monitor] 匿名事务1236 重挂载失败 {h_host}:{h_port}: {msg_r}")
                 else:
@@ -347,6 +357,11 @@ def _act_once():
                         sru, srp, cur_h, int(cur_p) if cur_p else None, mru, mrp)
                     if ok_g:
                         print(f"[monitor] IO 自愈 {h_host}:{h_port}: {msg_g}")
+                        try:
+                            if not query("SELECT 1 FROM alerts WHERE cluster_id=%s AND host=%s AND port=%s AND status='healed' AND created_at > NOW()-INTERVAL 10 MINUTE LIMIT 1", (cid, h_host, int(h_port))):
+                                execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) VALUES(%s,%s,%s,'selfheal','healed',%s,NOW())", (cid, h_host, int(h_port), msg_g))
+                        except Exception:
+                            pass
                     elif "more GTIDs" in msg_g or "13114" in msg_g or "1236" in msg_g:
                         print(f"[monitor] IO 自愈 {h_host}:{h_port} 失败: {msg_g}")
         # 当前主库连续失败达到阈值 -> 自动切换
@@ -354,7 +369,7 @@ def _act_once():
         for key, (st, is_master) in list(cache.items()):
             if key[2] != cid:
                 continue
-            if is_master and fails.get(key, 0) >= FAIL_THRESHOLD:
+            if is_master and fails.get(key, 0) >= FAIL_THRESHOLD and get_setting("AUTO_FAILOVER", "1") == "1":
                 print(f"[monitor] 集群[{cluster_name}] 主库 {cur_h}:{cur_p} "
                       f"连续 {fails[key]} 次探活失败，触发自动切换")
                 if do_failover(cid, "auto: master unreachable"):
@@ -382,7 +397,8 @@ def run_forever():
             _maybe_collect()
         except Exception as e:
             print(f"[monitor] 周期采集异常(已降级继续): {e}")
-        time.sleep(CHECK_INTERVAL)
+        # 轮询间隔动态读取 setting（页面可配置），默认 2s
+        time.sleep(int(get_setting("CHECK_INTERVAL", "2") or 2))
 
 
 # 周期计数：用于错峰触发采集任务（避免每周期都重连库写指标）。

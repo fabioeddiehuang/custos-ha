@@ -5,30 +5,41 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>登录 · MySQL HA 管理器</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/v3.css">
+  <style>
+    body{background:linear-gradient(135deg,#E11D74,#7C2D52);min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0}
+    .auth-card{max-width:380px;width:92%;background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(15,23,42,.25);padding:32px 30px}
+    .auth-brand{display:flex;align-items:center;gap:10px;margin-bottom:18px;color:#E11D74;font-weight:800;font-size:18px}
+    .auth-brand .logo{font-size:22px}
+    .auth-card h1{margin:0 0 4px;font-size:22px;color:#1e293b}
+    .auth-card .sub{margin:0 0 22px;color:#6b7280;font-size:13px}
+    .form-row{margin-bottom:14px}
+    .form-row label{display:block;font-size:12px;color:#6b7280;margin-bottom:6px}
+    .form-row input{width:100%;padding:10px 12px;border:1px solid #e9e9f0;border-radius:10px;font-size:14px;outline:none;transition:.15s;box-sizing:border-box}
+    .form-row input:focus{border-color:#E11D74;box-shadow:0 0 0 3px rgba(225,29,116,.12)}
+  </style>
 </head>
 <body>
-  <div class="auth-wrap">
-    <div class="auth-card">
-      <div class="brand"><span class="logo">◈</span><span class="brand-text">MySQL HA 管理器</span></div>
-      <h1>欢迎回来</h1>
-      <p class="sub">请登录以管理高可用集群</p>
+  <div class="auth-card">
+    <div class="auth-brand"><span class="logo">◈</span><span>MySQL HA 管理器</span></div>
+    <h1>欢迎回来</h1>
+    <p class="sub">请登录以管理高可用集群</p>
 
-      {% if error %}<div class="banner err" style="margin-bottom:16px">⚠ <div>{{ error }}</div></div>{% endif %}
+    {% if error %}<div class="banner err" style="margin-bottom:16px">⚠ <div>{{ error }}</div></div>{% endif %}
 
-      <form method="post" action="/login">
-        <div class="form-row">
-          <label>用户名</label>
-          <input type="text" name="username" placeholder="admin" required autofocus>
-        </div>
-        <div class="form-row">
-          <label>密码</label>
-          <input type="password" name="password" placeholder="请输入密码" required>
-        </div>
-        <div class="btn-row" style="margin-top:4px">
-          <button type="submit" class="btn btn-primary" style="width:100%">登 录</button>
-        </div>
-      </form>
-    </div>
+    <form method="post" action="/login">
+      <div class="form-row">
+        <label>用户名</label>
+        <input type="text" name="username" placeholder="admin" required autofocus>
+      </div>
+      <div class="form-row">
+        <label>密码</label>
+        <input type="password" name="password" placeholder="请输入密码" required>
+      </div>
+      <div class="btn-row" style="margin-top:8px">
+        <button type="submit" class="btn btn-primary" style="width:100%">登 录</button>
+      </div>
+    </form>
   </div>
 </body>
 </html>

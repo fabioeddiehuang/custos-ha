@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # ============================================================
   # 管理 MySQL（可选，默认关闭）
@@ -32,8 +30,7 @@ services:
     build:
       context: .
       args:
-        VERSION: ${VERSION:-v2.0.2}
-    image: mysql-ha-manager:${VERSION:-v2.0.2}
+        VERSION: ${VERSION:-v2}
     restart: always
     # 若启用上面的 mgmt-mysql，取消下一行注释
     # depends_on:
@@ -49,12 +46,12 @@ services:
       # 默认用户/密码/库名统一为 ha（使用外部库时请按你的实际情况修改）。
       MGMT_MYSQL_HOST: "192.168.1.88"   # 管理后台库地址（仅管理器内部存储，非集群节点）
       MGMT_MYSQL_PORT: "3306"
-      MGMT_MYSQL_USER: "ha-manager"
-      MGMT_MYSQL_PASS: "zjsmdjxNtCscL2aj"             # 含特殊字符请用引号包裹
-      MGMT_MYSQL_DB:   "ha-manager"
+      MGMT_MYSQL_USER: "ha"
+      MGMT_MYSQL_PASS: "ha"             # 含特殊字符请用引号包裹
+      MGMT_MYSQL_DB:   "ha"
       WEB_PORT: 28888
       WEB_USER: admin
-      WEB_PASS: huangyiwei  #留空则首次启动随机生成并打印到日志；填写则以该密码为准（可改密码，每次启动同步）
+      WEB_PASS: admin #留空则首次启动随机生成并打印到日志；填写则以该密码为准（可改密码，每次启动同步）
       CHECK_INTERVAL: 3
       FAIL_THRESHOLD: 2
       NODES_DIR: /app/generated_nodes

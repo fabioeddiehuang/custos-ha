@@ -1,0 +1,231 @@
+{% extends "base.html" %}
+{% block title %}告警设置 · MySQL HA 管理器{% endblock %}
+{% block content %}
+<style>
+  .smtp-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}
+  .smtp-t h3{margin:0;font-size:15px}
+  .smtp-desc{font-size:12px;color:var(--muted);margin-top:3px}
+  .smtp-actions{display:flex;align-items:center;gap:10px}
+  .smtp-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 18px}
+  .smtp-field{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);font-weight:600}
+  .smtp-field input{font-weight:400}
+  .smtp-field .switch{display:inline-block}
+  .rule-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 18px}
+  .rule-field{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);font-weight:600}
+  .rule-field .rule-input{display:flex;align-items:center;gap:8px}
+  .rule-field .rule-input input{font-weight:400;max-width:180px}
+  .rule-field .unit{font-size:12px;color:#94a3b8}
+  .rule-field.full{grid-column:1/-1}
+  .rule-field textarea{height:86px;resize:vertical;font-weight:400}
+  .email-chip{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border:1px solid var(--border);border-radius:999px;font-size:13px;background:#fafbff}
+  .email-chip .tag{font-size:11px}
+  .email-chip .del{cursor:pointer;color:#b91c1c;background:none;border:none;font-size:14px;line-height:1}
+  .email-chip .mini{cursor:pointer;color:var(--primary);background:none;border:none;font-size:11px;padding:0}
+</style>
+
+{% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
+{% if error %}<div class="banner err">⚠ {{ error }}</div>{% endif %}
+
+<div class="card">
+  <div class="smtp-head">
+    <div class="smtp-t">
+      <h3>邮件发送配置</h3>
+      <div class="smtp-desc">通过 SMTP 发送告警邮件</div>
+    </div>
+    <div class="smtp-actions">
+      <span class="badge {{ 'ok' if cfg.smtp_host else 'down' }}" id="smtpResult">{{ '✓ 已配置 SMTP' if cfg.smtp_host else '未配置 SMTP' }}</span>
+      <button class="btn btn-sm btn-ghost" onclick="toggleSmtpForm()">修改配置</button>
+    </div>
+  </div>
+  <div class="smtp-form" id="smtpForm" style="display:none">
+    <div class="smtp-grid">
+      <label class="smtp-field"><span>SMTP 主机</span><input id="smtpHost" placeholder="smtp.example.com" value="{{ cfg.smtp_host }}"></label>
+      <label class="smtp-field"><span>SMTP 端口</span><input id="smtpPort" placeholder="465 / 587" value="{{ cfg.smtp_port }}"></label>
+      <label class="smtp-field"><span>发件人地址</span><input id="smtpFrom" placeholder="noreply@example.com" value="{{ cfg.smtp_user }}"></label>
+      <label class="smtp-field"><span>SMTP 用户名</span><input id="smtpUser" value="{{ cfg.smtp_user }}"></label>
+      <label class="smtp-field"><span>SMTP 密码</span><input id="smtpPass" type="password" placeholder="留空保持原密码"></label>
+      <label class="smtp-field"><span>启用 TLS</span><label class="switch"><input type="checkbox" id="smtpTls"><span class="slider"></span></label></label>
+    </div>
+    <div class="smtp-actions" style="margin-top:14px">
+      <button class="btn btn-sm btn-primary" onclick="saveSmtp()">保存配置</button>
+      <button class="btn btn-sm btn-ghost" onclick="testSmtp()">测试发送</button>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>提醒邮箱</h3>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;" id="emailList">
+    {% for e in alert_emails %}
+    <span class="email-chip" data-id="{{ e.id }}">
+      <span>{{ e.email }}</span>
+      {% if e.is_default %}<span class="tag ok">默认</span>{% endif %}
+      <span class="tag sky">{{ e.clusters|join('、') if e.clusters else '全部集群' }}</span>
+      <button class="mini" onclick="mapCluster('{{ e.id }}')">映射集群</button>
+      <button class="mini" onclick="setDefault('{{ e.id }}')">设为默认</button>
+      <button class="del" onclick="delEmail('{{ e.id }}')">×</button>
+    </span>
+    {% else %}
+    <span style="color:#9ca3af;font-size:13px;">暂无提醒邮箱</span>
+    {% endfor %}
+  </div>
+  <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+    <input id="newEmail" placeholder="收件邮箱，如 admin@example.com" style="max-width:280px">
+    <select id="emailCluster" class="mini-sel" style="width:auto">
+      <option value="">全部集群</option>
+      {% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+    </select>
+    <button class="btn btn-sm" onclick="addEmail()">＋ 添加邮箱</button>
+  </div>
+</div>
+
+<div class="card">
+  <h3>告警发送规则（可自定义）</h3>
+  <div class="rule-grid">
+    <label class="rule-field"><span>同类告警冷却时间</span>
+      <div class="rule-input"><input id="ruleCooldown" value="{{ rules.cooldown }}"><span class="unit">秒</span></div>
+    </label>
+    <label class="rule-field"><span>复制延迟阈值</span>
+      <div class="rule-input"><input id="ruleLag" value="{{ rules.lag_threshold }}"><span class="unit">秒</span></div>
+    </label>
+    <label class="rule-field"><span>合并同类告警</span>
+      <label class="switch"><input type="checkbox" id="ruleMerge" {% if rules.merge == '1' %}checked{% endif %}><span class="slider"></span></label>
+    </label>
+    <label class="rule-field full"><span>接收邮箱（每行一个，追加到「提醒邮箱」）</span><textarea id="ruleReceivers" placeholder="admin@example.com">{{ rules.receivers }}</textarea></label>
+  </div>
+  <div style="margin-top:14px"><button class="btn btn-sm btn-primary" onclick="saveRules()">保存规则</button></div>
+</div>
+
+<div class="card">
+  <h3>当前告警与手动修复</h3>
+  <table class="tbl">
+    <thead>
+      <tr><th>时间</th><th>集群</th><th>节点</th><th>类型</th><th>级别</th><th>状态</th><th>手动修复</th></tr>
+    </thead>
+    <tbody id="alertBody"><tr><td colspan="7" style="color:#9ca3af;text-align:center;">加载中…</td></tr></tbody>
+  </table>
+</div>
+
+<script>
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+  function toast(msg,kind){
+    var t=document.getElementById("toastBox");
+    if(!t){t=document.createElement("div");t.id="toastBox";t.style.cssText="position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:2000;display:flex;flex-direction:column;gap:8px";document.body.appendChild(t);}
+    var el=document.createElement("div");
+    el.textContent=msg;
+    el.style.cssText="background:"+(kind==="err"?"#ef4444":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
+    t.appendChild(el);setTimeout(function(){el.remove();},2600);
+  }
+  function apiPost(url,body,cb){
+    fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams(body)})
+      .then(function(r){return r.json();}).then(cb)
+      .catch(function(e){toast("请求失败: "+e,"err");});
+  }
+
+  // ---- SMTP ----
+  function toggleSmtpForm(){var f=document.getElementById("smtpForm");f.style.display=(f.style.display==="none")?"block":"none";}
+  function saveSmtp(){
+    apiPost("/settings",{
+      smtp_host:document.getElementById("smtpHost").value,
+      smtp_port:document.getElementById("smtpPort").value,
+      smtp_user:document.getElementById("smtpUser").value,
+      smtp_pass:document.getElementById("smtpPass").value,
+      smtp_tls:document.getElementById("smtpTls").checked?"1":"0"
+    },function(d){toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");});
+  }
+  function testSmtp(){
+    apiPost("/settings/test_email",{
+      smtp_host:document.getElementById("smtpHost").value,
+      smtp_port:document.getElementById("smtpPort").value,
+      smtp_user:document.getElementById("smtpUser").value,
+      smtp_pass:document.getElementById("smtpPass").value,
+      smtp_tls:document.getElementById("smtpTls").checked?"1":"0"
+    },function(d){toast(d.msg||(d.ok?"发送成功":"发送失败"),d.ok?"ok":"err");});
+  }
+
+  // ---- 提醒邮箱 ----
+  function addEmail(){
+    var email=document.getElementById("newEmail").value.trim();
+    var cid=document.getElementById("emailCluster").value;
+    var body={email:email};
+    if(cid)body.cluster_ids=cid;
+    if(!email){toast("请输入邮箱","err");return;}
+    apiPost("/settings/email/add",body,function(d){
+      toast(d.msg||(d.ok?"已添加":"添加失败"),d.ok?"ok":"err");
+      if(d.ok)setTimeout(function(){location.reload();},600);
+    });
+  }
+  function delEmail(id){
+    if(!confirm("确认删除该提醒邮箱？"))return;
+    apiPost("/settings/email/delete",{id:id},function(d){
+      toast(d.msg||(d.ok?"已删除":"删除失败"),d.ok?"ok":"err");
+      if(d.ok)setTimeout(function(){location.reload();},600);
+    });
+  }
+  function setDefault(id){
+    apiPost("/settings/email/set_default",{id:id,is_default:1},function(d){
+      toast(d.msg||(d.ok?"已设为默认":"操作失败"),d.ok?"ok":"err");
+      if(d.ok)setTimeout(function(){location.reload();},600);
+    });
+  }
+  function mapCluster(id){
+    var cids=prompt("输入集群 ID（逗号分隔多个；留空=全部集群）：","");
+    if(cids===null)return;
+    apiPost("/settings/email/map",{id:id,cluster_ids:cids||""},function(d){
+      toast(d.msg||(d.ok?"已映射":"操作失败"),d.ok?"ok":"err");
+      if(d.ok)setTimeout(function(){location.reload();},600);
+    });
+  }
+
+  // ---- 规则 ----
+  function saveRules(){
+    apiPost("/api/alert_rules",{
+      cooldown:document.getElementById("ruleCooldown").value,
+      merge:document.getElementById("ruleMerge").checked?"1":"0",
+      lag_threshold:document.getElementById("ruleLag").value,
+      receivers:document.getElementById("ruleReceivers").value
+    },function(d){toast(d.msg||(d.ok?"规则已保存":"保存失败"),d.ok?"ok":"err");});
+  }
+
+  // ---- 当前告警 ----
+  function loadAlerts(){
+    var body=document.getElementById("alertBody");
+    fetch("/api/active_alerts",{cache:"no-store",credentials:"same-origin"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.ok){body.innerHTML='<tr><td colspan="7" style="color:#b91c1c;">'+esc(d.error||"加载失败")+'</td></tr>';return;}
+        var arr=d.alerts||[];
+        if(!arr.length){body.innerHTML='<tr><td colspan="7" style="color:#9ca3af;text-align:center;">暂无告警，集群运行正常。</td></tr>';return;}
+        body.innerHTML=arr.map(function(a){
+          var lv=a.level==="err"||a.level==="ERR"?"down":(a.level==="warn"||a.level==="WARN"?"warn":"sky");
+          var healed=(a.status==="已自愈"||a.status==="healed");
+          var st=healed?'<span class="badge ok">已自愈</span>':'<span class="badge warn">未恢复</span>';
+          var node=(a.host?a.host+(a.port?":"+a.port:""):"—");
+          var hb='<button class="btn btn-sm" onclick="healAlert(\''+escAttr(a.type)+'\',\''+escAttr(a.host||"")+'\',\''+(a.port||"")+'\',\''+(a.cluster_id||"")+'\',this)">修复</button>';
+          return '<tr><td>'+(a.ts||a.created_at||"—")+'</td>'
+            +'<td>'+esc(a.cluster_name||"")+'</td>'
+            +'<td class="mono">'+esc(node)+'</td>'
+            +'<td>'+esc(a.type)+'</td>'
+            +'<td><span class="badge '+lv+'">'+esc(a.level)+'</span></td>'
+            +'<td>'+st+'</td><td>'+hb+'</td></tr>';
+        }).join("");
+      })
+      .catch(function(e){body.innerHTML='<tr><td colspan="7" style="color:#b91c1c;">请求失败：'+esc(e)+'</td></tr>';});
+  }
+  function escAttr(s){return String(s==null?"":s).replace(/"/g,"&quot;");}
+  function healAlert(type,host,port,cid,btn){
+    btn.disabled=true;var old=btn.textContent;btn.textContent="修复中…";
+    var body;
+    if(type==="配置漂移"){body={cluster_id:cid};}
+    else{body={host:host,port:port,cluster_id:cid};}
+    apiPost(type==="配置漂移"?"/api/collect":"/api/heal",body,function(d){
+      btn.disabled=false;btn.textContent=old;
+      toast(d.msg||(d.ok?"已提交修复":"修复失败"),d.ok?"ok":"err");
+      if(d.ok)setTimeout(loadAlerts,1500);
+    });
+  }
+
+  loadAlerts();
+  setInterval(loadAlerts, 15000);
+</script>
+{% endblock %}

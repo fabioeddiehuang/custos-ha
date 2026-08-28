@@ -2,38 +2,88 @@
 {% block title %}审计日志 · MySQL HA 管理器{% endblock %}
 {% block content %}
 <style>
-  .audit-tbl td.act { font-weight:600; color:#7c2d52; white-space:nowrap; }
-  .audit-tbl td.tgt { font-family:ui-monospace,monospace; font-size:12.5px; }
-  .audit-tbl td.detail { color:#475569; max-width:420px; }
-  .audit-tbl td.actor { font-weight:600; }
-  .pill-sys { background:#eef2ff; color:#7c3aed; padding:1px 8px; border-radius:999px; font-size:11px; }
+  .audit-search{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .audit-search input{max-width:220px}
+  .detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px}
+  .detail-grid .kv{grid-column:auto}
 </style>
 
-<h1>操作审计日志</h1>
-<p class="muted">记录所有手动操作（Web 用户）与自动操作（故障切换/自愈/设主库等，记为 system）。仅追加、不可篡改，也不影响业务运行。</p>
+<div class="toolbar">
+  <div class="audit-search">
+    <input id="fSearch" placeholder="搜索用户 / 操作 / 节点 / 详情…">
+    <button class="btn btn-sm" onclick="applyFilter()">查询</button>
+    <button class="btn btn-sm btn-ghost" onclick="resetFilter()">重置</button>
+  </div>
+  <span class="spacer"></span>
+  <span class="badge sky">最近 {{ limit }} 条</span>
+</div>
 
 <div class="card">
-  <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px;">
-    <button class="btn btn-sm" onclick="location.reload()">↻ 刷新</button>
-    <span class="muted">显示最近 {{ limit }} 条</span>
-  </div>
-  <table class="tbl audit-tbl">
+  <table class="tbl">
     <thead>
-      <tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>说明</th><th>集群</th></tr>
+      <tr><th>时间</th><th>节点</th><th>类型</th><th>用户</th><th>操作</th><th>详情</th></tr>
     </thead>
-    <tbody>
-      {% for r in rows %}
-      <tr>
-        <td>{{ r.created_at }}</td>
-        <td class="actor">{% if r.actor == 'system' %}<span class="pill-sys">system</span>{% else %}{{ r.actor }}{% endif %}</td>
-        <td class="act">{{ r.action }}</td>
-        <td class="tgt">{{ r.target or '—' }}</td>
-        <td class="detail">{{ r.detail or '' }}</td>
-        <td>{% if r.cluster_id %}{{ r.cluster_id }}{% else %}—{% endif %}</td>
+    <tbody id="auditTbody">
+      {% for row in rows %}
+      <tr data-idx="{{ loop.index0 }}">
+        <td data-c="time">{{ row.created_at }}</td>
+        <td class="mono" data-c="node">{{ row.node or '—' }}</td>
+        <td data-c="action">{% if row.action == 'term_query' %}<span class="badge sky">终端查询</span>{% else %}<span class="badge">{{ row.action or '操作' }}</span>{% endif %}</td>
+        <td data-c="user">{{ row.username or '—' }}</td>
+        <td data-c="op">{{ row.operation or row.action or '—' }}</td>
+        <td>
+          {% if row.details %}
+          <button class="btn btn-sm" onclick="openAuditDetail({{ loop.index0 }})">查看</button>
+          {% else %}—{% endif %}
+        </td>
       </tr>
+      {% else %}
+      <tr id="noAuditRow"><td colspan="6" style="color:#9ca3af;text-align:center;padding:24px;">暂无审计记录</td></tr>
       {% endfor %}
     </tbody>
   </table>
-  {% if not rows %}<div class="muted" style="padding:14px 0;">暂无审计记录。</div>{% endif %}
+  <div id="noMatchRow" style="display:none;color:#9ca3af;text-align:center;padding:18px;">无匹配记录</div>
 </div>
+
+<!-- 详情 drawer -->
+<div class="drawer" id="auditDrawer">
+  <header><b>操作详情</b><span class="close" onclick="closeAuditDetail()">×</span></header>
+  <div class="body"><div class="detail-grid" id="auditBody"></div></div>
+</div>
+
+<script>
+  var _rows = {{ (rows or []) | map(attribute='details') | list | tojson }};
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+  function openAuditDetail(i){
+    document.getElementById("auditDrawer").classList.add("show");
+    var d=_rows[i]||{};
+    var html="";
+    try{
+      var obj=JSON.parse(d);
+      Object.keys(obj).forEach(function(k){
+        var v=(typeof obj[k]==="object")?JSON.stringify(obj[k]):String(obj[k]);
+        html+='<div class="kv"><span class="k">'+esc(k)+'</span><span class="v">'+esc(v)+'</span></div>';
+      });
+    }catch(e){html='<div class="kv"><span class="k">详情</span><span class="v" style="white-space:pre-wrap;font-size:12px;">'+esc(d)+'</span></div>';}
+    document.getElementById("auditBody").innerHTML=html;
+  }
+  function closeAuditDetail(){document.getElementById("auditDrawer").classList.remove("show");}
+  function applyFilter(){
+    var q=document.getElementById("fSearch").value.trim().toLowerCase();
+    var rows=document.querySelectorAll("#auditTbody tr");
+    var matched=0;
+    rows.forEach(function(tr){
+      var text=Array.prototype.map.call(tr.querySelectorAll("td"),function(td){return td.textContent.toLowerCase();}).join(" ");
+      var show=!q||text.indexOf(q)>=0;
+      tr.style.display=show?"":"none";
+      if(show)matched++;
+    });
+    document.getElementById("noMatchRow").style.display=(matched===0&&q)?"block":"none";
+  }
+  function resetFilter(){
+    document.getElementById("fSearch").value="";
+    document.querySelectorAll("#auditTbody tr").forEach(function(tr){tr.style.display="";});
+    document.getElementById("noMatchRow").style.display="none";
+  }
+</script>
 {% endblock %}

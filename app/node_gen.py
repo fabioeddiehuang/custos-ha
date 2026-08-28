@@ -427,7 +427,7 @@ def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
     )
 
 
-def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_ip):
+def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_ip, manager_subnet):
     """生成「节点账号/权限修复脚本」，当节点 ha_monitor 权限被面板/重装回退（只剩 USAGE）、
     或 root@'<管理器IP>' 密码漂移导致管理器连不上时使用。注入真实凭证。"""
     content = (

@@ -159,6 +159,18 @@ SCHEMA_SQL = [
         INDEX idx_ts (created_at)
     ) ENGINE=InnoDB
     """,
+    # ---- v2.1：自愈/告警状态记录（供告警「已自愈/未恢复」状态标记）----
+    """
+    CREATE TABLE IF NOT EXISTS alerts (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        cluster_id INT, host VARCHAR(64), port INT,
+        alert_type VARCHAR(32),
+        status VARCHAR(16),
+        message TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_host (cluster_id, host, port)
+    ) ENGINE=InnoDB
+    """,
 ]
 
 

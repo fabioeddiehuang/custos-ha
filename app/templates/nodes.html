@@ -1,179 +1,327 @@
 {% extends "base.html" %}
-{% block title %}节点配置 · MySQL HA 管理器{% endblock %}
+{% block title %}节点管理 · MySQL HA 管理器{% endblock %}
 {% block content %}
 <style>
-  .req { color:#f4511e; }
-  .node-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
-  .node-toolbar select, .node-toolbar input { margin:0; }
-  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; word-break:break-all; }
-  .md5-list { margin:0; padding:0; list-style:none; max-height:320px; overflow:auto; }
-  .md5-list li { display:flex; justify-content:space-between; gap:14px; padding:7px 0; border-bottom:1px dashed #eee; font-size:12.5px; }
-  .md5-list .f { color:#374151; font-family:ui-monospace,monospace; }
-  .md5-list .m { color:#7c3aed; font-family:ui-monospace,monospace; }
-  .modal-mask { position:fixed; inset:0; background:rgba(17,24,39,.45); display:none; align-items:center; justify-content:center; z-index:50; }
-  .modal-mask.show { display:flex; }
-  .modal { background:#fff; border-radius:14px; width:min(640px,92vw); max-height:86vh; overflow:auto; padding:22px; box-shadow:0 20px 50px rgba(0,0,0,.25); }
-  .modal h3 { margin:0 0 6px; }
-  .modal .runcmd { background:#0f172a; color:#e2e8f0; padding:10px 12px; border-radius:8px; margin:10px 0 14px; font-family:ui-monospace,monospace; font-size:12.5px; word-break:break-all; }
+  /* 账号掩码/显示/复制（mockup acc 组件补充） */
+  .acc-pwd .mask{font-family:var(--mono);color:#334155}
+  .acc-pwd .reveal{cursor:pointer;color:var(--primary);margin-left:8px;font-size:12px;background:none;border:none;padding:0}
+  .acc-pwd .reveal:hover{color:var(--primary-dark)}
+  .dd-actions{display:flex;gap:10px;flex-wrap:wrap}
+  .kv.hl .v{text-decoration:underline;text-decoration-color:var(--primary);text-decoration-thickness:2px;text-underline-offset:3px;font-weight:700}
+  /* 添加节点 / 节点配置 表单 */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px}
+  .grid2 label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);font-weight:600}
+  .grid2 label input,.grid2 label select{font-weight:400}
+  .grid2 .full{grid-column:1/-1}
+  .form-foot{grid-column:1/-1;display:flex;justify-content:flex-end;gap:10px}
+  .hint{font-weight:400;font-size:11.5px;color:#94a3b8}
+  .md5-list{margin:0;padding:0;list-style:none;max-height:320px;overflow:auto}
+  .md5-list li{display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-bottom:1px dashed var(--border);font-size:12.5px}
+  .md5-list .f{color:#374151;font-family:var(--mono)}
+  .md5-list .m{color:#E11D74;font-family:var(--mono)}
+  .runcmd{background:#0f172a;color:#e2e8f0;padding:10px 12px;border-radius:8px;margin:10px 0 14px;font-family:var(--mono);font-size:12.5px;word-break:break-all}
 </style>
 
-<h1>节点配置</h1>
-<p class="muted">在此生成各节点的部署单元（docker-compose + keepalived + 初始化 SQL），并下发到目标主机 <code class="mono">/home/docker/&lt;节点IP&gt;/</code> 运行。也可对已生成节点「重新生成」配置或删除。</p>
+{% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
+{% if error %}<div class="banner err">⚠ {{ error }}</div>{% endif %}
 
 <div class="card">
-  <h3>添加节点</h3>
-  <form method="post" action="/nodes/add" class="grid2">
-    <label>节点 IP
-      <input class="inp" name="ip" required placeholder="例如 192.168.1.203">
-    </label>
-    <label>MySQL 端口
-      <input class="inp" name="port" value="{{ cfg.port }}" placeholder="3307">
-    </label>
-    <label>节点 MySQL root 用户
-      <input class="inp" name="root_user" value="root">
-    </label>
-    <label>节点 MySQL root 密码 <span class="req">*</span>
-      <input class="inp" name="root_pass" type="password" required>
-    </label>
-    <label>初始角色
-      <select name="initial_role">
-        <option value="master" selected>主库（首次将作为当前主，VIP 优先绑定此节点）</option>
-        <option value="slave">从库</option>
-      </select>
-    </label>
-    <label>节点类型
-      <select name="node_type" id="nodeType" onchange="onNodeTypeChange()">
-        <option value="docker" selected>Docker（容器化 MySQL + keepalived 客户端）</option>
-        <option value="mariadb">MariaDB（裸机全量安装，脱离宝塔，独立数据库）</option>
-      </select>
-    </label>
-    <label>MySQL 版本
-      <input class="inp" name="mysql_version" id="mysqlVersion" placeholder="如 8.0.36 / 8.4.0（留空=沿用旧语法/自动探测）">
-    </label>
-    <label>所属集群
-      <select name="cluster_id" required>
-        <option value="" disabled {% if not active_cluster %}selected{% endif %}>请选择已有集群</option>
-        {% for c in clusters %}
-          <option value="{{ c.id }}" {% if active_cluster == c.id %}selected{% endif %}>{{ c.name }}</option>
-        {% endfor %}
-      </select>
-    </label>
-    <div id="mariadbTip" style="grid-column:1/-1; display:none; padding:10px 12px; border:1px dashed #1d4ed8; border-radius:10px; background:#eff6ff; font-size:13px; color:#1e3a8a;">
-      <strong>MariaDB 节点部署流程（全量安装，脱离宝塔）：</strong>生成后目录内含 <code class="mono">Install-ha-mariadb-Node.sh</code>（唯一全量安装脚本，自包含）、<code class="mono">Uninstall-mariadb-Node.sh</code>、<code class="mono">my.cnf</code>、<code class="mono">init_mariadb.sql</code>。推荐顺序 ——
-      ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/ha-node/&lt;本机IP&gt;/</code>），并把 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 放到同一目录（脚本会优先用本地包，跳过下载）；
-      ② 执行 <code class="mono">sudo bash Install-ha-mariadb-Node.sh</code>
-        （自动：解压 → mariadb-install-db 初始化 → 落盘服务端 my.cnf → systemd 启动 → 跑 init/fix SQL → 起 keepalived）。若需指定安装路径/数据目录/下载链接，设置环境变量
-        <code class="mono">MARIADB_INSTALL_DIR</code> / <code class="mono">MARIADB_DATA_DIR</code> / <code class="mono">MARIADB_DOWNLOAD_URL</code> 后重跑；
-      ③ 各节点都装好后，管理器自动建复制、选主、漂移 VIP。
-      <strong>注意：MariaDB 与 MySQL GTID 机制不兼容，MariaDB 集群所有节点必须都是 MariaDB 类型。</strong>
-    </div>
-    <div style="grid-column:1/-1; display:flex; gap:10px; align-items:center;">
-      <button class="btn btn-primary" type="submit">生成节点配置</button>
-      <span class="muted" style="font-size:13px;">集群的新建请在 <a href="/clusters" style="color:#f4511e;font-weight:600;">集群管理</a> 页面完成。</span>
-    </div>
-  </form>
-</div>
-
-<div class="card">
-  <div class="node-toolbar">
-    <strong>已生成节点（{{ nodes|length }}）</strong>
-    <span class="muted">按集群筛选：</span>
-    <select id="clusterFilter" onchange="filterNodes()">
-      <option value="">全部集群</option>
-      {% for c in clusters %}
-        <option value="{{ c.id }}">{{ c.name }}</option>
-      {% endfor %}
-    </select>
-    <input id="nodeSearch" placeholder="搜索 IP / 目录…" oninput="filterNodes()">
-  </div>
+  <h3>已添加节点<span style="flex:1"></span>
+    <button class="btn btn-primary btn-sm" onclick="openAddNode()">＋ 添加节点</button>
+  </h3>
   <table class="tbl">
     <thead>
-      <tr>
-        <th>IP</th><th>端口</th><th>server_id</th><th>初始角色</th><th>所属集群</th><th>部署目录</th><th>操作</th>
-      </tr>
+      <tr><th>集群名</th><th>节点</th><th>版本</th><th>状态</th><th>操作</th></tr>
     </thead>
     <tbody>
       {% for n in nodes %}
-      <tr data-cluster="{{ n.cluster_id or '' }}" data-search="{{ n.ip }} {{ n.dir_display }}">
-        <td class="mono">{{ n.ip }}{% if n.node_type == 'mariadb' %} <span class="badge" style="background:#eff6ff;color:#1d4ed8;">MariaDB</span>{% elif n.node_type == 'docker' %} <span class="badge" style="background:#eef2ff;color:#7c3aed;">Docker</span>{% endif %}</td>
-        <td>{{ n.port }}{% if n.mysql_version %} <span class="muted" style="font-size:11px;">{{ n.mysql_version }}</span>{% endif %}</td>
-        <td>{{ n.server_id }}</td>
-        <td>{{ n.initial_role or 'slave' }}</td>
+      <tr data-host="{{ n.ip }}:{{ n.port }}" data-cluster="{{ n.cluster_id or '' }}">
         <td>{{ n.cluster_name }}</td>
-        <td class="mono" title="{{ n.compose_path }}">{{ n.dir_display }}{% if n.node_type == 'mariadb' %}<br><span style="color:#1d4ed8;font-size:11px;">my.cnf · init_mariadb.sql · Install-ha-mariadb-Node.sh</span>{% endif %}</td>
-        <td class="row-actions">
-          <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
-          <a class="btn btn-sm" style="background:#0ABAB5;color:#fff;" href="/nodes/{{ n.ip }}/creds_sql" title="下载该节点账号/权限修复脚本 fix-node-creds.sql（含真实凭证，需节点本机以真实 root 执行）">下载修复SQL</a>
-          <form method="post" action="/nodes/delete" style="display:inline" onsubmit="return confirm('确认删除该节点？将同时清理项目目录中已生成的同名部署文件。');">
-            <input type="hidden" name="ip" value="{{ n.ip }}">
-            <button class="btn btn-sm btn-danger" type="submit">删除</button>
-          </form>
+        <td class="mono">{{ n.ip }}:{{ n.port }}</td>
+        <td>
+          {% if n.mysql_version %}{{ n.mysql_version }}{% endif %}
+          {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-left:4px">MariaDB</span>
+          {% elif n.node_type == 'docker' %}<span class="badge emerald" style="margin-left:4px">Docker</span>{% endif %}
         </td>
+        <td data-f="status"><span class="badge" style="background:#f1f5f9;color:#64748b;">检测中…</span></td>
+        <td><button class="btn btn-sm" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button></td>
       </tr>
+      <tr id="d{{ n.ip }}" class="detail-panel">
+        <td colspan="5"><div class="dd">
+          <div class="dd-sec">
+            <div class="dd-sec-t">基本信息</div>
+            <div class="dd-grid">
+              <div class="kv"><span class="k">角色</span><span class="v" data-f="role"><span class="role role-unknown">未知</span></span></div>
+              <div class="kv"><span class="k">初始角色</span><span class="v">{{ n.initial_role or 'slave' }}</span></div>
+              <div class="kv"><span class="k hl">server_id</span><span class="v">{{ n.server_id or '—' }}</span></div>
+              <div class="kv"><span class="k hl">部署目录</span><span class="v">{{ n.dir_display }}</span></div>
+              <div class="kv"><span class="k hl">数据目录</span><span class="v" data-f="datadir">—</span></div>
+              <div class="kv"><span class="k hl">GTID / read_only</span><span class="v" data-f="gtid">—</span></div>
+            </div>
+          </div>
+          <div class="dd-sec">
+            <div class="dd-sec-t">数据库账号<span class="dd-note">仅管理员可见 · 点击显示明文</span></div>
+            <div class="acc-list" data-f="creds"><div class="obs-empty">展开后加载…</div></div>
+          </div>
+          <div class="dd-actions">
+            <button class="btn btn-sm" onclick="openNodeCfg('{{ n.ip }}', {{ n.port }})">节点配置</button>
+            {% if n.node_type == 'mariadb' %}
+            <a class="btn btn-sm btn-ghost" href="/nodes/{{ n.ip }}/creds_sql" title="下载该节点账号/权限修复脚本 fix-node-creds.sql">查看/下载自愈 SQL</a>
+            {% else %}
+            <button class="btn btn-sm btn-primary" onclick="showSelfhealSql({{ n.cluster_id or 0 }}, '{{ n.ip }}', {{ n.port }})">查看/下载自愈 SQL</button>
+            {% endif %}
+          </div>
+        </div></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" style="color:#9ca3af;text-align:center;padding:24px;">暂无已添加节点。点击右上角「＋ 添加节点」生成部署单元。</td></tr>
       {% endfor %}
     </tbody>
   </table>
-  {% if not nodes %}<div class="muted" style="padding:14px 0;">暂无已生成节点。</div>{% endif %}
 </div>
 
-<!-- 重新生成结果弹窗 -->
-<div class="modal-mask" id="regenModal">
+<!-- 添加节点 modal -->
+<div class="overlay" id="addOverlay" onclick="if(event.target===this)closeAddNode()">
   <div class="modal">
-    <h3 id="regenTitle">重新生成结果</h3>
-    <div id="regenBody"></div>
-    <div style="text-align:right;margin-top:14px;">
-      <button class="btn" onclick="closeRegen()">关闭</button>
+    <header><b>＋ 添加节点</b><span class="close" onclick="closeAddNode()">×</span></header>
+    <div class="body">
+      <form method="post" action="/nodes/add" class="grid2">
+        <label>节点 IP<input name="ip" placeholder="例如 192.168.1.203" required></label>
+        <label>MySQL 端口<input name="port" value="{{ cfg.port }}" placeholder="3307"></label>
+        <label>节点 MySQL root 用户<input name="root_user" value="root"></label>
+        <label>节点 MySQL root 密码<input name="root_pass" type="password" required></label>
+        <label>初始角色
+          <select name="initial_role">
+            <option value="master" selected>主库（首次将作为当前主，VIP 优先绑定此节点）</option>
+            <option value="slave">从库</option>
+          </select>
+        </label>
+        <label>节点类型
+          <select name="node_type" id="nodeType" onchange="onNodeTypeChange()">
+            <option value="docker" selected>Docker（容器化 MySQL + keepalived 客户端）</option>
+            <option value="mariadb">MariaDB（裸机全量安装，脱离宝塔，独立数据库）</option>
+          </select>
+        </label>
+        <label>MySQL 版本<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=自动探测）"></label>
+        <label>所属集群
+          <select name="cluster_id" required>
+            <option value="" disabled {% if not active_cluster %}selected{% endif %}>请选择已有集群</option>
+            {% for c in clusters %}
+            <option value="{{ c.id }}" {% if active_cluster == c.id %}selected{% endif %}>{{ c.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div id="mariadbTip" class="full" style="display:none;padding:10px 12px;border:1px dashed #1d4ed8;border-radius:10px;background:#eff6ff;font-size:13px;color:#1e3a8a;">
+          <strong>MariaDB 节点部署流程（全量安装，脱离宝塔）：</strong>生成后目录内含 <code class="mono">Install-ha-mariadb-Node.sh</code>（唯一全量安装脚本，自包含）、<code class="mono">Uninstall-mariadb-Node.sh</code>、<code class="mono">my.cnf</code>、<code class="mono">init_mariadb.sql</code>。推荐顺序 ——
+          ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/ha-node/&lt;本机IP&gt;/</code>），并把 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 放到同一目录（脚本会优先用本地包，跳过下载）；
+          ② 执行 <code class="mono">sudo bash Install-ha-mariadb-Node.sh</code>（自动：解压 → 初始化 → 落盘 my.cnf → systemd 启动 → 跑 init/fix SQL → 起 keepalived）；
+          ③ 各节点都装好后，管理器自动建复制、选主、漂移 VIP。
+          <strong>注意：MariaDB 与 MySQL GTID 机制不兼容，MariaDB 集群所有节点必须都是 MariaDB 类型。</strong>
+        </div>
+        <div class="form-foot">
+          <button type="button" class="btn" onclick="closeAddNode()">取消</button>
+          <button type="submit" class="btn btn-primary">生成节点配置</button>
+        </div>
+      </form>
     </div>
+  </div>
+</div>
+
+<!-- 节点配置 modal -->
+<div class="overlay" id="cfgOverlay" onclick="if(event.target===this)closeNodeCfg()">
+  <div class="modal">
+    <header><b id="cfgTitle">节点配置</b><span class="close" onclick="closeNodeCfg()">×</span></header>
+    <div class="body">
+      <div id="cfgBody"></div>
+    </div>
+    <footer><button class="btn" onclick="closeNodeCfg()">关闭</button></footer>
+  </div>
+</div>
+
+<!-- 重新生成结果 modal -->
+<div class="overlay" id="regenModal">
+  <div class="modal">
+    <header><b id="regenTitle">重新生成结果</b><span class="close" onclick="closeRegen()">×</span></header>
+    <div class="body"><div id="regenBody"></div></div>
+    <footer><button class="btn" onclick="closeRegen()">关闭</button></footer>
   </div>
 </div>
 
 <script>
-  function onNodeTypeChange() {
-    var t = document.getElementById("nodeType").value;
-    var maria = document.getElementById("mariadbTip");
-    if (maria) maria.style.display = (t === "mariadb") ? "block" : "none";
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+  function escAttr(s){return String(s==null?"":s).replace(/"/g,"&quot;");}
+  function toast(msg,kind){
+    var t=document.getElementById("toastBox");
+    if(!t){t=document.createElement("div");t.id="toastBox";t.style.cssText="position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:2000;display:flex;flex-direction:column;gap:8px";document.body.appendChild(t);}
+    var el=document.createElement("div");
+    el.textContent=msg;
+    el.style.cssText="background:"+(kind==="err"?"#ef4444":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
+    t.appendChild(el);setTimeout(function(){el.remove();},2600);
   }
-  function filterNodes() {
-    var cf = document.getElementById("clusterFilter").value;
-    var kw = document.getElementById("nodeSearch").value.trim().toLowerCase();
-    document.querySelectorAll('tbody tr[data-cluster]').forEach(function (tr) {
-      var okC = !cf || tr.getAttribute("data-cluster") === cf;
-      var okK = !kw || (tr.getAttribute("data-search") || "").toLowerCase().indexOf(kw) >= 0;
-      tr.style.display = (okC && okK) ? "" : "none";
-    });
+  function onNodeTypeChange(){
+    var t=document.getElementById("nodeType").value;
+    var maria=document.getElementById("mariadbTip");
+    if(maria)maria.style.display=(t==="mariadb")?"block":"none";
   }
-  function closeRegen() { document.getElementById("regenModal").classList.remove("show"); }
-  function regenNode(ip, btn) {
-    if (!confirm("确认重新生成 " + ip + " 的配置文件？将覆盖原文件。")) return;
-    var old = btn.textContent; btn.disabled = true; btn.textContent = "生成中…";
-    fetch("/nodes/" + encodeURIComponent(ip) + "/regen", { method: "POST" })
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        btn.disabled = false; btn.textContent = old;
-        var body = document.getElementById("regenBody");
-        if (!d.ok) { body.innerHTML = '<div class="banner err">⚠ <div>' + d.msg + '</div></div>'; }
-        else {
-          var md5html = '<ul class="md5-list">';
-          (d.md5s || []).forEach(function (x) {
-            md5html += '<li><span class="f">' + x.file + '</span><span class="m">' + x.md5 + '</span></li>';
-          });
-          md5html += '</ul>';
-          body.innerHTML =
-            '<div class="banner ok">✓ <div>' + d.msg + '</div></div>' +
-            (d.run_cmd ? '<div class="runcmd">到目标主机执行：\n' + d.run_cmd + '</div>' : '') +
-            '<p class="muted" style="font-size:13px;margin:8px 0 4px;">生成文件 MD5（用于核对一致性）：</p>' +
-            md5html;
+  function openAddNode(){document.getElementById("addOverlay").classList.add("show");}
+  function closeAddNode(){document.getElementById("addOverlay").classList.remove("show");}
+
+  // 展开/收起详情 + 懒加载账号
+  function toggleDetail(id){
+    var row=document.getElementById(id);
+    var show=!row.classList.contains("show");
+    row.classList.toggle("show",show);
+    var btn=row.previousElementSibling.querySelector("button");
+    if(btn)btn.textContent=show?"收起详情":"展开详情";
+    if(show)loadNodeDetail(id);
+  }
+  function nodeKey(id){return id.replace(/^d/,"");}
+  function loadNodeDetail(rowId){
+    var tr=document.getElementById(rowId);
+    var main=tr.previousElementSibling;
+    var hp=main.getAttribute("data-host").split(":");
+    var cid=main.getAttribute("data-cluster")||"0";
+    fetch("/api/node_detail",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:new URLSearchParams({cluster_id:cid,host:hp[0],port:hp[1]})})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.ok){
+          tr.querySelector('[data-f="creds"]').innerHTML='<div class="obs-empty" style="color:#b91c1c;">'+esc(d.error||"加载失败")+'</div>';
+          return;
+        }
+        // 基本信息
+        var role=tr.querySelector('[data-f="role"]');
+        if(role){
+          var isMaster=(String(cid)==="0")?false:false;
+          if(d.host&&window._masters)isMaster=(window._masters[cid]||"")===d.host+":"+d.port;
+          var rl=isMaster?"主":"从";
+          role.innerHTML='<span class="role role-'+((isMaster)?"master":"slave")+'">'+rl+'</span>';
+        }
+        var dd=tr.querySelector('[data-f="datadir"]');if(dd)dd.textContent=d.datadir||"—";
+        var g=tr.querySelector('[data-f="gtid"]');
+        if(g){g.innerHTML='<span class="tag '+(d.gtid_mode==="ON"?"on":"off")+'">'+(d.gtid_mode||"—")+'</span> / <span class="tag '+((d.read_only==="ON"||d.read_only==="1"||d.read_only===true)?"on":"off")+'">'+(d.read_only||"—")+'</span>';}
+        // 账号列表
+        var acc=tr.querySelector('[data-f="creds"]');
+        if(acc){
+          var items=[
+            {n:"ha_monitor",u:d.ha_user,p:d.ha_pass},
+            {n:"replication",u:d.repl_user,p:d.repl_pass},
+            {n:"app",u:d.app_user,p:d.app_pass},
+            {n:"root",u:d.root_user,p:d.root_pass}
+          ].filter(function(x){return x.u||x.p;});
+          acc.innerHTML=items.length?'<div class="acc-list">'+items.map(function(x){
+            return '<div class="acc"><span class="acc-name">'+esc(x.n)+'</span><span class="acc-pwd"><span class="mask">••••••••</span>'
+              +'<button class="reveal" onclick="toggleMask(this,\''+escAttr(x.p||"")+'\')">显示</button>'
+              +'<button class="reveal" onclick="copyTxt(this,\''+escAttr(x.p||"")+'\')">复制</button></span></div>';
+          }).join('')+'</div>':'<div class="obs-empty">无账号信息</div>';
+        }
+      })
+      .catch(function(e){tr.querySelector('[data-f="creds"]').innerHTML='<div class="obs-empty" style="color:#b91c1c;">请求失败：'+esc(e)+'</div>';});
+  }
+  function toggleMask(el,real){
+    var m=el.parentNode.querySelector(".mask");
+    m.textContent=(m.textContent==="••••••••")?real:"••••••••";
+  }
+  function copyTxt(el,real){
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(real);}
+    var o=el.textContent;el.textContent="已复制";setTimeout(function(){el.textContent=o;},1000);
+  }
+
+  // 节点配置 modal（重新生成 / 删除）
+  function openNodeCfg(ip,port){
+    document.getElementById("cfgTitle").textContent="节点配置 · "+ip;
+    document.getElementById("cfgBody").innerHTML=
+      '<div class="kv"><span class="k">节点地址</span><span class="v">'+esc(ip)+':'+esc(port)+'</span></div>'
+      +'<div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;">'
+      +'<button class="btn btn-sm btn-accent" onclick="regenNode(\''+ip+'\', this)">重新生成</button>'
+      +'<a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none;" href="/nodes/'+encodeURIComponent(ip)+'/creds_sql" download>下载修复SQL</a>'
+      +'<button class="btn btn-sm btn-danger" style="background:var(--danger);color:#fff;" onclick="delNode(\''+ip+'\')">删除节点</button>'
+      +'</div>';
+    document.getElementById("cfgOverlay").classList.add("show");
+  }
+  function closeNodeCfg(){document.getElementById("cfgOverlay").classList.remove("show");}
+  function delNode(ip){
+    if(!confirm("确认删除该节点？将同时清理项目目录中已生成的同名部署文件。"))return;
+    var fd=new URLSearchParams();fd.append("ip",ip);
+    fetch("/nodes/delete",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:fd.toString()})
+      .then(function(r){return r.json();})
+      .then(function(d){toast(d.msg||(d.ok?"已删除":"删除失败"),d.ok?"ok":"err");if(d.ok)setTimeout(function(){location.reload();},800);})
+      .catch(function(e){toast("请求失败: "+e,"err");});
+  }
+  function regenNode(ip,btn){
+    if(!confirm("确认重新生成 "+ip+" 的配置文件？将覆盖原文件。"))return;
+    var old=btn.textContent;btn.disabled=true;btn.textContent="生成中…";
+    fetch("/nodes/"+encodeURIComponent(ip)+"/regen",{method:"POST"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        btn.disabled=false;btn.textContent=old;
+        var body=document.getElementById("regenBody");
+        if(!d.ok){body.innerHTML='<div class="banner err">⚠ <div>'+esc(d.msg||"生成失败")+'</div></div>';}
+        else{
+          var md5html='<ul class="md5-list">';
+          (d.md5s||[]).forEach(function(x){md5html+='<li><span class="f">'+esc(x.file)+'</span><span class="m">'+esc(x.md5)+'</span></li>';});
+          md5html+='</ul>';
+          body.innerHTML='<div class="banner ok">✓ <div>'+esc(d.msg||"")+'</div></div>'
+            +(d.run_cmd?'<div class="runcmd">到目标主机执行：\n'+esc(d.run_cmd)+'</div>':'')
+            +'<p class="note" style="margin:8px 0 4px;">生成文件 MD5（用于核对一致性）：</p>'+md5html;
         }
         document.getElementById("regenModal").classList.add("show");
       })
-      .catch(function (e) {
-        btn.disabled = false; btn.textContent = old;
-        document.getElementById("regenBody").innerHTML = '<div class="banner err">⚠ <div>请求失败：' + e + '</div></div>';
-        document.getElementById("regenModal").classList.add("show");
-      });
+      .catch(function(e){btn.disabled=false;btn.textContent=old;document.getElementById("regenBody").innerHTML='<div class="banner err">⚠ <div>请求失败：'+esc(e)+'</div></div>';document.getElementById("regenModal").classList.add("show");});
   }
-  document.getElementById("regenModal").addEventListener("click", function (e) {
-    if (e.target === this) closeRegen();
-  });
+  function closeRegen(){document.getElementById("regenModal").classList.remove("show");}
+  document.getElementById("regenModal").addEventListener("click",function(e){if(e.target===this)closeRegen();});
+  document.getElementById("cfgOverlay").addEventListener("click",function(e){if(e.target===this)closeNodeCfg();});
+
+  // 自愈 SQL
+  function showSelfhealSql(cid,host,port){
+    var existing=document.getElementById("sqlModal");
+    if(existing)existing.parentNode.removeChild(existing);
+    var box=document.createElement("div");
+    box.id="sqlModal";
+    box.style.cssText="position:fixed;inset:0;background:rgba(15,23,42,.5);z-index:200;display:flex;align-items:center;justify-content:center;";
+    box.innerHTML='<div style="background:#fff;width:min(720px,92vw);max-height:84vh;overflow:auto;border-radius:14px;padding:16px 18px;box-shadow:0 20px 60px rgba(0,0,0,.25);">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+      +'<h3 style="margin:0;">节点自愈 / 修复 SQL</h3>'
+      +'<button class="btn btn-sm" onclick="closeSqlModal()">✕</button></div>'
+      +'<pre id="sqlModalBody" style="white-space:pre-wrap;max-height:58vh;overflow:auto;background:#0f172a;color:#e2e8f0;padding:14px;border-radius:10px;font-size:12.5px;margin:0;"></pre>'
+      +'<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end;">'
+      +'<button class="btn btn-sm" onclick="copySql()">复制</button>'
+      +'<a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+'&host='+encodeURIComponent(host)+'&port='+port+'&download=1" download="fix-node-creds.sql">下载</a>'
+      +'</div></div>';
+    box.onclick=function(e){if(e.target===box)closeSqlModal();};
+    document.body.appendChild(box);
+    var pre=box.querySelector("#sqlModalBody");
+    pre.textContent="加载中…";
+    fetch("/api/node_creds_sql?cluster_id="+cid+"&host="+encodeURIComponent(host)+"&port="+port)
+      .then(function(r){return r.json();}).then(function(d){pre.textContent=d.ok?(d.sql||"(无内容)"):("加载失败: "+(d.error||""));})
+      .catch(function(e){pre.textContent="请求失败: "+e;});
+  }
+  function closeSqlModal(){var m=document.getElementById("sqlModal");if(m)m.parentNode.removeChild(m);}
+  function copySql(){var t=document.getElementById("sqlModalBody");if(t&&navigator.clipboard)navigator.clipboard.writeText(t.textContent);}
+
+  // 节点在线状态 + 角色（来自 /api/status）
+  window._masters = {};
+  (function refreshNodeStatus(){
+    fetch("/api/status",{cache:"no-store",credentials:"same-origin"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d||!d.ok)return;
+        d.current_masters=d.current_masters||{};
+        Object.keys(d.current_masters).forEach(function(cid){window._masters[cid]=d.current_masters[cid];});
+        var hosts={};
+        (d.hosts||[]).forEach(function(h){hosts[h.host+":"+h.port]=h;});
+        document.querySelectorAll('tr[data-host]').forEach(function(tr){
+          var h=hosts[tr.getAttribute("data-host")];
+          var st=tr.querySelector('[data-f="status"]');
+          if(st&&h){
+            st.innerHTML=h.status==="up"
+              ?'<span class="badge up">在线</span>'
+              :'<span class="badge down">离线</span>';
+          }
+        });
+      })
+      .catch(function(){});
+  })();
 </script>
 {% endblock %}

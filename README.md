@@ -1,6 +1,6 @@
 # MySQL HA Manager
 
-> 当前版本：**v2.0（正式版 / GA）**
+> 当前版本：**v2.1.0**
 > 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)。
 > 项目根目录指 `mysql-ha-manager/`（即本目录）。
 
