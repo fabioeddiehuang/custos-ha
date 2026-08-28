@@ -291,6 +291,11 @@ def init_schema():
                 c.execute("ALTER TABLE nodes ADD COLUMN cluster_id INT DEFAULT NULL")
             except Exception:
                 pass
+            # alerts 增加 acked（告警中心「已读/确认」标记）
+            try:
+                c.execute("ALTER TABLE alerts ADD COLUMN acked TINYINT(1) NOT NULL DEFAULT 0")
+            except Exception:
+                pass
             # current_master 改为按集群（cluster_id 主键），兼容旧版单列(id=1)结构。
             # 仅当 current_master 仍是旧结构（含 id 列、无 cluster_id 列）时迁移一次，
             # 避免每次重启都把当前主数据清空。

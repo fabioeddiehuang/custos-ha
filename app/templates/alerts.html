@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}告警设置 · MySQL HA 管理器{% endblock %}
+{% block title %}告警中心 · MySQL HA 管理器{% endblock %}
 {% block content %}
 <style>
   .smtp-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}
@@ -131,13 +131,39 @@
 </div>
 
 <div class="card">
-  <h3>当前告警与手动修复</h3>
-  <table class="tbl">
-    <thead>
-      <tr><th>时间</th><th>集群</th><th>节点</th><th>类型</th><th>级别</th><th>状态</th><th>手动修复</th></tr>
-    </thead>
-    <tbody id="alertBody"><tr><td colspan="7" style="color:#9ca3af;text-align:center;">加载中…</td></tr></tbody>
-  </table>
+  <div class="smtp-head">
+    <div class="smtp-t"><h3>告警中心</h3><div class="smtp-desc">全量告警记录，支持级别 / 状态 / 集群 / 时间筛选与分页</div></div>
+    <span class="badge" id="alertCount">—</span>
+  </div>
+  <div class="toolbar">
+    <select id="afLevel" class="mini-sel" onchange="loadAlertCenter()">
+      <option value="">级别：全部</option><option value="error">error</option><option value="warn">warn</option><option value="info">info</option>
+    </select>
+    <select id="afStatus" class="mini-sel" onchange="loadAlertCenter()">
+      <option value="">状态：全部</option><option value="unread">未读</option><option value="acked">已确认</option>
+    </select>
+    <select id="afCluster" class="mini-sel" onchange="loadAlertCenter()">
+      <option value="0">集群：全部</option>{% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+    </select>
+    <select id="afHours" class="mini-sel" onchange="loadAlertCenter()">
+      <option value="0">时间：全部</option><option value="24">近 24 小时</option><option value="168">近 7 天</option><option value="720">近 30 天</option>
+    </select>
+    <input id="afQ" placeholder="关键字" onkeydown="if(event.key==='Enter')loadAlertCenter()" style="width:150px;padding:5px 9px;border:1px solid var(--border);border-radius:8px;font-size:12px">
+    <button class="btn btn-sm" onclick="loadAlertCenter()">查询</button>
+    <span class="spacer"></span>
+    <button class="btn btn-sm btn-primary" onclick="ackAlerts('all')">全部已读</button>
+  </div>
+  <div class="tbl-scroll">
+    <table class="tbl">
+      <thead><tr><th>时间</th><th>集群</th><th>节点</th><th>类型</th><th>级别</th><th>状态</th><th>详情</th><th>操作</th></tr></thead>
+      <tbody id="alertBody"><tr><td colspan="8" style="color:#9ca3af;text-align:center;">加载中…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="toolbar" style="margin-top:12px">
+    <button class="btn btn-sm" id="afPrev" onclick="afPage(-1)">上一页</button>
+    <span id="afPageInfo" style="color:var(--muted);font-size:12px"></span>
+    <button class="btn btn-sm" id="afNext" onclick="afPage(1)">下一页</button>
+  </div>
 </div>
 
 <script>
@@ -246,45 +272,62 @@
     },function(d){toast(d.msg||(d.ok?"规则已保存":"保存失败"),d.ok?"ok":"err");});
   }
 
-  // ---- 当前告警 ----
-  function loadAlerts(){
-    var body=document.getElementById("alertBody");
-    fetch("/api/active_alerts",{cache:"no-store",credentials:"same-origin"})
-      .then(function(r){return r.json();})
-      .then(function(d){
-        if(!d.ok){body.innerHTML='<tr><td colspan="7" style="color:#b91c1c;">'+esc(d.error||"加载失败")+'</td></tr>';return;}
-        var arr=d.alerts||[];
-        if(!arr.length){body.innerHTML='<tr><td colspan="7" style="color:#9ca3af;text-align:center;">暂无告警，集群运行正常。</td></tr>';return;}
-        body.innerHTML=arr.map(function(a){
-          var lv=a.level==="err"||a.level==="ERR"?"down":(a.level==="warn"||a.level==="WARN"?"warn":"sky");
-          var healed=(a.status==="已自愈"||a.status==="healed");
-          var st=healed?'<span class="badge ok">已自愈</span>':'<span class="badge warn">未恢复</span>';
-          var node=(a.host?a.host+(a.port?":"+a.port:""):"—");
-          var hb='<button class="btn btn-sm" onclick="healAlert(\''+escAttr(a.type)+'\',\''+escAttr(a.host||"")+'\',\''+(a.port||"")+'\',\''+(a.cluster_id||"")+'\',this)">修复</button>';
-          return '<tr><td>'+(a.ts||a.created_at||"—")+'</td>'
-            +'<td>'+esc(a.cluster_name||"")+'</td>'
-            +'<td class="mono">'+esc(node)+'</td>'
-            +'<td>'+esc(a.type)+'</td>'
-            +'<td><span class="badge '+lv+'">'+esc(a.level)+'</span></td>'
-            +'<td>'+st+'</td><td>'+hb+'</td></tr>';
-        }).join("");
-      })
-      .catch(function(e){body.innerHTML='<tr><td colspan="7" style="color:#b91c1c;">请求失败：'+esc(e)+'</td></tr>';});
+  // ---- 告警中心 ----
+  var _afPage = 1;
+  function afPage(d){ _afPage = Math.max(1, _afPage + d); loadAlertCenter(); }
+  function atype(t){
+    return ({down:'宕机',recover:'恢复',lag:'复制延迟',replication:'复制异常',selfheal:'自愈',ha_fail:'切换失败',config_drift:'配置漂移'})[t] || t;
   }
-  function escAttr(s){return String(s==null?"":s).replace(/"/g,"&quot;");}
-  function healAlert(type,host,port,cid,btn){
-    btn.disabled=true;var old=btn.textContent;btn.textContent="修复中…";
-    var body;
-    if(type==="配置漂移"){body={cluster_id:cid};}
-    else{body={host:host,port:port,cluster_id:cid};}
-    apiPost(type==="配置漂移"?"/api/collect":"/api/heal",body,function(d){
-      btn.disabled=false;btn.textContent=old;
-      toast(d.msg||(d.ok?"已提交修复":"修复失败"),d.ok?"ok":"err");
-      if(d.ok)setTimeout(loadAlerts,1500);
+  function fmtAlertTs(t){ if(!t) return '—'; return String(t).replace('T',' '); }
+  function loadAlertCenter(){
+    var p = new URLSearchParams({
+      level: document.getElementById("afLevel").value,
+      status: document.getElementById("afStatus").value,
+      cluster_id: document.getElementById("afCluster").value,
+      hours: document.getElementById("afHours").value,
+      q: document.getElementById("afQ").value,
+      page: _afPage, page_size: 20
     });
+    fetch("/api/alerts?" + p.toString(), {cache:"no-store", credentials:"same-origin"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        var body = document.getElementById("alertBody");
+        if(!d.ok){ body.innerHTML = '<tr><td colspan="8" style="color:#b91c1c;text-align:center;">加载失败：' + esc(d.error||"") + '</td></tr>'; return; }
+        var rows = d.alerts || [];
+        if(!rows.length){ body.innerHTML = '<tr><td colspan="8" style="color:#9ca3af;text-align:center;">暂无告警记录</td></tr>'; }
+        else {
+          body.innerHTML = rows.map(function(r){
+            var lv = r.level || 'warn';
+            var lvCls = lv==='error' ? 'down' : (lv==='warn' ? 'warn' : 'sky');
+            var st = r.acked ? '<span class="badge ok">已确认</span>' : '<span class="badge warn">未读</span>';
+            var act = r.acked ? '' : '<button class="btn btn-sm" onclick="ackAlerts(' + r.id + ')">确认</button>';
+            return '<tr>'
+              + '<td class="mono" style="white-space:nowrap">' + fmtAlertTs(r.created_at) + '</td>'
+              + '<td>' + esc(r.cluster_name||'—') + '</td>'
+              + '<td class="mono">' + esc(r.host||'—') + ':' + (r.port||'') + '</td>'
+              + '<td>' + esc(atype(r.alert_type)) + '</td>'
+              + '<td><span class="badge ' + lvCls + '">' + esc(lv) + '</span></td>'
+              + '<td>' + st + '</td>'
+              + '<td style="max-width:380px;word-break:break-all">' + esc(r.message||'') + '</td>'
+              + '<td>' + act + '</td>'
+              + '</tr>';
+          }).join('');
+        }
+        document.getElementById("alertCount").textContent = "共 " + (d.total||0) + " 条";
+        var pages = Math.max(1, Math.ceil((d.total||0) / (d.page_size||20)));
+        document.getElementById("afPageInfo").textContent = "第 " + (d.page||1) + " / " + pages + " 页";
+      })
+      .catch(function(e){ document.getElementById("alertBody").innerHTML = '<tr><td colspan="8" style="color:#b91c1c;text-align:center;">请求失败：' + esc(e) + '</td></tr>'; });
+  }
+  function ackAlerts(arg){
+    var body = (arg === 'all') ? {all:true} : (typeof arg === 'number' ? {id:arg} : {ids:arg});
+    fetch("/api/alert_ack", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body), credentials:"same-origin"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){ if(d.ok){ loadAlertCenter(); } else { toast(d.error||"确认失败","err"); } })
+      .catch(function(e){ toast("请求失败: " + e, "err"); });
   }
 
-  loadAlerts();
-  setInterval(loadAlerts, 15000);
+  loadAlertCenter();
+  setInterval(loadAlertCenter, 30000);
 </script>
 {% endblock %}

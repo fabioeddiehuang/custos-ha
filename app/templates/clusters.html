@@ -42,6 +42,17 @@
   .cr-line .pw{font-family:var(--mono);background:#f1f5f9;padding:1px 6px;border-radius:6px}
   .btn-ico{background:none;border:none;cursor:pointer;font-size:15px;color:var(--muted)}
   .btn-ico:hover{color:var(--primary)}
+  /* 节点详情抽屉：角色/参数/目录分区，统一 v3 配色 */
+  .nd-rolebar{display:flex;align-items:center;gap:12px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+  .nd-host{font-size:13px;color:var(--muted)}
+  .nd-section{margin-bottom:14px}
+  .nd-title{font-size:13px;font-weight:600;color:var(--muted);margin-bottom:8px;letter-spacing:.3px}
+  .nd-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .nd-cell{background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+  .nd-k{font-size:11px;color:var(--muted);margin-bottom:4px}
+  .nd-v{font-size:14px;color:var(--text);word-break:break-all}
+  .nd-v.on{color:#0f9d6b;font-weight:700}
+  .nd-v.off{color:#e11d48;font-weight:700}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -86,7 +97,7 @@
           <td>{% if r.status == 'up' %}<span class="badge up">在线</span>{% else %}<span class="badge down">离线</span>{% endif %}</td>
           <td>{% if r.role == '主库' %}<span class="badge ok">正常</span>{% elif r.status != 'up' %}<span class="badge down">未启动</span>{% elif r.bad %}<span class="badge warn">异常</span>{% else %}<span class="badge ok">正常</span>{% endif %}</td>
           <td class="mono">{% if r.role == '主库' %}—{% else %}{{ r.seconds_behind if r.seconds_behind is not none else '—' }}s{% endif %}</td>
-          <td><button class="btn btn-sm" onclick="openNodeDetail({{ c.id }}, '{{ r.host }}', {{ r.port }})">详情</button></td>
+          <td><button class="btn btn-sm" onclick="openNodeDetail({{ c.id }}, '{{ r.host }}', {{ r.port }}, '{{ 'master' if r.role=='主库' else 'slave' }}')">详情</button></td>
         </tr>
         {% endfor %}
       {% else %}
@@ -270,15 +281,16 @@
   }
 
   // ---- 节点详情 drawer ----
-  function openNodeDetail(cid,host,port){
+  function openNodeDetail(cid,host,port,role){
     var d=document.getElementById("nodeDrawer");
-    document.getElementById("dHost").textContent="节点详情 · "+host+":"+port;
+    var roleTxt = role==='master' ? ' · MASTER' : ' · SLAVE';
+    document.getElementById("dHost").textContent="节点详情 · "+host+":"+port+roleTxt;
     document.getElementById("dBody").innerHTML='<div class="obs-empty">加载中…</div>';
     d.classList.add("show");
     fetch("/api/node_detail",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
       body:new URLSearchParams({cluster_id:cid,host:host,port:port})})
       .then(function(r){return r.json();})
-      .then(function(d){renderNodeDetail(d,cid);})
+      .then(function(d){renderNodeDetail(d,cid,role);})
       .catch(function(e){document.getElementById("dBody").innerHTML='<div class="err-cell">请求失败: '+esc(e)+'</div>';});
   }
   function closeDrawer(){document.getElementById("nodeDrawer").classList.remove("show");}
@@ -294,27 +306,43 @@
     if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){toast("已复制","ok");},function(){toast("复制失败","err");});}
   }
   function chip(t,c){return '<span class="badge '+c+'">'+esc(t)+'</span>';}
-  function renderNodeDetail(d,cid){
+  function renderNodeDetail(d,cid,role){
     var body=document.getElementById("dBody");
     if(!d.ok){body.innerHTML='<div class="err-cell">'+esc(d.error||"加载失败")+'</div>';return;}
+    var role=role||'slave';
+    var roleCls=role==='master'?'master':'slave';
+    var roleTxt=role==='master'?'MASTER':'SLAVE';
     var ro=(d.read_only==="ON"||d.read_only==="1"||d.read_only===true);
+    var roCls=ro?' on':' off';
     var gm=(d.gtid_mode==="ON");
     var html="";
     if(d.conn_error)html+='<div class="banner err">无法连接节点：'+esc(d.conn_error)+'</div>';
-    html+='<div class="kv-row"><span class="k">server_id</span><span class="v">'+esc(d.server_id||"—")+'</span></div>';
-    html+='<div class="kv-row"><span class="k">数据目录</span><span class="v">'+esc(d.datadir||"—")+'</span></div>';
-    html+='<div class="kv-row"><span class="k">GTID 模式</span>'+chip(gm?"ON":"OFF",gm?"ok":"down")+'</div>';
-    html+='<div class="kv-row"><span class="k">read_only</span>'+chip(d.read_only||"—",ro?"warn":"ok")+'</div>';
-    html+='<div class="kv-row"><span class="k">enforce_gtid_consistency</span><span class="v">'+esc(d.enforce_gtid_consistency||"—")+'</span></div>';
-    html+='<div class="sub">数据库账号<span class="dd-note"> 仅管理员可见</span></div>';
+    // 角色栏
+    html+='<div class="nd-rolebar"><span class="role role-'+roleCls+'">'+roleTxt+'</span>'
+      +'<span class="nd-host mono">'+esc(d.host||"-")+':'+(d.port||3306)+'</span></div>';
+    // 第一行：read_only / GTID / server_id
+    html+='<div class="nd-section"><div class="nd-title">角色与实例参数</div><div class="nd-row">'
+      +'<div class="nd-cell"><div class="nd-k">read_only</div><div class="nd-v mono'+roCls+'">'+esc(d.read_only||"—")+'</div></div>'
+      +'<div class="nd-cell"><div class="nd-k">GTID 模式</div><div class="nd-v mono">'+chip(gm?"ON":"OFF",gm?"ok":"down")+'</div></div>'
+      +'<div class="nd-cell"><div class="nd-k">Server ID</div><div class="nd-v mono">'+esc(d.server_id||"—")+'</div></div>'
+      +'</div></div>';
+    // 第二行：部署目录 / 数据目录
+    html+='<div class="nd-section"><div class="nd-title">目录</div><div class="nd-row">'
+      +'<div class="nd-cell"><div class="nd-k">部署目录(compose)</div><div class="nd-v mono">'+esc(d.compose_path||"—")+'</div></div>'
+      +'<div class="nd-cell"><div class="nd-k">数据目录(datadir)</div><div class="nd-v mono">'+esc(d.datadir||"—")+'</div></div>'
+      +'</div></div>';
+    // 账号
+    html+='<div class="nd-section"><div class="nd-title">数据库账号<span class="dd-note"> 仅管理员可见</span></div>';
     html+=credBlock("节点 root（本地独立密码）",d.root_user,d.root_pass);
     html+=credBlock("HA 监控账号",d.ha_user,d.ha_pass);
     html+=credBlock("复制账号",d.repl_user,d.repl_pass);
     html+=credBlock("业务账号",d.app_user,d.app_pass);
-    html+='<div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;">'
+    html+='</div>';
+    // 自愈
+    html+='<div class="nd-section"><div class="nd-title">自愈操作</div><div style="display:flex;gap:8px;flex-wrap:wrap;">'
       +'<button class="btn btn-sm" onclick="showSelfhealSql('+cid+",'"+d.host+"',"+d.port+')">查看自愈 SQL</button>'
       +'<a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+"&host="+encodeURIComponent(d.host)+"&port="+d.port+'&download=1" download="fix-node-creds.sql">下载修复 SQL</a>'
-      +'</div>';
+      +'</div></div>';
     body.innerHTML=html;
   }
   function showSelfhealSql(cid,host,port){

@@ -60,6 +60,12 @@ TEMPLATES = Environment(
     loader=FileSystemLoader(str(Path(__file__).parent / "templates")),
     autoescape=select_autoescape(["html"]),
 )
+try:
+    TEMPLATES.globals["APP_VERSION"] = (
+        Path(__file__).resolve().parent / "VERSION"
+    ).read_text().strip()
+except Exception:
+    TEMPLATES.globals["APP_VERSION"] = ""
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 COOKIE = "ha_session"
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
@@ -1302,6 +1308,9 @@ def api_node_detail(cluster_id: int = Form(...), host: str = Form(...), port: in
         (cluster_id, host, port))
     root_user = (node[0]["root_user"] if node else "root") or "root"
     root_pass = node[0]["root_pass"] if node else ""
+    _cp = query("SELECT compose_path FROM nodes WHERE cluster_id=%s AND ip=%s AND port=%s",
+                (cluster_id, host, port))
+    compose_path = (_cp[0]["compose_path"] if _cp and _cp[0].get("compose_path") else "")
     creds = {}
     try:
         creds = get_cluster_creds(cluster_id) or {}
@@ -1309,7 +1318,7 @@ def api_node_detail(cluster_id: int = Form(...), host: str = Form(...), port: in
         creds = {}
     out = {
         "ok": True, "host": host, "port": port, "cluster_id": cluster_id,
-        "root_user": root_user, "root_pass": root_pass,
+        "root_user": root_user, "root_pass": root_pass, "compose_path": compose_path,
         "ha_user": creds.get("ha_user"), "ha_pass": creds.get("ha_pass"),
         "repl_user": creds.get("repl_user"), "repl_pass": creds.get("repl_pass"),
         "app_user": creds.get("app_user"), "app_pass": creds.get("app_pass"),
@@ -1339,6 +1348,99 @@ def api_node_detail(cluster_id: int = Form(...), host: str = Form(...), port: in
     except Exception as e:
         out["conn_error"] = f"{type(e).__name__}: {e}"
     return JSONResponse(out)
+
+
+@app.get("/api/alerts")
+def api_alerts(
+    level: str = "", status: str = "", cluster_id: int = 0,
+    hours: int = 0, q: str = "", page: int = 1, page_size: int = 20,
+    user=Depends(auth_required),
+):
+    """告警中心：按级别/确认状态/集群/时间/关键字筛选，分页返回。"""
+    where, params = [], []
+    if cluster_id:
+        where.append("a.cluster_id=%s"); params.append(cluster_id)
+    if status == "unread":
+        where.append("a.acked=0")
+    elif status == "acked":
+        where.append("a.acked=1")
+    if hours and hours > 0:
+        where.append("a.created_at>=DATE_SUB(NOW(), INTERVAL %s HOUR)"); params.append(hours)
+    if q:
+        where.append("(a.message LIKE %s OR a.host LIKE %s OR a.alert_type LIKE %s)")
+        params += [f"%{q}%", f"%{q}%", f"%{q}%"]
+    level_case = (
+        "CASE WHEN a.alert_type IN ('down','replication','ha_fail') THEN 'error'"
+        " WHEN a.alert_type='lag' THEN 'warn'"
+        " WHEN a.alert_type='recover' THEN 'info'"
+        " WHEN a.alert_type='selfheal' AND a.status='unresolved' THEN 'warn'"
+        " WHEN a.alert_type='selfheal' THEN 'info'"
+        " ELSE 'warn' END"
+    )
+    if level in ("error", "warn", "info"):
+        where.append(f"{level_case}=%s"); params.append(level)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    total = query(f"SELECT COUNT(*) AS n FROM alerts a{where_sql}", params)[0]["n"]
+    off = max(0, (page - 1) * page_size)
+    rows = query(
+        f"SELECT a.id, a.cluster_id, a.host, a.port, a.alert_type, a.status, a.message, "
+        f"a.acked, a.created_at, {level_case} AS level "
+        f"FROM alerts a{where_sql} ORDER BY a.created_at DESC LIMIT %s OFFSET %s",
+        params + [page_size, off],
+    )
+    cname = {c["id"]: (c.get("name") or f"集群{c['id']}") for c in list_clusters()}
+    for r in rows:
+        r["cluster_name"] = cname.get(r["cluster_id"], f"集群{r['cluster_id']}")
+    return _json_ok({"ok": True, "alerts": rows, "total": total,
+                     "page": page, "page_size": page_size})
+
+
+@app.post("/api/alert_ack")
+async def api_alert_ack(request: Request, user=Depends(auth_required)):
+    """确认告警：单条(id)、批量(ids)或全部(all)。"""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    # 注意：写操作必须用 execute()（内部 commit），query() 不提交事务
+    if bool(data.get("all")):
+        execute("UPDATE alerts SET acked=1 WHERE acked=0")
+    elif data.get("ids"):
+        id_list = [int(x) for x in data["ids"] if str(x).isdigit()]
+        if id_list:
+            ph = ",".join(["%s"] * len(id_list))
+            execute(f"UPDATE alerts SET acked=1 WHERE id IN ({ph})", id_list)
+    elif data.get("id"):
+        try:
+            execute("UPDATE alerts SET acked=1 WHERE id=%s", (int(data["id"]),))
+        except Exception as e:
+            print(f"[alert_ack] 确认失败: {e}")
+    return _json_ok({"ok": True})
+
+
+@app.get("/api/switch_history")
+def api_switch_history(
+    cluster_id: int = 0, hours: int = 0, page: int = 1, page_size: int = 20,
+    user=Depends(auth_required),
+):
+    """切换历史：按集群/时间筛选，分页返回。"""
+    where, params = [], []
+    if cluster_id:
+        where.append("h.cluster_id=%s"); params.append(cluster_id)
+    if hours and hours > 0:
+        where.append("h.created_at>=DATE_SUB(NOW(), INTERVAL %s HOUR)"); params.append(hours)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    total = query(f"SELECT COUNT(*) AS n FROM switch_history h{where_sql}", params)[0]["n"]
+    off = max(0, (page - 1) * page_size)
+    rows = query(
+        "SELECT h.id, h.cluster_id, h.from_host, h.from_port, h.to_host, h.to_port, "
+        f"h.reason, h.created_at FROM switch_history h{where_sql} "
+        "ORDER BY h.id DESC LIMIT %s OFFSET %s", params + [page_size, off])
+    cname = {c["id"]: (c.get("name") or f"集群{c['id']}") for c in list_clusters()}
+    for r in rows:
+        r["cluster_name"] = cname.get(r["cluster_id"], f"集群{r['cluster_id']}")
+    return _json_ok({"ok": True, "history": rows, "total": total,
+                     "page": page, "page_size": page_size})
 
 
 @app.post("/clusters")

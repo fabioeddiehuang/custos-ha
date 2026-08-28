@@ -184,20 +184,24 @@
 </div>
 
 <div class="card">
-  <h3 style="margin:0 0 12px;">切换记录</h3>
-  <div class="dh-timeline">
-    {% for r in history %}
-    <div class="dh-tl">
-      <span class="dh-tl-dot {{ 'err' if r.reason and '宕机' in r.reason else 'ok' }}"></span>
-      <div class="dh-tl-body">
-        <div class="dh-tl-t">{{ (r.created_at or '')|string|truncate(16, true, '') }} · {{ r.cluster_name or ('集群' ~ r.cluster_id) }}</div>
-        <div class="dh-tl-d">{{ r.from_host }}:{{ r.from_port }} → {{ r.to_host }}:{{ r.to_port }}（{{ r.reason }}）</div>
-      </div>
-    </div>
-    {% else %}
-    <div class="obs-empty">暂无切换记录</div>
-    {% endfor %}
+  <h3 style="margin:0 0 12px;">切换记录 <span class="muted" id="swCount"></span></h3>
+  <div class="toolbar" style="margin-bottom:12px">
+    <select id="swCluster" class="mini-sel" onchange="loadSwitchHistory()">
+      <option value="0">集群：全部</option>
+      {% for c in clusters %}<option value="{{ c.cluster_id }}">{{ c.name }}</option>{% endfor %}
+    </select>
+    <select id="swHours" class="mini-sel" onchange="loadSwitchHistory()">
+      <option value="0">时间：全部</option>
+      <option value="24">近 24 小时</option>
+      <option value="168">近 7 天</option>
+      <option value="720">近 30 天</option>
+    </select>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" id="swPrev" onclick="swPage(-1)">上一页</button>
+    <span id="swPageInfo" class="muted"></span>
+    <button class="btn btn-sm" id="swNext" onclick="swPage(1)">下一页</button>
   </div>
+  <div class="dh-timeline" id="swBody"><div class="obs-empty">加载中…</div></div>
 </div>
 
 <script>
@@ -722,9 +726,46 @@
     });
   }
 
+  // ---- 切换历史（集群/时间筛选 + 分页）----
+  var _swPage = 1;
+  function swPage(d) { _swPage = Math.max(1, _swPage + d); loadSwitchHistory(); }
+  function fmtSwTs(t) { if (!t) return '—'; return String(t).slice(0, 16).replace('T', ' '); }
+  function loadSwitchHistory() {
+    var cid = document.getElementById("swCluster") ? document.getElementById("swCluster").value : 0;
+    var hours = document.getElementById("swHours") ? document.getElementById("swHours").value : 0;
+    var p = new URLSearchParams({ cluster_id: cid, hours: hours, page: _swPage, page_size: 20 });
+    fetch("/api/switch_history?" + p.toString(), { cache: "no-store", credentials: "same-origin" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var box = document.getElementById("swBody");
+        if (!d.ok) { box.innerHTML = '<div class="obs-empty">加载失败</div>'; return; }
+        var rows = d.history || [];
+        if (!rows.length) { box.innerHTML = '<div class="obs-empty">暂无切换记录</div>'; }
+        else {
+          box.innerHTML = rows.map(function (h) {
+            var err = h.reason && String(h.reason).indexOf('宕机') >= 0;
+            var name = h.cluster_name || ('集群' + (h.cluster_id || '?'));
+            return '<div class="dh-tl">'
+              + '<span class="dh-tl-dot ' + (err ? 'err' : 'ok') + '"></span>'
+              + '<div class="dh-tl-body">'
+              + '<div class="dh-tl-t">' + fmtSwTs(h.created_at) + ' · ' + esc(name) + '</div>'
+              + '<div class="dh-tl-d">' + esc(h.from_host || '—') + ':' + (h.from_port || '')
+              + ' → ' + esc(h.to_host || '—') + ':' + (h.to_port || '')
+              + '（' + esc(h.reason || '') + '）</div>'
+              + '</div></div>';
+          }).join('');
+        }
+        document.getElementById("swCount").textContent = "共 " + (d.total || 0) + " 条";
+        var pages = Math.max(1, Math.ceil((d.total || 0) / (d.page_size || 20)));
+        document.getElementById("swPageInfo").textContent = " 第 " + (d.page || 1) + " / " + pages + " 页 ";
+      })
+      .catch(function (e) { document.getElementById("swBody").innerHTML = '<div class="obs-empty">请求失败：' + esc(e) + '</div>'; });
+  }
+
   refreshStatus(false);
   checkVip();
   loadAlertCount();
+  loadSwitchHistory();
   var _obsSel = document.getElementById("obsCluster");
   var _hasObs = !!(_obsSel && _obsSel.options && _obsSel.options.length);
   if (_hasObs) { loadTrend(); loadSlow(); loadDrift(); }
@@ -733,6 +774,7 @@
   setInterval(checkVip, 15000);
   setInterval(loadDrift, 30000);
   setInterval(loadAlertCount, 15000);
+  setInterval(loadSwitchHistory, 30000);
   if (_hasObs) { setInterval(loadTrend, 60000); setInterval(loadSlow, 60000); }
   setInterval(loadActivity, 15000);
 </script>
