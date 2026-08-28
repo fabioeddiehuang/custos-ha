@@ -12,11 +12,10 @@
   /* 数据库终端：黑屏交互（参考 V3 设计稿） */
   .term-modal{max-width:880px;width:94vw}
   .term-modal .body{display:flex;flex-direction:column}
-  .term-modal.term-full{width:100vw;height:100vh;max-width:none;border-radius:0;margin:0;display:flex;flex-direction:column}
+  /* 全屏：脱离 overlay，直接挂到 body，避免被 overlay 的 transform 限制导致上下留白 */
+  .term-modal.term-full{position:fixed;top:0;left:0;right:0;bottom:0;width:100vw;height:100vh;max-width:none;border-radius:0;margin:0;display:flex;flex-direction:column;z-index:3000;background:#fff}
   .term-modal.term-full .body{flex:1;min-height:0}
   .term-modal.term-full .term{flex:1;height:auto;min-height:0}
-  .term-full-btn{cursor:pointer;margin-left:14px;font-size:17px;color:var(--muted);user-select:none}
-  .term-full-btn:hover{color:var(--primary)}
   .term{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;height:52vh;overflow:auto;font-family:var(--mono);font-size:13px;line-height:1.55}
   .term-output{white-space:pre-wrap;word-break:break-word}
   .term-output>div{padding:1px 0}
@@ -98,6 +97,11 @@
     <div class="tab active" onclick="switchLogTab(this,'err')">错误日志</div>
     <div class="tab" onclick="switchLogTab(this,'slow')">慢日志</div>
     <span style="flex:1"></span>
+    <label class="switch" style="align-self:center" title="开启后管理器定时采集各节点慢日志到 mysql.slow_log">
+      <input type="checkbox" id="slowlogSwitch" {% if slowlog_enabled %}checked{% endif %} onchange="toggleSlowlog(this)">
+      <span class="slider"></span>
+    </label>
+    <span style="font-size:12px;color:var(--muted);white-space:nowrap;align-self:center">慢日志采集</span>
     <select id="logCluster" class="mini-sel" onchange="loadCurrentLog()">
       {% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
     </select>
@@ -113,7 +117,7 @@
 
 <div class="toolbar" style="margin-top:4px">
   <button class="btn btn-primary" onclick="openTerm()">▷ 数据库终端</button>
-  <span class="spacer"></span><span class="badge sky">终端复用 ha_monitor（只读）</span>
+  <span class="spacer"></span><span class="badge sky">终端使用节点 root 账号（可读写 · 记录入审计）</span>
 </div>
 
 <!-- 新增集群 modal -->
@@ -161,9 +165,9 @@
 <div class="overlay" id="termOverlay" onclick="if(event.target===this)closeTerm()">
   <div class="modal term-modal" id="termModal">
     <header><b>数据库终端</b>
-      <span class="badge sky" style="margin-left:auto">账号 ha_monitor（只读）</span>
-      <span class="term-full-btn" id="termFullBtn" onclick="toggleTermFull()" title="全屏">⛶</span>
-      <span class="close" onclick="closeTerm()">×</span>
+      <span class="badge sky" id="termAccount" style="margin-left:auto">账号 root（可读写）</span>
+      <button class="btn btn-sm" id="termFullBtn" onclick="toggleTermFull()" title="全屏">全屏</button>
+      <button class="btn btn-sm" onclick="closeTerm()">关闭</button>
     </header>
     <div class="body">
       <div class="toolbar">
@@ -176,9 +180,9 @@
       </div>
       <div class="term" id="termScreen">
         <div class="term-output" id="termOutput"></div>
-        <div class="term-input-line"><span class="term-prompt">mysql&gt;</span><input id="termInput" class="term-input" onkeydown="runTerm(event)" autocomplete="off" spellcheck="false" placeholder="输入只读 SQL，回车执行（无需点击执行）"></div>
+        <div class="term-input-line"><span class="term-prompt" id="termPrompt">mysql&gt;</span><input id="termInput" class="term-input" onkeydown="runTerm(event)" autocomplete="off" spellcheck="false" placeholder="输入 SQL（读写均可），回车执行，↑/↓ 调历史"></div>
       </div>
-      <div class="note">黑屏内直接输入 SQL，回车执行；默认仅允许 SELECT / SHOW / EXPLAIN / DESCRIBE 类只读语句，执行记录写入审计日志。</div>
+      <div class="note">黑屏内直接输入 SQL，回车执行（无需点击执行）；支持 ↑/↓ 翻阅历史命令。默认使用节点 root 账号，可读写全部语句，执行记录写入审计日志。</div>
     </div>
     <footer><button class="btn" onclick="closeTerm()">关闭</button></footer>
   </div>
@@ -407,22 +411,38 @@
     if(!sel.options.length){var o=document.createElement("option");o.value="";o.textContent="无节点";sel.appendChild(o);}
   }
   function openTerm(){
-    document.getElementById("termOverlay").classList.add("show");
+    var m=document.getElementById("termModal"),ov=document.getElementById("termOverlay");
+    if(m.parentNode!==ov)ov.appendChild(m);
+    m.classList.remove("term-full");
+    document.getElementById("termFullBtn").textContent="全屏";
+    ov.classList.add("show");
     fillTermNodes();
     setTimeout(function(){var i=document.getElementById("termInput");if(i)i.focus();},60);
   }
+  function exitTermFull(){
+    var m=document.getElementById("termModal"),ov=document.getElementById("termOverlay"),fb=document.getElementById("termFullBtn");
+    if(m&&m.parentNode!==ov)ov.appendChild(m);
+    if(m)m.classList.remove("term-full");
+    if(fb)fb.textContent="全屏";
+  }
   function closeTerm(){
+    exitTermFull();
     document.getElementById("termOverlay").classList.remove("show");
-    var m=document.getElementById("termModal");if(m)m.classList.remove("term-full");
-    var fb=document.getElementById("termFullBtn");if(fb)fb.textContent="⛶";
   }
   function toggleTermFull(){
-    var m=document.getElementById("termModal"),fb=document.getElementById("termFullBtn");
+    var m=document.getElementById("termModal"),ov=document.getElementById("termOverlay"),fb=document.getElementById("termFullBtn");
     if(!m)return;
-    var fs=m.classList.toggle("term-full");
-    if(fb)fb.textContent=fs?"✕":"⛶";
-    var i=document.getElementById("termInput");if(i&&fs)i.focus();
+    if(m.classList.contains("term-full")){
+      exitTermFull();
+    }else{
+      document.body.appendChild(m);   // 挂到 body，脱离 overlay 的 transform 限制
+      m.classList.add("term-full");
+      if(fb)fb.textContent="退出全屏";
+      var i=document.getElementById("termInput");if(i)i.focus();
+    }
   }
+  // 命令历史（↑/↓）
+  var termHistory=[],termHistIdx=0;
   function termAppend(text,cls){
     var o=document.getElementById("termOutput");
     var d=document.createElement("div");
@@ -433,7 +453,13 @@
   }
   function clearTerm(){var o=document.getElementById("termOutput");if(o)o.innerHTML="";}
   function runTerm(e){
-    if(e&&e.type==="keydown"){ if(e.key!=="Enter")return; e.preventDefault(); }
+    if(e&&e.type==="keydown"){
+      var i=document.getElementById("termInput");
+      if(e.key==="ArrowUp"){ if(termHistIdx>0){termHistIdx--; i.value=termHistory[termHistIdx];} e.preventDefault(); return; }
+      if(e.key==="ArrowDown"){ if(termHistIdx<termHistory.length-1){termHistIdx++; i.value=termHistory[termHistIdx];} else {termHistIdx=termHistory.length; i.value="";} e.preventDefault(); return; }
+      if(e.key!=="Enter")return;
+      e.preventDefault();
+    }
     var cid=document.getElementById("termCluster").value;
     var nv=document.getElementById("termNode").value;
     if(!nv){toast("请先选择节点","err");return;}
@@ -441,8 +467,9 @@
     var i=document.getElementById("termInput");
     var sql=i.value;
     if(!sql.trim())return;
-    termAppend("mysql> "+sql);
+    termAppend(nv+" [(none)]> "+sql);
     i.value="";
+    termHistory.push(sql);termHistIdx=termHistory.length;
     var busy=document.createElement("div");
     busy.textContent="…执行中";
     busy.className="term-busy";
@@ -451,12 +478,19 @@
     apiPost("/api/term",{cluster_id:cid,host:hp[0],port:hp[1],sql:sql},function(d){
       if(busy.parentNode)busy.parentNode.removeChild(busy);
       if(!d.ok){termAppend("错误: "+(d.error||"执行失败"),"term-err");return;}
+      var ac=document.getElementById("termAccount");
+      if(ac&&d.account)ac.textContent="账号 "+(d.account||"");
       if(!d.cols||!d.cols.length){termAppend(d.info||"OK, 0 rows affected","");return;}
       termAppend(d.cols.join(" | "),"term-head");
       d.rows.forEach(function(r){
         termAppend(r.map(function(v){return v===null?"NULL":v;}).join(" | "),"");
       });
       termAppend("("+d.count+" 行)","");
+    });
+  }
+  function toggleSlowlog(el){
+    apiPost("/api/setting_set",{key:"SLOWLOG_ENABLED",value:el.checked?"1":"0"},function(d){
+      toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");
     });
   }
 

@@ -17,10 +17,11 @@
   .rule-field .unit{font-size:12px;color:#94a3b8}
   .rule-field.full{grid-column:1/-1}
   .rule-field textarea{height:86px;resize:vertical;font-weight:400}
-  .email-chip{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border:1px solid var(--border);border-radius:999px;font-size:13px;background:#fafbff}
-  .email-chip .tag{font-size:11px}
-  .email-chip .del{cursor:pointer;color:#b91c1c;background:none;border:none;font-size:14px;line-height:1}
-  .email-chip .mini{cursor:pointer;color:var(--primary);background:none;border:none;font-size:11px;padding:0}
+  .email-card{display:flex;flex-direction:column;gap:10px;min-width:280px;border:1px solid var(--border);border-radius:14px;padding:14px 16px;background:#fff;box-shadow:0 1px 3px rgba(16,24,40,.04)}
+  .email-card .ec-top{display:flex;align-items:center;gap:10px}
+  .email-card .ec-mail{font-weight:700;font-size:14px;word-break:break-all}
+  .email-card .ec-clusters{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .email-card .ec-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -55,16 +56,33 @@
 
 <div class="card">
   <h3>提醒邮箱</h3>
-  <div style="display:flex;flex-wrap:wrap;gap:8px;" id="emailList">
+  <div style="display:flex;flex-wrap:wrap;gap:14px;" id="emailList">
     {% for e in alert_emails %}
-    <span class="email-chip" data-id="{{ e.id }}">
-      <span>{{ e.email }}</span>
-      {% if e.is_default %}<span class="tag ok">默认</span>{% endif %}
-      {% if e.clusters %}<span class="tag sky">{{ e.clusters|join('、') }}</span>{% else %}<span class="tag" style="background:#fee2e2;color:#b91c1c">未绑定集群·不接收</span>{% endif %}
-      <button class="mini" onclick="mapCluster('{{ e.id }}','{{ e.clusters|join('、') }}')">映射集群</button>
-      <button class="mini" onclick="setDefault('{{ e.id }}')">设为默认</button>
-      <button class="del" onclick="delEmail('{{ e.id }}')">×</button>
-    </span>
+    <div class="email-card" data-id="{{ e.id }}">
+      <div class="ec-top">
+        <span class="ec-mail">{{ e.email }}</span>
+        {% if e.is_default %}<span class="tag ok">默认</span>{% endif %}
+        <label class="switch" title="开启后该邮箱可接收告警（需已绑定集群）" style="margin-left:auto">
+          <input type="checkbox" onchange="toggleEmail({{ e.id }}, this)" {% if e.enabled %}checked{% endif %}>
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div>
+        {% if not e.enabled %}<span class="tag" style="background:#fee2e2;color:#b91c1c">不接收</span>
+        {% elif e.clusters %}<span class="tag ok">接收中</span>
+        {% else %}<span class="tag warn">未绑定集群·不接收</span>{% endif %}
+      </div>
+      <div class="ec-clusters">
+        {% if e.clusters %}
+          {% for c in e.clusters %}<span class="tag sky">{{ c }}</span>{% endfor %}
+        {% else %}<span style="color:#9ca3af;font-size:12px">尚未绑定集群</span>{% endif %}
+      </div>
+      <div class="ec-actions">
+        <button class="btn btn-sm btn-ghost" onclick="mapCluster('{{ e.id }}','{{ e.clusters|join('、') }}')">映射集群</button>
+        {% if not e.is_default %}<button class="btn btn-sm" onclick="setDefault('{{ e.id }}')">设为默认</button>{% endif %}
+        <button class="btn btn-sm" style="margin-left:auto;background:var(--danger);color:#fff" onclick="delEmail('{{ e.id }}')">删除</button>
+      </div>
+    </div>
     {% else %}
     <span style="color:#9ca3af;font-size:13px;">暂无提醒邮箱</span>
     {% endfor %}
@@ -182,6 +200,13 @@
     apiPost("/settings/email/set_default",{id:id,is_default:1},function(d){
       toast(d.msg||(d.ok?"已设为默认":"操作失败"),d.ok?"ok":"err");
       if(d.ok)setTimeout(function(){location.reload();},600);
+    });
+  }
+  function toggleEmail(id, el){
+    apiPost("/settings/email/toggle",{id:id, enabled: el.checked?1:0},function(d){
+      toast(d.msg||(d.ok?"已更新":"操作失败"),d.ok?"ok":"err");
+      if(!d.ok){ el.checked=!el.checked; }   // 失败回滚
+      else setTimeout(function(){location.reload();},500);
     });
   }
   var __clusters = {{ clusters|tojson }};

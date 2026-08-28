@@ -225,6 +225,13 @@ def init_schema():
                 c.execute("ALTER TABLE hosts ADD COLUMN err TEXT")
             except Exception:
                 pass
+            # 兼容旧 schema：alert_emails 新增 enabled（收件开关，默认开启）
+            try:
+                c.execute(
+                    "ALTER TABLE alert_emails ADD COLUMN enabled TINYINT(1) NOT NULL DEFAULT 1"
+                )
+            except Exception:
+                pass
             # 兼容旧 schema：nodes 表新增 root_pass（节点 MySQL root 密码，用于 ha_monitor
             # 凭证自愈与切换的 root 回退；root 密码在容器创建时固定，不随 HA_PASS 漂移）
             try:

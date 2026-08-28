@@ -26,7 +26,7 @@ def resolve_recipients(cluster_id=None):
     emails = []
     seen = set()
     try:
-        for r in query("SELECT email FROM alert_emails WHERE is_default=1"):
+        for r in query("SELECT email FROM alert_emails WHERE is_default=1 AND enabled=1"):
             e = (r.get("email") or "").strip()
             if e and e not in seen:
                 seen.add(e)
@@ -34,7 +34,8 @@ def resolve_recipients(cluster_id=None):
         if cluster_id is not None:
             for r in query(
                 "SELECT e.email AS email FROM alert_emails e "
-                "JOIN alert_email_map m ON m.email_id=e.id WHERE m.cluster_id=%s",
+                "JOIN alert_email_map m ON m.email_id=e.id "
+                "WHERE m.cluster_id=%s AND e.enabled=1",
                 (int(cluster_id),),
             ):
                 e = (r.get("email") or "").strip()

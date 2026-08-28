@@ -78,6 +78,9 @@ services:
       # 持久化「添加节点」生成的部署文件，便于到目标主机 docker compose up。
       # 统一收敛到项目根下的 ./generated_nodes（每个 <ip> 为自包含部署单元，可直接拷到 /home/docker/<ip>/）。
       - ./generated_nodes:/app/generated_nodes
+      # 挂载宿主 docker.sock：使管理器能读取兄弟容器（keepalived / monitor 等）日志。
+      # 无需在镜像内安装 docker CLI，直接经 Unix Socket 调 Docker HTTP API。
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - ha_net
 

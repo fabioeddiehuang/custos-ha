@@ -7,14 +7,14 @@
   .acc-pwd .reveal{cursor:pointer;color:var(--primary);margin-left:8px;font-size:12px;background:none;border:none;padding:0}
   .acc-pwd .reveal:hover{color:var(--primary-dark)}
   .dd-actions{display:flex;gap:10px;flex-wrap:wrap}
-  /* 基本信息：每项「标签/值」两行，2 列网格，避免文字重叠 */
-  .dd-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 22px}
-  .kv{display:flex;flex-direction:column;gap:3px;min-width:0}
-  .kv .k{font-size:12px;color:var(--muted);font-weight:600}
-  .kv .v{font-weight:600;word-break:break-word;white-space:normal;line-height:1.4}
-  /* 高亮字段：去掉下划线，改为 hover 高亮效果 */
-  .kv.hl .v{font-weight:700;cursor:default;border-radius:4px;padding:1px 4px;margin:-1px -4px;transition:color .15s,background .15s}
-  .kv.hl .v:hover{color:#fff;background:var(--primary)}
+  /* 基本信息：单行信息条，标签+值横向排列，过长省略避免重叠 */
+  .info-strip{display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;background:#f8fafc;border:1px solid var(--border);border-radius:12px;padding:12px 16px}
+  .is{display:flex;align-items:center;gap:8px;min-width:0}
+  .is-k{font-size:12px;color:var(--muted);font-weight:600;white-space:nowrap}
+  .is-v{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px}
+  .is-v.tr{cursor:default}
+  .is-v.tr:hover{color:var(--primary)}
+  .is-sep{width:1px;align-self:stretch;background:var(--border)}
   /* 添加节点 / 节点配置 表单 */
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px}
   .grid2 label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);font-weight:600}
@@ -57,13 +57,18 @@
         <td colspan="5"><div class="dd">
           <div class="dd-sec">
             <div class="dd-sec-t">基本信息</div>
-            <div class="dd-grid">
-              <div class="kv"><span class="k">角色</span><span class="v" data-f="role"><span class="role role-unknown">未知</span></span></div>
-              <div class="kv"><span class="k">初始角色</span><span class="v">{{ n.initial_role or 'slave' }}</span></div>
-              <div class="kv"><span class="k hl">server_id</span><span class="v">{{ n.server_id or '—' }}</span></div>
-              <div class="kv"><span class="k hl">部署目录</span><span class="v">{{ n.dir_display }}</span></div>
-              <div class="kv"><span class="k hl">数据目录</span><span class="v" data-f="datadir">—</span></div>
-              <div class="kv"><span class="k hl">GTID / read_only</span><span class="v" data-f="gtid">—</span></div>
+            <div class="info-strip">
+              <div class="is"><span class="is-k">当前角色</span><span class="is-v" data-f="role"><span class="role role-unknown">未知</span></span></div>
+              <div class="is-sep"></div>
+              <div class="is"><span class="is-k">server_id</span><span class="is-v">{{ n.server_id or '—' }}</span></div>
+              <div class="is-sep"></div>
+              <div class="is"><span class="is-k">部署目录</span><span class="is-v tr" title="{{ n.dir_display }}">{{ n.dir_display }}</span></div>
+              <div class="is-sep"></div>
+              <div class="is"><span class="is-k">数据目录</span><span class="is-v tr" data-f="datadir" title="">—</span></div>
+              <div class="is-sep"></div>
+              <div class="is"><span class="is-k">GTID</span><span class="is-v" data-f="gtid_mode">—</span></div>
+              <div class="is-sep"></div>
+              <div class="is"><span class="is-k">read_only</span><span class="is-v" data-f="read_only">—</span></div>
             </div>
           </div>
           <div class="dd-sec">
@@ -71,12 +76,14 @@
             <div class="acc-list" data-f="creds"><div class="obs-empty">展开后加载…</div></div>
           </div>
           <div class="dd-actions">
-            <button class="btn btn-sm" onclick="openNodeCfg('{{ n.ip }}', {{ n.port }})">节点配置</button>
             {% if n.node_type == 'mariadb' %}
             <a class="btn btn-sm btn-ghost" href="/nodes/{{ n.ip }}/creds_sql" title="下载该节点账号/权限修复脚本 fix-node-creds.sql">查看/下载自愈 SQL</a>
             {% else %}
             <button class="btn btn-sm btn-primary" onclick="showSelfhealSql({{ n.cluster_id or 0 }}, '{{ n.ip }}', {{ n.port }})">查看/下载自愈 SQL</button>
             {% endif %}
+            <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
+            <a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none" href="/nodes/{{ n.ip }}/creds_sql" download>下载修复SQL</a>
+            <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delNode('{{ n.ip }}')">删除节点</button>
           </div>
         </div></td>
       </tr>
@@ -204,9 +211,11 @@
           var rl=isMaster?"主":"从";
           role.innerHTML='<span class="role role-'+((isMaster)?"master":"slave")+'">'+rl+'</span>';
         }
-        var dd=tr.querySelector('[data-f="datadir"]');if(dd)dd.textContent=d.datadir||"—";
-        var g=tr.querySelector('[data-f="gtid"]');
-        if(g){g.innerHTML='<span class="tag '+(d.gtid_mode==="ON"?"on":"off")+'">'+(d.gtid_mode||"—")+'</span> / <span class="tag '+((d.read_only==="ON"||d.read_only==="1"||d.read_only===true)?"on":"off")+'">'+(d.read_only||"—")+'</span>';}
+        var dd=tr.querySelector('[data-f="datadir"]');if(dd){dd.textContent=d.datadir||"—"; dd.title=d.datadir||"";}
+        var gm=tr.querySelector('[data-f="gtid_mode"]');
+        if(gm)gm.innerHTML='<span class="tag '+(d.gtid_mode==="ON"?"on":"off")+'">'+(d.gtid_mode||"—")+'</span>';
+        var ro=tr.querySelector('[data-f="read_only"]');
+        if(ro)ro.innerHTML='<span class="tag '+((d.read_only==="ON"||d.read_only==="1"||d.read_only===true)?"on":"off")+'">'+(d.read_only||"—")+'</span>';
         // 账号列表
         var acc=tr.querySelector('[data-f="creds"]');
         if(acc){

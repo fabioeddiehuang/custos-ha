@@ -9,9 +9,10 @@
   .setting-item input{max-width:300px;font-family:var(--mono)}
   .setting-input{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}
   .setting-input input{max-width:160px;font-family:var(--mono)}
-  .srv-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
-  .srv-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .srv-head{display:flex;flex-direction:column;gap:10px;margin-bottom:12px}
+  .srv-actions{display:flex;align-items:center;gap:8px;flex-wrap:nowrap}
   .srv-actions .btn{flex:0 0 auto;white-space:nowrap}
+  .srv-actions .mini-sel{flex:0 0 auto}
   .srv-log{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:12px;max-height:420px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.6;white-space:pre-wrap;margin:0}
 </style>
 
@@ -40,18 +41,18 @@
 <div class="card">
   <h3>服务端容器日志</h3>
   <div class="srv-head">
-    <div class="note">用于排查管理器自身故障，日志由管理器写入本地文件（容器内通常无 docker.sock，因此不依赖 docker logs）；切换服务可查看对应运行日志。</div>
+    <div class="note">实时读取管理端容器日志（经宿主 docker.sock 读取 keepalived / mysql-ha-manager / ha-manager-monitor / mysql-ha-manager-mgmt 等兄弟容器）。每 4 秒自动刷新新增内容，可切换服务查看。</div>
     <div class="srv-actions">
       <select id="srvUnit" class="mini-sel">
-        <option value="ha_manager">mysql-ha-manager</option>
-        <option value="mysqld">mysqld</option>
+        <option value="ha_manager">mysql-ha-manager（管理器）</option>
         <option value="keepalived">keepalived</option>
-        <option value="ha-manager-monitor">ha-manager-monitor</option>
+        <option value="monitor">ha-manager-monitor</option>
+        <option value="ha_manager-mgmt">mysql-ha-manager-mgmt（如有）</option>
       </select>
-      <button class="btn btn-sm" onclick="loadSrvLog()">读取日志</button>
+      <button class="btn btn-sm btn-primary" onclick="loadSrvLog()">读取日志</button>
+      <button class="btn btn-sm" onclick="exportSrvLog()">导出TXT（24h）</button>
       <button class="btn btn-sm btn-ghost" onclick="toggleFull()">全屏</button>
       <button class="btn btn-sm btn-ghost" onclick="clearSrvLog()">清空</button>
-      <button class="btn btn-sm btn-ghost" onclick="exportSrvLog()">导出TXT</button>
     </div>
   </div>
   <pre class="srv-log" id="srvLog">日志加载中…</pre>
@@ -92,10 +93,15 @@
       close.style.cssText="display:none";
     }
   }
+  function svcVal(){return document.getElementById("srvUnit").value;}
+  function enc(s){return encodeURIComponent(s);}
+  var _lastFetch=0, _autoTail=true;
   function loadSrvLog(){
+    // 全量读取（最近 24h）并替换
+    _lastFetch=Math.floor(Date.now()/1000);
     var log=document.getElementById("srvLog");
     log.textContent="日志加载中…";
-    fetch("/api/srv_log?svc="+encodeURIComponent(document.getElementById("srvUnit").value))
+    fetch("/api/srv_log?svc="+enc(svcVal())+"&since=86400")
       .then(function(r){return r.json();})
       .then(function(d){
         if(!d.ok){log.textContent="加载失败: "+(d.error||"");return;}
@@ -104,16 +110,44 @@
       })
       .catch(function(e){log.textContent="请求失败: "+e;});
   }
+  function pollSrvLog(){
+    if(_full)return; // 全屏时不重复追加
+    var now=Math.floor(Date.now()/1000);
+    var since=Math.max(2, now-_lastFetch+1);
+    _lastFetch=now;
+    fetch("/api/srv_log?svc="+enc(svcVal())+"&since="+since)
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.ok||!d.log||!d.log.trim())return;
+        var log=document.getElementById("srvLog");
+        var cur=log.textContent;
+        var append=(cur&&!cur.endsWith("\n")?"\n":"")+d.log;
+        log.textContent=cur+append;
+        if(_autoTail)log.scrollTop=log.scrollHeight;
+      })
+      .catch(function(){});
+  }
+  // 用户向上滚动时暂停自动跟随到底部
+  document.getElementById("srvLog").addEventListener("scroll",function(){
+    var el=this;_autoTail=(el.scrollTop+el.clientHeight>=el.scrollHeight-6);
+  });
   function clearSrvLog(){document.getElementById("srvLog").textContent="";}
   function exportSrvLog(){
-    var txt=document.getElementById("srvLog").textContent;
-    if(!txt.trim()||txt==="日志加载中…"){toast("暂无日志可导出","err");return;}
-    var blob=new Blob([txt],{type:"text/plain;charset=utf-8"});
-    var a=document.createElement("a");a.href=URL.createObjectURL(blob);
-    a.download="srv_log_"+document.getElementById("srvUnit").value+"_24h.txt";a.click();
-    URL.revokeObjectURL(a.href);
+    // 始终导出最近 24h 全量日志
+    fetch("/api/srv_log?svc="+enc(svcVal())+"&since=86400")
+      .then(function(r){return r.json();})
+      .then(function(d){
+        var txt=d.ok?(d.log||""):"";
+        if(!txt.trim()){toast("暂无日志可导出","err");return;}
+        var blob=new Blob([txt],{type:"text/plain;charset=utf-8"});
+        var a=document.createElement("a");a.href=URL.createObjectURL(blob);
+        a.download="srv_log_"+svcVal()+"_24h.txt";a.click();
+        URL.revokeObjectURL(a.href);
+      })
+      .catch(function(e){toast("导出失败: "+e,"err");});
   }
 
   loadSrvLog();
+  setInterval(pollSrvLog, 4000);
 </script>
 {% endblock %}

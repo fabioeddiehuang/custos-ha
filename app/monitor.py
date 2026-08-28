@@ -423,7 +423,7 @@ def _maybe_collect():
             import traceback; traceback.print_exc()
     if _COLLECT_CYCLE["slow"] >= _SLOW_EVERY:
         _COLLECT_CYCLE["slow"] = 0
-        if SLOWLOG_ENABLED:
+        if slow_log.slowlog_enabled():
             try:
                 slow_log.collect_slow_log()
             except Exception as e:

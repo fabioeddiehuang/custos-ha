@@ -29,7 +29,7 @@ from .ha_client import (connect, heal_replication, heal_io_gtid_gap, get_status,
                        fix_node_mysql_params, reset_replication_creds_on_master,
                        restart_slave_io, connect_robust)
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
-from . import precheck, audit, metrics, slow_log, config_drift
+from . import precheck, audit, metrics, slow_log, config_drift, docker_helper
 
 # ---------------------------------------------------------------------------
 # 管理器运行日志（「系统设置 → 服务端容器日志」读取此文件）
@@ -681,7 +681,7 @@ def api_failover_to(host: str = Form(...), port: int = Form(...),
 
 def _load_alert_emails():
     """返回全部告警邮箱及其绑定的集群列表（用于「提醒邮箱」横排展示与编辑）。"""
-    emails = query("SELECT id, email, is_default FROM alert_emails ORDER BY id")
+    emails = query("SELECT id, email, is_default, enabled FROM alert_emails ORDER BY id")
     for e in emails:
         e["clusters"] = [
             {"id": r["cluster_id"], "name": r["cluster_name"]}
@@ -891,6 +891,16 @@ def email_set_default(id: int = Form(...), is_default: int = Form(0), user=Depen
         return JSONResponse({"ok": False, "msg": f"✗ 更新失败：{e}"}, status_code=200)
 
 
+@app.post("/settings/email/toggle")
+def email_toggle(id: int = Form(...), enabled: int = Form(1), user=Depends(auth_required)):
+    """切换某邮箱是否接收告警邮件。enabled=0 时即使已绑定集群也不发送。"""
+    try:
+        execute("UPDATE alert_emails SET enabled=%s WHERE id=%s", (int(enabled), id))
+        return JSONResponse({"ok": True, "msg": "✓ 已更新"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"✗ 更新失败：{e}"}, status_code=200)
+
+
 @app.post("/settings/email/map")
 def email_map(id: int = Form(...), cluster_ids: str = Form(""), user=Depends(auth_required)):
     """保存某邮箱绑定的集群列表（逗号分隔的 cluster_id）。"""
@@ -1001,7 +1011,8 @@ def clusters_page(request: Request, user=Depends(auth_required), msg: str = "", 
     return render("clusters.html", request, user=user, clusters=clusters,
                   active=active, creds=creds, msg=msg, error=error,
                   auto_failover=get_setting("AUTO_FAILOVER", "1") == "1",
-                  auto_repair=get_setting("AUTO_REPAIR", "1") == "1")
+                  auto_repair=get_setting("AUTO_REPAIR", "1") == "1",
+                  slowlog_enabled=slow_log.slowlog_enabled())
 
 
 @app.post("/api/setting_set")
@@ -1009,7 +1020,8 @@ def api_setting_set(key: str = Form(...), value: str = Form(...),
                     user=Depends(auth_required)):
     """保存一个开关/配置项（如 AUTO_FAILOVER / AUTO_REPAIR）。"""
     allowed = {"AUTO_FAILOVER", "AUTO_REPAIR", "ALERT_COOLDOWN_SEC",
-               "ALERT_MERGE", "ALERT_LAG_THRESHOLD", "ALERT_RECEIVERS"}
+               "ALERT_MERGE", "ALERT_LAG_THRESHOLD", "ALERT_RECEIVERS",
+               "SLOWLOG_ENABLED"}
     if key not in allowed:
         return JSONResponse({"ok": False, "error": "不允许修改该项"})
     upsert_setting(key, value)
@@ -1071,34 +1083,46 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
 @app.post("/api/term")
 def api_term(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(...),
              sql: str = Form(...), user=Depends(auth_required)):
-    """只读 SQL 终端：复用 ha_monitor 账号，仅允许 SELECT/SHOW/EXPLAIN/DESCRIBE/DESC/WITH/USE/HELP。"""
-    if not _READONLY_RE.match(sql or ""):
-        return JSONResponse({"ok": False,
-                              "error": "仅允许只读语句 (SELECT/SHOW/EXPLAIN/DESCRIBE/DESC/WITH/USE/HELP)"})
+    """SQL 终端：优先用节点 root 账号执行（可读写，支持全部 SQL）；
+    若节点未配置 root 密码，则回退到 ha_monitor 只读账号。"""
+    sql = (sql or "").strip()
+    if not sql:
+        return JSONResponse({"ok": False, "error": "请输入 SQL"})
     try:
         port = int(port)
     except (TypeError, ValueError):
         return JSONResponse({"ok": False, "error": "端口无效"})
-    creds = get_cluster_creds(cluster_id) or {}
-    ha_user = creds.get("ha_user")
-    ha_pass = creds.get("ha_pass")
-    if not ha_user:
-        return JSONResponse({"ok": False, "error": "集群缺少 ha_monitor 凭证"})
+    # 先取节点 root 凭证（可读写）
+    node = query("SELECT root_user, root_pass FROM nodes "
+                 "WHERE cluster_id=%s AND ip=%s AND port=%s", (cluster_id, host, port))
+    ru = (node[0]["root_user"] if node else "root") or "root"
+    rp = node[0]["root_pass"] if node else ""
+    account = "root"
     try:
-        conn = connect(host, port, ha_user, ha_pass, timeout=5)
+        conn = connect(host, port, ru, rp, timeout=5)
     except Exception as e:
-        return JSONResponse({"ok": False, "error": "无法连接节点: " + str(e)})
+        # 回退到 ha_monitor 只读账号
+        creds = get_cluster_creds(cluster_id) or {}
+        hu = creds.get("ha_user")
+        hp = creds.get("ha_pass")
+        if not hu:
+            return JSONResponse({"ok": False,
+                                  "error": "无法连接节点(无 root 密码且缺 ha_monitor 凭证): " + str(e)})
+        conn = connect(host, port, hu, hp, timeout=5)
+        account = "ha_monitor(只读)"
     try:
         cur = conn.cursor()
         cur.execute(sql)
         if cur.description:
             cols = [d[0] for d in cur.description]
             rows = [[_jsonable(v) for v in r] for r in cur.fetchall()]
-            return JSONResponse({"ok": True, "cols": cols, "rows": rows, "count": len(rows)})
+            return JSONResponse({"ok": True, "account": account, "cols": cols,
+                                  "rows": rows, "count": len(rows)})
         conn.commit()
-        return JSONResponse({"ok": True, "cols": [], "rows": [], "count": 0, "info": "执行成功（无结果集）"})
+        return JSONResponse({"ok": True, "account": account, "cols": [], "rows": [],
+                              "count": 0, "info": "执行成功（无结果集）"})
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)})
+        return JSONResponse({"ok": False, "account": account, "error": str(e)})
     finally:
         conn.close()
 
@@ -1633,28 +1657,37 @@ def api_node_creds_sql(cluster_id: int = 0, host: str = "", port: int = 0,
 
 
 @app.get("/api/srv_log")
-def api_srv_log(svc: str = "ha_manager", user=Depends(auth_required)):
-    """读取服务端容器日志：容器内通常无 docker.sock，优先 docker logs，失败则回退到本地日志文件。"""
-    # 1) 优先 docker logs（若宿主已挂载 docker.sock 并可用）
+def api_srv_log(svc: str = "ha_manager", since: int = 86400, user=Depends(auth_required)):
+    """读取管理端容器日志（默认最近 24h，支持 since 秒数用于实时轮询）。
+
+    管理器自身运行在容器内、镜像无 docker CLI，故经宿主 /var/run/docker.sock
+    调用 Docker HTTP API 读取兄弟容器（keepalived / mysql-ha-manager / monitor 等）日志；
+    ha_manager 自身无可用套接字时回退到本地日志文件。
+    """
     try:
-        r = subprocess.run(["docker", "logs", "--tail", "1500", svc],
-                           capture_output=True, text=True, timeout=8)
-        out = (r.stdout + r.stderr).strip()
-        if r.returncode == 0 and out:
-            return JSONResponse({"ok": True, "svc": svc, "source": "docker", "log": out})
-    except Exception:
-        pass
-    # 2) 回退到管理器本地日志文件（最可靠）
-    log_path = _MANAGER_LOG
-    if os.path.exists(log_path):
+        since = max(1, int(since))
+    except (TypeError, ValueError):
+        since = 86400
+    # 下拉项 -> 容器名匹配 token（仅管理端侧容器）
+    TOKEN = {
+        "ha_manager": "mysql-ha-manager",
+        "keepalived": "keepalived",
+        "monitor": "ha-manager-monitor",
+        "ha_manager-mgmt": "mysql-ha-manager-mgmt",
+    }
+    token = TOKEN.get(svc, svc)
+    log = docker_helper.container_logs(token, since)
+    if log is not None:
+        return JSONResponse({"ok": True, "svc": svc, "source": "docker",
+                             "log": log if log.strip() else "（该容器暂无日志）"})
+    # ha_manager 回退到本地日志文件（最可靠）
+    if svc == "ha_manager" and os.path.exists(_MANAGER_LOG):
         try:
-            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.read().splitlines()[-1500:]
-            note = "" if svc == "ha_manager" else (
-                f"# 当前展示的是管理器运行日志；节点服务「{svc}」的日志需在对应节点查看。\n")
+            with open(_MANAGER_LOG, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.read().splitlines()[-2000:]
             return JSONResponse({"ok": True, "svc": svc, "source": "file",
-                                  "log": note + "\n".join(lines)})
+                                  "log": "\n".join(lines)})
         except Exception as e:
             return JSONResponse({"ok": False, "svc": svc, "error": f"读取日志文件失败: {e}"})
     return JSONResponse({"ok": False, "svc": svc,
-                         "error": f"无法获取「{svc}」日志：容器内无 docker.sock，且日志文件 {log_path} 不存在。"})
+                         "error": f"本机无容器「{token}」日志（docker.sock 未挂载或容器不存在）。"})
