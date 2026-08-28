@@ -822,7 +822,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
         # 注意：MySQL 8.0 语法为 `REPLICATE_IGNORE_DB = (db)`，MariaDB 12.x 为
         # `REPLICATE_IGNORE_DB=(db)`（无空格），必须走 mysql_compat 分支函数，不可硬编码。
         try:
-            cur.execute(change_replication_filter_sql(["ha_local"], channel=channel, flavour=flavour))
+            cur.execute(change_replication_filter_sql(["ha_local"], flavour=flavour))
         except Exception as e_flt:
             print(f"[repl] 设置 REPLICATE_IGNORE_DB=ha_local 失败(可忽略): {e_flt}")
         cur.execute(start_replication_sql(flavour))

@@ -120,7 +120,7 @@ textarea{resize:vertical;min-height:64px}
 .close{cursor:pointer;color:var(--muted);font-size:20px;line-height:1}
 .term{background:#0f172a;color:#e2e8f0;font-family:var(--mono);font-size:13px;border-radius:10px;padding:14px;height:320px;overflow:auto;white-space:pre-wrap;cursor:text}
 .term .prompt{color:#22d3ee}.term .res{color:#a7f3d0}
-.term-input{background:transparent!important;border:none!important;color:#e6edf3!important;font-family:var(--mono);font-size:13px;outline:none!important;width:auto;flex:1;caret-color:#22d3ee}
+.term-input{background:transparent!important;border:none!important;color:#e6edf3!important;font-family:var(--mono);font-size:13px;line-height:1.55;outline:none!important;width:auto;flex:1;min-width:0;caret-color:#22d3ee;-webkit-appearance:none;appearance:none}
 .term-input:focus{background:transparent!important;border:none!important;color:#e6edf3!important;outline:none!important;box-shadow:none!important}
 .drawer{position:fixed;top:0;right:0;height:100vh;width:min(460px,92vw);background:#fff;box-shadow:-4px 0 20px rgba(15,23,42,.15);transform:translateX(100%);transition:.25s;z-index:60;display:flex;flex-direction:column}
 .drawer.show{transform:translateX(0)}
