@@ -68,8 +68,8 @@
       </div>
     </div>
     <div class="dh-clus-metrics">
-      <div><span class="dh-m-num">{{ c.masters }}/{{ c.slaves }}</span><span class="dh-m-lab">主/从</span></div>
-      <div><span class="dh-m-num" id="online-{{ c.cluster_id }}">{{ c.online }}</span><span class="dh-m-lab">在线</span></div>
+      <div><span class="dh-m-num">{{ c.masters }}/{{ c.slaves }}</span><span class="dh-m-lab">主库/从库</span></div>
+      <div><span class="dh-m-num" id="online-{{ c.cluster_id }}">{{ c.online }}/{{ c.total_nodes }}</span><span class="dh-m-lab">在线/总数</span></div>
       <div><span class="dh-m-num" id="maxdelay-{{ c.cluster_id }}">—</span><span class="dh-m-lab">最大延迟</span></div>
     </div>
     <table class="tbl" style="margin-top:14px">
@@ -325,7 +325,7 @@
         Object.keys(byCid).forEach(function (cid) {
           var b = byCid[cid];
           var on = document.getElementById("online-" + cid);
-          if (on) on.textContent = b.online;
+          if (on) on.textContent = b.online + "/" + b.total;
           var md = document.getElementById("maxdelay-" + cid);
           if (md) md.textContent = (maxDelayByCid[cid] != null ? maxDelayByCid[cid] + "s" : "—");
         });

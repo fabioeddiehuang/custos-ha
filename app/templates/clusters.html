@@ -16,16 +16,21 @@
   .term-modal.term-full{position:fixed;top:0;left:0;right:0;bottom:0;width:100vw;height:100vh;max-width:none;border-radius:0;margin:0;display:flex;flex-direction:column;z-index:3000;background:#fff}
   .term-modal.term-full .body{flex:1;min-height:0}
   .term-modal.term-full .term{flex:1;height:auto;min-height:0}
-  .term{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;height:52vh;overflow:auto;font-family:var(--mono);font-size:13px;line-height:1.55}
+  .term{background:#0f172a;color:#e6edf3;border-radius:10px;padding:12px 14px;height:52vh;overflow:auto;font-family:var(--mono);font-size:13px;line-height:1.55}
   .term-output{white-space:pre-wrap;word-break:break-word}
   .term-output>div{padding:1px 0}
+  .term-table{white-space:pre}
   .term-head{color:#7dd3fc;font-weight:700}
-  .term-err{color:#fca5a5}
-  .term-busy{color:#94a3b8}
+  .term-err{color:#ff7b72}
+  .term-busy{color:#d29922}
+  .term-hint{color:#8b949e}
+  .term-cmd{color:#c9d1d9}
+  .term-cont{color:#8b949e}
+  .term-foot{color:#8b949e}
   .term-input-line{display:flex;align-items:center;gap:6px;margin-top:6px}
-  .term-prompt{color:#34d399;font-family:var(--mono);font-weight:700;white-space:nowrap}
-  .term-input{flex:1;background:transparent;border:none;outline:none;color:#e2e8f0;font-family:var(--mono);font-size:13px}
-  .term-input::placeholder{color:#475569}
+  .term-prompt{color:#3fb950;font-family:var(--mono);font-weight:700;white-space:nowrap}
+  .term-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;caret-color:#3fb950;font-weight:600;font-family:var(--mono);font-size:13px}
+  .term-input::placeholder{color:#586069}
   .ok-note{color:#16a34a;padding:10px}
   .err-cell{color:#b91c1c;font-size:13px}
   .kv-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
@@ -180,9 +185,9 @@
       </div>
       <div class="term" id="termScreen">
         <div class="term-output" id="termOutput"></div>
-        <div class="term-input-line"><span class="term-prompt" id="termPrompt">mysql&gt;</span><input id="termInput" class="term-input" onkeydown="runTerm(event)" autocomplete="off" spellcheck="false" placeholder="输入 SQL（读写均可），回车执行，↑/↓ 调历史"></div>
+        <div class="term-input-line"><span class="term-prompt" id="termPrompt">mysql&gt;</span><input id="termInput" class="term-input" onkeydown="onTermKey(event)" autocomplete="off" spellcheck="false" placeholder="输入 SQL，; 或 \g 结束 · Tab 补全 · ↑/↓ 历史"></div>
       </div>
-      <div class="note">黑屏内直接输入 SQL，回车执行（无需点击执行）；支持 ↑/↓ 翻阅历史命令。默认使用节点 root 账号，可读写全部语句，执行记录写入审计日志。</div>
+      <div class="note">mysql CLI 风格：直接输入 SQL，以 <b>;</b> 或 <b>\g</b> 结束回车执行，多行续写（提示符 →）；支持 ↑/↓ 历史、Tab 补全、<b>\c \h \s \G</b> 等命令；默认使用节点 root 账号（可读写），执行记录写入审计日志，高危 DDL/DML 会二次确认。</div>
     </div>
     <footer><button class="btn" onclick="closeTerm()">关闭</button></footer>
   </div>
@@ -417,6 +422,12 @@
     document.getElementById("termFullBtn").textContent="全屏";
     ov.classList.add("show");
     fillTermNodes();
+    var o=document.getElementById("termOutput");
+    if(o && !o.dataset.boot){
+      o.dataset.boot="1";
+      termAppend("MySQL HA 交互终端（mysql CLI 风格）","term-hint");
+      termAppend("输入 SQL 以 ; 或 \\g 结束回车执行；多行续写；↑/↓ 历史；Tab 补全；\\h 帮助。","term-hint");
+    }
     setTimeout(function(){var i=document.getElementById("termInput");if(i)i.focus();},60);
   }
   function exitTermFull(){
@@ -441,8 +452,12 @@
       var i=document.getElementById("termInput");if(i)i.focus();
     }
   }
-  // 命令历史（↑/↓）
+  // ---- 终端（mysql CLI 风格交互） ----
   var termHistory=[],termHistIdx=0;
+  var termBuf="", termCont=false;
+  var termCacheKey="", termComps=null, termCompLoading=false;
+  var TERM_KEYWORDS=["SELECT","INSERT","UPDATE","DELETE","FROM","WHERE","SET","SHOW","USE","CREATE","ALTER","DROP","GRANT","REVOKE","TABLE","DATABASE","INDEX","JOIN","ON","AND","OR","NOT","NULL","ORDER","GROUP","BY","LIMIT","VALUES","INTO","AS","DESC","ASC","COUNT","DISTINCT","LEFT","RIGHT","INNER","OUTER","REPLACE"];
+
   function termAppend(text,cls){
     var o=document.getElementById("termOutput");
     var d=document.createElement("div");
@@ -451,43 +466,167 @@
     o.appendChild(d);
     o.scrollTop=o.scrollHeight;
   }
-  function clearTerm(){var o=document.getElementById("termOutput");if(o)o.innerHTML="";}
-  function runTerm(e){
-    if(e&&e.type==="keydown"){
-      var i=document.getElementById("termInput");
-      if(e.key==="ArrowUp"){ if(termHistIdx>0){termHistIdx--; i.value=termHistory[termHistIdx];} e.preventDefault(); return; }
-      if(e.key==="ArrowDown"){ if(termHistIdx<termHistory.length-1){termHistIdx++; i.value=termHistory[termHistIdx];} else {termHistIdx=termHistory.length; i.value="";} e.preventDefault(); return; }
-      if(e.key!=="Enter")return;
-      e.preventDefault();
+  function clearTerm(){var o=document.getElementById("termOutput");if(o){o.innerHTML="";o.dataset.boot="";}}
+  function setTermPrompt(p){var s=document.getElementById("termPrompt");if(s)s.textContent=p;}
+
+  function isHighRisk(sql){
+    var s=sql.replace(/^\s*\([^)]*\)/,"").toUpperCase();
+    return /\b(DROP|DELETE|TRUNCATE|ALTER|RENAME|UPDATE|GRANT|REVOKE|CREATE\s+USER|DROP\s+USER|FLUSH\s+PRIVILEGES|SET\s+GLOBAL|RESET\s+MASTER|RESET\s+SLAVE|STOP\s+(REPLICA|SLAVE)|START\s+(REPLICA|SLAVE)|CHANGE\s+(MASTER|REPLICATION)|PURGE\s+BINARY|PURGE\s+MASTER)\b/.test(s);
+  }
+
+  function onTermKey(e){
+    var i=document.getElementById("termInput");
+    if(e.key==="ArrowUp"){ if(termHistIdx>0){termHistIdx--; i.value=termHistory[termHistIdx];} e.preventDefault(); return; }
+    if(e.key==="ArrowDown"){ if(termHistIdx<termHistory.length-1){termHistIdx++; i.value=termHistory[termHistIdx];} else {termHistIdx=termHistory.length; i.value="";} e.preventDefault(); return; }
+    if(e.key==="Tab"){ e.preventDefault(); doComplete(); return; }
+    if(e.key!=="Enter") return;
+    e.preventDefault();
+    var line=i.value;
+    if(!line.trim()){
+      termAppend(termCont?"    -> ":"mysql> ","term-cont");
+      i.value=""; return;
+    }
+    termAppend((termCont?"    -> ":"mysql> ")+line, termCont?"term-cont":"term-cmd");
+    termBuf = termCont ? (termBuf+"\n"+line) : line;
+    i.value="";
+    var trimmed=termBuf.replace(/\s+$/,"");
+    var vert=false, term=false;
+    if(trimmed.endsWith("\\G")){ vert=true; term=true; trimmed=trimmed.slice(0,-2).replace(/\s+$/,""); }
+    else if(trimmed.endsWith("\\g")){ term=true; trimmed=trimmed.slice(0,-2).replace(/\s+$/,""); }
+    if(trimmed.endsWith(";")){ term=true; trimmed=trimmed.replace(/;$/,"").replace(/\s+$/,""); }
+    if(term){
+      termCont=false; setTermPrompt("mysql> ");
+      if(trimmed.trim()) execTerm(trimmed, vert);
+      else if(vert){ termAppend("提示：竖向输出仅对单条以 \\G 结尾的语句生效。","term-hint"); }
+      termBuf="";
+    } else if(/^\s*\\[a-zA-Z]/.test(termBuf)){
+      handleBackslash(termBuf.trim());
+      termBuf=""; termCont=false; setTermPrompt("mysql> ");
+    } else {
+      termCont=true; setTermPrompt("    -> ");
+    }
+  }
+
+  function handleBackslash(cmd){
+    if(cmd==="\\c"){ termAppend("已清空当前输入缓冲。","term-hint"); return; }
+    if(cmd==="\\h"||cmd==="\\?"){ termAppend(HELP_TEXT,"term-hint"); return; }
+    if(cmd==="\\s"){ printTermStatus(); return; }
+    termAppend("ERROR: 未知命令 '"+cmd+"'。输入 \\h 查看帮助。","term-err");
+  }
+
+  function printTermStatus(){
+    var cid=document.getElementById("termCluster").value;
+    var nv=document.getElementById("termNode").value;
+    var csel=document.getElementById("termCluster");
+    var cname=(csel.selectedOptions&&csel.selectedOptions[0])?csel.selectedOptions[0].textContent:cid;
+    termAppend("--------------","term-hint");
+    termAppend("集群: "+cname+"  (id="+cid+")","term-hint");
+    termAppend("节点: "+(nv||"（未选择）"),"term-hint");
+    termAppend("连接账号: "+document.getElementById("termAccount").textContent,"term-hint");
+    termAppend("--------------","term-hint");
+  }
+
+  function execTerm(sql, vert){
+    sql=sql.trim();
+    if(!sql) return;
+    if(isHighRisk(sql) && !confirm("高危操作二次确认：\n\n"+sql.slice(0,300)+"\n\n确定在当前节点执行？")){
+      termAppend("已取消执行。","term-hint"); return;
     }
     var cid=document.getElementById("termCluster").value;
     var nv=document.getElementById("termNode").value;
-    if(!nv){toast("请先选择节点","err");return;}
+    if(!nv){toast("请先选择节点","err"); return;}
     var hp=nv.split(":");
-    var i=document.getElementById("termInput");
-    var sql=i.value;
-    if(!sql.trim())return;
-    termAppend(nv+" [(none)]> "+sql);
-    i.value="";
-    termHistory.push(sql);termHistIdx=termHistory.length;
     var busy=document.createElement("div");
-    busy.textContent="…执行中";
-    busy.className="term-busy";
+    busy.textContent="Querying..."; busy.className="term-busy";
     document.getElementById("termOutput").appendChild(busy);
     document.getElementById("termOutput").scrollTop=document.getElementById("termOutput").scrollHeight;
     apiPost("/api/term",{cluster_id:cid,host:hp[0],port:hp[1],sql:sql},function(d){
       if(busy.parentNode)busy.parentNode.removeChild(busy);
-      if(!d.ok){termAppend("错误: "+(d.error||"执行失败"),"term-err");return;}
+      if(!d.ok){
+        var code=d.error_code!=null?d.error_code:"00000";
+        termAppend("ERROR "+code+" ("+(d.sqlstate||"HY000")+"): "+(d.error||""),"term-err");
+        return;
+      }
       var ac=document.getElementById("termAccount");
       if(ac&&d.account)ac.textContent="账号 "+(d.account||"");
-      if(!d.cols||!d.cols.length){termAppend(d.info||"OK, 0 rows affected","");return;}
-      termAppend(d.cols.join(" | "),"term-head");
-      d.rows.forEach(function(r){
-        termAppend(r.map(function(v){return v===null?"NULL":v;}).join(" | "),"");
-      });
-      termAppend("("+d.count+" 行)","");
+      var dur=(d.duration!=null?d.duration:0);
+      if(d.cols&&d.cols.length){
+        termAppend(formatTable(d.cols,d.rows,vert),"term-table");
+        termAppend(d.count+" rows in set ("+dur+" sec)","term-foot");
+      } else {
+        termAppend("Query OK, "+(d.count||0)+" row(s) affected ("+dur+" sec)","term-foot");
+      }
     });
   }
+
+  function formatTable(cols, rows, vert){
+    if(vert){
+      var out=[];
+      rows.forEach(function(r,ri){
+        out.push("********** "+ (ri+1) +". row **********");
+        cols.forEach(function(c,ci){ out.push("   "+c+": "+(r[ci]===null?"NULL":String(r[ci]))); });
+      });
+      return out.join("\n");
+    }
+    function w(v){ return String(v===null?"NULL":v).length; }
+    var widths=cols.map(function(c){return c.length;});
+    rows.forEach(function(r){ r.forEach(function(v,ci){ if(widths[ci]<w(v))widths[ci]=w(v); }); });
+    function fmt(row){ return "| "+row.map(function(v,ci){ var s=String(v===null?"NULL":v); return s+" ".repeat(widths[ci]-s.length); }).join(" | ")+" |"; }
+    var sep="+-" + widths.map(function(x){return "-".repeat(x);}).join("-+-") + "-+";
+    var lines=[sep, fmt(cols), sep];
+    rows.forEach(function(r){ lines.push(fmt(r)); });
+    lines.push(sep);
+    return lines.join("\n");
+  }
+
+  function doComplete(){
+    var i=document.getElementById("termInput");
+    var val=i.value;
+    var caret=(i.selectionStart!=null)?i.selectionStart:val.length;
+    var m=val.slice(0,caret).match(/([A-Za-z_][A-Za-z0-9_$.]*)$/);
+    if(!m) return;
+    var word=m[1], start=m.index;
+    var key=document.getElementById("termCluster").value+"|"+document.getElementById("termNode").value;
+    function apply(list){
+      var matches=list.filter(function(x){return x.toLowerCase().indexOf(word.toLowerCase())===0;});
+      if(!matches.length) return;
+      if(matches.length===1){ replaceWord(val,start,caret,word,matches[0]); return; }
+      var cp=matches.reduce(function(a,b){var k=0;while(k<a.length&&k<b.length&&a[k].toLowerCase()===b[k].toLowerCase())k++;return a.slice(0,k);});
+      if(cp.length>word.length) replaceWord(val,start,caret,word,cp);
+      termAppend(matches.join("   "),"term-hint");
+      document.getElementById("termInput").focus();
+    }
+    if(termCacheKey===key && termComps){ apply(termComps); return; }
+    if(termCompLoading) return;
+    termCompLoading=true;
+    var cid=document.getElementById("termCluster").value;
+    var nv=document.getElementById("termNode").value;
+    if(!nv){termCompLoading=false;return;}
+    var hp=nv.split(":");
+    apiPost("/api/term_complete",{cluster_id:cid,host:hp[0],port:hp[1]},function(d){
+      termCompLoading=false;
+      if(d.ok){ termCacheKey=key; termComps=d.completions||[]; }
+      else { termComps=TERM_KEYWORDS.slice(); termCacheKey=key; }
+      apply(termComps);
+    });
+  }
+
+  function replaceWord(val,start,caret,word,rep){
+    var i=document.getElementById("termInput");
+    i.value=val.slice(0,start)+rep+val.slice(caret);
+    var pos=(val.slice(0,start)+rep).length;
+    try{i.setSelectionRange(pos,pos);}catch(e){}
+  }
+
+  var HELP_TEXT="MySQL HA 终端帮助：\n"
+    +"  ; 或 \\g    结束语句并执行\n"
+    +"  \\G         结束语句并以竖向格式显示\n"
+    +"  \\c         清空当前输入缓冲\n"
+    +"  \\h \\?      显示本帮助\n"
+    +"  \\s         显示当前连接状态\n"
+    +"  回车        发送当前行；未以 ;/\\g/\\G 结尾则续写多行(提示符 ->)\n"
+    +"  ↑/↓        历史命令    Tab  补全(库/表/列/关键字)\n"
+    +"支持全部 SQL（可读写）；高危 DDL/DML 会二次确认。";
   function toggleSlowlog(el){
     apiPost("/api/setting_set",{key:"SLOWLOG_ENABLED",value:el.checked?"1":"0"},function(d){
       toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");

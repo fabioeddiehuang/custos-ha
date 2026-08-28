@@ -95,17 +95,19 @@
   }
   function svcVal(){return document.getElementById("srvUnit").value;}
   function enc(s){return encodeURIComponent(s);}
-  var _lastFetch=0, _autoTail=true;
+  var _lastFetch=0, _autoTail=true, _srvOffset=0;
   function loadSrvLog(){
-    // 全量读取（最近 24h）并替换
+    // 全量读取（最近内容）并替换；管理器走本地文件尾部，其它走 docker
     _lastFetch=Math.floor(Date.now()/1000);
+    _srvOffset=0;
     var log=document.getElementById("srvLog");
     log.textContent="日志加载中…";
-    fetch("/api/srv_log?svc="+enc(svcVal())+"&since=86400")
+    fetch("/api/srv_log?svc="+enc(svcVal())+"&since=86400&offset=0")
       .then(function(r){return r.json();})
       .then(function(d){
         if(!d.ok){log.textContent="加载失败: "+(d.error||"");return;}
-        log.textContent=(d.log||"(空日志)");
+        log.textContent=(d.log||"（空日志）");
+        if(d.offset!=null)_srvOffset=d.offset;
         log.scrollTop=log.scrollHeight;
       })
       .catch(function(e){log.textContent="请求失败: "+e;});
@@ -115,7 +117,7 @@
     var now=Math.floor(Date.now()/1000);
     var since=Math.max(2, now-_lastFetch+1);
     _lastFetch=now;
-    fetch("/api/srv_log?svc="+enc(svcVal())+"&since="+since)
+    fetch("/api/srv_log?svc="+enc(svcVal())+"&since="+since+"&offset="+_srvOffset)
       .then(function(r){return r.json();})
       .then(function(d){
         if(!d.ok||!d.log||!d.log.trim())return;
@@ -123,6 +125,7 @@
         var cur=log.textContent;
         var append=(cur&&!cur.endsWith("\n")?"\n":"")+d.log;
         log.textContent=cur+append;
+        if(d.offset!=null)_srvOffset=d.offset;
         if(_autoTail)log.scrollTop=log.scrollHeight;
       })
       .catch(function(){});

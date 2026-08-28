@@ -66,8 +66,81 @@ def list_containers():
         return []
 
 
-def container_logs(token, since_seconds=86400):
-    """返回名称匹配 token 的容器日志文本（最近 since_seconds 秒）。无则返回 None。"""
+def _http_post(path, body):
+    """经 Unix Socket 发送一次 HTTP/1.1 POST，返回 (status_line, body_bytes)。"""
+    if not docker_available():
+        return None, b""
+    req = (
+        f"POST {path} HTTP/1.1\r\n"
+        "Host: docker\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(15)
+    try:
+        s.connect(SOCK)
+        s.sendall(req.encode() + body)
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except Exception:
+        return None, b""
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    sep = data.find(b"\r\n\r\n")
+    if sep < 0:
+        return None, b""
+    status = data[:data.find(b"\r\n")].decode(errors="replace")
+    return status, data[sep + 4:]
+
+
+def _decode_mux(body):
+    """解码 Docker 多路复用流（每帧 8 字节头）。"""
+    out, i, n = [], 0, len(body)
+    while i + 8 <= n:
+        size = struct.unpack(">I", body[i + 4:i + 8])[0]
+        i += 8
+        if i + size > n:
+            size = n - i
+        out.append(body[i:i + size].decode("utf-8", "replace"))
+        i += size
+    return "".join(out)
+
+
+def _docker_exec(ctr_id, cmd):
+    """在容器内执行命令并返回合并输出（stdout+stderr）。"""
+    body = json.dumps({"Cmd": ["sh", "-c", cmd], "AttachStdout": True,
+                       "AttachStderr": True, "Tty": False}).encode()
+    status, resp = _http_post(f"/containers/{ctr_id}/exec", body)
+    if status is None or "200" not in status:
+        return ""
+    try:
+        j = json.loads(resp.decode("utf-8", "replace"))
+        exec_id = j.get("Id")
+    except Exception:
+        return ""
+    if not exec_id:
+        return ""
+    _, out = _http_post(f"/exec/{exec_id}/start",
+                        json.dumps({"Detach": False, "Tty": False}).encode())
+    return _decode_mux(out)
+
+
+def container_logs(token, since_seconds=86400, file_fallback=True):
+    """返回名称匹配 token 的容器日志文本（最近 since_seconds 秒）。
+
+    无匹配容器返回 None；容器存在但 stdout/stderr 为空时：
+      - file_fallback=True 则兜底读取容器内常见日志文件（tail）；
+      - 否则返回空串 ""。
+    """
     if not docker_available():
         return None
     token = (token or "").strip()
@@ -88,17 +161,19 @@ def container_logs(token, since_seconds=86400):
         since_ts = int(time.time()) - 86400
     qs = urllib.parse.urlencode({"stdout": "1", "stderr": "1", "since": since_ts})
     status, body = _http_get(f"/containers/{ctr_id}/logs?{qs}")
-    if status is None or "200" not in status:
-        return None
-    # 解码 multiplexed stream（Docker >= 1.13：每帧 8 字节头 [类型,0,0,0,长度(4BE)]）
-    out = []
-    i = 0
-    n = len(body)
-    while i + 8 <= n:
-        size = struct.unpack(">I", body[i + 4:i + 8])[0]
-        i += 8
-        if i + size > n:
-            size = n - i
-        out.append(body[i:i + size].decode("utf-8", "replace").rstrip("\n"))
-        i += size
-    return "\n".join(out)
+    if status is not None and "200" in status:
+        logs = _decode_mux(body)
+        if logs.strip():
+            return logs
+    # stdout 为空 -> 兜底读取容器内日志文件
+    if file_fallback:
+        cmd = ("for f in /app/data/logs/ha-manager.log /var/log/keepalived_chk.log "
+               "/var/log/keepalived.log /var/log/messages /var/log/syslog; do "
+               "if [ -f \"$f\" ]; then echo \"===== $f =====\"; tail -n 1500 \"$f\"; fi; done")
+        try:
+            out = _docker_exec(ctr_id, cmd)
+            if out.strip():
+                return out
+        except Exception:
+            pass
+    return ""

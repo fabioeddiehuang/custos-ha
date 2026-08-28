@@ -5,6 +5,7 @@ import subprocess
 import socket
 import threading
 import re
+import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, date, time
@@ -1110,21 +1111,101 @@ def api_term(cluster_id: int = Form(...), host: str = Form(...), port: int = For
                                   "error": "无法连接节点(无 root 密码且缺 ha_monitor 凭证): " + str(e)})
         conn = connect(host, port, hu, hp, timeout=5)
         account = "ha_monitor(只读)"
+    t0 = _time.time()
     try:
         cur = conn.cursor()
         cur.execute(sql)
+        dur = round(_time.time() - t0, 3)
         if cur.description:
             cols = [d[0] for d in cur.description]
             rows = [[_jsonable(v) for v in r] for r in cur.fetchall()]
             return JSONResponse({"ok": True, "account": account, "cols": cols,
-                                  "rows": rows, "count": len(rows)})
+                                  "rows": rows, "count": len(rows), "duration": dur})
         conn.commit()
+        affected = cur.rowcount if cur.rowcount and cur.rowcount >= 0 else 0
         return JSONResponse({"ok": True, "account": account, "cols": [], "rows": [],
-                              "count": 0, "info": "执行成功（无结果集）"})
+                              "count": affected, "info": "Query OK", "duration": dur})
     except Exception as e:
-        return JSONResponse({"ok": False, "account": account, "error": str(e)})
+        dur = round(_time.time() - t0, 3)
+        args = getattr(e, "args", None)
+        code = None
+        if isinstance(args, (list, tuple)) and len(args) >= 1 and isinstance(args[0], int):
+            code = args[0]
+        sqlstate = getattr(e, "sqlstate", None) or "HY000"
+        return JSONResponse({"ok": False, "account": account, "error": str(e),
+                              "error_code": code, "sqlstate": sqlstate, "duration": dur})
     finally:
         conn.close()
+
+
+SQL_KEYWORDS = [
+    "SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "CALL", "DO", "HANDLER",
+    "SET", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "USE", "CREATE", "ALTER", "DROP", "TRUNCATE",
+    "RENAME", "GRANT", "REVOKE", "FLUSH", "PURGE", "RESET", "START", "STOP", "RESTART",
+    "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "LOCK", "UNLOCK", "ANALYZE", "OPTIMIZE",
+    "REPAIR", "CHECK", "BACKUP", "RESTORE", "LOAD", "INSTALL", "UNINSTALL", "CACHE",
+    "CHANGE", "KILL", "BINLOG", "TABLE", "DATABASE", "SCHEMA", "VIEW", "INDEX", "TRIGGER",
+    "PROCEDURE", "FUNCTION", "EVENT", "USER", "ROLE", "PRIVILEGE", "FROM", "WHERE", "GROUP",
+    "ORDER", "BY", "HAVING", "LIMIT", "OFFSET", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER",
+    "ON", "AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE", "IS", "NULL", "AS",
+    "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX", "INTO", "VALUES", "DUAL", "WITH",
+]
+
+
+@app.post("/api/term_complete")
+def api_term_complete(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(...),
+                      user=Depends(auth_required)):
+    """Tab 补全候选：关键字 + 库 + 表 + 列。"""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "端口无效"})
+    node = query("SELECT root_user, root_pass FROM nodes "
+                 "WHERE cluster_id=%s AND ip=%s AND port=%s", (cluster_id, host, port))
+    ru = (node[0]["root_user"] if node else "root") or "root"
+    rp = node[0]["root_pass"] if node else ""
+    account = "root"
+    try:
+        conn = connect(host, port, ru, rp, timeout=5)
+    except Exception:
+        creds = get_cluster_creds(cluster_id) or {}
+        hu = creds.get("ha_user")
+        hp = creds.get("ha_pass")
+        if not hu:
+            return JSONResponse({"ok": True, "completions": list(SQL_KEYWORDS)})
+        conn = connect(host, port, hu, hp, timeout=5)
+        account = "ha_monitor"
+    cands = list(SQL_KEYWORDS)
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT schema_name FROM information_schema.schemata")
+            cands += [r[0] for r in cur.fetchall()]
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') "
+                        "LIMIT 400")
+            cands += [r[0] for r in cur.fetchall()]
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT DISTINCT column_name FROM information_schema.columns "
+                        "WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') "
+                        "LIMIT 600")
+            cands += [r[0] for r in cur.fetchall()]
+        except Exception:
+            pass
+    finally:
+        conn.close()
+    # 去重保序
+    seen, uniq = set(), []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return JSONResponse({"ok": True, "account": account, "completions": uniq})
 
 
 @app.get("/alerts")
@@ -1656,19 +1737,51 @@ def api_node_creds_sql(cluster_id: int = 0, host: str = "", port: int = 0,
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
-@app.get("/api/srv_log")
-def api_srv_log(svc: str = "ha_manager", since: int = 86400, user=Depends(auth_required)):
-    """读取管理端容器日志（默认最近 24h，支持 since 秒数用于实时轮询）。
+def _tail_file(path, offset=0, max_first=200000):
+    """按字节偏移读取文件尾部，用于实时增量轮询。offset=0 时取最后 max_first 字节。"""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return "", 0, 0
+    if offset < 0 or offset > size:
+        offset = max(0, size - max_first)
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+        new_offset = offset + len(data)
+        return data.decode("utf-8", "replace"), new_offset, size
+    except Exception:
+        return "", offset, size
 
-    管理器自身运行在容器内、镜像无 docker CLI，故经宿主 /var/run/docker.sock
-    调用 Docker HTTP API 读取兄弟容器（keepalived / mysql-ha-manager / monitor 等）日志；
-    ha_manager 自身无可用套接字时回退到本地日志文件。
+
+@app.get("/api/srv_log")
+def api_srv_log(svc: str = "ha_manager", since: int = 86400, offset: int = 0,
+                user=Depends(auth_required)):
+    """读取管理端容器日志。
+
+    - ha_manager：管理器自身日志写本地文件，直接按字节偏移读取，支持实时增量轮询(offset)。
+    - 其它管理端容器（keepalived / monitor / mysql-ha-manager-mgmt）：经宿主
+      /var/run/docker.sock 调用 Docker HTTP API 读取；若 stdout 为空则兜底读取容器内日志文件。
     """
+    # 管理器自身日志：本地文件，实时增量
+    if svc == "ha_manager":
+        if not os.path.exists(_MANAGER_LOG):
+            return JSONResponse({"ok": True, "svc": svc, "source": "file",
+                                  "log": "（管理器日志文件不存在）", "offset": 0})
+        try:
+            off = int(offset)
+        except (TypeError, ValueError):
+            off = 0
+        text, new_off, size = _tail_file(_MANAGER_LOG, off)
+        return JSONResponse({"ok": True, "svc": svc, "source": "file",
+                              "log": text if text.strip() else "（日志文件为空）",
+                              "offset": new_off, "size": size})
+    # 其它：docker 兄弟容器
     try:
         since = max(1, int(since))
     except (TypeError, ValueError):
         since = 86400
-    # 下拉项 -> 容器名匹配 token（仅管理端侧容器）
     TOKEN = {
         "ha_manager": "mysql-ha-manager",
         "keepalived": "keepalived",
@@ -1676,18 +1789,9 @@ def api_srv_log(svc: str = "ha_manager", since: int = 86400, user=Depends(auth_r
         "ha_manager-mgmt": "mysql-ha-manager-mgmt",
     }
     token = TOKEN.get(svc, svc)
-    log = docker_helper.container_logs(token, since)
-    if log is not None:
-        return JSONResponse({"ok": True, "svc": svc, "source": "docker",
-                             "log": log if log.strip() else "（该容器暂无日志）"})
-    # ha_manager 回退到本地日志文件（最可靠）
-    if svc == "ha_manager" and os.path.exists(_MANAGER_LOG):
-        try:
-            with open(_MANAGER_LOG, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.read().splitlines()[-2000:]
-            return JSONResponse({"ok": True, "svc": svc, "source": "file",
-                                  "log": "\n".join(lines)})
-        except Exception as e:
-            return JSONResponse({"ok": False, "svc": svc, "error": f"读取日志文件失败: {e}"})
-    return JSONResponse({"ok": False, "svc": svc,
-                         "error": f"本机无容器「{token}」日志（docker.sock 未挂载或容器不存在）。"})
+    log = docker_helper.container_logs(token, since, file_fallback=(since >= 3600))
+    if log is None:
+        return JSONResponse({"ok": False, "svc": svc,
+                             "error": f"本机无容器「{token}」日志（docker.sock 未挂载或容器不存在）。"})
+    return JSONResponse({"ok": True, "svc": svc, "source": "docker",
+                          "log": log if log.strip() else "（该容器暂无可读日志）", "offset": 0})
