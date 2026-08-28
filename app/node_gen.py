@@ -486,7 +486,8 @@ def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user,
 
 
 def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
-                                       root_user, root_pass, manager_ip, port):
+                                      root_user, root_pass, manager_ip, port,
+                                      manager_subnet=None):
     """MariaDB 的节点账号/权限修复脚本（语法与 MySQL 不同）。
 
     差异：
@@ -496,7 +497,9 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
       - MariaDB 无 REPLICATION_SLAVE_ADMIN / SYSTEM_VARIABLES_ADMIN（或用旧名），用通用权限集。
       - gtid_domain_id 不在本脚本处理（已由 my.cnf 固定）。
     """
-    return (
+    # 注意：这里必须赋值给 content 而非直接 return —— 否则下方「同机子网放行」
+    # 这段代码永远不会执行（此前正是因此成了死代码）。
+    content = (
         "-- MariaDB 节点账号/权限修复脚本（由管理器生成，已注入真实凭证）\n"
         "-- ⚠ 无需手动执行：Install-ha-mariadb-Node.sh 在节点准备阶段【自动重放】本文件。\n"
         "--   仅当自动重放失败（日志有提示）时，才需在本机手动跑：\n"

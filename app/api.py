@@ -23,7 +23,8 @@ from .db import query, execute, get_conn, get_setting, upsert_setting
 from .state import get_current_master
 from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root
 from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
-                       sync_node_creds, render_fix_node_creds_sql)
+                       sync_node_creds, render_fix_node_creds_sql,
+                       render_fix_node_creds_sql_mariadb)
 from .clusters import list_clusters, validate_node_version, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
 from .alerts import send_alert, last_error
 from .ha_client import (connect, heal_replication, heal_io_gtid_gap, get_status, make_slave_of,
@@ -31,6 +32,7 @@ from .ha_client import (connect, heal_replication, heal_io_gtid_gap, get_status,
                        restart_slave_io, connect_robust)
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
 from . import precheck, audit, metrics, slow_log, config_drift, docker_helper
+from .mysql_compat import detect_flavour, flavour_from_node_type, F_MARIADB
 
 # ---------------------------------------------------------------------------
 # 管理器运行日志（「系统设置 → 服务端容器日志」读取此文件）
@@ -54,6 +56,54 @@ try:
             _root.setLevel(logging.INFO)
 except Exception:
     _MANAGER_LOG = os.environ.get("LOG_DIR", "/app/data/logs") + "/ha-manager.log"
+
+# ---------------------------------------------------------------------------
+# 控制台日志落盘（Tee）
+# 应用内大量输出走 print()（entrypoint / ha_client / monitor / failover），
+# 这些不经过 logging 模块，导致 ha-manager.log 恒为空：docker.sock 不可用时
+# 「容器日志」就完全没内容可读。这里把 stdout/stderr 同步写一份到控制台日志，
+# 终端输出照旧，同时保证文件兜底数据源始终有内容。
+# ---------------------------------------------------------------------------
+_MANAGER_CONSOLE_LOG = os.path.join(_LOG_DIR, "ha-manager-console.log")
+try:
+    import sys as _sys
+
+    class _Tee(object):
+        """把输出同时写到多个流（终端 + 日志文件），任一路失败不影响其它路。"""
+
+        def __init__(self, *streams):
+            self._streams = [s for s in streams if s is not None]
+
+        def write(self, data):
+            for _s in self._streams:
+                try:
+                    _s.write(data)
+                    _s.flush()
+                except Exception:
+                    pass
+            return len(data or "")
+
+        def flush(self):
+            for _s in self._streams:
+                try:
+                    _s.flush()
+                except Exception:
+                    pass
+
+        def isatty(self):
+            return False
+
+    # 超过 20MB 先截断，避免无界增长（容器重启后重新累积）
+    try:
+        if os.path.getsize(_MANAGER_CONSOLE_LOG) > 20 * 1024 * 1024:
+            open(_MANAGER_CONSOLE_LOG, "w").close()
+    except OSError:
+        pass
+    _console_stream = open(_MANAGER_CONSOLE_LOG, "a", encoding="utf-8", errors="replace")
+    _sys.stdout = _Tee(_sys.__stdout__, _console_stream)
+    _sys.stderr = _Tee(_sys.__stderr__, _console_stream)
+except Exception:
+    _console_stream = None
 
 app = FastAPI()
 TEMPLATES = Environment(
@@ -1775,6 +1825,56 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
 
 
 @app.get("/nodes/{ip}/creds_sql")
+def _render_node_fix_sql(n, creds, manager_ip, manager_subnet=None):
+    """按节点真实风味（MySQL / MariaDB）生成 fix-node-creds.sql。
+
+    管理后台需同时支持 MySQL 与 MariaDB 集群，而两者账号/权限语法**不兼容**：
+      - MariaDB：`IDENTIFIED VIA mysql_native_password USING PASSWORD()`，
+        特权为 REPLICATION SLAVE ADMIN / SLAVE MONITOR / READ_ONLY ADMIN
+      - MySQL 8 ：`IDENTIFIED WITH mysql_native_password BY`，
+        特权为 REPLICATION_SLAVE_ADMIN / SYSTEM_VARIABLES_ADMIN
+    用错会直接 1064（语法错）或 1227（特权名不存在），故必须按 flavour 选渲染器。
+
+    优先连库用 `SELECT VERSION()` 实时探测；节点不可达（恰恰是最需要本脚本的场景）
+    时回退到库里记录的 node_type。
+    """
+    ha_user = creds.get("ha_user") or "ha_monitor"
+    ha_pass = creds.get("ha_pass") or ""
+    repl_user = creds.get("repl_user") or "replication"
+    repl_pass = creds.get("repl_pass") or ""
+    root_user = n.get("root_user") or "root"
+    root_pass = n.get("root_pass") or ""
+    host = n.get("ip") or n.get("host") or ""
+    try:
+        port = int(n.get("port") or 0) or 3306
+    except (TypeError, ValueError):
+        port = 3306
+
+    flavour = None
+    if host and ha_pass:
+        try:
+            conn = connect(host, port, ha_user, ha_pass, timeout=3)
+            try:
+                flavour = detect_flavour(conn.cursor())
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            flavour = None
+    if flavour is None:
+        flavour = flavour_from_node_type(n.get("node_type") or "docker")
+
+    if flavour == F_MARIADB:
+        return render_fix_node_creds_sql_mariadb(
+            ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass,
+            manager_ip, port, manager_subnet)
+    return render_fix_node_creds_sql(
+        ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass,
+        manager_ip, manager_subnet)
+
+
 def node_creds_sql(ip: str, user=Depends(auth_required)):
     """下载该节点的「账号/权限修复脚本」fix-node-creds.sql。
 
@@ -1784,7 +1884,8 @@ def node_creds_sql(ip: str, user=Depends(auth_required)):
     """
     try:
         row = query(
-            "SELECT n.root_user, n.root_pass, n.cluster_id FROM nodes n WHERE n.ip=%s", (ip,))
+            "SELECT n.ip, n.port, n.node_type, n.root_user, n.root_pass, n.cluster_id "
+            "FROM nodes n WHERE n.ip=%s", (ip,))
         if not row:
             return JSONResponse({"ok": False, "msg": f"未找到节点 {ip}"}, status_code=404)
         n = row[0]
@@ -1792,13 +1893,7 @@ def node_creds_sql(ip: str, user=Depends(auth_required)):
         creds = get_cluster_creds(cid)
         manager_ip = get_manager_public_ip()
         manager_subnet = get_manager_docker_subnet_wildcard()
-        sql = render_fix_node_creds_sql(
-            creds.get("ha_user") or "ha_monitor", creds.get("ha_pass") or "",
-            creds.get("repl_user") or "replication", creds.get("repl_pass") or "",
-            n.get("root_user") or "root", n.get("root_pass") or "",
-            manager_ip,
-            manager_subnet,
-        )
+        sql = _render_node_fix_sql(n, creds, manager_ip, manager_subnet)
         headers = {"Content-Disposition": f'attachment; filename="fix-node-creds-{ip}.sql"'}
         return Response(content=sql, media_type="application/sql", headers=headers)
     except Exception as e:
@@ -1815,7 +1910,8 @@ def api_node_creds_sql(cluster_id: int = 0, host: str = "", port: int = 0,
     """
     try:
         row = query(
-            "SELECT n.root_user, n.root_pass, n.cluster_id FROM nodes n "
+            "SELECT n.ip, n.port, n.node_type, n.root_user, n.root_pass, n.cluster_id "
+            "FROM nodes n "
             "WHERE n.cluster_id=%s AND n.ip=%s AND n.port=%s", (int(cluster_id), host, int(port)))
         if not row:
             return _json_ok({"ok": False, "error": f"未找到节点 {host}:{port}"})
@@ -1824,13 +1920,7 @@ def api_node_creds_sql(cluster_id: int = 0, host: str = "", port: int = 0,
         creds = get_cluster_creds(cid)
         manager_ip = get_manager_public_ip()
         manager_subnet = get_manager_docker_subnet_wildcard()
-        sql = render_fix_node_creds_sql(
-            creds.get("ha_user") or "ha_monitor", creds.get("ha_pass") or "",
-            creds.get("repl_user") or "replication", creds.get("repl_pass") or "",
-            n.get("root_user") or "root", n.get("root_pass") or "",
-            manager_ip,
-            manager_subnet,
-        )
+        sql = _render_node_fix_sql(n, creds, manager_ip, manager_subnet)
         if download:
             headers = {"Content-Disposition": f'attachment; filename="fix-node-creds-{host}.sql"'}
             return Response(content=sql, media_type="application/sql", headers=headers)
@@ -1862,38 +1952,100 @@ def api_srv_log(svc: str = "ha_manager", since: int = 86400, offset: int = 0,
                 user=Depends(auth_required)):
     """读取管理端容器日志。
 
-    - ha_manager：管理器自身日志写本地文件，直接按字节偏移读取，支持实时增量轮询(offset)。
-    - 其它管理端容器（keepalived / monitor / mysql-ha-manager-mgmt）：经宿主
-      /var/run/docker.sock 调用 Docker HTTP API 读取；若 stdout 为空则兜底读取容器内日志文件。
+    - ha_manager：优先经宿主 docker.sock 读取**本容器自身**的 stdout/stderr
+      （entrypoint / uvicorn / print 输出都在这里，等价于 `docker logs`），
+      这是唯一完整的数据源；docker.sock 不可用时回退到本地控制台日志文件。
+    - 其它容器：按容器名/ID 读取宿主上的兄弟容器日志（经 docker.sock）。
+
+    增量轮询（since < 3600）无新内容时返回空串，前端据此跳过追加，
+    避免把「暂无日志」占位文本反复追加进日志区。
     """
-    # 管理器自身日志：本地文件，实时增量
-    if svc == "ha_manager":
-        if not os.path.exists(_MANAGER_LOG):
-            return JSONResponse({"ok": True, "svc": svc, "source": "file",
-                                  "log": "（管理器日志文件不存在）", "offset": 0})
-        try:
-            off = int(offset)
-        except (TypeError, ValueError):
-            off = 0
-        text, new_off, size = _tail_file(_MANAGER_LOG, off)
-        return JSONResponse({"ok": True, "svc": svc, "source": "file",
-                              "log": text if text.strip() else "（日志文件为空）",
-                              "offset": new_off, "size": size})
-    # 其它：docker 兄弟容器
     try:
         since = max(1, int(since))
     except (TypeError, ValueError):
         since = 86400
+    try:
+        off = int(offset)
+    except (TypeError, ValueError):
+        off = 0
+    incremental = since < 3600          # 轮询增量 vs 首次全量
+    empty_hint = "" if incremental else "（最近 %d 秒内暂无日志）" % since
+
+    # ---- 管理器自身 ----
+    if svc in ("ha_manager", "mysql-ha-manager", "__self__"):
+        # 1) 自身容器 stdout/stderr（最完整）
+        try:
+            cid = docker_helper.own_container_id()
+        except Exception:
+            cid = None
+        if cid:
+            try:
+                log = docker_helper.container_logs_by_id(cid, since)
+            except Exception:
+                log = None
+            if log is not None:
+                return JSONResponse({
+                    "ok": True, "svc": svc, "source": "docker-self",
+                    "log": log if log.strip() else empty_hint, "offset": 0,
+                })
+        # 2) 回退：本地落盘日志（stdout Tee 写入的控制台日志优先）
+        for path in (_MANAGER_CONSOLE_LOG, _MANAGER_LOG):
+            if path and os.path.exists(path):
+                text, new_off, size = _tail_file(path, off)
+                if text.strip():
+                    return JSONResponse({"ok": True, "svc": svc, "source": "file",
+                                         "log": text, "offset": new_off, "size": size})
+        return JSONResponse({"ok": True, "svc": svc, "source": "file",
+                             "log": "" if incremental else
+                             "（暂无日志：docker.sock 不可用，且本地日志文件为空）",
+                             "offset": 0})
+
+    # ---- 兄弟容器 ----
     TOKEN = {
-        "ha_manager": "mysql-ha-manager",
         "keepalived": "keepalived",
         "monitor": "ha-manager-monitor",
         "ha_manager-mgmt": "mysql-ha-manager-mgmt",
     }
     token = TOKEN.get(svc, svc)
+    if not docker_helper.docker_available():
+        return JSONResponse({"ok": False, "svc": svc,
+                             "error": "未挂载 /var/run/docker.sock，无法读取兄弟容器日志。"})
     log = docker_helper.container_logs(token, since, file_fallback=(since >= 3600))
     if log is None:
-        return JSONResponse({"ok": False, "svc": svc,
-                             "error": f"本机无容器「{token}」日志（docker.sock 未挂载或容器不存在）。"})
+        try:
+            units = [u["name"] for u in docker_helper.list_units()]
+        except Exception:
+            units = []
+        return JSONResponse({
+            "ok": False, "svc": svc,
+            "error": (f"本机未找到容器「{token}」。注意 keepalived / monitor 通常运行在"
+                      f"**节点主机**上，不在管理端本机。"
+                      f"当前宿主容器：{('、'.join(units) if units else '无')}"),
+            "units": units,
+        })
     return JSONResponse({"ok": True, "svc": svc, "source": "docker",
-                          "log": log if log.strip() else "（该容器暂无可读日志）", "offset": 0})
+                         "log": log if log.strip() else empty_hint, "offset": 0})
+
+
+@app.get("/api/srv_units")
+def api_srv_units(user=Depends(auth_required)):
+    """列出宿主上可读取日志的容器，供「容器日志」下拉动态选择。
+
+    动态列举可避免下拉里出现本机根本不存在的容器（如运行在节点主机上的
+    keepalived / monitor），从源头消除「点了但读不到」。
+    """
+    try:
+        units = docker_helper.list_units()
+    except Exception:
+        units = []
+    items = [{"value": "ha_manager", "label": "mysql-ha-manager（管理器自身）"}]
+    seen = {"ha_manager"}
+    for u in units:
+        name = u.get("name") or ""
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        items.append({"value": name,
+                      "label": f"{name}（{u.get('state') or '未知'}）"})
+    return _json_ok({"ok": True, "units": items,
+                     "docker": docker_helper.docker_available()})

@@ -24,14 +24,18 @@ services:
   # MySQL HA 管理器（单容器：决策器 + Web + 节点一键部署生成）
   ha-manager:
     # 镜像标签使用语义化版本号（MAJOR.MINOR.PATCH），【不再使用 latest】。
-    # 手动修改版本号：将下方两处的 v2.1.4 改为目标版本；或用环境变量 VERSION 覆盖
-    #   （如：VERSION=v2.1.4 docker compose up -d --build）。
-    # 涉及大版本(MAJOR)变更需人工确认。升版请同步修改 app/VERSION。
-    image: mysql-ha-manager:${VERSION:-v2.1.4}
+    # 版本单一来源 = app/VERSION，本文件【不写死版本号】，升版时无需改动本文件。
+    # 构建/部署统一用 ./deploy.sh（或 make build）：它会自动把 app/VERSION 同步到
+    # .env 再调用 docker compose，保证镜像标签与页面显示版本始终一致。
+    #   ./deploy.sh               # 等价于 docker compose up -d --build
+    #   ./deploy.sh logs -f       # 其余参数原样透传给 docker compose
+    # 若直接跑 docker compose 且 .env 的 VERSION 与 app/VERSION 不一致，
+    # 构建会主动失败并提示改用 ./deploy.sh（防止「标签旧、内容新」错配）。
+    image: mysql-ha-manager:${VERSION:?请先执行./deploy.sh}
     build:
       context: .
       args:
-        VERSION: ${VERSION:-v2.1.4}
+        VERSION: ${VERSION}
     restart: always
     # 若启用上面的 mgmt-mysql，取消下一行注释
     # depends_on:

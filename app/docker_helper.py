@@ -20,6 +20,35 @@ def docker_available():
     return os.path.exists(SOCK)
 
 
+def _dechunk(data):
+    """解码 HTTP chunked 传输编码。
+
+    Docker API 对 /containers/json、/containers/{id}/logs 等接口普遍使用
+    Transfer-Encoding: chunked。不解码的话：JSON 解析失败（表现为「查不到容器」）、
+    日志正文混入 chunk 长度前缀（表现为「读不到日志」）。
+    """
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n:
+        j = data.find(b"\r\n", i)
+        if j < 0:
+            break
+        line = data[i:j].strip()
+        semi = line.find(b";")          # 忽略 chunk 扩展
+        if semi >= 0:
+            line = line[:semi]
+        try:
+            size = int(line, 16)
+        except ValueError:
+            break
+        i = j + 2
+        if size == 0:                   # 结束块
+            break
+        out += data[i:i + size]
+        i += size + 2                   # 跳过数据后的 CRLF
+    return bytes(out)
+
+
 def _http_get(path):
     """经 Unix Socket 发送一次 HTTP/1.1 GET，返回 (status_line, body_bytes)。"""
     if not docker_available():
@@ -51,8 +80,11 @@ def _http_get(path):
     sep = data.find(b"\r\n\r\n")
     if sep < 0:
         return None, b""
-    status = data[:data.find(b"\r\n")].decode(errors="replace")
+    head = data[:sep]
+    status = head[:head.find(b"\r\n")].decode(errors="replace")
     body = data[sep + 4:]
+    if b"chunked" in head.lower():
+        body = _dechunk(body)
     return status, body
 
 
@@ -98,8 +130,12 @@ def _http_post(path, body):
     sep = data.find(b"\r\n\r\n")
     if sep < 0:
         return None, b""
-    status = data[:data.find(b"\r\n")].decode(errors="replace")
-    return status, data[sep + 4:]
+    head = data[:sep]
+    status = head[:head.find(b"\r\n")].decode(errors="replace")
+    body = data[sep + 4:]
+    if b"chunked" in head.lower():
+        body = _dechunk(body)
+    return status, body
 
 
 def _decode_mux(body):
@@ -134,6 +170,95 @@ def _docker_exec(ctr_id, cmd):
     return _decode_mux(out)
 
 
+# 兜底：容器把日志写进文件而非 stdout 时，读取这些常见路径
+_LOG_FILES_CMD = (
+    "for f in /app/data/logs/*.log /var/log/keepalived_chk.log "
+    "/var/log/keepalived.log /var/log/messages /var/log/syslog; do "
+    "if [ -f \"$f\" ]; then echo \"===== $f =====\"; tail -n 1500 \"$f\"; fi; done"
+)
+
+
+def container_logs_by_id(ctr_id, since_seconds=86400, file_fallback=False):
+    """按容器 ID 读取日志文本。
+
+    返回约定：
+      - None  -> 容器不存在或 Docker API 不可用（调用方提示「本机无该容器」）
+      - ""    -> 容器存在但时间窗内无输出（调用方提示「暂无日志」）
+      - 文本  -> 日志内容
+    """
+    if not ctr_id or not docker_available():
+        return None
+    try:
+        since_ts = int(time.time()) - int(since_seconds)
+    except (TypeError, ValueError):
+        since_ts = int(time.time()) - 86400
+    qs = urllib.parse.urlencode({"stdout": "1", "stderr": "1", "since": since_ts})
+    status, body = _http_get(f"/containers/{ctr_id}/logs?{qs}")
+    if status is None or "200" not in status:
+        return None
+    logs = _decode_mux(body)
+    if logs.strip():
+        return logs
+    if file_fallback:
+        try:
+            out = _docker_exec(ctr_id, _LOG_FILES_CMD)
+            if out and out.strip():
+                return out
+        except Exception:
+            pass
+    return ""
+
+
+def find_container(token):
+    """按容器名 / ID 前缀匹配容器，返回 (id, name)；无匹配返回 (None, None)。"""
+    token = (token or "").strip()
+    if not token:
+        return None, None
+    for c in list_containers():
+        names = [n.lstrip("/") for n in (c.get("Names") or [])]
+        cid = c.get("Id") or ""
+        if token in names or (cid and cid.startswith(token)) \
+                or any(token in n for n in names):
+            return cid, (names[0] if names else cid[:12])
+    return None, None
+
+
+def own_container_id():
+    """返回本容器自身的容器 ID。
+
+    Docker 默认把容器 hostname 设为容器 ID 前 12 位，据此定位自身，
+    避免依赖 compose 项目名（不同部署目录生成的容器名不同）。
+    """
+    if not docker_available():
+        return None
+    try:
+        host = socket.gethostname()
+    except Exception:
+        return None
+    if not host:
+        return None
+    for c in list_containers():
+        cid = c.get("Id") or ""
+        if cid and (cid.startswith(host) or host.startswith(cid[:12])):
+            return cid
+    return None
+
+
+def list_units():
+    """列出宿主上所有容器（含已停止），供「容器日志」下拉动态选择。"""
+    out = []
+    for c in list_containers():
+        names = [n.lstrip("/") for n in (c.get("Names") or [])]
+        out.append({
+            "id": (c.get("Id") or "")[:12],
+            "name": names[0] if names else (c.get("Id") or "")[:12],
+            "image": c.get("Image") or "",
+            "state": c.get("State") or "",
+            "status": c.get("Status") or "",
+        })
+    return out
+
+
 def container_logs(token, since_seconds=86400, file_fallback=True):
     """返回名称匹配 token 的容器日志文本（最近 since_seconds 秒）。
 
@@ -143,37 +268,7 @@ def container_logs(token, since_seconds=86400, file_fallback=True):
     """
     if not docker_available():
         return None
-    token = (token or "").strip()
-    if not token:
-        return None
-    # 查找名称匹配的容器（docker API 用容器名/id，compose 服务名需自行匹配）
-    ctr_id = None
-    for c in list_containers():
-        names = [n.lstrip("/") for n in (c.get("Names") or [])]
-        if token in names or any(token in n for n in names):
-            ctr_id = c.get("Id")
-            break
+    ctr_id, _ = find_container(token)
     if not ctr_id:
         return None
-    try:
-        since_ts = int(time.time()) - int(since_seconds)
-    except (TypeError, ValueError):
-        since_ts = int(time.time()) - 86400
-    qs = urllib.parse.urlencode({"stdout": "1", "stderr": "1", "since": since_ts})
-    status, body = _http_get(f"/containers/{ctr_id}/logs?{qs}")
-    if status is not None and "200" in status:
-        logs = _decode_mux(body)
-        if logs.strip():
-            return logs
-    # stdout 为空 -> 兜底读取容器内日志文件
-    if file_fallback:
-        cmd = ("for f in /app/data/logs/ha-manager.log /var/log/keepalived_chk.log "
-               "/var/log/keepalived.log /var/log/messages /var/log/syslog; do "
-               "if [ -f \"$f\" ]; then echo \"===== $f =====\"; tail -n 1500 \"$f\"; fi; done")
-        try:
-            out = _docker_exec(ctr_id, cmd)
-            if out.strip():
-                return out
-        except Exception:
-            pass
-    return ""
+    return container_logs_by_id(ctr_id, since_seconds, file_fallback=file_fallback)

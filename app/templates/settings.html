@@ -41,13 +41,10 @@
 <div class="card">
   <h3>服务端容器日志</h3>
   <div class="srv-head">
-    <div class="note">实时读取管理端容器日志（经宿主 docker.sock 读取 keepalived / mysql-ha-manager / ha-manager-monitor / mysql-ha-manager-mgmt 等兄弟容器）。每 4 秒自动刷新新增内容，可切换服务查看。</div>
+    <div class="note">实时读取容器日志：管理器读取<b>自身容器</b>的 stdout/stderr（等价于 <code>docker logs</code>），其余容器经宿主 <code>/var/run/docker.sock</code> 读取。下拉为<b>本机实际存在的容器</b>（动态列举，不再出现本机没有的容器）。每 4 秒自动追加新增内容。</div>
     <div class="srv-actions">
-      <select id="srvUnit" class="mini-sel">
-        <option value="ha_manager">mysql-ha-manager（管理器）</option>
-        <option value="keepalived">keepalived</option>
-        <option value="monitor">ha-manager-monitor</option>
-        <option value="ha_manager-mgmt">mysql-ha-manager-mgmt（如有）</option>
+      <select id="srvUnit" class="mini-sel" onchange="loadSrvLog()">
+        <option value="ha_manager">mysql-ha-manager（管理器自身）</option>
       </select>
       <button class="btn btn-sm btn-primary" onclick="loadSrvLog()">读取日志</button>
       <button class="btn btn-sm" onclick="exportSrvLog()">导出TXT（24h）</button>
@@ -150,6 +147,28 @@
       .catch(function(e){toast("导出失败: "+e,"err");});
   }
 
+  // 动态填充「本机实际存在」的容器，避免点到本机没有的容器
+  function loadSrvUnits(){
+    var sel=document.getElementById("srvUnit");
+    if(!sel)return;
+    fetch("/api/srv_units",{cache:"no-store",credentials:"same-origin"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.ok||!d.units||!d.units.length)return;
+        var keep=sel.value;
+        sel.innerHTML="";
+        d.units.forEach(function(u){
+          var o=document.createElement("option");
+          o.value=u.value;o.textContent=u.label;
+          sel.appendChild(o);
+        });
+        if(keep)sel.value=keep;
+        if(!sel.value&&sel.options.length)sel.selectedIndex=0;
+      })
+      .catch(function(){});
+  }
+
+  loadSrvUnits();
   loadSrvLog();
   setInterval(pollSrvLog, 4000);
 </script>

@@ -17,11 +17,16 @@ COPY . .
 # 统一版本真相：构建时若传入 --build-arg VERSION（由 docker-compose 的 .env 提供），
 # 以它为准并写回镜像内 app/VERSION；否则回退使用源码内的 app/VERSION。
 # 这样 镜像标签 / LABEL / 容器内 app/VERSION 三处一致，Web 也能读到版本。
-RUN if [ -z "${VERSION}" ] && [ -f app/VERSION ]; then \
-      VERSION=$(cat app/VERSION | tr -d '[:space:]'); \
+RUN SRC_VER=$(tr -d '[:space:]' < app/VERSION 2>/dev/null || echo ""); \
+    ARG_VER=$(printf '%s' "${VERSION}" | tr -d '[:space:]'); \
+    if [ -n "${SRC_VER}" ] && [ -n "${ARG_VER}" ] && [ "${SRC_VER}" != "${ARG_VER}" ]; then \
+      echo "ERROR: 版本不一致 —— app/VERSION=${SRC_VER}，构建参数 VERSION=${ARG_VER}" >&2; \
+      echo "       请改用 ./deploy.sh（或 make build），它会自动同步 .env 后再构建。" >&2; \
+      exit 1; \
     fi; \
-    printf '%s' "${VERSION}" > app/VERSION && \
-    echo "VERSION=${VERSION}" > /app/.version.env
+    VER="${SRC_VER:-${ARG_VER}}"; \
+    printf '%s' "${VER}" > app/VERSION && \
+    echo "VERSION=${VER}" > /app/.version.env
 
 RUN chmod +x docker-entrypoint.sh
 

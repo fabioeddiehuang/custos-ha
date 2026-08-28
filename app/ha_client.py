@@ -1103,8 +1103,11 @@ def _native_password_hash(password):
     if password is None:
         return None
     s1 = hashlib.sha1(password.encode("utf-8")).digest()
-    s2 = hashlib.sha1(s1).digest()
-    return "*" + s2.hexdigest().upper()
+    # 注意：二次哈希要取 hexdigest（str），不能用 digest() 后再 .hexdigest()
+    # —— bytes 没有 .hexdigest()，会抛 'bytes' object has no attribute 'hexdigest'，
+    # 导致整个账号自愈链路失效。
+    s2 = hashlib.sha1(s1).hexdigest()
+    return "*" + s2.upper()
 
 
 def _parse_grant_privs(grant_sql):
@@ -1151,7 +1154,37 @@ def _ensure_account(cur, user, host, passwd, idn_expr, grant_sql=None):
         want_privs = _parse_grant_privs(grant_sql)
         have = _granted_privs(cur, user, host)
         if want_privs and not want_privs.issubset(have):
+            # ALL PRIVILEGES 需单独判定：MySQL 8 的 SHOW GRANTS 会把它**展开**成一长串
+            # 具体权限（不含 "ALL PRIVILEGES" 字面量），直接做子集判断会误判为「权限缺失」，
+            # 导致每周期重复 GRANT -> 重新引入「主库空闲也持续写 binlog、副本跟着写盘」。
+            # MariaDB 则直接给出 "ALL PRIVILEGES" 字面量，两种都必须覆盖。
+            if "ALL PRIVILEGES" in want_privs and _has_all_privileges(cur, user, host):
+                return
             cur.execute(grant_sql)
+
+
+# 判定「已拥有全部权限」的签名集：这些权限只有 ALL PRIVILEGES 才会同时具备，
+# 用于识别 MySQL 8 展开式的 SHOW GRANTS（无法靠 "ALL PRIVILEGES" 字面量匹配）。
+_ALL_PRIV_SIG = {
+    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "RELOAD",
+    "SHUTDOWN", "PROCESS", "FILE", "REFERENCES", "INDEX", "ALTER", "SUPER",
+    "CREATE USER", "TRIGGER",
+}
+
+
+def _has_all_privileges(cur, user, host):
+    """判断账号是否已拥有全部权限（兼容 MySQL / MariaDB 两种 SHOW GRANTS 形式）。"""
+    try:
+        cur.execute("SHOW GRANTS FOR %s@%s", (user, host))
+        rows = cur.fetchall()
+    except Exception:
+        return False
+    have = set()
+    for (g,) in rows:
+        if "ALL PRIVILEGES" in (g or "").upper():
+            return True
+        have |= _parse_grant_privs(g)
+    return _ALL_PRIV_SIG.issubset(have)
 
 
 def ensure_ha_creds(host, port, root_user, root_pass,
@@ -1243,7 +1276,14 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             root_targets.append(manager_subnet)
         root_targets.append("%")  # 内网远程访问
         for rh in root_targets:
-            _ensure_account(cur, root_user, rh, root_pass, idn_root)
+            # 必须与 node_gen 生成的 fix-node-creds.sql 保持一致：
+            # root 远程账号必须是 ALL PRIVILEGES + WITH GRANT OPTION。
+            # 否则 root 只有 USAGE（CREATE USER 默认仅 USAGE）：一旦 ha_monitor 权限退化
+            # （自身无 GRANT OPTION，无法自行补齐），root 回退也救不了，
+            # 账号自愈就彻底锁死成死循环。
+            root_grant = ("GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION"
+                          % (root_user, rh))
+            _ensure_account(cur, root_user, rh, root_pass, idn_root, root_grant)
         # 补授 ha_monitor 的额外特权（已授权时跳过，避免每周期重复 GRANT 写 binlog）。
         #  - CREATE USER：MySQL 8.0 与 MariaDB 均需要（MariaDB 中 CREATE USER 特权即隐含
         #    覆盖 ALTER USER / DROP USER，无需也不能单独 GRANT ALTER/DROP USER——后者在
