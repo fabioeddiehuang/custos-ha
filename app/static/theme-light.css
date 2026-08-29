@@ -45,6 +45,8 @@ html[data-theme="light"] {
 /* ---------- 结构件：原样式写死了深色半透明底，这里覆盖 ---------- */
 html[data-theme="light"] .sidebar { background: rgba(255,255,255,.88); }
 html[data-theme="light"] .topbar  { background: rgba(255,255,255,.88); }
+/* body 的暗色渐变（v3.css 写死）在浅色下须隐藏，否则右侧内容区仍显黑色 */
+html[data-theme="light"] body { background: var(--bg); background-image: none; }
 
 /* ---------- 下拉选项（原生控件，必须显式给底色） ---------- */
 html[data-theme="light"] select option,
