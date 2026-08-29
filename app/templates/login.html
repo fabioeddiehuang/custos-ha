@@ -7,39 +7,138 @@
   <link rel="stylesheet" href="/static/styles.css">
   <link rel="stylesheet" href="/static/v3.css">
   <style>
-    body{background:linear-gradient(135deg,#E11D74,#7C2D52);min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0}
-    .auth-card{max-width:380px;width:92%;background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(15,23,42,.25);padding:32px 30px}
-    .auth-brand{display:flex;align-items:center;gap:10px;margin-bottom:18px;color:#E11D74;font-weight:800;font-size:18px}
-    .auth-brand .logo{font-size:22px}
-    .auth-card h1{margin:0 0 4px;font-size:22px;color:#1e293b}
-    .auth-card .sub{margin:0 0 22px;color:#6b7280;font-size:13px}
-    .form-row{margin-bottom:14px}
-    .form-row label{display:block;font-size:12px;color:#6b7280;margin-bottom:6px}
-    .form-row input{width:100%;padding:10px 12px;border:1px solid #e9e9f0;border-radius:10px;font-size:14px;outline:none;transition:.15s;box-sizing:border-box}
-    .form-row input:focus{border-color:#E11D74;box-shadow:0 0 0 3px rgba(225,29,116,.12)}
+    /* 登录页：深色质感底 + 毛玻璃双栏。
+       不再使用大面积玫红：玫红仅作为品牌点缀，主色交给蒂凡尼青，整体更沉稳大气。 */
+    :root{
+      --bg-0:#070b14; --bg-1:#0e1830;
+      --ink:#e8eefc; --muted:#8b9ac0;
+      --accent:#0ABAB5; --accent-2:#22d3ee; --plum:#7C2D52;
+      --line:rgba(255,255,255,.10);
+    }
+    html,body{height:100%}
+    body{
+      margin:0; background:var(--bg-0); color:var(--ink);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+      display:flex; align-items:center; justify-content:center; padding:24px;
+      background-image:
+        radial-gradient(900px 520px at 12% 8%,  rgba(10,186,181,.20), transparent 60%),
+        radial-gradient(760px 480px at 88% 92%, rgba(124,45,82,.28), transparent 62%),
+        radial-gradient(600px 600px at 50% 45%, rgba(34,211,238,.07), transparent 70%),
+        linear-gradient(140deg, var(--bg-0) 0%, var(--bg-1) 55%, #0a1222 100%);
+      background-attachment:fixed;
+    }
+    /* 细网格底纹（中心亮、四周渐隐），增加质感又不喧宾夺主 */
+    body::before{
+      content:""; position:fixed; inset:0; pointer-events:none; opacity:.5;
+      background-image:linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+                       linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+      background-size:44px 44px;
+      -webkit-mask-image:radial-gradient(circle at 50% 40%, #000 0%, transparent 72%);
+              mask-image:radial-gradient(circle at 50% 40%, #000 0%, transparent 72%);
+    }
+    .auth-wrap{
+      position:relative; width:100%; max-width:960px;
+      display:grid; grid-template-columns:1.05fr .95fr;
+      border:1px solid var(--line); border-radius:22px; overflow:hidden;
+      background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+      box-shadow:0 40px 90px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.07);
+      -webkit-backdrop-filter:blur(18px); backdrop-filter:blur(18px);
+    }
+    @media (max-width:860px){
+      .auth-wrap{grid-template-columns:1fr}
+      .auth-side{display:none}
+    }
+    /* 左：品牌与价值点 */
+    .auth-side{
+      position:relative; padding:40px 36px; border-right:1px solid var(--line);
+      background:
+        radial-gradient(620px 320px at 18% 12%, rgba(10,186,181,.18), transparent 60%),
+        linear-gradient(160deg, rgba(124,45,82,.30), rgba(7,11,20,.10));
+    }
+    .brand{display:flex;align-items:center;gap:12px;font-size:19px;font-weight:800;letter-spacing:.4px}
+    .brand .mark{
+      width:38px;height:38px;border-radius:11px;display:grid;place-items:center;
+      font-size:19px;color:#04121a;
+      background:linear-gradient(135deg,var(--accent-2),var(--accent));
+      box-shadow:0 8px 22px rgba(10,186,181,.35);
+    }
+    .side-title{margin:28px 0 10px;font-size:26px;line-height:1.4;font-weight:800}
+    .side-title em{
+      font-style:normal;
+      background:linear-gradient(90deg,var(--accent-2),var(--accent));
+      -webkit-background-clip:text; background-clip:text; color:transparent;
+    }
+    .side-sub{color:var(--muted);font-size:13.5px;line-height:1.85;margin:0 0 24px}
+    .feat{display:grid;gap:12px;margin:0;padding:0;list-style:none}
+    .feat li{display:flex;gap:10px;align-items:flex-start;font-size:13px;color:#c3cee9}
+    .feat .dot{
+      width:7px;height:7px;border-radius:50%;margin-top:7px;flex:none;
+      background:linear-gradient(135deg,var(--accent-2),var(--accent));
+      box-shadow:0 0 0 4px rgba(10,186,181,.14);
+    }
+    /* 右：表单 */
+    .auth-main{padding:40px 36px}
+    .auth-main h1{margin:0 0 6px;font-size:22px;font-weight:800;letter-spacing:.3px}
+    .auth-main .sub{margin:0 0 24px;color:var(--muted);font-size:13px}
+    .field{margin-bottom:15px}
+    .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px;font-weight:600}
+    .field input{
+      width:100%;padding:12px 13px;border-radius:11px;font-size:14px;color:var(--ink);
+      background:rgba(255,255,255,.05);border:1px solid var(--line);outline:none;transition:.18s;
+    }
+    .field input::placeholder{color:rgba(139,154,192,.55)}
+    .field input:focus{
+      border-color:rgba(34,211,238,.65);background:rgba(255,255,255,.08);
+      box-shadow:0 0 0 4px rgba(10,186,181,.16);
+    }
+    .submit{
+      width:100%;padding:12px 14px;border:0;border-radius:11px;cursor:pointer;margin-top:4px;
+      font-size:14.5px;font-weight:800;letter-spacing:1px;color:#04121a;
+      background:linear-gradient(135deg,var(--accent-2),var(--accent));
+      box-shadow:0 12px 30px rgba(10,186,181,.28);transition:.18s;
+    }
+    .submit:hover{transform:translateY(-1px);box-shadow:0 16px 36px rgba(10,186,181,.38)}
+    .submit:active{transform:translateY(0)}
+    .banner.err{
+      background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.35);color:#fecaca;
+      border-radius:11px;padding:10px 12px;margin-bottom:18px;font-size:13px;
+    }
+    .foot{margin-top:20px;font-size:11.5px;color:rgba(139,154,192,.75);text-align:center}
   </style>
 </head>
 <body>
-  <div class="auth-card">
-    <div class="auth-brand"><span class="logo">◈</span><span>MySQL HA 管理器</span></div>
-    <h1>欢迎回来</h1>
-    <p class="sub">请登录以管理高可用集群</p>
+  <div class="auth-wrap">
+    <aside class="auth-side">
+      <div class="brand"><span class="mark">◈</span><span>MySQL HA 管理器</span></div>
+      <h2 class="side-title">为数据库<br><em>永不中断</em>而设计</h2>
+      <p class="side-sub">主库故障秒级切换、复制自愈、配置巡检，一套后台托管 MySQL / MariaDB 高可用集群。</p>
+      <ul class="feat">
+        <li><span class="dot"></span><span>秒级故障切换 · VIP 自动漂移</span></li>
+        <li><span class="dot"></span><span>复制中断 / 配置漂移 自动自愈</span></li>
+        <li><span class="dot"></span><span>多集群统一观测与告警中心</span></li>
+      </ul>
+    </aside>
 
-    {% if error %}<div class="banner err" style="margin-bottom:16px">⚠ <div>{{ error }}</div></div>{% endif %}
+    <main class="auth-main">
+      <h1>欢迎回来</h1>
+      <p class="sub">请登录以管理高可用集群</p>
 
-    <form method="post" action="/login">
-      <div class="form-row">
-        <label>用户名</label>
-        <input type="text" name="username" placeholder="admin" required autofocus>
-      </div>
-      <div class="form-row">
-        <label>密码</label>
-        <input type="password" name="password" placeholder="请输入密码" required>
-      </div>
-      <div class="btn-row" style="margin-top:8px">
-        <button type="submit" class="btn btn-primary" style="width:100%">登 录</button>
-      </div>
-    </form>
+      {% if error %}<div class="banner err">⚠ {{ error }}</div>{% endif %}
+
+      <form method="post" action="/login">
+        <div class="field">
+          <label for="username">用户名</label>
+          <input id="username" type="text" name="username" placeholder="admin" required autofocus autocomplete="username">
+        </div>
+        <div class="field">
+          <label for="password">密码</label>
+          <input id="password" type="password" name="password" placeholder="请输入密码" required autocomplete="current-password">
+        </div>
+        <button type="submit" class="submit">登 录</button>
+      </form>
+
+      <div class="foot">建议部署于内网环境 · 请妥善保管管理员凭证</div>
+    </main>
   </div>
 </body>
 </html>

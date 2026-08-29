@@ -17,11 +17,21 @@
   .rule-field .unit{font-size:12px;color:#94a3b8}
   .rule-field.full{grid-column:1/-1}
   .rule-field textarea{height:86px;resize:vertical;font-weight:400}
-  .email-card{display:flex;flex-direction:column;gap:10px;min-width:280px;border:1px solid var(--border);border-radius:14px;padding:14px 16px;background:#fff;box-shadow:0 1px 3px rgba(16,24,40,.04)}
-  .email-card .ec-top{display:flex;align-items:center;gap:10px}
-  .email-card .ec-mail{font-weight:700;font-size:14px;word-break:break-all}
-  .email-card .ec-clusters{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-  .email-card .ec-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  /* 提醒邮箱卡片：头像 + 身份/状态 + 绑定集群 + 操作，分区清晰、自适应网格 */
+  .ec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+  .email-card{display:flex;flex-direction:column;gap:12px;border:1px solid var(--border);border-radius:14px;padding:14px 16px;background:#fff;box-shadow:0 1px 3px rgba(16,24,40,.04);transition:.18s}
+  .email-card:hover{box-shadow:0 6px 20px rgba(16,24,40,.08);border-color:#e2e8f0}
+  .ec-head{display:flex;align-items:flex-start;gap:11px}
+  .ec-avatar{width:38px;height:38px;border-radius:11px;flex:none;display:grid;place-items:center;font-weight:800;font-size:16px;color:#fff;background:linear-gradient(135deg,#22d3ee,#0ABAB5)}
+  .ec-ident{min-width:0;flex:1}
+  .ec-mail{font-weight:700;font-size:13.5px;word-break:break-all;color:var(--text)}
+  .ec-status{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+  .ec-head .switch{flex:none;margin-top:2px}
+  .ec-bind{border-top:1px dashed var(--border);padding-top:11px}
+  .ec-bind-k{font-size:11px;color:var(--muted);font-weight:600;margin-bottom:7px;letter-spacing:.3px}
+  .ec-bind-v{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .ec-empty{font-size:12px;color:#94a3b8}
+  .ec-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -56,35 +66,41 @@
 
 <div class="card">
   <h3>提醒邮箱</h3>
-  <div style="display:flex;flex-wrap:wrap;gap:14px;" id="emailList">
+  <div class="ec-grid" id="emailList">
     {% for e in alert_emails %}
     <div class="email-card" data-id="{{ e.id }}">
-      <div class="ec-top">
-        <span class="ec-mail">{{ e.email }}</span>
-        {% if e.is_default %}<span class="tag ok">默认</span>{% endif %}
-        <label class="switch" title="开启后该邮箱可接收告警（需已绑定集群）" style="margin-left:auto">
+      <div class="ec-head">
+        <div class="ec-avatar">{{ e.email[:1]|upper }}</div>
+        <div class="ec-ident">
+          <div class="ec-mail" title="{{ e.email }}">{{ e.email }}</div>
+          <div class="ec-status">
+            {% if not e.enabled %}<span class="badge down">不接收</span>
+            {% elif e.clusters %}<span class="badge up">接收中</span>
+            {% else %}<span class="badge warn">未绑定集群</span>{% endif %}
+            {% if e.is_default %}<span class="badge sky">默认</span>{% endif %}
+          </div>
+        </div>
+        <label class="switch" title="开启后该邮箱可接收告警（需已绑定集群）">
           <input type="checkbox" onchange="toggleEmail({{ e.id }}, this)" {% if e.enabled %}checked{% endif %}>
           <span class="slider"></span>
         </label>
       </div>
-      <div>
-        {% if not e.enabled %}<span class="tag" style="background:#fee2e2;color:#b91c1c">不接收</span>
-        {% elif e.clusters %}<span class="tag ok">接收中</span>
-        {% else %}<span class="tag warn">未绑定集群·不接收</span>{% endif %}
-      </div>
-      <div class="ec-clusters">
-        {% if e.clusters %}
-          {% for c in e.clusters %}<span class="tag sky">{{ c }}</span>{% endfor %}
-        {% else %}<span style="color:#9ca3af;font-size:12px">尚未绑定集群</span>{% endif %}
+      <div class="ec-bind">
+        <div class="ec-bind-k">接收集群</div>
+        <div class="ec-bind-v">
+          {% if e.clusters %}
+            {% for c in e.clusters %}<span class="badge sky">{{ c.name }}</span>{% endfor %}
+          {% else %}<span class="ec-empty">尚未绑定集群，不会收到告警</span>{% endif %}
+        </div>
       </div>
       <div class="ec-actions">
-        <button class="btn btn-sm btn-ghost" onclick="mapCluster('{{ e.id }}','{{ e.clusters|join('、') }}')">映射集群</button>
-        {% if not e.is_default %}<button class="btn btn-sm" onclick="setDefault('{{ e.id }}')">设为默认</button>{% endif %}
+        <button class="btn btn-sm" onclick="mapCluster('{{ e.id }}','{{ e.clusters|map(attribute='id')|list|join(',') }}')">映射集群</button>
+        {% if not e.is_default %}<button class="btn btn-sm btn-ghost" onclick="setDefault('{{ e.id }}')">设为默认</button>{% endif %}
         <button class="btn btn-sm" style="margin-left:auto;background:var(--danger);color:#fff" onclick="delEmail('{{ e.id }}')">删除</button>
       </div>
     </div>
     {% else %}
-    <span style="color:#9ca3af;font-size:13px;">暂无提醒邮箱</span>
+    <div class="obs-empty">暂无提醒邮箱</div>
     {% endfor %}
   </div>
 
@@ -240,7 +256,8 @@
   function mapCluster(id, clustersStr){
     _emapId = id;
     var list = document.getElementById("emapList");
-    var mapped = (clustersStr||"").split("、").map(function(x){return x.trim();}).filter(Boolean);
+    // 模板传的是逗号分隔的 cluster_id（此前用「、」拼接的是 dict repr，导致勾选状态匹配不上）
+    var mapped = (clustersStr||"").split(",").map(function(x){return x.trim();}).filter(Boolean);
     if(!__clusters.length){
       list.innerHTML = '<div class="note">当前没有任何集群可绑定。</div>';
     } else {

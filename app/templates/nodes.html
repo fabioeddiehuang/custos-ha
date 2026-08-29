@@ -7,14 +7,33 @@
   .acc-pwd .reveal{cursor:pointer;color:var(--primary);margin-left:8px;font-size:12px;background:none;border:none;padding:0}
   .acc-pwd .reveal:hover{color:var(--primary-dark)}
   .dd-actions{display:flex;gap:10px;flex-wrap:wrap}
-  /* 基本信息：单行信息条，标签+值横向排列，过长省略避免重叠 */
-  .info-strip{display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;background:#f8fafc;border:1px solid var(--border);border-radius:12px;padding:12px 16px}
-  .is{display:flex;align-items:center;gap:8px;min-width:0}
-  .is-k{font-size:12px;color:var(--muted);font-weight:600;white-space:nowrap}
-  .is-v{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px}
-  .is-v.tr{cursor:default}
-  .is-v.tr:hover{color:var(--primary)}
-  .is-sep{width:1px;align-self:stretch;background:var(--border)}
+  /* 每个节点一个配色：展开多个节点时，靠色块+底色区分细节与底部按钮归属 */
+  .na-0{--accent:#0ABAB5;--tint:#f3fdfc}
+  .na-1{--accent:#7C2D52;--tint:#fdf5f9}
+  .na-2{--accent:#2563eb;--tint:#f2f7ff}
+  .na-3{--accent:#d97706;--tint:#fffaf0}
+  .na-4{--accent:#7c3aed;--tint:#f8f6ff}
+  .dd{background:var(--tint,#f8fafc);border:1px solid var(--border);border-left:4px solid var(--accent,#0ABAB5);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:14px}
+  .dd-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .dd-dot{width:9px;height:9px;border-radius:50%;background:var(--accent,#0ABAB5);flex:none}
+  .dd-title{font-size:13.5px;font-weight:800;color:var(--text);font-family:var(--mono)}
+  .dd-title small{font-weight:600;color:var(--muted);font-family:inherit;margin-left:8px}
+  /* 基本信息：等宽网格 + 1px 细分隔线，取代原来拥挤的单行信息条 */
+  .info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .ig-item{background:#fff;padding:11px 14px;min-width:0}
+  .ig-item.wide{grid-column:span 2}
+  @media (max-width:560px){ .ig-item.wide{grid-column:span 1} }
+  .ig-k{font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.3px;margin-bottom:5px}
+  .ig-v{font-size:13.5px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ig-v.mono{font-family:var(--mono)}
+  .ig-v.tr{cursor:default}
+  .ig-v.tr:hover{color:var(--primary)}
+  /* 批量操作条 */
+  .batch-bar{display:none;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;padding:10px 14px;border-radius:12px;background:#f8fafc;border:1px solid var(--border)}
+  .batch-bar.show{display:flex}
+  .bb-count{font-size:13px;color:var(--muted)}
+  .bb-count b{color:var(--text);font-size:14px}
+  .bb-actions{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
   /* 添加节点 / 节点配置 表单 */
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px}
   .grid2 label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);font-weight:600}
@@ -36,13 +55,28 @@
   <h3>已添加节点<span style="flex:1"></span>
     <button class="btn btn-primary btn-sm" onclick="openAddNode()">＋ 添加节点</button>
   </h3>
+  <!-- 批量操作：勾选左侧复选框后自动出现 -->
+  <div class="batch-bar" id="batchBar">
+    <span class="bb-count">已选 <b id="selCount">0</b> 个节点</span>
+    <div class="bb-actions">
+      <button class="btn btn-sm btn-accent" onclick="batchRegen()">批量重新生成</button>
+      <button class="btn btn-sm" onclick="batchDownload()">批量下载修复SQL</button>
+      <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="batchDelete()">批量删除</button>
+      <button class="btn btn-sm btn-ghost" onclick="clearSelection()">取消选择</button>
+    </div>
+  </div>
+
   <table class="tbl">
     <thead>
-      <tr><th>集群名</th><th>节点</th><th>版本</th><th>状态</th><th>操作</th></tr>
+      <tr>
+        <th style="width:36px"><input type="checkbox" id="selAll" onchange="toggleSelectAll(this)" title="全选/取消全选"></th>
+        <th>集群名</th><th>节点</th><th>版本</th><th>状态</th><th>操作</th>
+      </tr>
     </thead>
     <tbody>
       {% for n in nodes %}
       <tr data-host="{{ n.ip }}:{{ n.port }}" data-cluster="{{ n.cluster_id or '' }}">
+        <td><input type="checkbox" class="node-sel" value="{{ n.ip }}" onchange="syncBatchBar()" title="选择该节点"></td>
         <td>{{ n.cluster_name }}</td>
         <td class="mono">{{ n.ip }}:{{ n.port }}</td>
         <td>
@@ -54,21 +88,20 @@
         <td><button class="btn btn-sm" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button></td>
       </tr>
       <tr id="d{{ n.ip }}" class="detail-panel">
-        <td colspan="5"><div class="dd">
+        <td colspan="6"><div class="dd na-{{ loop.index0 % 5 }}">
+          <div class="dd-head">
+            <span class="dd-dot"></span>
+            <span class="dd-title">{{ n.ip }}:{{ n.port }}<small>{{ n.cluster_name }}</small></span>
+          </div>
           <div class="dd-sec">
             <div class="dd-sec-t">基本信息</div>
-            <div class="info-strip">
-              <div class="is"><span class="is-k">当前角色</span><span class="is-v" data-f="role"><span class="role role-unknown">未知</span></span></div>
-              <div class="is-sep"></div>
-              <div class="is"><span class="is-k">server_id</span><span class="is-v">{{ n.server_id or '—' }}</span></div>
-              <div class="is-sep"></div>
-              <div class="is"><span class="is-k">部署目录</span><span class="is-v tr" title="{{ n.dir_display }}">{{ n.dir_display }}</span></div>
-              <div class="is-sep"></div>
-              <div class="is"><span class="is-k">数据目录</span><span class="is-v tr" data-f="datadir" title="">—</span></div>
-              <div class="is-sep"></div>
-              <div class="is"><span class="is-k">GTID</span><span class="is-v" data-f="gtid_mode">—</span></div>
-              <div class="is-sep"></div>
-              <div class="is"><span class="is-k">read_only</span><span class="is-v" data-f="read_only">—</span></div>
+            <div class="info-grid">
+              <div class="ig-item"><div class="ig-k">当前角色</div><div class="ig-v" data-f="role"><span class="role role-unknown">未知</span></div></div>
+              <div class="ig-item"><div class="ig-k">server_id</div><div class="ig-v mono">{{ n.server_id or '—' }}</div></div>
+              <div class="ig-item"><div class="ig-k">GTID</div><div class="ig-v" data-f="gtid_mode">—</div></div>
+              <div class="ig-item"><div class="ig-k">read_only</div><div class="ig-v" data-f="read_only">—</div></div>
+              <div class="ig-item wide"><div class="ig-k">部署目录</div><div class="ig-v mono tr" title="{{ n.dir_display }}">{{ n.dir_display }}</div></div>
+              <div class="ig-item wide"><div class="ig-k">数据目录</div><div class="ig-v mono tr" data-f="datadir" title="">—</div></div>
             </div>
           </div>
           <div class="dd-sec">
@@ -88,7 +121,7 @@
         </div></td>
       </tr>
       {% else %}
-      <tr><td colspan="5" style="color:#9ca3af;text-align:center;padding:24px;">暂无已添加节点。点击右上角「＋ 添加节点」生成部署单元。</td></tr>
+      <tr><td colspan="6" style="color:#9ca3af;text-align:center;padding:24px;">暂无已添加节点。点击右上角「＋ 添加节点」生成部署单元。</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -263,6 +296,75 @@
       .then(function(r){return r.json();})
       .then(function(d){toast(d.msg||(d.ok?"已删除":"删除失败"),d.ok?"ok":"err");if(d.ok)setTimeout(function(){location.reload();},800);})
       .catch(function(e){toast("请求失败: "+e,"err");});
+  }
+  // ---- 批量操作（勾选左侧复选框后可用） ----
+  function selectedIps(){
+    return Array.prototype.map.call(document.querySelectorAll(".node-sel:checked"), function(i){return i.value;});
+  }
+  function syncBatchBar(){
+    var n = selectedIps().length;
+    var c = document.getElementById("selCount");
+    var bar = document.getElementById("batchBar");
+    if(c)c.textContent = n;
+    if(bar)bar.classList.toggle("show", n > 0);
+    var all = document.getElementById("selAll");
+    if(all){
+      var total = document.querySelectorAll(".node-sel").length;
+      all.checked = (total > 0 && n === total);
+    }
+  }
+  function toggleSelectAll(el){
+    document.querySelectorAll(".node-sel").forEach(function(i){ i.checked = !!el.checked; });
+    syncBatchBar();
+  }
+  function clearSelection(){
+    document.querySelectorAll(".node-sel").forEach(function(i){ i.checked = false; });
+    var a = document.getElementById("selAll"); if(a) a.checked = false;
+    syncBatchBar();
+  }
+  // 串行执行，避免并发把管理端/节点打爆；结束后汇总成功/失败数
+  function runBatch(ips, fn, label){
+    var ok = 0, fail = 0, chain = Promise.resolve();
+    ips.forEach(function(ip){
+      chain = chain.then(function(){
+        return fn(ip).then(function(d){ if(d && d.ok) ok++; else fail++; })
+                     .catch(function(){ fail++; });
+      });
+    });
+    return chain.then(function(){
+      toast(label + "完成：成功 " + ok + " 个" + (fail ? ("，失败 " + fail + " 个") : ""), fail ? "err" : "ok");
+      setTimeout(function(){ location.reload(); }, 900);
+    });
+  }
+  function batchDelete(){
+    var ips = selectedIps();
+    if(!ips.length){ toast("请先勾选节点","err"); return; }
+    if(!confirm("确认批量删除以下 " + ips.length + " 个节点？\n\n" + ips.join("\n") + "\n\n将同时清理项目目录中已生成的同名部署文件。"))return;
+    runBatch(ips, function(ip){
+      var fd = new URLSearchParams(); fd.append("ip", ip);
+      return fetch("/nodes/delete",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:fd.toString()}).then(function(r){return r.json();});
+    }, "删除");
+  }
+  function batchRegen(){
+    var ips = selectedIps();
+    if(!ips.length){ toast("请先勾选节点","err"); return; }
+    if(!confirm("确认批量重新生成以下 " + ips.length + " 个节点的配置文件？将覆盖原文件。\n\n" + ips.join("\n")))return;
+    runBatch(ips, function(ip){
+      return fetch("/nodes/" + encodeURIComponent(ip) + "/regen",{method:"POST"}).then(function(r){return r.json();});
+    }, "重新生成");
+  }
+  function batchDownload(){
+    var ips = selectedIps();
+    if(!ips.length){ toast("请先勾选节点","err"); return; }
+    ips.forEach(function(ip, idx){
+      setTimeout(function(){
+        var a = document.createElement("a");
+        a.href = "/nodes/" + encodeURIComponent(ip) + "/creds_sql";
+        a.download = "fix-node-creds-" + ip + ".sql";
+        document.body.appendChild(a); a.click(); a.remove();
+      }, idx * 400);
+    });
+    toast("已触发 " + ips.length + " 个修复 SQL 下载，请留意浏览器下载提示","ok");
   }
   function regenNode(ip,btn){
     if(!confirm("确认重新生成 "+ip+" 的配置文件？将覆盖原文件。"))return;
