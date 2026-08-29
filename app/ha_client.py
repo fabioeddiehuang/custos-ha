@@ -31,7 +31,7 @@ from .mysql_compat import (detect_syntax, detect_flavour, flavour_from_node_type
                            change_replication_sql, change_replication_filter_sql,
                            start_replication_sql,
                            stop_replication_sql, reset_replica_sql, show_replica_status_sql,
-                           F_MYSQL8, F_MARIADB)
+                           default_auth_plugin, F_MYSQL8, F_MARIADB)
 from .config import get_manager_public_ip
 
 
@@ -1159,23 +1159,77 @@ def _granted_privs(cur, user, host):
     return privs
 
 
-def _ensure_account(cur, user, host, passwd, idn_expr, grant_sql=None):
+def _can_login(host, port, user, password, timeout=3):
+    """实连校验账号密码。
+
+    caching_sha2_password 的 authentication_string 形如 ``$A$005$<随机盐><摘要>``，
+    盐每次 ALTER 都变，无法在管理端本地复算比对，故改用「真的连一次」判断是否一致。
+    """
+    if not host or not port:
+        return False
+    conn = None
+    try:
+        conn = connect(host, int(port), user, password, timeout=timeout)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+# 「插件已迁移、但实连校验仍失败」时去重用的记忆表，避免每周期重复 ALTER 写 binlog。
+# key 含 passwd：密码一变 key 就变，仍能第一时间修正。
+_alter_memo = {}
+_ALTER_MEMO_TTL = 3600
+
+
+def _ensure_account(cur, user, host, passwd, idn_expr, grant_sql=None,
+                    conn_host=None, conn_port=None, plugin=None):
     """幂等确保账号存在、密码正确、权限正确；无变化时完全不执行写操作（不产生 binlog）。
 
     这是根治「主库每周期被 ALTER/GRANT 刷写、副本经复制持续写盘」的关键：
     稳定态下本函数只做 SELECT 比对，0 条写语句 -> 主库 binlog 静默 -> 副本空闲即静默。
+
+    plugin 为目标认证插件；当它非 mysql_native_password（如 caching_sha2_password）时，
+    本地无法复算哈希，改为「插件一致 + 实连校验通过」即判定密码正确、跳过 ALTER。
     """
-    cur.execute("SELECT authentication_string FROM mysql.user WHERE user=%s AND host=%s",
-                (user, host))
-    row = cur.fetchone()
+    try:
+        cur.execute("SELECT plugin, authentication_string FROM mysql.user "
+                    "WHERE user=%s AND host=%s", (user, host))
+        row = cur.fetchone()
+    except Exception:
+        # 极旧版本 mysql.user 无 plugin 列：退回只查 authentication_string
+        cur.execute("SELECT NULL, authentication_string FROM mysql.user "
+                    "WHERE user=%s AND host=%s", (user, host))
+        row = cur.fetchone()
     want = _native_password_hash(passwd)
+
+    need_alter = False
     if row is None:
         # 账号不存在：创建（CREATE 同时设密码），随后跳过 ALTER
         cur.execute("CREATE USER IF NOT EXISTS %s@%s " + idn_expr, (user, host, passwd))
-        cur_hash = want
     else:
-        cur_hash = row[0]
-    if cur_hash != want:
+        cur_plugin, cur_hash = row[0], row[1]
+        if plugin and cur_plugin and cur_plugin != plugin:
+            need_alter = True                      # 插件迁移（native -> caching_sha2）
+        elif plugin and plugin != "mysql_native_password":
+            need_alter = not _can_login(conn_host, conn_port, user, passwd)
+        else:
+            need_alter = (cur_hash != want)
+
+    if need_alter:
+        memo_key = (conn_host, conn_port, user, host, passwd)
+        now = time.time()
+        last = _alter_memo.get(memo_key, 0)
+        if plugin and plugin != "mysql_native_password" and now - last < _ALTER_MEMO_TTL:
+            need_alter = False                     # 刚改过仍连不上，本周期不再重复写 binlog
+        else:
+            _alter_memo[memo_key] = now
+    if need_alter:
         cur.execute("ALTER USER %s@%s " + idn_expr, (user, host, passwd))
     if grant_sql:
         want_privs = _parse_grant_privs(grant_sql)
@@ -1281,6 +1335,22 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             flavour = detect_flavour(cur)
         except Exception:
             flavour = F_MYSQL8
+        # 认证插件：MySQL >= 8.0.34 用 caching_sha2_password，消除
+        # "[MY-013360] mysql_native_password is deprecated" 告警（8.4 起该插件默认不可用）。
+        # MariaDB 始终用自带的 mysql_native_password（无废弃问题）。
+        version_str = ""
+        try:
+            cur.execute("SELECT VERSION()")
+            _vr = cur.fetchone()
+            version_str = (_vr[0] if _vr else "") or ""
+        except Exception:
+            version_str = ""
+        try:
+            from .db import get_setting            # 局部导入，避免模块级循环依赖
+            _prefer = (get_setting("AUTH_PLUGIN") or "auto")
+        except Exception:
+            _prefer = "auto"
+        auth_plugin = default_auth_plugin(version_str, None, _prefer)
         if flavour == F_MARIADB:
             # MariaDB：认证插件显式 mysql_native_password（兼容管理器/老驱动）。
             # MariaDB 10.6 不支持 `IDENTIFIED VIA ... BY '明文'`，须用
@@ -1299,8 +1369,8 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             repl_grant = ("GRANT REPLICATION SLAVE, REPLICATION SLAVE ADMIN ON *.* "
                           "TO '%s'@'%%'" % repl_user)
         else:
-            idn = "IDENTIFIED WITH mysql_native_password BY %s"
-            idn_root = "IDENTIFIED WITH mysql_native_password BY %s"
+            idn = "IDENTIFIED WITH " + auth_plugin + " BY %s"
+            idn_root = "IDENTIFIED WITH " + auth_plugin + " BY %s"
             ha_grant = ("GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
                         "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* "
                         f"TO '{ha_user}'@'%'")
@@ -1314,7 +1384,8 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         # 幂等：账号/密码/权限无变化则不写任何语句（见 _ensure_account），
         # 彻底消除「主库每周期 ALTER/GRANT -> binlog -> 副本重放再写盘」的空闲写盘。
         for u, p, grant_sql in accts:
-            _ensure_account(cur, u, "%", p, idn, grant_sql)
+            _ensure_account(cur, u, "%", p, idn, grant_sql,
+                            conn_host=host, conn_port=port, plugin=auth_plugin)
         # 关键：把 root@'<管理器IP>' 与 root@'%' 密码校正为管理器库存 root_pass。
         #  - manager_ip 的 root 用于管理器自愈回退；
         #  - root@'%' 用于内网 Navicat/其它主机远程连接（用户要求可远程登录）。
@@ -1335,7 +1406,8 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             # 账号自愈就彻底锁死成死循环。
             root_grant = ("GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION"
                           % (root_user, rh))
-            _ensure_account(cur, root_user, rh, root_pass, idn_root, root_grant)
+            _ensure_account(cur, root_user, rh, root_pass, idn_root, root_grant,
+                            conn_host=host, conn_port=port, plugin=auth_plugin)
         # 补授 ha_monitor 的额外特权（已授权时跳过，避免每周期重复 GRANT 写 binlog）。
         #  - CREATE USER：MySQL 8.0 与 MariaDB 均需要（MariaDB 中 CREATE USER 特权即隐含
         #    覆盖 ALTER USER / DROP USER，无需也不能单独 GRANT ALTER/DROP USER——后者在

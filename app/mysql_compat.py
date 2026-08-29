@@ -23,6 +23,9 @@ import re
 # 新复制术语 (CHANGE REPLICATION SOURCE / SHOW REPLICA) 在 8.0.22 引入
 _NEW_SYNTAX_MIN = (8, 0, 22)
 
+# MySQL 8.0.34 起 mysql_native_password 被标记废弃；8.4 起默认不再启用
+_CSHA2_MIN = (8, 0, 34)
+
 # 风味常量
 F_MYSQL8 = "mysql8"
 F_MARIADB = "mariadb"
@@ -98,6 +101,49 @@ def flavour_from_version(version_str):
     if parse_version(version_str) >= _NEW_SYNTAX_MIN:
         return F_MYSQL8
     return F_OLD
+
+
+def default_auth_plugin(version_str=None, node_type=None, prefer="auto"):
+    """返回节点账号应使用的默认认证插件名。
+
+    背景：MySQL 8.0.34 起 ``mysql_native_password`` 被标记废弃，任何以该插件认证
+    的连接都会在 error log 写一条
+    ``[Warning] [MY-013360] Plugin mysql_native_password reported: '...is deprecated...'``；
+    8.4 起默认不再加载该插件。故对新版本改用 ``caching_sha2_password``。
+
+    规则（prefer 可强制覆盖，取值 auto / native / caching_sha2）：
+      - MariaDB         -> mysql_native_password（MariaDB 自带，无废弃告警）
+      - MySQL >= 8.0.34 -> caching_sha2_password
+      - MySQL < 8.0.34 / 5.7 / 版本未知 -> mysql_native_password
+        （8.0 之前根本没有 caching_sha2；版本未知时沿用既有行为，避免误伤老集群）
+    """
+    p = (prefer or "auto").strip().lower()
+    if p in ("caching_sha2", "caching_sha2_password", "sha2"):
+        return "caching_sha2_password"
+    if p in ("native", "mysql_native_password"):
+        return "mysql_native_password"
+    if not version_str:
+        # 版本未知：MariaDB 裸机节点可凭 node_type 判定；其余沿用既有行为
+        if (node_type or "").lower() == "mariadb":
+            return "mysql_native_password"
+        # docker 节点固定 MySQL 8.0，但小版本未知（可能 < 8.0.34），不敢冒进改插件
+        return "mysql_native_password"
+    if is_mariadb(version_str):
+        return "mysql_native_password"
+    if parse_version(version_str) >= _CSHA2_MIN:
+        return "caching_sha2_password"
+    return "mysql_native_password"
+
+
+def identify_clause(plugin, password, mariadb=False):
+    """生成 CREATE/ALTER USER 的认证子句（明文密码）。
+
+    MariaDB 10.6 不支持 ``IDENTIFIED VIA <plugin> BY '明文'``，必须用
+    ``IDENTIFIED VIA <plugin> USING PASSWORD('明文')``。
+    """
+    if mariadb:
+        return "IDENTIFIED VIA %s USING PASSWORD('%s')" % (plugin, password)
+    return "IDENTIFIED WITH %s BY '%s'" % (plugin, password)
 
 
 def flavour_from_node_type(node_type):

@@ -1,0 +1,319 @@
+{% extends "base.html" %}
+{% block title %}备份恢复 · {{ cluster.name }}{% endblock %}
+{% block page_title %}集群管理-{{ cluster.name }} · 备份恢复{% endblock %}
+{% block content %}
+<style>
+  .bk-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:1080px){ .bk-grid{grid-template-columns:1fr} }
+  .db-list{
+    max-height:260px;overflow:auto;border:1px solid var(--border);
+    border-radius:10px;padding:10px 12px;background:var(--surface-2);
+  }
+  .db-item{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:13px}
+  .db-item label{display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text);font-family:var(--mono)}
+  .db-empty{color:var(--muted);font-size:12.5px;padding:8px 0}
+  .db-bar{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+  .db-bar .sp{flex:1}
+  .bk-note{font-size:12px;color:var(--muted);line-height:1.7;margin-top:10px}
+  .bk-table td,.bk-table th{white-space:nowrap}
+  .bk-table td.wrap{white-space:normal;word-break:break-all}
+  .bk-scope{font-size:11.5px;color:var(--muted)}
+  .bk-preview{
+    background:var(--surface-3);color:var(--text);border-radius:10px;padding:12px 14px;
+    font-family:var(--mono);font-size:12px;line-height:1.6;max-height:52vh;overflow:auto;white-space:pre-wrap;
+  }
+</style>
+
+{% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
+{% if error %}<div class="banner err">⚠ {{ error }}</div>{% endif %}
+
+<div class="toolbar">
+  <a class="btn" href="/clusters/{{ cluster.id }}">← 集群详情</a>
+  <button class="btn" onclick="location.reload()">⟳ 刷新</button>
+  <span class="spacer"></span>
+  <span class="badge sky">备份源建议选主库 · 恢复目标必须是可写节点（主库）</span>
+</div>
+
+<div class="bk-grid">
+  <!-- ============ 新建备份 ============ -->
+  <div class="card">
+    <h3>创建备份</h3>
+
+    <div class="field">
+      <label for="bkNode">备份源节点</label>
+      <select id="bkNode" onchange="loadDatabases()">
+        {% for r in cluster.host_rows %}
+        <option value="{{ r.host }}:{{ r.port }}" {% if r.role == '主库' %}selected{% endif %}>
+          {{ r.host }}:{{ r.port }}（{{ r.role }}）
+        </option>
+        {% else %}
+        <option value="">（该集群暂无节点）</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div style="display:flex;gap:16px;align-items:center;margin:12px 0 10px;flex-wrap:wrap">
+      <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer">
+        <input type="radio" name="bkScope" value="all" checked onchange="onScopeChange()">全库（所有业务库）
+      </label>
+      <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer">
+        <input type="radio" name="bkScope" value="custom" onchange="onScopeChange()">指定库
+      </label>
+      <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="bkWithData" checked>包含数据
+      </label>
+    </div>
+
+    <div id="dbWrap" style="display:none">
+      <div class="db-bar">
+        <span style="font-size:12.5px;color:var(--muted)">勾选要备份的库</span>
+        <span class="sp"></span>
+        <button class="btn btn-sm btn-ghost" onclick="dbSelectAll(true)">全选</button>
+        <button class="btn btn-sm btn-ghost" onclick="dbSelectAll(false)">清空</button>
+      </div>
+      <div class="db-list" id="dbList"><div class="db-empty">选择节点后加载…</div></div>
+    </div>
+
+    <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="runBackup()">⤓ 立即备份</button>
+    </div>
+
+    <div class="bk-note">
+      备份为<b>逻辑备份</b>（建表语句 + INSERT），由管理器用节点 root 账号直连导出，
+      容器内无需 mysqldump，对 MySQL 8.0 / MariaDB 同样适用。<br>
+      系统库（information_schema / mysql / performance_schema / sys）不参与备份。<br>
+      产物：<code class="mono">./backups/{{ cluster.id }}/&lt;时间戳&gt;.sql.gz</code>（已挂载到项目根，重建容器不丢失）。
+    </div>
+  </div>
+
+  <!-- ============ 恢复 ============ -->
+  <div class="card">
+    <h3>恢复备份</h3>
+
+    <div class="field">
+      <label for="rtNode">恢复目标节点</label>
+      <select id="rtNode">
+        {% for r in cluster.host_rows %}
+        <option value="{{ r.host }}:{{ r.port }}" {% if r.role == '主库' %}selected{% endif %}>
+          {{ r.host }}:{{ r.port }}（{{ r.role }}）
+        </option>
+        {% else %}
+        <option value="">（该集群暂无节点）</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="field" style="margin-top:12px">
+      <label for="rtFile">备份文件</label>
+      <select id="rtFile" onchange="onFileChange()">
+        {% for b in backups %}
+        <option value="{{ b.file }}">{{ b.file }}（{{ (b.size/1024)|round(1) }} KB）</option>
+        {% else %}
+        <option value="">（暂无备份文件）</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="field" style="margin-top:12px">
+      <label for="rtDbs">只恢复指定库（可选，逗号分隔；留空=恢复备份内全部库）</label>
+      <input id="rtDbs" type="text" placeholder="例如 db_order,db_user">
+    </div>
+
+    <div id="rtMeta" class="bk-scope" style="margin-top:10px"></div>
+
+    <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+      <button class="btn btn-danger" style="background:var(--danger);color:#fff" onclick="runRestore()">⤒ 执行恢复</button>
+      <button class="btn" onclick="previewBackup()">预览备份头</button>
+    </div>
+
+    <div class="bk-note">
+      <b style="color:var(--danger)">恢复会 DROP 并重建同名对象，属于高危操作，请先确认备份内容。</b><br>
+      恢复脚本默认<b>不关闭 binlog</b>：在主库执行会自然复制到从库，与集群拓扑保持一致。<br>
+      整库恢复前建议先做一次当前状态备份。
+    </div>
+  </div>
+</div>
+
+<!-- ============ 备份历史 ============ -->
+<div class="card">
+  <h3>备份历史<span style="flex:1"></span>
+    <span class="badge sky">{{ backups|length }} 个文件</span>
+  </h3>
+  <table class="tbl bk-table">
+    <thead>
+      <tr><th>文件名</th><th>时间</th><th>范围</th><th>数据库</th><th>表/视图/行</th><th>大小</th><th>源节点</th><th>操作</th></tr>
+    </thead>
+    <tbody id="bkBody">
+      {% for b in backups %}
+      <tr data-file="{{ b.file }}">
+        <td class="mono">{{ b.file }}</td>
+        <td>{{ (b.meta.time if b.meta else b.mtime) }}</td>
+        <td>{% if b.meta %}{% if b.meta.scope == 'all' %}<span class="badge sky">全库</span>{% else %}<span class="badge warn">指定库</span>{% endif %}{% if not b.meta.with_data %}<span class="badge">仅结构</span>{% endif %}{% else %}<span class="badge">—</span>{% endif %}</td>
+        <td class="wrap">{{ (b.meta.databases|join(', ')) if b.meta else '—' }}</td>
+        <td class="mono">{% if b.meta %}{{ b.meta.tables }}/{{ b.meta.views }}/{{ b.meta.rows }}{% else %}—{% endif %}</td>
+        <td class="mono">{{ (b.size/1024)|round(1) }} KB</td>
+        <td class="mono">{% if b.meta %}{{ b.meta.host }}:{{ b.meta.port }}{% else %}—{% endif %}</td>
+        <td>
+          <button class="btn btn-sm" onclick="restoreFile('{{ b.file }}')">恢复</button>
+          <a class="btn btn-sm btn-ghost" href="/api/backup/download?cluster_id={{ cluster.id }}&file={{ b.file }}">下载</a>
+          <button class="btn btn-sm" onclick="previewFile('{{ b.file }}')">预览</button>
+          <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delBackup('{{ b.file }}')">删除</button>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" style="color:var(--muted);text-align:center;padding:24px;">暂无备份文件。在上方「创建备份」执行一次即可。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <div class="note">表/视图/行 为备份时的统计；时间取自备份元信息。</div>
+</div>
+
+<!-- 预览 modal -->
+<div class="overlay" id="pvOverlay" onclick="if(event.target===this)closePreview()">
+  <div class="modal" style="max-width:820px">
+    <header><b id="pvTitle">备份预览</b><span class="close" onclick="closePreview()">×</span></header>
+    <div class="body"><div class="bk-preview" id="pvBody">加载中…</div></div>
+    <footer><button class="btn" onclick="closePreview()">关闭</button></footer>
+  </div>
+</div>
+
+<script>
+  var CID = {{ cluster.id }};
+  var BK_META = {
+    {% for b in backups %}"{{ b.file }}": {{ b.meta|tojson if b.meta else 'null' }},
+    {% endfor %}
+  };
+
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+  function toast(msg,kind){
+    var t=document.getElementById("toastBox");
+    if(!t){t=document.createElement("div");t.id="toastBox";t.style.cssText="position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:2000;display:flex;flex-direction:column;gap:8px";document.body.appendChild(t);}
+    var el=document.createElement("div");
+    el.textContent=msg;
+    el.style.cssText="background:"+(kind==="err"?"#e11d48":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
+    t.appendChild(el);setTimeout(function(){el.remove();},3200);
+  }
+  function post(url,obj,cb){
+    fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams(obj)})
+      .then(function(r){return r.json();}).then(cb)
+      .catch(function(e){toast("请求失败: "+e,"err");});
+  }
+  function hp(selId){
+    var v=document.getElementById(selId).value||"";
+    if(!v) return null;
+    var p=v.split(":");
+    return {host:p[0], port:p[1]};
+  }
+
+  // ---------- 库列表 ----------
+  function onScopeChange(){
+    var v=document.querySelector('input[name="bkScope"]:checked').value;
+    document.getElementById("dbWrap").style.display = (v==="custom") ? "block" : "none";
+    if(v==="custom") loadDatabases();
+  }
+  function dbSelectAll(on){
+    document.querySelectorAll('#dbList input[type="checkbox"]').forEach(function(i){i.checked=!!on;});
+  }
+  function loadDatabases(){
+    var n=hp("bkNode");
+    var box=document.getElementById("dbList");
+    if(!n){box.innerHTML='<div class="db-empty">请先选择节点</div>';return;}
+    box.innerHTML='<div class="db-empty">加载中…</div>';
+    fetch("/api/backup/databases?cluster_id="+CID+"&host="+encodeURIComponent(n.host)+"&port="+n.port)
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.ok){box.innerHTML='<div class="db-empty" style="color:var(--danger)">'+esc(d.error||"加载失败")+'</div>';return;}
+        var dbs=d.databases||[];
+        if(!dbs.length){box.innerHTML='<div class="db-empty">该节点没有可备份的业务库</div>';return;}
+        box.innerHTML=dbs.map(function(x){
+          return '<div class="db-item"><label><input type="checkbox" class="db-cb" value="'+esc(x)+'"> '+esc(x)+'</label></div>';
+        }).join("");
+      })
+      .catch(function(e){box.innerHTML='<div class="db-empty" style="color:var(--danger)">'+esc(e)+'</div>';});
+  }
+
+  // ---------- 备份 ----------
+  function selectedDbs(){
+    return Array.prototype.map.call(document.querySelectorAll('#dbList input.db-cb:checked'), function(i){return i.value;});
+  }
+  function runBackup(){
+    var n=hp("bkNode");
+    if(!n){toast("请先选择备份源节点","err");return;}
+    var scope=document.querySelector('input[name="bkScope"]:checked').value;
+    var dbs=selectedDbs();
+    if(scope==="custom" && !dbs.length){toast("请至少勾选一个库","err");return;}
+    var btn=event.target; btn.disabled=true; btn.textContent="备份中…";
+    post("/api/backup/run",{
+      cluster_id:CID, host:n.host, port:n.port, scope:scope,
+      databases:dbs.join(","), with_data:document.getElementById("bkWithData").checked?"1":""
+    },function(d){
+      btn.disabled=false; btn.textContent="⤓ 立即备份";
+      toast(d.msg||(d.ok?"备份完成":"备份失败"), d.ok?"ok":"err");
+      if(d.ok)setTimeout(function(){location.reload();},1200);
+    });
+  }
+
+  // ---------- 恢复 ----------
+  function onFileChange(){
+    var f=document.getElementById("rtFile").value;
+    var m=BK_META[f];
+    var el=document.getElementById("rtMeta");
+    if(!m){el.textContent="";return;}
+    el.textContent="该备份包含："+(m.databases||[]).join(", ")
+      + " ｜ " + m.tables + " 表 / " + m.views + " 视图 / " + m.rows + " 行"
+      + " ｜ 源 " + m.host + ":" + m.port
+      + " ｜ " + (m.with_data?"含数据":"仅结构");
+  }
+  function restoreFile(f){
+    document.getElementById("rtFile").value=f;
+    onFileChange();
+    document.getElementById("rtNode").scrollIntoView({behavior:"smooth",block:"center"});
+    toast("已选中备份 "+f+"，请在右侧确认目标节点后执行恢复","ok");
+  }
+  function runRestore(){
+    var n=hp("rtNode"), f=document.getElementById("rtFile").value;
+    if(!n){toast("请选择恢复目标节点","err");return;}
+    if(!f){toast("请选择备份文件","err");return;}
+    var dbs=document.getElementById("rtDbs").value.trim();
+    var tip="确认把备份 "+f+" 恢复到 "+n.host+":"+n.port+" ？\n\n"
+      +(dbs?("仅恢复这些库："+dbs):"恢复备份内的全部库")
+      +"\n\n该操作会 DROP 并重建同名对象，且不可撤销。";
+    if(!confirm(tip))return;
+    var btn=event.target; btn.disabled=true; btn.textContent="恢复中…";
+    post("/api/backup/restore",{
+      cluster_id:CID, host:n.host, port:n.port, file:f, databases:dbs
+    },function(d){
+      btn.disabled=false; btn.textContent="⤒ 执行恢复";
+      toast(d.msg||(d.ok?"恢复完成":"恢复失败"), d.ok?"ok":"err");
+      if(d.errors && d.errors.length) console.warn("恢复错误明细：", d.errors);
+    });
+  }
+
+  // ---------- 删除 / 预览 ----------
+  function delBackup(f){
+    if(!confirm("确认删除备份 "+f+" ？此操作不可恢复。"))return;
+    post("/api/backup/delete",{cluster_id:CID, file:f},function(d){
+      toast(d.msg||(d.ok?"已删除":"删除失败"), d.ok?"ok":"err");
+      if(d.ok)setTimeout(function(){location.reload();},900);
+    });
+  }
+  function previewFile(f){ openPreview(f); }
+  function previewBackup(){ var f=document.getElementById("rtFile").value; if(!f){toast("请先选择备份文件","err");return;} openPreview(f); }
+  function openPreview(f){
+    document.getElementById("pvTitle").textContent="备份预览 · "+f;
+    document.getElementById("pvBody").textContent="加载中…";
+    document.getElementById("pvOverlay").classList.add("show");
+    fetch("/api/backup/preview?cluster_id="+CID+"&file="+encodeURIComponent(f))
+      .then(function(r){return r.json();})
+      .then(function(d){
+        document.getElementById("pvBody").textContent =
+          d.ok ? (d.head||"(空文件)") : ("加载失败："+(d.error||""));
+      })
+      .catch(function(e){document.getElementById("pvBody").textContent="请求失败："+e;});
+  }
+  function closePreview(){document.getElementById("pvOverlay").classList.remove("show");}
+
+  onScopeChange();
+  onFileChange();
+</script>
+{% endblock %}

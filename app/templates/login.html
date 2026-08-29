@@ -1,99 +1,168 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>登录 · Custos</title>
   <link rel="stylesheet" href="/static/styles.css">
   <link rel="stylesheet" href="/static/v3.css">
+  <script>
+    // 主题：尽早应用，避免首屏闪白（与内页 base.html 保持一致）
+    (function(){
+      try{
+        var t = localStorage.getItem('custos-theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', t);
+      }catch(e){}
+    })();
+  </script>
   <style>
-    /* 登录页：深色质感底 + 毛玻璃双栏。
-       不再使用大面积玫红：玫红仅作为品牌点缀，主色交给蒂凡尼青，整体更沉稳大气。
-       内页（v3.css / styles.css）已对齐本页同一套配色。 */
+    /* ============================================================
+       登录页 —— 全宽分栏（取消原先的圆角卡片遮罩，改为铺满视口）
+       配色令牌跟随主题：默认暗色，[data-theme="light"] 覆盖为浅色。
+       主色沿用品牌渐变 #22d3ee → #0ABAB5（蒂凡尼青）。
+       ============================================================ */
     :root{
-      --bg-0:#070b14; --bg-1:#0e1830;
-      --ink:#e8eefc; --muted:#8b9ac0;
+      --lp-bg:#070b14; --lp-bg-2:#0e1830; --lp-bg-3:#0a1222;
+      --lp-ink:#e8eefc; --lp-muted:#8b9ac0;
+      --lp-line:rgba(255,255,255,.10);
+      --lp-surface:rgba(255,255,255,.045);
+      --lp-input:rgba(255,255,255,.05);
+      --lp-input-focus:rgba(255,255,255,.085);
+      --lp-ink-strong:#04121a;              /* 主按钮上的深墨字 */
+      --lp-glow-a:rgba(10,186,181,.22);     /* 左上：青 */
+      --lp-glow-b:rgba(124,45,82,.30);      /* 右下：紫酱红 */
+      --lp-grid:rgba(255,255,255,.035);
+      --lp-watermark:.055;
       --accent:#0ABAB5; --accent-2:#22d3ee; --plum:#7C2D52;
-      --line:rgba(255,255,255,.10);
     }
+    html[data-theme="light"]{
+      --lp-bg:#eaf0fa; --lp-bg-2:#ffffff; --lp-bg-3:#f4f7fd;
+      --lp-ink:#0f172a; --lp-muted:#5a6b8c;
+      --lp-line:rgba(15,23,42,.10);
+      --lp-surface:rgba(255,255,255,.75);
+      --lp-input:rgba(15,23,42,.035);
+      --lp-input-focus:#ffffff;
+      --lp-ink-strong:#04121a;
+      --lp-glow-a:rgba(10,186,181,.18);
+      --lp-glow-b:rgba(124,45,82,.13);
+      --lp-grid:rgba(15,23,42,.040);
+      --lp-watermark:.07;
+    }
+
+    *{box-sizing:border-box}
     html,body{height:100%}
     body{
-      margin:0; background:var(--bg-0); color:var(--ink);
-      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-      display:flex; align-items:center; justify-content:center; padding:24px;
+      margin:0; color:var(--lp-ink);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+      -webkit-font-smoothing:antialiased;
+    }
+
+    /* ---------- 全宽分栏容器 ---------- */
+    .auth{
+      position:relative; min-height:100vh;
+      display:grid; grid-template-columns:1.02fr .98fr;
       background-image:
-        radial-gradient(900px 520px at 12% 8%,  rgba(10,186,181,.20), transparent 60%),
-        radial-gradient(760px 480px at 88% 92%, rgba(124,45,82,.28), transparent 62%),
-        radial-gradient(600px 600px at 50% 45%, rgba(34,211,238,.07), transparent 70%),
-        linear-gradient(140deg, var(--bg-0) 0%, var(--bg-1) 55%, #0a1222 100%);
+        radial-gradient(880px 520px at 10% 6%,   var(--lp-glow-a), transparent 60%),
+        radial-gradient(760px 500px at 92% 96%,  var(--lp-glow-b), transparent 62%),
+        linear-gradient(140deg, var(--lp-bg) 0%, var(--lp-bg-2) 55%, var(--lp-bg-3) 100%);
       background-attachment:fixed;
     }
-    /* 细网格底纹（中心亮、四周渐隐），增加质感又不喧宾夺主 */
-    body::before{
-      content:""; position:fixed; inset:0; pointer-events:none; opacity:.5;
-      background-image:linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
-                       linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
-      background-size:44px 44px;
-      -webkit-mask-image:radial-gradient(circle at 50% 40%, #000 0%, transparent 72%);
-              mask-image:radial-gradient(circle at 50% 40%, #000 0%, transparent 72%);
+    /* 细网格底纹：中心亮、四周渐隐 */
+    .auth::before{
+      content:""; position:absolute; inset:0; pointer-events:none; opacity:.6;
+      background-image:
+        linear-gradient(var(--lp-grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--lp-grid) 1px, transparent 1px);
+      background-size:46px 46px;
+      -webkit-mask-image:radial-gradient(circle at 50% 40%, #000 0%, transparent 78%);
+              mask-image:radial-gradient(circle at 50% 40%, #000 0%, transparent 78%);
     }
-    .auth-wrap{
-      position:relative; width:100%; max-width:980px;
-      display:grid; grid-template-columns:1fr 440px;
-      border:1px solid var(--line); border-radius:22px; overflow:hidden;
-      background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
-      box-shadow:0 40px 90px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.07);
-      -webkit-backdrop-filter:blur(18px); backdrop-filter:blur(18px);
+
+    /* ---------- 左：品牌区 ---------- */
+    .brand-side{
+      position:relative; z-index:1;
+      padding:clamp(34px,4.6vw,72px);
+      display:flex; flex-direction:column; justify-content:center;
+      border-right:1px solid var(--lp-line);
+      overflow:hidden;
     }
-    @media (max-width:900px){
-      .auth-wrap{grid-template-columns:1fr}
-      .auth-side{display:none}
+    /* 竖向光带分隔线：全高分栏的中缝，替代圆角卡片边框 */
+    .brand-side::after{
+      content:""; position:absolute; top:10%; right:-1px; bottom:10%; width:1px;
+      background:linear-gradient(180deg, transparent, var(--accent-2), var(--accent), transparent);
+      opacity:.5;
     }
-    /* 左：品牌与价值点 */
-    .auth-side{
-      position:relative; padding:40px 36px; border-right:1px solid var(--line);
-      background:
-        radial-gradient(620px 320px at 18% 12%, rgba(10,186,181,.18), transparent 60%),
-        linear-gradient(160deg, rgba(124,45,82,.30), rgba(7,11,20,.10));
+    /* 巨型水印 Logo：低透明，纯装饰 */
+    .brand-wm{
+      position:absolute; right:-64px; bottom:-84px; width:400px; height:400px;
+      opacity:var(--lp-watermark); pointer-events:none;
     }
-    .brand{display:flex;align-items:center;gap:12px;font-size:19px;font-weight:800;letter-spacing:.4px}
-    .brand .mark{width:38px;height:38px;flex:0 0 auto;filter:drop-shadow(0 6px 16px rgba(10,186,181,.38))}
-    .brand .mark svg{width:38px;height:38px;display:block}
-    .side-title{margin:28px 0 10px;font-size:26px;line-height:1.4;font-weight:800}
+    .brand-wm svg{width:100%;height:100%;display:block}
+
+    .lockup{display:flex; align-items:center; gap:18px}
+    .mark{
+      width:clamp(60px,5.4vw,76px); height:clamp(60px,5.4vw,76px); flex:none;
+      filter:drop-shadow(0 12px 30px rgba(10,186,181,.34));
+    }
+    .mark svg{width:100%;height:100%;display:block}
+
+    .wordmark{
+      font-size:clamp(30px,3.1vw,42px); font-weight:800;
+      letter-spacing:.20em; line-height:1; white-space:nowrap;
+    }
+    .tagline{
+      margin-top:9px; font-size:12.5px; letter-spacing:.16em;
+      color:var(--lp-muted); font-weight:500;
+    }
+
+    .side-title{
+      margin:38px 0 12px; font-size:clamp(22px,2.3vw,30px);
+      line-height:1.45; font-weight:800; letter-spacing:.5px;
+    }
     .side-title em{
       font-style:normal;
       background:linear-gradient(90deg,var(--accent-2),var(--accent));
       -webkit-background-clip:text; background-clip:text; color:transparent;
     }
-    .side-sub{color:var(--muted);font-size:13.5px;line-height:1.85;margin:0 0 24px}
-    .feat{display:grid;gap:12px;margin:0;padding:0;list-style:none}
-    .feat li{display:flex;gap:10px;align-items:flex-start;font-size:13px;color:#c3cee9}
+    .side-sub{color:var(--lp-muted);font-size:13.5px;line-height:1.9;margin:0 0 26px;max-width:44ch}
+
+    .feat{display:grid;gap:13px;margin:0;padding:0;list-style:none}
+    .feat li{display:flex;gap:11px;align-items:flex-start;font-size:13px;color:var(--lp-ink);opacity:.88}
     .feat .dot{
       width:7px;height:7px;border-radius:50%;margin-top:7px;flex:none;
       background:linear-gradient(135deg,var(--accent-2),var(--accent));
       box-shadow:0 0 0 4px rgba(10,186,181,.14);
     }
-    /* 右：表单 */
-    .auth-main{padding:40px 36px}
-    .auth-main h1{margin:0 0 6px;font-size:22px;font-weight:800;letter-spacing:.3px}
-    .auth-main .sub{margin:0 0 24px;color:var(--muted);font-size:13px}
-    /* v3.css 的 .field 是设置页「标签左 / 控件右」的行式布局（display:flex）。
-       登录页必须改回块级上下排布 —— 否则 label 会被挤成极窄的一列，
-       「用户名 / 密码」被逐字竖向换行。 */
-    .auth-main .field{display:block;padding:0;border-bottom:0;margin-bottom:15px}
-    .auth-main .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px;font-weight:600;white-space:nowrap}
-    .auth-main .field input{
-      width:100%;padding:12px 13px;border-radius:11px;font-size:14px;color:var(--ink);
-      background:rgba(255,255,255,.05);border:1px solid var(--line);outline:none;transition:.18s;
+
+    /* ---------- 右：表单区 ---------- */
+    .form-side{
+      position:relative; z-index:1;
+      display:flex; align-items:center; justify-content:center;
+      padding:clamp(28px,4vw,64px);
     }
-    .auth-main .field input::placeholder{color:rgba(139,154,192,.55)}
-    .auth-main .field input:focus{
-      border-color:rgba(34,211,238,.65);background:rgba(255,255,255,.08);
+    .form-box{width:100%; max-width:376px}
+    .form-box h1{margin:0 0 7px;font-size:23px;font-weight:800;letter-spacing:.3px}
+    .form-box .sub{margin:0 0 26px;color:var(--lp-muted);font-size:13px}
+
+    /* 陷阱备忘：v3.css 的 .field 是设置页「标签左/控件右」的行式 flex，
+       登录页必须改回块级上下排布，否则 label 被挤成窄列、文字竖排换行。 */
+    .form-box .field{display:block;padding:0;border-bottom:0;margin-bottom:16px}
+    .form-box .field label{
+      display:block;font-size:12px;color:var(--lp-muted);
+      margin-bottom:7px;font-weight:600;white-space:nowrap;
+    }
+    .form-box .field input{
+      width:100%;padding:12px 14px;border-radius:11px;font-size:14px;color:var(--lp-ink);
+      background:var(--lp-input);border:1px solid var(--lp-line);outline:none;transition:.18s;
+    }
+    .form-box .field input::placeholder{color:var(--lp-muted);opacity:.6}
+    .form-box .field input:focus{
+      border-color:rgba(34,211,238,.65);background:var(--lp-input-focus);
       box-shadow:0 0 0 4px rgba(10,186,181,.16);
     }
     .submit{
-      width:100%;padding:12px 14px;border:0;border-radius:11px;cursor:pointer;margin-top:4px;
-      font-size:14.5px;font-weight:800;letter-spacing:1px;color:#04121a;
+      width:100%;padding:12px 14px;border:0;border-radius:11px;cursor:pointer;margin-top:6px;
+      font-size:14.5px;font-weight:800;letter-spacing:2px;color:var(--lp-ink-strong);
       background:linear-gradient(135deg,var(--accent-2),var(--accent));
       box-shadow:0 12px 30px rgba(10,186,181,.28);transition:.18s;
     }
@@ -103,45 +172,94 @@
       background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.35);color:#fecaca;
       border-radius:11px;padding:10px 12px;margin-bottom:18px;font-size:13px;
     }
-    .foot{margin-top:20px;font-size:11.5px;color:rgba(139,154,192,.75);text-align:center}
+
+    /* ---------- Logo 方案切换器（选型用，定稿后可整块删除） ---------- */
+    .lp-picker{
+      position:absolute; left:clamp(34px,4.6vw,72px); right:clamp(18px,3vw,40px); bottom:22px;
+      z-index:2; font-size:11.5px; color:var(--lp-muted);
+    }
+    .lp-picker .row{display:flex; align-items:center; flex-wrap:wrap; gap:6px}
+    .lp-picker b{font-weight:600;letter-spacing:.08em;margin-right:3px}
+    .lp-picker button{
+      width:26px;height:26px;border-radius:8px;cursor:pointer;
+      border:1px solid var(--lp-line); background:var(--lp-input);
+      color:var(--lp-muted); font-size:11.5px; font-weight:700;
+      transition:.16s; padding:0;
+    }
+    .lp-picker button:hover{color:var(--lp-ink);border-color:rgba(34,211,238,.5);transform:translateY(-1px)}
+    .lp-picker button.on{
+      background:linear-gradient(135deg,var(--accent-2),var(--accent));
+      color:var(--lp-ink-strong); border-color:transparent;
+      box-shadow:0 6px 16px rgba(10,186,181,.28);
+    }
+    .lp-picker .lp-name{
+      margin-top:9px; font-size:12px; color:var(--lp-ink); opacity:.8;
+    }
+    .lp-picker .lp-name span{color:var(--accent);font-weight:700}
+
+    @media (max-width:920px){
+      .auth{grid-template-columns:1fr}
+      .brand-side{display:none}
+      .form-side{padding:40px 24px}
+    }
   </style>
 </head>
 <body>
-  <!-- Custos Logo：与内页（base.html）同一枚 -->
-  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
-    <defs>
-      <linearGradient id="cs-grad" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0" stop-color="#22d3ee"/>
-        <stop offset="1" stop-color="#0ABAB5"/>
-      </linearGradient>
-    </defs>
-    <symbol id="cs-logo" viewBox="0 0 32 32">
-      <path d="M16 2.2 27.5 6.4v9.4c0 6.8-4.8 12.0-11.5 14.0C9.3 27.8 4.5 22.6 4.5 15.8V6.4L16 2.2z"
-            fill="url(#cs-grad)"/>
-      <g fill="none" stroke="#04121a" stroke-width="1.7" stroke-linecap="round">
-        <ellipse cx="16" cy="12.2" rx="5.6" ry="2.2"/>
-        <path d="M10.4 12.2v6.6c0 1.2 2.5 2.2 5.6 2.2s5.6-1 5.6-2.2v-6.6"/>
-        <path d="M10.4 15.4c0 1.2 2.5 2.2 5.6 2.2s5.6-1 5.6-2.2"/>
-      </g>
-    </symbol>
-  </svg>
 
-  <div class="auth-wrap">
-    <aside class="auth-side">
-      <div class="brand">
-        <span class="mark"><svg viewBox="0 0 32 32" aria-hidden="true"><use href="#cs-logo"/></svg></span>
-        <span>Custos</span>
+<!-- ===== Logo 14 版方案（1-4 既有盾牌系，5-14 彩色 / 非盾牌新方案） ===== -->
+{% include "_logos.html" %}
+
+<div class="auth">
+  <!-- ============ 左：品牌 ============ -->
+  <aside class="brand-side">
+    <!-- 水印（装饰） -->
+    <span class="brand-wm" aria-hidden="true">
+      <svg viewBox="0 0 32 32"><use href="#cs-logo-1" id="wmUse"/></svg>
+    </span>
+
+    <div class="lockup">
+      <span class="mark"><svg viewBox="0 0 32 32" aria-hidden="true"><use href="#cs-logo-1" id="markUse"/></svg></span>
+      <div>
+        <div class="wordmark">CUSTOS</div>
+        <div class="tagline">Never let your database down</div>
       </div>
-      <h2 class="side-title">为数据库<br><em>永不中断</em>而设计</h2>
-      <p class="side-sub">主库故障秒级切换、复制自愈、配置巡检，一套后台托管 MySQL / MariaDB 高可用集群。</p>
-      <ul class="feat">
-        <li><span class="dot"></span><span>秒级故障切换 · VIP 自动漂移</span></li>
-        <li><span class="dot"></span><span>复制中断 / 配置漂移 自动自愈</span></li>
-        <li><span class="dot"></span><span>多集群统一观测与告警中心</span></li>
-      </ul>
-    </aside>
+    </div>
 
-    <main class="auth-main">
+    <h2 class="side-title">为数据库<br><em>永不中断</em>而设计</h2>
+    <p class="side-sub">主库故障秒级切换、复制自愈、配置巡检，一套后台托管 MySQL / MariaDB 高可用集群。</p>
+
+    <ul class="feat">
+      <li><span class="dot"></span><span>秒级故障切换 · VIP 自动漂移</span></li>
+      <li><span class="dot"></span><span>复制中断 / 配置漂移 自动自愈</span></li>
+      <li><span class="dot"></span><span>多集群统一观测与告警中心</span></li>
+    </ul>
+
+    <!-- 选型切换器：点击编号实时预览（定稿后整块删除即可） -->
+    <div class="lp-picker" id="logoPicker">
+      <div class="row" id="logoPickerRow">
+        <b>Logo 方案</b>
+        <button type="button" data-v="1">1</button>
+        <button type="button" data-v="2">2</button>
+        <button type="button" data-v="3">3</button>
+        <button type="button" data-v="4" class="on">4</button>
+        <button type="button" data-v="5">5</button>
+        <button type="button" data-v="6">6</button>
+        <button type="button" data-v="7">7</button>
+        <button type="button" data-v="8">8</button>
+        <button type="button" data-v="9">9</button>
+        <button type="button" data-v="10">10</button>
+        <button type="button" data-v="11">11</button>
+        <button type="button" data-v="12">12</button>
+        <button type="button" data-v="13">13</button>
+        <button type="button" data-v="14">14</button>
+      </div>
+      <div class="lp-name" id="logoName"></div>
+    </div>
+  </aside>
+
+  <!-- ============ 右：登录表单 ============ -->
+  <main class="form-side">
+    <div class="form-box">
       <h1>欢迎回来</h1>
       <p class="sub">请登录以管理高可用集群</p>
 
@@ -158,9 +276,63 @@
         </div>
         <button type="submit" class="submit">登 录</button>
       </form>
+    </div>
+  </main>
+</div>
 
-      <div class="foot">Custos — Never let your database down · 建议部署于内网环境</div>
-    </main>
-  </div>
+<script>
+(function(){
+  var KEY='custos-logo-variant';
+  var DEFAULT=4;   // 当前保留方案：4（盾牌 + 字母 C）
+  var NAMES={
+    1:'盾牌 · 单盘（品牌青）',
+    2:'盾牌 · 双层盘（品牌青）',
+    3:'盾牌 · 守护环（品牌青）',
+    4:'盾牌 · 字母 C（品牌青）',
+    5:'六边形 · 数据库（青绿）',
+    6:'圆徽章 · 数据柱（琥珀橙）',
+    7:'菱形 · 数据库（靛蓝紫）',
+    8:'轨道环（天蓝）',
+    9:'四叶风车（翡翠绿）',
+    10:'心跳脉冲（玫红）',
+    11:'等距立方（暖橙）',
+    12:'无限符号（青 → 梅紫）',
+    13:'循环同步箭头（紫罗兰 → 青）',
+    14:'守护之星（金琥珀）'
+  };
+  var MAX=14;
+
+  var markUse=document.getElementById('markUse');
+  var wmUse=document.getElementById('wmUse');
+  var picker=document.getElementById('logoPicker');
+  var nameEl=document.getElementById('logoName');
+
+  function apply(v){
+    if(!(v>=1&&v<=MAX)) v=DEFAULT;
+    var href='#cs-logo-'+v;
+    if(markUse)markUse.setAttribute('href',href);
+    if(wmUse)wmUse.setAttribute('href',href);
+    if(picker){
+      picker.querySelectorAll('button[data-v]').forEach(function(b){
+        b.classList.toggle('on', b.getAttribute('data-v')===String(v));
+      });
+    }
+    if(nameEl) nameEl.innerHTML='<span>'+v+'.</span> '+NAMES[v];
+    try{ localStorage.setItem(KEY,String(v)); }catch(e){}
+  }
+
+  var saved=DEFAULT;
+  try{ saved=parseInt(localStorage.getItem(KEY),10)||DEFAULT; }catch(e){}
+  apply(saved);
+
+  if(picker){
+    picker.addEventListener('click',function(e){
+      var b=e.target.closest('button[data-v]');
+      if(!b)return;
+      apply(parseInt(b.getAttribute('data-v'),10)||DEFAULT);
+    });
+  }
+})();
+</script>
 </body>
 </html>

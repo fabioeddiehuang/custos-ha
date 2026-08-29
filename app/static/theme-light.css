@@ -1,0 +1,88 @@
+/* ============================================================
+   Custos · 浅色主题
+   切换方式：<html data-theme="light">（由 base.html / login.html 设置）
+   加载顺序：styles.css → v3.css → theme-light.css（本文件最后，优先级最高）
+   全站组件统一走 var(--*)，因此这里只需覆盖令牌 + 少量写死的深色。
+   ============================================================ */
+
+html[data-theme="light"] {
+  --primary:#0d9488;
+  --primary-dark:#0f766e;
+  --primary-light:rgba(13,148,136,.10);
+  --primary-ring:rgba(13,148,136,.22);
+
+  --accent:#0891b2;
+  --accent-dark:#0e7490;
+  --accent-light:rgba(8,145,178,.10);
+  --accent-ring:rgba(8,145,178,.22);
+
+  --bg:#f4f7fc;
+  --bg-1:#ffffff;
+
+  --surface:#ffffff;
+  --surface-2:#f7f9fd;
+  --surface-3:#eef2f9;
+
+  --text:#0f172a;
+  --muted:#5a6b8c;
+  --border:rgba(15,23,42,.10);
+  --border-strong:rgba(15,23,42,.18);
+
+  --success:#059669; --success-bg:rgba(5,150,105,.10);  --success-border:rgba(5,150,105,.28);
+  --danger:#e11d48;  --danger-bg:rgba(225,29,72,.10);   --danger-border:rgba(225,29,72,.26);
+  --warning:#b45309; --warning-bg:rgba(180,83,9,.10);   --warning-border:rgba(180,83,9,.26);
+
+  --emerald:#059669; --emerald-bg:rgba(5,150,105,.10);
+  --sky:#0284c7;     --sky-bg:rgba(2,132,199,.10);
+  --amber:#b45309;   --amber-bg:rgba(180,83,9,.10);
+  --rose:#e11d48;    --rose-bg:rgba(225,29,72,.10);
+  --plum:#9D174D;
+
+  --shadow:0 1px 2px rgba(15,23,42,.06), 0 10px 30px rgba(15,23,42,.08);
+  --shadow-sm:0 1px 2px rgba(15,23,42,.06);
+}
+
+/* ---------- 结构件：原样式写死了深色半透明底，这里覆盖 ---------- */
+html[data-theme="light"] .sidebar { background: rgba(255,255,255,.88); }
+html[data-theme="light"] .topbar  { background: rgba(255,255,255,.88); }
+
+/* ---------- 下拉选项（原生控件，必须显式给底色） ---------- */
+html[data-theme="light"] select option,
+html[data-theme="light"] .mini-sel option { background:#fff; color:#0f172a; }
+
+/* ---------- 终端 / 日志块：深底改浅底 ---------- */
+html[data-theme="light"] .term              { background:#f8fafc; color:#0f172a; }
+html[data-theme="light"] .srv-log           { background:#f8fafc; color:#334155; }
+html[data-theme="light"] .term-output,
+html[data-theme="light"] .term-cmd          { color:#0f172a; }
+html[data-theme="light"] .term-hint,
+html[data-theme="light"] .term-cont,
+html[data-theme="light"] .term-foot         { color:#5a6b8c; }
+html[data-theme="light"] .term-head         { color:#0284c7; }
+html[data-theme="light"] .term-err          { color:#e11d48; }
+html[data-theme="light"] .term-busy         { color:#b45309; }
+html[data-theme="light"] .term-prompt       { color:#059669; }
+html[data-theme="light"] .term-input        { color:#0f172a; }
+
+/* ---------- 节点详情 / 卡片内嵌深色块 ---------- */
+html[data-theme="light"] .nd-cell,
+html[data-theme="light"] .batch-bar,
+html[data-theme="light"] .cred-row2 { background: var(--surface-2); }
+html[data-theme="light"] .dd { background: var(--surface-2); }
+
+/* ---------- 代码/命令块（浅色下用浅灰蓝底 + 深色字） ---------- */
+html[data-theme="light"] .runcmd,
+html[data-theme="light"] pre,
+html[data-theme="light"] code { background: var(--surface-3); color: #1e293b; }
+
+/* ---------- 弹窗/抽屉遮罩：深色下更暗，浅色下更淡 ---------- */
+html[data-theme="light"] .overlay { background: rgba(15,23,42,.34); }
+
+/* ---------- 观测中心 / 表格：补齐 v3.css 中仍残留的深色字面量块 ---------- */
+html[data-theme="light"] .trend-svg      { background: var(--surface-3); }
+html[data-theme="light"] .slow-bar       { background: var(--surface-3); }
+html[data-theme="light"] .acc            { background: var(--surface-2); }
+html[data-theme="light"] .port-chip      { background: var(--surface-2); }
+html[data-theme="light"] .drift-item     { background: rgba(157,23,77,.10); }
+html[data-theme="light"] .tbl tbody tr:hover { background: rgba(15,23,42,.05); }
+html[data-theme="light"] .btn-ghost:hover{ background: var(--surface-2); border-color: var(--primary); color: var(--primary); }

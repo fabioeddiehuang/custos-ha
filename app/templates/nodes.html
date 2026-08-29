@@ -7,6 +7,9 @@
   .acc-pwd .reveal{cursor:pointer;color:var(--primary);margin-left:8px;font-size:12px;background:none;border:none;padding:0}
   .acc-pwd .reveal:hover{color:var(--primary-dark)}
   .dd-actions{display:flex;gap:10px;flex-wrap:wrap}
+  /* 按集群分卡片：每个集群一张独立卡片，左侧色条区分 */
+  .ng-card{border-left:3px solid var(--primary)}
+  .ng-dot{width:9px;height:9px;border-radius:50%;flex:none;background:linear-gradient(135deg,var(--accent),var(--primary))}
   /* 每个节点一个配色：展开多个节点时，靠色块+底色区分细节与底部按钮归属 */
   /* 深色底：accent 提亮一档，tint 改为同色低透明底（原为浅色底，深底上会成白块） */
   .na-0{--accent:#0ABAB5;--tint:rgba(10,186,181,.12)}
@@ -52,44 +55,66 @@
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
 {% if error %}<div class="banner err">⚠ {{ error }}</div>{% endif %}
 
-<div class="card">
-  <h3>已添加节点<span style="flex:1"></span>
-    <button class="btn btn-primary btn-sm" onclick="openAddNode()">＋ 添加节点</button>
-  </h3>
-  <!-- 批量操作：勾选左侧复选框后自动出现 -->
-  <div class="batch-bar" id="batchBar">
-    <span class="bb-count">已选 <b id="selCount">0</b> 个节点</span>
-    <div class="bb-actions">
-      <button class="btn btn-sm btn-accent" onclick="batchRegen()">批量重新生成</button>
-      <button class="btn btn-sm" onclick="batchDownload()">批量下载修复SQL</button>
-      <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="batchDelete()">批量删除</button>
-      <button class="btn btn-sm btn-ghost" onclick="clearSelection()">取消选择</button>
-    </div>
+<!-- 顶部工具条 -->
+<div class="toolbar">
+  <button class="btn btn-primary" onclick="openAddNode()">＋ 添加节点</button>
+  {% if clusters|length > 1 %}
+  <span style="font-size:12.5px;color:var(--muted)">按集群筛选</span>
+  <select class="mini-sel" style="width:auto" onchange="location.href='/nodes?cluster_id='+this.value">
+    <option value="0" {% if not active_cluster %}selected{% endif %}>全部集群</option>
+    {% for c in clusters %}
+    <option value="{{ c.id }}" {% if active_cluster == c.id %}selected{% endif %}>{{ c.name }}</option>
+    {% endfor %}
+  </select>
+  {% endif %}
+  <span class="spacer"></span>
+  <span class="badge sky">共 {{ nodes|length }} 个节点 · {{ groups|length }} 个集群</span>
+</div>
+
+<!-- 批量操作：勾选左侧复选框后自动出现（跨集群统一操作） -->
+<div class="batch-bar" id="batchBar">
+  <span class="bb-count">已选 <b id="selCount">0</b> 个节点</span>
+  <div class="bb-actions">
+    <button class="btn btn-sm btn-accent" onclick="batchRegen()">批量重新生成</button>
+    <button class="btn btn-sm" onclick="batchDownload()">批量下载修复SQL</button>
+    <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="batchDelete()">批量删除</button>
+    <button class="btn btn-sm btn-ghost" onclick="clearSelection()">取消选择</button>
   </div>
+</div>
+
+{% for g in groups %}
+<div class="card ng-card">
+  <h3>
+    <span class="ng-dot"></span>{{ g.name }}
+    <span class="badge sky">{{ g.nodes|length }} 节点</span>
+    {% if g.id %}<span class="badge">{{ g.node_type }}</span>{% endif %}
+    {% if g.vip %}<span class="badge ok mono">VIP {{ g.vip }}</span>{% endif %}
+    <span style="flex:1"></span>
+    {% if g.id %}<a class="btn btn-sm btn-ghost" href="/clusters/{{ g.id }}">集群详情</a>{% endif %}
+  </h3>
 
   <table class="tbl">
     <thead>
       <tr>
-        <th style="width:36px"><input type="checkbox" id="selAll" onchange="toggleSelectAll(this)" title="全选/取消全选"></th>
-        <th>集群名</th><th>节点</th><th>版本</th><th>状态</th><th>操作</th>
+        <th style="width:36px"><input type="checkbox" class="grp-sel" onchange="toggleGroup(this,'g{{ g.id }}')" title="全选/取消本集群"></th>
+        <th>节点</th><th>版本</th><th>状态</th><th>操作</th>
       </tr>
     </thead>
-    <tbody>
-      {% for n in nodes %}
+    <tbody id="g{{ g.id }}">
+      {% for n in g.nodes %}
       <tr data-host="{{ n.ip }}:{{ n.port }}" data-cluster="{{ n.cluster_id or '' }}">
         <td><input type="checkbox" class="node-sel" value="{{ n.ip }}" onchange="syncBatchBar()" title="选择该节点"></td>
-        <td>{{ n.cluster_name }}</td>
         <td class="mono">{{ n.ip }}:{{ n.port }}</td>
         <td>
           {% if n.mysql_version %}{{ n.mysql_version }}{% endif %}
           {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-left:4px">MariaDB</span>
           {% elif n.node_type == 'docker' %}<span class="badge emerald" style="margin-left:4px">Docker</span>{% endif %}
         </td>
-        <td data-f="status"><span class="badge" style="background:#1c2b47;color:#8b9ac0;">检测中…</span></td>
+        <td data-f="status"><span class="badge" style="background:var(--surface-3);color:var(--muted);">检测中…</span></td>
         <td><button class="btn btn-sm" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button></td>
       </tr>
       <tr id="d{{ n.ip }}" class="detail-panel">
-        <td colspan="6"><div class="dd na-{{ loop.index0 % 5 }}">
+        <td colspan="5"><div class="dd na-{{ loop.index0 % 5 }}">
           <div class="dd-head">
             <span class="dd-dot"></span>
             <span class="dd-title">{{ n.ip }}:{{ n.port }}<small>{{ n.cluster_name }}</small></span>
@@ -122,11 +147,19 @@
         </div></td>
       </tr>
       {% else %}
-      <tr><td colspan="6" style="color:#8b9ac0;text-align:center;padding:24px;">暂无已添加节点。点击右上角「＋ 添加节点」生成部署单元。</td></tr>
+      <tr><td colspan="5" style="color:var(--muted);text-align:center;padding:24px;">该集群暂无节点。</td></tr>
       {% endfor %}
     </tbody>
   </table>
 </div>
+{% else %}
+<div class="card">
+  <div style="text-align:center;padding:44px 20px;color:var(--muted)">
+    <b style="display:block;font-size:15px;color:var(--text);margin-bottom:6px">暂无已添加节点</b>
+    点击上方「＋ 添加节点」生成部署单元。若还没有集群，请先到「集群管理」创建。
+  </div>
+</div>
+{% endfor %}
 
 <!-- 添加节点 modal -->
 <div class="overlay" id="addOverlay" onclick="if(event.target===this)closeAddNode()">
@@ -242,7 +275,7 @@
         if(role){
           var isMaster=(String(cid)==="0")?false:false;
           if(d.host&&window._masters)isMaster=(window._masters[cid]||"")===d.host+":"+d.port;
-          var rl=isMaster?"主":"从";
+          var rl=isMaster?"master":"slave";
           role.innerHTML='<span class="role role-'+((isMaster)?"master":"slave")+'">'+rl+'</span>';
         }
         var dd=tr.querySelector('[data-f="datadir"]');if(dd){dd.textContent=d.datadir||"—"; dd.title=d.datadir||"";}
@@ -316,6 +349,13 @@
   }
   function toggleSelectAll(el){
     document.querySelectorAll(".node-sel").forEach(function(i){ i.checked = !!el.checked; });
+    syncBatchBar();
+  }
+  // 按集群全选 / 取消（节点已按集群分卡片，每个集群一个表头复选框）
+  function toggleGroup(el, tbodyId){
+    var tb = document.getElementById(tbodyId);
+    if(!tb) return;
+    tb.querySelectorAll(".node-sel").forEach(function(i){ i.checked = !!el.checked; });
     syncBatchBar();
   }
   function clearSelection(){

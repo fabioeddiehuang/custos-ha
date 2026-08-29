@@ -139,6 +139,18 @@ SCHEMA_SQL = [
         INDEX idx_host (cluster_id, host, port, ts)
     ) ENGINE=InnoDB
     """,
+    # ---- v2.2：慢日志增量采集游标（每个节点已采集到的最大 start_time）----
+    # 有了水位后「清空节点侧 mysql.slow_log」不再必须成功，清空失败也不会重复入库。
+    """
+    CREATE TABLE IF NOT EXISTS slow_log_cursor (
+        cluster_id INT NOT NULL,
+        host VARCHAR(64) NOT NULL,
+        port INT NOT NULL,
+        last_start_time DATETIME(6) NULL,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (cluster_id, host, port)
+    ) ENGINE=InnoDB
+    """,
     # ---- v2.1：跨节点配置一致性巡检结果（定时/手动跑）----
     """
     CREATE TABLE IF NOT EXISTS config_drift (

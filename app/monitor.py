@@ -193,22 +193,35 @@ def _cred_self_heal():
     except Exception as e:
         print(f"[monitor][cred-heal] 读取集群失败(可忽略): {e}")
         return
+    # 上次巡检结果（每集群独立）：只在「结果发生变化」时才打印，
+    # 否则每个 CRED_SYNC_INTERVAL 都会刷一条「凭证已校正到 N 个节点」的噪音。
+    if not hasattr(run_once, "_last_cred_state"):
+        run_once._last_cred_state = {}
+
     now = time.time()
     for cl in clusters:
         cid = cl["id"]
         last = run_once._last_cred_sync.get(cid, 0.0)
         if now - last < CRED_SYNC_INTERVAL:
             continue
+        run_once._last_cred_sync[cid] = now
+        prev = run_once._last_cred_state.get(cid)
         try:
             # sync_node_creds 返回已同步节点数(int)
             synced = node_gen.sync_node_creds(cid)
-            if synced:
-                print(f"[monitor][cred-heal] 集群 {cid} 凭证已校正到 {synced} 个节点")
         except Exception as e:
-            # 自愈失败不应影响主流程（下次周期再试）
-            print(f"[monitor][cred-heal] 集群 {cid} 校正失败(可忽略): {e}")
-        finally:
-            run_once._last_cred_sync[cid] = now
+            # 自愈失败不应影响主流程（下次周期再试）；失败状态同样去重打印
+            if prev != "err":
+                print(f"[monitor][cred-heal] 集群 {cid} 校正失败(可忽略): {e}")
+            run_once._last_cred_state[cid] = "err"
+            continue
+        if prev is None:
+            print(f"[monitor][cred-heal] 集群 {cid} 凭证巡检完成：{synced} 个节点已对齐")
+        elif prev == "err":
+            print(f"[monitor][cred-heal] 集群 {cid} 凭证校正已恢复：{synced} 个节点已对齐")
+        elif prev != synced:
+            print(f"[monitor][cred-heal] 集群 {cid} 已对齐节点数变化：{prev} → {synced}")
+        run_once._last_cred_state[cid] = synced
 
 
 def request_act_once():

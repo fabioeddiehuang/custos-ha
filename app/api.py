@@ -17,6 +17,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature
 import os
 import logging
 from logging.handlers import RotatingFileHandler
+from urllib.parse import quote
 
 from .config import SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT
 from .db import query, execute, get_conn, get_setting, upsert_setting
@@ -31,7 +32,7 @@ from .ha_client import (connect, heal_replication, heal_io_gtid_gap, get_status,
                        fix_node_mysql_params, reset_replication_creds_on_master,
                        restart_slave_io, connect_robust)
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
-from . import precheck, audit, metrics, slow_log, config_drift, docker_helper
+from . import precheck, audit, metrics, slow_log, config_drift, docker_helper, backup
 from .mysql_compat import detect_flavour, flavour_from_node_type, F_MARIADB
 
 # ---------------------------------------------------------------------------
@@ -150,6 +151,19 @@ def _json_default(o):
     if isinstance(o, (datetime, date, time)):
         return o.isoformat()
     return str(o)
+
+
+# 模板里的 `{{ obj|tojson }}` 默认只走 json.dumps，遇到 datetime / Decimal 会
+# 抛 TypeError → 整页 500（集群页正是因此打不开）。这里给 Jinja 环境挂上
+# json.dumps_kwargs 策略，让模板内所有 tojson 都用同一套兜底序列化。
+try:
+    TEMPLATES.policies["json.dumps_kwargs"] = {
+        "default": _json_default,
+        "ensure_ascii": False,
+        "sort_keys": False,
+    }
+except Exception:
+    pass
 
 
 def _json_ok(payload):
@@ -1001,75 +1015,236 @@ def change_password(
 
 
 # ---------------- 集群管理（多集群：每集群独立账号/复制账号/密码/VIP） ----------------
-@app.get("/clusters")
-def clusters_page(request: Request, user=Depends(auth_required), msg: str = "", error: str = "",
-                  cid: int = 0):
-    raw = list_clusters()
-    counts = {r["cluster_id"]: r["n"] for r in
-              query("SELECT cluster_id, COUNT(*) AS n FROM hosts GROUP BY cluster_id")}
-    cms = {r["cluster_id"]: f"{r['host']}:{r['port']}"
-           for r in query("SELECT cluster_id, host, port FROM current_master")}
-    hosts_all = query(
-        "SELECT cluster_id, host, port, status, role, slave_io, slave_sql, err, "
+def _cluster_view(cid: int):
+    """构造单个集群在页面上的完整视图（总览卡片与单集群详情页共用）。
+
+    返回 None 表示集群不存在。字段：
+      id/name/vip/...（集群表原始列）
+      node_count 节点总数 / online 在线数 / current_master / slaves
+      host_rows  节点表格行 / has_issue 是否存在异常 / creds 集群凭证
+    """
+    c = get_cluster(cid)
+    if not c:
+        return None
+    n = query("SELECT COUNT(*) AS n FROM hosts WHERE cluster_id=%s", (cid,))
+    node_count = int(n[0]["n"]) if n else 0
+    cm_rows = query("SELECT host, port FROM current_master WHERE cluster_id=%s", (cid,))
+    cm = f"{cm_rows[0]['host']}:{cm_rows[0]['port']}" if cm_rows else ""
+    hs = query(
+        "SELECT host, port, status, role, slave_io, slave_sql, err, "
         "(SELECT m.seconds_behind FROM metric_history m WHERE m.host=h.host AND m.port=h.port "
         "ORDER BY m.id DESC LIMIT 1) AS seconds_behind "
-        "FROM hosts h")
-    by_cluster = {}
-    for h in hosts_all:
-        by_cluster.setdefault(h["cluster_id"], []).append(h)
+        "FROM hosts h WHERE h.cluster_id=%s", (cid,))
+    host_rows = []
+    slaves = []
+    online = 0
+    for h in hs:
+        hk = f"{h['host']}:{h['port']}"
+        is_cm = (hk == cm)
+        if not is_cm:
+            slaves.append(hk)
+        repl_bad = (not is_cm) and (
+            h.get("slave_io") not in ("Yes", None) or
+            h.get("slave_sql") not in ("Yes", None))
+        down = h.get("status") != "up"
+        if not down:
+            online += 1
+        host_rows.append({
+            "host": h["host"], "port": h["port"],
+            "role": "主库" if is_cm else "从库",
+            "status": h.get("status"),
+            "slave_io": h.get("slave_io") or "—",
+            "slave_sql": h.get("slave_sql") or "—",
+            "err": (h.get("err") or "").strip(),
+            "seconds_behind": h.get("seconds_behind"),
+            "bad": bool(repl_bad or down),
+        })
+    has_issue = (online != node_count) or any(r["bad"] for r in host_rows)
+    cc = dict(
+        c, node_count=node_count,
+        current_master=cm or "未选举",
+        online=online,
+        slaves=slaves,
+        host_rows=host_rows,
+        has_issue=has_issue,
+    )
+    try:
+        cc["creds"] = get_cluster_creds(cid)
+    except Exception:
+        cc["creds"] = None
+    cc["js"] = _cluster_js(cc)
+    return cc
+
+
+def _cluster_js(c):
+    """供前端 JS 使用的精简集群信息（编辑弹窗回填用）。
+
+    只取渲染需要的标量字段：
+      - 剔除密码（ha_pass/repl_pass/app_pass 不下发到页面源码）；
+      - 剔除 created_at/updated_at 等 datetime（tojson 序列化不稳定）；
+      - 时间戳统一转字符串，任何异常类型都兜底成字符串。
+    """
+    cr = c.get("creds") or {}
+
+    def _s(v):
+        if v is None:
+            return ""
+        if isinstance(v, (datetime, date, time)):
+            return v.isoformat()
+        if isinstance(v, (str, int, float, bool)):
+            return v
+        return str(v)
+
+    return {
+        "id": c.get("id"),
+        "name": _s(c.get("name")),
+        "vip": _s(c.get("vip")),
+        "vrid": _s(c.get("vrid")),
+        "vip_port": _s(c.get("vip_port")),
+        "vip_prefix": _s(c.get("vip_prefix")),
+        "interface": _s(c.get("interface")),
+        "node_type": _s(c.get("node_type") or "docker"),
+        "mysql_version": _s(c.get("mysql_version")),
+        "creds": {
+            "ha_user": _s(cr.get("ha_user")),
+            "repl_user": _s(cr.get("repl_user")),
+            "app_user": _s(cr.get("app_user")),
+        },
+    }
+
+
+@app.get("/clusters")
+def clusters_page(request: Request, user=Depends(auth_required), msg: str = "", error: str = ""):
+    """集群管理 · 总览页：所有集群的状态卡片列表。"""
     clusters = []
-    for c in raw:
-        cid = c["id"]
-        cm = cms.get(cid, "")
-        hs = by_cluster.get(cid, [])
-        online = sum(1 for h in hs if h.get("status") == "up")
-        host_rows = []
-        slaves = []
-        for h in hs:
-            hk = f"{h['host']}:{h['port']}"
-            is_cm = (hk == cm)
-            if not is_cm:
-                slaves.append(hk)
-            repl_bad = (not is_cm) and (
-                h.get("slave_io") not in ("Yes", None) or
-                h.get("slave_sql") not in ("Yes", None))
-            down = h.get("status") != "up"
-            host_rows.append({
-                "host": h["host"], "port": h["port"],
-                "role": "主库" if is_cm else "从库",
-                "status": h.get("status"),
-                "slave_io": h.get("slave_io") or "—",
-                "slave_sql": h.get("slave_sql") or "—",
-                "err": (h.get("err") or "").strip(),
-                "seconds_behind": h.get("seconds_behind"),
-                "bad": bool(repl_bad or down),
-            })
-        has_issue = (online != counts.get(cid, 0)) or any(r["bad"] for r in host_rows)
-        cc = dict(
-            c, node_count=counts.get(cid, 0),
-            current_master=cm or "未选举",
-            online=online,
-            slaves=slaves,
-            host_rows=host_rows,
-            has_issue=has_issue,
-        )
-        try:
-            cc["creds"] = get_cluster_creds(cid)
-        except Exception:
-            cc["creds"] = None
-        clusters.append(cc)
-    active = None
-    for c in clusters:
-        if c["id"] == cid:
-            active = c
-    if not active and clusters:
-        active = clusters[0]
-    creds = active.get("creds") if active else None
+    for row in list_clusters():
+        v = _cluster_view(row["id"])
+        if v:
+            clusters.append(v)
     return render("clusters.html", request, user=user, clusters=clusters,
-                  active=active, creds=creds, msg=msg, error=error,
+                  msg=msg, error=error,
+                  auto_failover=get_setting("AUTO_FAILOVER", "1") == "1",
+                  auto_repair=get_setting("AUTO_REPAIR", "1") == "1")
+
+
+@app.get("/clusters/{cid}")
+def cluster_detail_page(request: Request, cid: int, user=Depends(auth_required),
+                        msg: str = "", error: str = ""):
+    """集群管理 · 单集群详情页（左侧集群子菜单进入）。
+
+    顶栏标题由模板的 page_title 块给出："集群管理-{集群名称}"。
+    """
+    c = _cluster_view(cid)
+    if not c:
+        return RedirectResponse("/clusters?error=集群不存在或已被删除", status_code=303)
+    return render("cluster_detail.html", request, user=user, cluster=c,
+                  clusters=[c], msg=msg, error=error,
                   auto_failover=get_setting("AUTO_FAILOVER", "1") == "1",
                   auto_repair=get_setting("AUTO_REPAIR", "1") == "1",
                   slowlog_enabled=slow_log.slowlog_enabled())
+
+
+# ==================================================================
+# 备份 / 恢复（全库 / 指定库）
+# 纯 Python 实现，容器内无需 mysqldump；产物落在 ./backups/<集群ID>/。
+# ==================================================================
+@app.get("/clusters/{cid}/backup")
+def cluster_backup_page(request: Request, cid: int, user=Depends(auth_required),
+                        msg: str = "", error: str = ""):
+    """集群备份 / 恢复页。"""
+    c = _cluster_view(cid)
+    if not c:
+        return RedirectResponse("/clusters?error=集群不存在或已被删除", status_code=303)
+    return render("backup.html", request, user=user, cluster=c,
+                  backups=backup.list_backups(cid), msg=msg, error=error)
+
+
+@app.get("/api/backup/databases")
+def api_backup_databases(cluster_id: int = 0, host: str = "", port: int = 3306,
+                         user=Depends(auth_required)):
+    """列出该节点上可备份的业务库。"""
+    try:
+        r = backup.list_databases(int(cluster_id), host.strip(), int(port))
+    except Exception as e:
+        r = {"ok": False, "error": str(e)}
+    return JSONResponse(r)
+
+
+@app.post("/api/backup/run")
+def api_backup_run(cluster_id: int = Form(...), host: str = Form(...),
+                   port: int = Form(3306), scope: str = Form("all"),
+                   databases: str = Form(""), with_data: bool = Form(True),
+                   user=Depends(auth_required)):
+    """执行备份。scope=all 全库；scope=custom 时 databases 为逗号分隔的库名。"""
+    dbs = [d.strip() for d in (databases or "").split(",") if d.strip()]
+    r = backup.run_backup(int(cluster_id), host.strip(), int(port),
+                          databases=dbs if scope == "custom" else None,
+                          with_data=bool(with_data), scope=scope)
+    if r.get("ok"):
+        m = r.get("meta", {})
+        r["msg"] = (f"备份完成：{m.get('tables', 0)} 张表 / {m.get('views', 0)} 个视图 / "
+                    f"{m.get('rows', 0)} 行，文件 {m.get('file', '')} "
+                    f"（{round(m.get('size', 0) / 1024, 1)} KB）")
+    return JSONResponse(r)
+
+
+@app.get("/api/backup/list")
+def api_backup_list(cluster_id: int = 0, user=Depends(auth_required)):
+    """列出该集群的历史备份。"""
+    try:
+        return JSONResponse({"ok": True, "backups": backup.list_backups(int(cluster_id))})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e), "backups": []})
+
+
+@app.post("/api/backup/restore")
+def api_backup_restore(cluster_id: int = Form(...), host: str = Form(...),
+                       port: int = Form(3306), file: str = Form(...),
+                       databases: str = Form(""), user=Depends(auth_required)):
+    """把备份恢复到指定节点（默认恢复备份内的全部库，可指定只恢复部分库）。"""
+    dbs = [d.strip() for d in (databases or "").split(",") if d.strip()]
+    r = backup.restore_backup(int(cluster_id), host.strip(), int(port),
+                              file, databases=dbs or None)
+    try:
+        audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                        "restore_backup", f"{host}:{port}",
+                        f"file={file} dbs={','.join(dbs) or 'ALL'}",
+                        cluster_id=int(cluster_id))
+    except Exception:
+        pass
+    return JSONResponse(r)
+
+
+@app.post("/api/backup/delete")
+def api_backup_delete(cluster_id: int = Form(...), file: str = Form(...),
+                      user=Depends(auth_required)):
+    try:
+        return JSONResponse(backup.delete_backup(int(cluster_id), file))
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})
+
+
+@app.get("/api/backup/preview")
+def api_backup_preview(cluster_id: int = 0, file: str = "",
+                       user=Depends(auth_required)):
+    try:
+        return JSONResponse({"ok": True, "head": backup.read_backup_head(int(cluster_id), file)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+@app.get("/api/backup/download")
+def api_backup_download(cluster_id: int = 0, file: str = "",
+                        user=Depends(auth_required)):
+    """下载备份文件。"""
+    try:
+        p = backup.get_backup_path(int(cluster_id), file)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+    data = p.read_bytes()
+    return Response(
+        content=data, media_type="application/gzip",
+        headers={"Content-Disposition": f'attachment; filename="{p.name}"'})
 
 
 @app.post("/api/setting_set")
@@ -1539,12 +1714,11 @@ def clusters_create(
         return RedirectResponse(f"/clusters?error={e}", status_code=303)
     audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
                     "create_cluster", f"cluster={new_id}", name, new_id)
-    # 直接渲染新集群，便于用户立即查看自动生成的账号密码（眼睛图标可显隐）
-    return render(
-        "clusters.html", request, user=user, clusters=list_clusters(),
-        active=get_cluster(new_id), creds=get_cluster_creds(new_id),
-        msg=f"已创建集群「{name}」，请妥善保存自动生成的账号密码（点击眼睛图标可查看/隐藏）",
-    )
+    # 创建成功后直达该集群详情页（新路由结构：总览 → 单集群详情）。
+    # 自动生成的账号密码可在详情页「⚙ 修改配置/密码」中查看，或展开节点详情查看。
+    return RedirectResponse(
+        f"/clusters/{new_id}?msg={quote('已创建集群「' + name + '」；自动生成的账号密码可在「⚙ 修改配置/密码」中查看，或展开节点详情查看')}",
+        status_code=303)
 
 
 @app.post("/clusters/{cid}")
@@ -1602,18 +1776,14 @@ def cluster_update(
                 raise ValueError()
             fields["vip_port"] = vp
         except ValueError:
-            return render(
-                "clusters.html", request, user=user, clusters=list_clusters(),
-                active=get_cluster(cid), creds=get_cluster_creds(cid),
-                error="vip端口必须是 1-65535 之间的整数")
+            return RedirectResponse(
+                f"/clusters/{cid}?error={quote('vip端口必须是 1-65535 之间的整数')}",
+                status_code=303)
     try:
         update_cluster(cid, **fields)
     except Exception as e:
-        return render(
-            "clusters.html", request, user=user, clusters=list_clusters(),
-            active=get_cluster(cid), creds=get_cluster_creds(cid),
-            error=f"保存失败: {e}",
-        )
+        return RedirectResponse(
+            f"/clusters/{cid}?error={quote('保存失败: ' + str(e))}", status_code=303)
     synced = 0
     if any(k in fields for k in ("ha_pass", "repl_pass", "app_pass")):
         try:
@@ -1636,10 +1806,7 @@ def cluster_update(
                 "docker compose restart keepalived）")
     except Exception:
         pass
-    return render(
-        "clusters.html", request, user=user, clusters=list_clusters(),
-        active=get_cluster(cid), creds=get_cluster_creds(cid), msg=msg,
-    )
+    return RedirectResponse(f"/clusters/{cid}?msg={quote(msg)}", status_code=303)
 
 
 @app.post("/clusters/{cid}/delete")
@@ -1702,8 +1869,30 @@ def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", err
         for _p in _DIR_PREFIXES:
             dp = dp.split(_p, 1)[-1]
         n["dir_display"] = dp or cp
+
+    # 按集群分组：节点管理页按「一个集群一张卡片」渲染，避免多集群混在同一张表里
+    by_cid = {}
+    for n in nodes:
+        by_cid.setdefault(n.get("cluster_id"), []).append(n)
+    groups = []
+    for c in clusters:
+        cid = c["id"]
+        if ac and cid != ac:      # 指定了集群筛选时只显示该集群
+            continue
+        groups.append({
+            "id": cid,
+            "name": c.get("name") or f"集群{cid}",
+            "node_type": c.get("node_type") or "docker",
+            "vip": c.get("vip") or "",
+            "nodes": by_cid.get(cid, []),
+        })
+    # 尚未归属任何集群的节点（历史数据）单独归到「未分配」
+    orphans = by_cid.get(None, [])
+    if orphans and not ac:
+        groups.append({"id": 0, "name": "未分配集群", "node_type": "", "vip": "", "nodes": orphans})
+
     return render("nodes.html", request, user=user, nodes=nodes, clusters=clusters,
-                  creds=creds, cfg=cfg, active_cluster=ac, msg=msg, error=error)
+                  groups=groups, creds=creds, cfg=cfg, active_cluster=ac, msg=msg, error=error)
 
 
 @app.get("/audit")
@@ -1881,7 +2070,8 @@ def _render_node_fix_sql(n, creds, manager_ip, manager_subnet=None):
             manager_ip, port, manager_subnet)
     return render_fix_node_creds_sql(
         ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass,
-        manager_ip, manager_subnet)
+        manager_ip, manager_subnet,
+        auth_plugin=_auth_plugin_for(n.get("mysql_version"), n.get("node_type")))
 
 
 def node_creds_sql(ip: str, user=Depends(auth_required)):

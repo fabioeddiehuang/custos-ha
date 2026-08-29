@@ -21,6 +21,7 @@ from pathlib import Path
 import pymysql
 
 from .db import get_setting, query, execute
+from .mysql_compat import default_auth_plugin
 from .config import NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
@@ -377,12 +378,36 @@ def render_docker_my_cnf():
     )
 
 
-def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass):
+def _auth_plugin_pref():
+    """全局认证插件偏好（settings.AUTH_PLUGIN：auto / native / caching_sha2）。"""
+    try:
+        return (get_setting("AUTH_PLUGIN") or "auto").strip().lower()
+    except Exception:
+        return "auto"
+
+
+def _auth_plugin_for(mysql_version=None, node_type=None):
+    """按节点版本选认证插件：MySQL 8.0.34+ 用 caching_sha2_password。
+
+    消除节点 error log 里的
+    ``[MY-013360] Plugin mysql_native_password reported: '...is deprecated...'``；
+    MariaDB 与 MySQL 8.0.33- 仍用 mysql_native_password。
+    """
+    try:
+        return default_auth_plugin(mysql_version, node_type, _auth_plugin_pref())
+    except Exception:
+        return "mysql_native_password"
+
+
+def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
+                     auth_plugin="mysql_native_password"):
     """渲染 init.sql（首次启动即创建与所属集群一致的 ha_monitor / replication / app 账号）。
 
     抽成模块级函数，供 generate_node（首次生成）与 sync_node_creds（密码变更后重生成）
     共用，保证「节点部署文件」中的凭证与集群当前凭证始终一致——这样即使重部署
     （清空 MySQL-data 后 init.sql 重新执行）也不会因旧密码导致无法连接。
+
+    auth_plugin：CREATE/ALTER USER 的认证插件，由 _auth_plugin_for() 按节点版本给出。
     """
     return (
         # 启用 GTID 一致性（复制/切换必需）。gtid_mode 已在 compose 启动参数
@@ -425,9 +450,18 @@ def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
         app_user, app_pass, app_user,
         app_user, app_pass,
     )
+    return _apply_auth_plugin(content, auth_plugin)
 
 
-def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_ip, manager_subnet):
+def _apply_auth_plugin(sql, auth_plugin):
+    """把模板里写死的 mysql_native_password 换成目标插件（默认即 native，直接返回）。"""
+    if not auth_plugin or auth_plugin == "mysql_native_password":
+        return sql
+    return sql.replace("mysql_native_password", auth_plugin)
+
+
+def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_ip,
+                              manager_subnet, auth_plugin="mysql_native_password"):
     """生成「节点账号/权限修复脚本」，当节点 ha_monitor 权限被面板/重装回退（只剩 USAGE）、
     或 root@'<管理器IP>' 密码漂移导致管理器连不上时使用。注入真实凭证。"""
     content = (
@@ -482,7 +516,7 @@ def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user,
         ) % (root_user, manager_subnet, root_pass,
              root_user, manager_subnet, root_pass,
              root_user, manager_subnet)
-    return content
+    return _apply_auth_plugin(content, auth_plugin)
 
 
 def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
@@ -746,7 +780,8 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     kd.mkdir(parents=True, exist_ok=True)
 
     # 1) init.sql / compose（按节点类型分支）
-    init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
+    init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
+                                auth_plugin=_auth_plugin_for(mysql_version, node_type))
     extra_files = {}
     if node_type == "mariadb":
         # MariaDB 裸机：完全独立安装（脱离宝塔），由 Install 脚本全量安装 tarball。
@@ -942,6 +977,7 @@ def sync_node_creds(cluster_id=None):
             root_user = n.get("root_user") or "root"
             root_pass = n.get("root_pass") or ""
             node_type = n.get("node_type") or "docker"
+            mysql_version = n.get("mysql_version") or ""
 
             # 只读副本：账号密码由主库经复制自动同步，严禁在副本上直接执行
             # CREATE/ALTER USER —— 否则会与复制线程争用 mysql.* 元数据锁，造成复制线程
@@ -986,7 +1022,8 @@ def sync_node_creds(cluster_id=None):
                 init_sql = render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
                 _write(_safe_node_path(ip) / "init_mariadb.sql", init_sql, mode=0o644)
             else:
-                init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
+                init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
+                                            auth_plugin=_auth_plugin_for(mysql_version, node_type))
                 _write(_safe_node_path(ip) / "init.sql", init_sql, mode=0o644)
             # 同步修复脚本（凭证变更/权限回退时，可在节点本机重放）
             # MariaDB 用 MariaDB 语法修复脚本（native 密码，无 MySQL8 专有特权）；其余用通用版。
@@ -997,7 +1034,7 @@ def sync_node_creds(cluster_id=None):
             else:
                 fix_sql = render_fix_node_creds_sql(
                     ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip,
-                    manager_subnet)
+                    manager_subnet, auth_plugin=_auth_plugin_for(mysql_version, node_type))
             _write(_safe_node_path(ip) / "fix-node-creds.sql", fix_sql, mode=0o644)
             synced += 1
     return synced

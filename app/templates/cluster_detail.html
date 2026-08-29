@@ -1,0 +1,708 @@
+{% extends "base.html" %}
+{% block title %}集群管理 · {{ cluster.name }}{% endblock %}
+{% block page_title %}集群管理-{{ cluster.name }}{% endblock %}
+{% block content %}
+<style>
+  /* 新建/编辑表单 */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px}
+  .grid2 label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);font-weight:600}
+  .grid2 label input,.grid2 label select{font-weight:400}
+  .grid2 .full{grid-column:1/-1}
+  .form-foot{grid-column:1/-1;display:flex;justify-content:flex-end;gap:10px}
+  .hint{font-weight:400;font-size:11.5px;color:#8b9ac0}
+  html[data-theme="light"] .hint{color:#5a6b8c}
+  .pw-row{display:flex;gap:8px;align-items:center}
+  .pw-row input{flex:1;min-width:0}
+
+  /* 集群概要条 */
+  .cd-summary{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+  .cd-sum{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px 15px;min-width:112px}
+  .cd-sum .k{font-size:11px;color:var(--muted);font-weight:600;margin-bottom:3px}
+  .cd-sum .v{font-size:14px;font-weight:700;color:var(--text);font-family:var(--mono)}
+  .cd-sum .v.ok{color:var(--success)} .cd-sum .v.bad{color:var(--danger)}
+
+  /* 数据库终端：黑屏交互 */
+  .term-modal{max-width:880px;width:94vw}
+  .term-modal .body{display:flex;flex-direction:column}
+  .term-modal.term-full{position:fixed;top:0;left:0;right:0;bottom:0;width:auto;height:auto;max-width:none;max-height:none;border-radius:0;margin:0;display:flex;flex-direction:column;z-index:3000;background:var(--surface);overflow:hidden}
+  .term-modal.term-full .body{flex:1;min-height:0;overflow:hidden}
+  .term-modal.term-full .term{flex:1;height:auto;min-height:0}
+  body.term-fs{overflow:hidden}
+  .term{background:#060b16;color:#e8eefc;border-radius:10px;padding:12px 14px;height:52vh;overflow:auto;font-family:var(--mono);font-size:13px;line-height:1.55}
+  .term-output{white-space:pre-wrap;word-break:break-word}
+  .term-output>div{padding:1px 0}
+  .term-table{white-space:pre}
+  .term-head{color:#38bdf8;font-weight:700}
+  .term-err{color:#fb7185}
+  .term-busy{color:#fbbf24}
+  .term-hint{color:#8b9ac0}
+  .term-cmd{color:#e8eefc}
+  .term-cont{color:#8b9ac0}
+  .term-foot{color:#8b9ac0}
+  .term-input-line{display:flex;align-items:center;gap:6px;margin-top:6px}
+  .term-prompt{color:#34d399;font-family:var(--mono);font-weight:700;white-space:nowrap}
+  .term-input{flex:1;min-width:0;background:transparent;border:none;outline:none;color:#e8eefc;caret-color:#34d399;font-weight:600;font-family:var(--mono);font-size:13px;line-height:1.55;-webkit-appearance:none;appearance:none}
+  .term-input::placeholder{color:#8b9ac0}
+  .ok-note{color:#34d399;padding:10px}
+  .err-cell{color:#fb7185;font-size:13px}
+  .kv-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+  .kv-row .k{color:var(--muted)}
+  .kv-row .v{font-family:var(--mono);font-weight:600}
+  .cred-row2{padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface-2);margin-top:8px}
+  .cr-label{font-size:12px;color:var(--plum);font-weight:700;margin-bottom:4px}
+  .cr-line{font-size:13px;padding:2px 0;color:var(--text)}
+  .cr-line .pw{font-family:var(--mono);background:var(--surface-3);padding:1px 6px;border-radius:6px}
+  .btn-ico{background:none;border:none;cursor:pointer;font-size:15px;color:var(--muted)}
+  .btn-ico:hover{color:var(--primary)}
+  /* 节点详情分区 */
+  .nd-rolebar{display:flex;align-items:center;gap:12px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+  .nd-host{font-size:13px;color:var(--muted)}
+  .nd-section{margin-bottom:14px}
+  .nd-title{font-size:13px;font-weight:600;color:var(--muted);margin-bottom:8px;letter-spacing:.3px}
+  .nd-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .nd-cell{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+  .nd-k{font-size:11px;color:var(--muted);margin-bottom:4px}
+  .nd-v{font-size:14px;color:var(--text);word-break:break-all}
+  .nd-v.on{color:var(--success);font-weight:700}
+  .nd-v.off{color:var(--danger);font-weight:700}
+</style>
+
+{% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
+{% if error %}<div class="banner err">⚠ {{ error }}</div>{% endif %}
+
+<!-- 单集群页：以下隐藏字段固定为当前集群 ID，供既有 JS 复用 -->
+<input type="hidden" id="ctlCluster" value="{{ cluster.id }}">
+<input type="hidden" id="logCluster" value="{{ cluster.id }}">
+<input type="hidden" id="termCluster" value="{{ cluster.id }}">
+
+<div class="toolbar">
+  <a class="btn" href="/clusters">← 集群总览</a>
+  <button class="btn" onclick="location.reload()">⟳ 刷新状态</button>
+  <button class="btn" onclick="openEdit({{ cluster.id }})">⚙ 修改配置/密码</button>
+  <a class="btn" href="/clusters/{{ cluster.id }}/backup">⤓ 备份恢复</a>
+  <div class="menu-wrap"><button class="btn" onclick="toggleMenu('switchMenu',event)">⇄ 手动切换主从 ▾</button>
+    <div class="menu" id="switchMenu"></div>
+  </div>
+  <span style="display:flex;align-items:center;gap:8px">自动切换<label class="switch"><input type="checkbox" id="swFailover" {% if auto_failover %}checked{% endif %} onchange="toggleAuto('AUTO_FAILOVER', this)"><span class="slider"></span></label></span>
+  <span style="display:flex;align-items:center;gap:8px">自动修复<label class="switch"><input type="checkbox" id="swRepair" {% if auto_repair %}checked{% endif %} onchange="toggleAuto('AUTO_REPAIR', this)"><span class="slider"></span></label></span>
+  <div class="menu-wrap"><button class="btn green" onclick="toggleMenu('fixMenu',event)">🛠 一键修复 ▾</button>
+    <div class="menu" id="fixMenu">
+      <a onclick="doRepair('heal_io')">修复复制延迟<span class="d">高延迟</span></a>
+      <a onclick="doRepair('heal_sql')">修复复制中断<span class="d">IO/SQL 报错</span></a>
+      <a onclick="doRepair('sync')">同步账号凭证<span class="d">支持自动</span></a>
+      <a onclick="doRepair('push')">重新下发配置<span class="d">支持自动</span></a>
+    </div>
+  </div>
+  <span class="spacer"></span><span class="badge ok">复制正常</span>
+</div>
+
+<!-- 集群概要 -->
+<div class="cd-summary">
+  <div class="cd-sum"><div class="k">集群名称</div><div class="v">{{ cluster.name }}</div></div>
+  <div class="cd-sum"><div class="k">VIP 地址</div><div class="v">{{ cluster.vip or '—' }}</div></div>
+  <div class="cd-sum"><div class="k">当前主库</div><div class="v {% if cluster.current_master == '未选举' %}bad{% else %}ok{% endif %}">{{ cluster.current_master }}</div></div>
+  <div class="cd-sum"><div class="k">节点在线</div><div class="v">{{ cluster.online }}/{{ cluster.node_count }}</div></div>
+  <div class="cd-sum"><div class="k">从库数量</div><div class="v">{{ cluster.slaves|length }}</div></div>
+  <div class="cd-sum"><div class="k">部署形态</div><div class="v">{{ cluster.node_type or 'docker' }}</div></div>
+</div>
+
+<div class="banner info">自动化说明：开启「自动修复」后，账号凭证密码漂移与节点配置漂移由管理器在轮询中自动校正（复用 ensure_ha_creds / 配置下发），无需登录节点手动操作。一键修复用于立即触发。</div>
+
+<div class="card">
+  <h3>节点状态<span style="flex:1"></span>
+    <span class="badge sky">集群 ID {{ cluster.id }}</span>
+  </h3>
+  <table class="tbl">
+    <thead>
+      <tr><th>节点</th><th>角色</th><th>在线状态</th><th>复制</th><th>延迟</th><th>操作</th></tr>
+    </thead>
+    <tbody>
+      {% for r in cluster.host_rows %}
+      <tr data-host="{{ r.host }}:{{ r.port }}" data-role="{{ 'master' if r.role == '主库' else 'slave' }}" data-cluster="{{ cluster.id }}">
+        <td class="mono">{{ r.host }}:{{ r.port }}</td>
+        <td><span class="role {{ 'role-master' if r.role == '主库' else 'role-slave' }}">{{ r.role }}</span></td>
+        <td>{% if r.status == 'up' %}<span class="badge up">在线</span>{% else %}<span class="badge down">离线</span>{% endif %}</td>
+        <td>{% if r.role == '主库' %}<span class="badge ok">正常</span>{% elif r.status != 'up' %}<span class="badge down">未启动</span>{% elif r.bad %}<span class="badge warn">异常</span>{% else %}<span class="badge ok">正常</span>{% endif %}</td>
+        <td class="mono">{% if r.role == '主库' %}—{% else %}{{ r.seconds_behind if r.seconds_behind is not none else '—' }}s{% endif %}</td>
+        <td><button class="btn btn-sm" onclick="openNodeDetail({{ cluster.id }}, '{{ r.host }}', {{ r.port }}, '{{ 'master' if r.role=='主库' else 'slave' }}')">详情</button></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" style="color:#8b9ac0;text-align:center;padding:24px;">该集群暂无节点。请前往「节点管理」添加节点。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>最近 24 小时数据库日志</h3>
+  <div class="history-tabs">
+    <div class="tab active" onclick="switchLogTab(this,'err')">错误日志</div>
+    <div class="tab" onclick="switchLogTab(this,'slow')">慢日志</div>
+    <span style="flex:1"></span>
+    <label class="switch" style="align-self:center" title="开启后管理器定时采集各节点慢日志到 mysql.slow_log">
+      <input type="checkbox" id="slowlogSwitch" {% if slowlog_enabled %}checked{% endif %} onchange="toggleSlowlog(this)">
+      <span class="slider"></span>
+    </label>
+    <span style="font-size:12px;color:var(--muted);white-space:nowrap;align-self:center">慢日志采集</span>
+    <span class="badge sky" id="logSrc">来源：mysql.error_log</span>
+    <button class="btn btn-sm" onclick="exportLog()">导出TXT</button>
+  </div>
+  <table class="tbl">
+    <thead><tr><th>时间</th><th>节点</th><th>级别</th><th>内容</th></tr></thead>
+    <tbody id="logBody"><tr><td colspan="4" style="color:#8b9ac0;text-align:center;">点击上方标签加载…</td></tr></tbody>
+  </table>
+  <div class="note">错误日志读取 mysql.error_log 表（不使用 SSH）；慢日志读取 mysql.slow_log 表，默认近 24h，支持导出 TXT。</div>
+</div>
+
+<div class="toolbar" style="margin-top:4px">
+  <button class="btn btn-primary" onclick="openTerm()">▷ 数据库终端</button>
+  <span class="spacer"></span><span class="badge sky">终端使用节点 root 账号（可读写 · 记录入审计）</span>
+</div>
+
+<!-- 节点详情 drawer -->
+<div class="drawer" id="nodeDrawer">
+  <header><b id="dHost">节点详情</b><span class="close" onclick="closeDrawer()">×</span></header>
+  <div class="body" id="dBody"><div class="obs-empty">加载中…</div></div>
+</div>
+
+<!-- 修改配置 / 密码 modal -->
+<div class="overlay" id="editOverlay" onclick="if(event.target===this)closeEdit()">
+  <div class="modal">
+    <header><b id="editTitle">修改集群配置 / 密码</b><span class="close" onclick="closeEdit()">×</span></header>
+    <div class="body">
+      <form method="post" id="editForm" action="/clusters/{{ cluster.id }}" class="grid2">
+        <label>集群名称<input name="name" id="ed_name" placeholder="如 prod-bj"></label>
+        <label>VIP 地址<input name="vip" id="ed_vip" placeholder="192.168.1.10"></label>
+        <label>VRID<input name="vrid" id="ed_vrid" placeholder="51"></label>
+        <label>VIP 端口<input name="vip_port" id="ed_vip_port" type="number" min="1" max="65535" placeholder="3307"></label>
+        <label>VIP 掩码位<input name="vip_prefix" id="ed_vip_prefix" placeholder="24"></label>
+        <label>网卡<input name="interface" id="ed_interface" placeholder="eth0"></label>
+
+        <div class="full" style="border-top:1px solid var(--border);margin-top:2px;padding-top:14px">
+          <div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:10px">
+            集群账号 / 密码
+            <span class="hint" style="font-weight:400">（留空=保持不变，勾选开关=重新生成随机密码并同步到在线节点）</span>
+          </div>
+        </div>
+
+        <label>HA 监控账号<input name="ha_user" id="ed_ha_user" placeholder="ha_monitor"></label>
+        <label>HA 监控密码
+          <div class="pw-row">
+            <input name="ha_pass" id="ed_ha_pass" type="password" placeholder="留空保持不变">
+            <label class="switch" style="flex:none" title="重新生成随机密码">
+              <input type="checkbox" name="ha_regen" value="1"><span class="slider"></span>
+            </label>
+          </div>
+        </label>
+        <label>复制账号<input name="repl_user" id="ed_repl_user" placeholder="replication"></label>
+        <label>复制密码
+          <div class="pw-row">
+            <input name="repl_pass" id="ed_repl_pass" type="password" placeholder="留空保持不变">
+            <label class="switch" style="flex:none" title="重新生成随机密码">
+              <input type="checkbox" name="repl_regen" value="1"><span class="slider"></span>
+            </label>
+          </div>
+        </label>
+        <label>业务账号<input name="app_user" id="ed_app_user" placeholder="app"></label>
+        <label>业务密码
+          <div class="pw-row">
+            <input name="app_pass" id="ed_app_pass" type="password" placeholder="留空保持不变">
+            <label class="switch" style="flex:none" title="重新生成随机密码">
+              <input type="checkbox" name="app_regen" value="1"><span class="slider"></span>
+            </label>
+          </div>
+        </label>
+
+        <div class="form-foot">
+          <button type="button" class="btn" onclick="closeEdit()">取消</button>
+          <button type="submit" class="btn btn-primary">保存并同步</button>
+        </div>
+      </form>
+      <div class="note" style="margin-top:10px">
+        保存后若修改了密码，管理器会立刻把新密码同步到该集群所有在线节点；节点侧需重载 keepalived 使 ha_check.conf 生效。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 数据库终端 modal -->
+<div class="overlay" id="termOverlay" onclick="if(event.target===this)closeTerm()">
+  <div class="modal term-modal" id="termModal">
+    <header><b>数据库终端</b>
+      <span class="badge sky" id="termAccount" style="margin-left:auto">账号 root（可读写）</span>
+      <button class="btn btn-sm" id="termFullBtn" onclick="toggleTermFull()" title="全屏">全屏</button>
+      <button class="btn btn-sm" onclick="closeTerm()">关闭</button>
+    </header>
+    <div class="body">
+      <div class="toolbar">
+        <select id="termNode" style="width:240px"></select>
+        <span style="flex:1"></span>
+        <button class="btn btn-sm" onclick="clearTerm()">清空</button>
+      </div>
+      <div class="term" id="termScreen">
+        <div class="term-output" id="termOutput"></div>
+        <div class="term-input-line"><span class="term-prompt" id="termPrompt">mysql&gt;</span><input id="termInput" class="term-input" onkeydown="onTermKey(event)" autocomplete="off" spellcheck="false" placeholder="输入 SQL，; 或 \g 结束 · Tab 补全 · ↑/↓ 历史"></div>
+      </div>
+      <div class="note">mysql CLI 风格：直接输入 SQL，以 <b>;</b> 或 <b>\g</b> 结束回车执行，多行续写（提示符 →）；支持 ↑/↓ 历史、Tab 补全、<b>\c \h \s \G</b> 等命令；默认使用节点 root 账号（可读写），执行记录写入审计日志，高危 DDL/DML 会二次确认。</div>
+    </div>
+    <footer><button class="btn" onclick="closeTerm()">关闭</button></footer>
+  </div>
+</div>
+
+<script>
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+  function escAttr(s){return String(s==null?"":s).replace(/"/g,"&quot;");}
+  function toast(msg,kind){
+    var t=document.getElementById("toastBox");
+    if(!t){t=document.createElement("div");t.id="toastBox";t.style.cssText="position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:2000;display:flex;flex-direction:column;gap:8px";document.body.appendChild(t);}
+    var el=document.createElement("div");
+    el.textContent=msg;
+    el.style.cssText="background:"+(kind==="err"?"#e11d48":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
+    t.appendChild(el);setTimeout(function(){el.remove();},2600);
+  }
+  function apiPost(url,body,cb){
+    fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams(body)})
+      .then(function(r){return r.json();}).then(cb)
+      .catch(function(e){toast("请求失败: "+e,"err");});
+  }
+  function toggleMenu(id,e){e.stopPropagation();var m=document.getElementById(id);m.classList.toggle("show");}
+  document.addEventListener("click",function(){document.querySelectorAll(".menu").forEach(function(m){m.classList.remove("show");});});
+
+  var CID = {{ cluster.id }};
+  var CLUSTER = {{ cluster.js|tojson }};
+
+  function curCid(){ return String(CID); }
+
+  // ---- 修改配置 / 密码 ----
+  function openEdit(cid){
+    var c = CLUSTER;
+    document.getElementById("editTitle").textContent = "修改配置 / 密码 · " + (c.name||"");
+    document.getElementById("editForm").action = "/clusters/" + cid;
+    var set=function(id,v){var e=document.getElementById(id);if(e)e.value=(v==null?"":v);};
+    set("ed_name",c.name); set("ed_vip",c.vip); set("ed_vrid",c.vrid);
+    set("ed_vip_port",c.vip_port); set("ed_vip_prefix",c.vip_prefix); set("ed_interface",c.interface);
+    var cr=c.creds||{};
+    set("ed_ha_user",cr.ha_user); set("ed_repl_user",cr.repl_user); set("ed_app_user",cr.app_user);
+    set("ed_ha_pass",""); set("ed_repl_pass",""); set("ed_app_pass","");
+    document.querySelectorAll('#editForm input[type="checkbox"]').forEach(function(x){x.checked=false;});
+    document.getElementById("editOverlay").classList.add("show");
+  }
+  function closeEdit(){document.getElementById("editOverlay").classList.remove("show");}
+
+  // ---- 手动切换主从 ----
+  function clusterRows(){
+    return Array.prototype.filter.call(document.querySelectorAll('.tbl tbody tr[data-host]'),function(r){
+      return r.getAttribute("data-cluster")===curCid();
+    });
+  }
+  function rebuildMenus(){
+    var m=document.getElementById("switchMenu"); if(!m)return;
+    var items=[];
+    clusterRows().forEach(function(r){
+      var host=r.getAttribute("data-host"), role=r.getAttribute("data-role");
+      if(role==="slave") items.push('<a onclick="doManualSwitch(\''+host+'\')">提升 '+esc(host)+' 为主<span class="d">当前为从</span></a>');
+      else items.push('<a onclick="alert(\''+esc(host)+' 已是当前主库\')">保持 '+esc(host)+' 为主<span class="d">当前为主</span></a>');
+    });
+    m.innerHTML=items.join("")||'<a style="color:#8b9ac0;cursor:default">暂无节点</a>';
+  }
+  function doManualSwitch(hp){
+    var p=hp.split(":");
+    apiPost("/api/failover/to",{host:p[0],port:p[1],cluster_id:curCid()},function(d){
+      toast(d.msg||(d.ok?"已切换为主":"切换失败"),d.ok?"ok":"err");
+      if(d.ok)setTimeout(function(){location.reload();},1200);
+    });
+  }
+
+  // ---- 自动切换/修复开关 ----
+  function toggleAuto(key,el){
+    apiPost("/api/setting_set",{key:key,value:el.checked?"1":"0"},function(d){
+      toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");
+    });
+  }
+
+  // ---- 一键修复 ----
+  function doRepair(act){
+    var cid=curCid();
+    if(act==="sync"){apiPost("/clusters/"+cid+"/sync",{},function(d){toast(d.msg||(d.ok?"已同步凭证":"同步失败"),d.ok?"ok":"err");});return;}
+    if(act==="push"){toast("下发配置：请在目标节点执行 docker compose -f /opt/mysql/compose.yml up -d 重新加载 keepalived","ok");return;}
+    var rows=Array.prototype.filter.call(document.querySelectorAll('.tbl tbody tr[data-host][data-role="slave"]'),function(r){
+      return r.getAttribute("data-cluster")===cid;
+    });
+    var n=0;
+    rows.forEach(function(r){
+      var hp=r.getAttribute("data-host").split(":");
+      (function(host,port){apiPost("/api/heal",{host:host,port:port,cluster_id:cid},function(d){toast(host+":"+port+" "+(d.msg||(d.ok?"已修复":"失败")),d.ok?"ok":"err");});})(hp[0],hp[1]);
+      n++;
+    });
+    if(n===0)toast("该集群无可用从库","err");
+  }
+
+  // ---- 节点详情 drawer ----
+  function openNodeDetail(cid,host,port,role){
+    var d=document.getElementById("nodeDrawer");
+    document.getElementById("dHost").textContent="节点详情 · "+host+":"+port+(role==='master'?' · MASTER':' · SLAVE');
+    document.getElementById("dBody").innerHTML='<div class="obs-empty">加载中…</div>';
+    d.classList.add("show");
+    fetch("/api/node_detail",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:new URLSearchParams({cluster_id:cid,host:host,port:port})})
+      .then(function(r){return r.json();})
+      .then(function(d){renderNodeDetail(d,cid,role);})
+      .catch(function(e){document.getElementById("dBody").innerHTML='<div class="err-cell">请求失败: '+esc(e)+'</div>';});
+  }
+  function closeDrawer(){document.getElementById("nodeDrawer").classList.remove("show");}
+  function credBlock(label,user,pw){
+    if(!user&&!pw)return "";
+    return '<div class="cred-row2"><div class="cr-label">'+esc(label)+'</div>'
+      +'<div class="cr-line">用户 <b>'+esc(user||"—")+'</b></div>'
+      +'<div class="cr-line">密码 <span class="pw">'+esc(pw||"—")+'</span>'
+      +' <button class="btn-ico" type="button" data-copy="'+escAttr(pw||"")+'" onclick="copyAttr(this)">⧉</button></div></div>';
+  }
+  function copyAttr(b){
+    var t=b.getAttribute("data-copy");
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){toast("已复制","ok");},function(){toast("复制失败","err");});}
+  }
+  function chip(t,c){return '<span class="badge '+c+'">'+esc(t)+'</span>';}
+  function renderNodeDetail(d,cid,role){
+    var body=document.getElementById("dBody");
+    if(!d.ok){body.innerHTML='<div class="err-cell">'+esc(d.error||"加载失败")+'</div>';return;}
+    role=role||'slave';
+    var roleCls=role==='master'?'master':'slave';
+    var roleTxt=role==='master'?'MASTER':'SLAVE';
+    var ro=(d.read_only==="ON"||d.read_only==="1"||d.read_only===true);
+    var gm=(d.gtid_mode==="ON");
+    var html="";
+    if(d.conn_error)html+='<div class="banner err">无法连接节点：'+esc(d.conn_error)+'</div>';
+    html+='<div class="nd-rolebar"><span class="role role-'+roleCls+'">'+roleTxt+'</span>'
+      +'<span class="nd-host mono">'+esc(d.host||"-")+':'+(d.port||3306)+'</span></div>';
+    html+='<div class="nd-section"><div class="nd-title">角色与实例参数</div><div class="nd-row">'
+      +'<div class="nd-cell"><div class="nd-k">read_only</div><div class="nd-v mono'+(ro?' on':' off')+'">'+esc(d.read_only||"—")+'</div></div>'
+      +'<div class="nd-cell"><div class="nd-k">GTID 模式</div><div class="nd-v mono">'+chip(gm?"ON":"OFF",gm?"ok":"down")+'</div></div>'
+      +'<div class="nd-cell"><div class="nd-k">Server ID</div><div class="nd-v mono">'+esc(d.server_id||"—")+'</div></div>'
+      +'</div></div>';
+    html+='<div class="nd-section"><div class="nd-title">目录</div><div class="nd-row">'
+      +'<div class="nd-cell"><div class="nd-k">部署目录(compose)</div><div class="nd-v mono">'+esc(d.compose_path||"—")+'</div></div>'
+      +'<div class="nd-cell"><div class="nd-k">数据目录(datadir)</div><div class="nd-v mono">'+esc(d.datadir||"—")+'</div></div>'
+      +'</div></div>';
+    html+='<div class="nd-section"><div class="nd-title">数据库账号<span class="dd-note"> 仅管理员可见</span></div>';
+    html+=credBlock("节点 root（本地独立密码）",d.root_user,d.root_pass);
+    html+=credBlock("HA 监控账号",d.ha_user,d.ha_pass);
+    html+=credBlock("复制账号",d.repl_user,d.repl_pass);
+    html+=credBlock("业务账号",d.app_user,d.app_pass);
+    html+='</div>';
+    html+='<div class="nd-section"><div class="nd-title">自愈操作</div><div style="display:flex;gap:8px;flex-wrap:wrap;">'
+      +'<button class="btn btn-sm" onclick="showSelfhealSql('+cid+",'"+d.host+"',"+d.port+')">查看自愈 SQL</button>'
+      +'<a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+"&host="+encodeURIComponent(d.host)+"&port="+d.port+'&download=1" download="fix-node-creds.sql">下载修复 SQL</a>'
+      +'</div></div>';
+    body.innerHTML=html;
+  }
+  function showSelfhealSql(cid,host,port){
+    var existing=document.getElementById("sqlModal");
+    if(existing)existing.parentNode.removeChild(existing);
+    var box=document.createElement("div");
+    box.id="sqlModal";
+    box.style.cssText="position:fixed;inset:0;background:rgba(15,23,42,.5);z-index:200;display:flex;align-items:center;justify-content:center;";
+    box.innerHTML='<div style="background:var(--surface);width:min(720px,92vw);max-height:84vh;overflow:auto;border-radius:14px;padding:16px 18px;box-shadow:0 20px 60px rgba(0,0,0,.55);">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+      +'<h3 style="margin:0;">节点自愈 / 修复 SQL</h3>'
+      +'<button class="btn btn-sm" onclick="closeSqlModal()">✕</button></div>'
+      +'<pre id="sqlModalBody" style="white-space:pre-wrap;max-height:58vh;overflow:auto;background:var(--surface-3);color:var(--text);padding:14px;border-radius:10px;font-size:12.5px;margin:0;"></pre>'
+      +'<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end;">'
+      +'<button class="btn btn-sm" onclick="copySql()">复制</button>'
+      +'<a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+'&host='+encodeURIComponent(host)+'&port='+port+'&download=1" download="fix-node-creds.sql">下载</a>'
+      +'</div></div>';
+    box.onclick=function(e){if(e.target===box)closeSqlModal();};
+    document.body.appendChild(box);
+    var pre=box.querySelector("#sqlModalBody");
+    pre.textContent="加载中…";
+    fetch("/api/node_creds_sql?cluster_id="+cid+"&host="+encodeURIComponent(host)+"&port="+port)
+      .then(function(r){return r.json();}).then(function(d){
+        pre.textContent=d.ok?(d.sql||"(无内容)"):("加载失败: "+(d.error||""));
+      }).catch(function(e){pre.textContent="请求失败: "+e;});
+  }
+  function closeSqlModal(){var m=document.getElementById("sqlModal");if(m)m.parentNode.removeChild(m);}
+  function copySql(){var t=document.getElementById("sqlModalBody");if(t&&navigator.clipboard)navigator.clipboard.writeText(t.textContent);}
+
+  // ---- 最近 24h 日志 ----
+  var _logTab="err";
+  window._cmMap = {};
+  {% if cluster.current_master and cluster.current_master != "未选举" %}window._cmMap[{{ cluster.id }}] = "{{ cluster.current_master }}";{% endif %}
+  function masterOfCluster(cid){ return window._cmMap ? (window._cmMap[cid]||null) : null; }
+
+  function switchLogTab(el,kind){
+    document.querySelectorAll(".history-tabs .tab").forEach(function(t){t.classList.remove("active");});
+    el.classList.add("active");
+    _logTab=kind;
+    document.getElementById("logSrc").textContent = kind==="slow"?"来源：mysql.slow_log":"来源：mysql.error_log";
+    loadCurrentLog();
+  }
+  function loadCurrentLog(){
+    var cid=document.getElementById("logCluster").value;
+    var cm=masterOfCluster(cid);
+    var body=document.getElementById("logBody");
+    body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">加载中…</td></tr>';
+    if(!cm){body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">该集群无主库，无法读取日志</td></tr>';return;}
+    var p=cm.split(":");
+    if(_logTab==="slow"){
+      fetch("/api/slow_log?cluster_id="+cid+"&host="+encodeURIComponent(p[0])+"&port="+p[1]+"&limit=200")
+        .then(function(r){return r.json();}).then(function(d){
+          var rows=(d.rows||[]).slice(0,50);
+          if(!rows.length){body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">慢日志为空（采集可能未开启）</td></tr>';return;}
+          body.innerHTML=rows.map(function(r){
+            return '<tr><td>'+(r.ts||"—")+'</td><td class="mono">'+esc(cm)+'</td>'
+              +'<td><span class="badge sky">Slow</span></td>'
+              +'<td style="white-space:normal;word-break:break-word;">'+esc((r.sql_text||"").slice(0,300))+'</td></tr>';
+          }).join("");
+        }).catch(function(e){body.innerHTML='<tr><td colspan="4" style="color:#fb7185;">请求失败：'+esc(e)+'</td></tr>';});
+    }else{
+      apiPost("/api/node_error_log",{cluster_id:cid,host:p[0],port:p[1],limit:100},function(d){
+        if(!d.ok){body.innerHTML='<tr><td colspan="4" style="color:#fb7185;">'+(d.path?"路径: "+esc(d.path)+"<br>":"")+esc(d.error||"加载失败")+'</td></tr>';return;}
+        var lines=(d.lines||[]).slice(-50);
+        if(!lines.length){body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">错误日志为空</td></tr>';return;}
+        body.innerHTML=lines.map(function(l){
+          var level=/error|aborted|GLIBCXX/i.test(l)?"down":(/warn/i.test(l)?"warn":"sky");
+          return '<tr><td>'+esc(l.slice(0,19))+'</td><td class="mono">'+esc(cm)+'</td>'
+            +'<td><span class="badge '+level+'">'+(level==="down"?"Error":(level==="warn"?"Warn":"Info"))+'</span></td>'
+            +'<td style="white-space:normal;word-break:break-word;">'+esc(l.slice(19))+'</td></tr>';
+        }).join("");
+      });
+    }
+  }
+  function exportLog(){
+    var body=document.getElementById("logBody");
+    var txt=Array.prototype.map.call(body.querySelectorAll("tr"),function(tr){
+      return Array.prototype.map.call(tr.querySelectorAll("td"),function(td){return td.textContent.trim();}).join("\t");
+    }).filter(Boolean).join("\n");
+    var blob=new Blob([txt],{type:"text/plain;charset=utf-8"});
+    var a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download="cluster_"+curCid()+"_"+_logTab+".txt";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+  function toggleSlowlog(el){
+    apiPost("/api/setting_set",{key:"SLOWLOG_ENABLED",value:el.checked?"1":"0"},function(d){
+      toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");
+    });
+  }
+
+  // ---- 数据库终端（mysql CLI 风格） ----
+  function fillTermNodes(){
+    var sel=document.getElementById("termNode");
+    sel.innerHTML="";
+    document.querySelectorAll('.tbl tbody tr[data-host]').forEach(function(r){
+      var o=document.createElement("option");
+      o.value=r.getAttribute("data-host");
+      o.textContent=r.getAttribute("data-host")+(r.getAttribute("data-role")==="master"?"（主）":"（从）");
+      sel.appendChild(o);
+    });
+    if(!sel.options.length){var o=document.createElement("option");o.value="";o.textContent="无节点";sel.appendChild(o);}
+  }
+  function openTerm(){
+    var m=document.getElementById("termModal"),ov=document.getElementById("termOverlay");
+    if(m.parentNode!==ov)ov.appendChild(m);
+    m.classList.remove("term-full");
+    document.body.classList.remove("term-fs");
+    document.getElementById("termFullBtn").textContent="全屏";
+    ov.classList.add("show");
+    fillTermNodes();
+    var o=document.getElementById("termOutput");
+    if(o && !o.dataset.boot){
+      o.dataset.boot="1";
+      termAppend("Custos 交互终端（mysql CLI 风格）","term-hint");
+      termAppend("输入 SQL 以 ; 或 \\g 结束回车执行；多行续写；↑/↓ 历史；Tab 补全；\\h 帮助。","term-hint");
+    }
+    setTimeout(function(){var i=document.getElementById("termInput");if(i)i.focus();},60);
+  }
+  function exitTermFull(){
+    var m=document.getElementById("termModal"),ov=document.getElementById("termOverlay"),fb=document.getElementById("termFullBtn");
+    if(m&&m.parentNode!==ov)ov.appendChild(m);
+    if(m)m.classList.remove("term-full");
+    document.body.classList.remove("term-fs");
+    if(fb)fb.textContent="全屏";
+  }
+  function closeTerm(){exitTermFull();document.getElementById("termOverlay").classList.remove("show");}
+  function toggleTermFull(){
+    var m=document.getElementById("termModal"),fb=document.getElementById("termFullBtn");
+    if(!m)return;
+    if(m.classList.contains("term-full")){exitTermFull();}
+    else{
+      document.body.appendChild(m);
+      m.classList.add("term-full");
+      document.body.classList.add("term-fs");
+      if(fb)fb.textContent="退出全屏";
+      var i=document.getElementById("termInput");if(i)i.focus();
+    }
+  }
+
+  var termHistory=[],termHistIdx=0;
+  var termBuf="", termCont=false;
+  var termCacheKey="", termComps=null, termCompLoading=false;
+  var TERM_KEYWORDS=["SELECT","INSERT","UPDATE","DELETE","FROM","WHERE","SET","SHOW","USE","CREATE","ALTER","DROP","GRANT","REVOKE","TABLE","DATABASE","INDEX","JOIN","ON","AND","OR","NOT","NULL","ORDER","GROUP","BY","LIMIT","VALUES","INTO","AS","DESC","ASC","COUNT","DISTINCT","LEFT","RIGHT","INNER","OUTER","REPLACE"];
+
+  function termAppend(text,cls){
+    var o=document.getElementById("termOutput");
+    var d=document.createElement("div");
+    if(cls)d.className=cls;
+    d.textContent=text;
+    o.appendChild(d);
+    o.scrollTop=o.scrollHeight;
+  }
+  function clearTerm(){var o=document.getElementById("termOutput");if(o){o.innerHTML="";o.dataset.boot="";}}
+  function setTermPrompt(p){var s=document.getElementById("termPrompt");if(s)s.textContent=p;}
+  function isHighRisk(sql){
+    var s=sql.replace(/^\s*\([^)]*\)/,"").toUpperCase();
+    return /\b(DROP|DELETE|TRUNCATE|ALTER|RENAME|UPDATE|GRANT|REVOKE|CREATE\s+USER|DROP\s+USER|FLUSH\s+PRIVILEGES|SET\s+GLOBAL|RESET\s+MASTER|RESET\s+SLAVE|STOP\s+(REPLICA|SLAVE)|START\s+(REPLICA|SLAVE)|CHANGE\s+(MASTER|REPLICATION)|PURGE\s+BINARY|PURGE\s+MASTER)\b/.test(s);
+  }
+  function termCaretEnd(i){ try{ i.setSelectionRange(i.value.length,i.value.length); }catch(e){} }
+  function onTermKey(e){
+    var i=document.getElementById("termInput");
+    if(e.key==="ArrowUp"){
+      if(termHistIdx>0){ termHistIdx--; i.value=termHistory[termHistIdx]||""; termCaretEnd(i); }
+      e.preventDefault(); return;
+    }
+    if(e.key==="ArrowDown"){
+      if(termHistIdx<termHistory.length-1){ termHistIdx++; i.value=termHistory[termHistIdx]||""; }
+      else { termHistIdx=termHistory.length; i.value=""; }
+      termCaretEnd(i); e.preventDefault(); return;
+    }
+    if(e.key==="Tab"){ e.preventDefault(); doComplete(); return; }
+    if(e.key!=="Enter") return;
+    e.preventDefault();
+    var line=i.value;
+    if(!line.trim()){ termAppend(termCont?"    -> ":"mysql> ","term-cont"); i.value=""; return; }
+    if(termHistory[termHistory.length-1]!==line) termHistory.push(line);
+    if(termHistory.length>200) termHistory.shift();
+    termHistIdx=termHistory.length;
+    termAppend((termCont?"    -> ":"mysql> ")+line, termCont?"term-cont":"term-cmd");
+    termBuf = termCont ? (termBuf+"\n"+line) : line;
+    i.value="";
+    var trimmed=termBuf.replace(/\s+$/,"");
+    var vert=false, term=false;
+    if(trimmed.endsWith("\\G")){ vert=true; term=true; trimmed=trimmed.slice(0,-2).replace(/\s+$/,""); }
+    else if(trimmed.endsWith("\\g")){ term=true; trimmed=trimmed.slice(0,-2).replace(/\s+$/,""); }
+    if(trimmed.endsWith(";")){ term=true; trimmed=trimmed.replace(/;$/,"").replace(/\s+$/,""); }
+    if(term){
+      termCont=false; setTermPrompt("mysql> ");
+      if(trimmed.trim()) execTerm(trimmed, vert);
+      else if(vert){ termAppend("提示：竖向输出仅对单条以 \\G 结尾的语句生效。","term-hint"); }
+      termBuf="";
+    } else if(/^\s*\\[a-zA-Z]/.test(termBuf)){
+      handleBackslash(termBuf.trim());
+      termBuf=""; termCont=false; setTermPrompt("mysql> ");
+    } else {
+      termCont=true; setTermPrompt("    -> ");
+    }
+  }
+  function handleBackslash(cmd){
+    if(cmd==="\\c"){ termAppend("已清空当前输入缓冲。","term-hint"); return; }
+    if(cmd==="\\h"||cmd==="\\?"){ termAppend(HELP_TEXT,"term-hint"); return; }
+    if(cmd==="\\s"){ printTermStatus(); return; }
+    termAppend("ERROR: 未知命令 '"+cmd+"'。输入 \\h 查看帮助。","term-err");
+  }
+  function printTermStatus(){
+    termAppend("--------------","term-hint");
+    termAppend("集群: "+(CLUSTER.name||"")+"  (id="+CID+")","term-hint");
+    termAppend("节点: "+(document.getElementById("termNode").value||"（未选择）"),"term-hint");
+    termAppend("连接账号: "+document.getElementById("termAccount").textContent,"term-hint");
+    termAppend("--------------","term-hint");
+  }
+  function execTerm(sql, vert){
+    sql=sql.trim();
+    if(!sql) return;
+    if(isHighRisk(sql) && !confirm("高危操作二次确认：\n\n"+sql.slice(0,300)+"\n\n确定在当前节点执行？")){
+      termAppend("已取消执行。","term-hint"); return;
+    }
+    var nv=document.getElementById("termNode").value;
+    if(!nv){toast("请先选择节点","err"); return;}
+    var hp=nv.split(":");
+    var busy=document.createElement("div");
+    busy.textContent="Querying..."; busy.className="term-busy";
+    document.getElementById("termOutput").appendChild(busy);
+    document.getElementById("termOutput").scrollTop=document.getElementById("termOutput").scrollHeight;
+    apiPost("/api/term",{cluster_id:CID,host:hp[0],port:hp[1],sql:sql},function(d){
+      if(busy.parentNode)busy.parentNode.removeChild(busy);
+      if(!d.ok){
+        var code=d.error_code!=null?d.error_code:"00000";
+        termAppend("ERROR "+code+" ("+(d.sqlstate||"HY000")+"): "+(d.error||""),"term-err");
+        return;
+      }
+      var ac=document.getElementById("termAccount");
+      if(ac&&d.account)ac.textContent="账号 "+(d.account||"");
+      var dur=(d.duration!=null?d.duration:0);
+      if(d.cols&&d.cols.length){
+        termAppend(formatTable(d.cols,d.rows,vert),"term-table");
+        termAppend(d.count+" rows in set ("+dur+" sec)","term-foot");
+      } else {
+        termAppend("Query OK, "+(d.count||0)+" row(s) affected ("+dur+" sec)","term-foot");
+      }
+    });
+  }
+  function formatTable(cols, rows, vert){
+    if(vert){
+      var out=[];
+      rows.forEach(function(r,ri){
+        out.push("********** "+ (ri+1) +". row **********");
+        cols.forEach(function(c,ci){ out.push("   "+c+": "+(r[ci]===null?"NULL":String(r[ci]))); });
+      });
+      return out.join("\n");
+    }
+    function w(v){ return String(v===null?"NULL":v).length; }
+    var widths=cols.map(function(c){return c.length;});
+    rows.forEach(function(r){ r.forEach(function(v,ci){ if(widths[ci]<w(v))widths[ci]=w(v); }); });
+    function fmt(row){ return "| "+row.map(function(v,ci){ var s=String(v===null?"NULL":v); return s+" ".repeat(widths[ci]-s.length); }).join(" | ")+" |"; }
+    var sep="+-" + widths.map(function(x){return "-".repeat(x);}).join("-+-") + "-+";
+    var lines=[sep, fmt(cols), sep];
+    rows.forEach(function(r){ lines.push(fmt(r)); });
+    lines.push(sep);
+    return lines.join("\n");
+  }
+  function doComplete(){
+    var i=document.getElementById("termInput");
+    var val=i.value;
+    var caret=(i.selectionStart!=null)?i.selectionStart:val.length;
+    var m=val.slice(0,caret).match(/([A-Za-z_][A-Za-z0-9_$.]*)$/);
+    if(!m) return;
+    var word=m[1], start=m.index;
+    var key=CID+"|"+document.getElementById("termNode").value;
+    function apply(list){
+      var matches=list.filter(function(x){return x.toLowerCase().indexOf(word.toLowerCase())===0;});
+      if(!matches.length) return;
+      if(matches.length===1){ replaceWord(val,start,caret,word,matches[0]); return; }
+      var cp=matches.reduce(function(a,b){var k=0;while(k<a.length&&k<b.length&&a[k].toLowerCase()===b[k].toLowerCase())k++;return a.slice(0,k);});
+      if(cp.length>word.length) replaceWord(val,start,caret,word,cp);
+      termAppend(matches.join("   "),"term-hint");
+      document.getElementById("termInput").focus();
+    }
+    if(termCacheKey===key && termComps){ apply(termComps); return; }
+    if(termCompLoading) return;
+    termCompLoading=true;
+    var nv=document.getElementById("termNode").value;
+    if(!nv){termCompLoading=false;return;}
+    var hp=nv.split(":");
+    apiPost("/api/term_complete",{cluster_id:CID,host:hp[0],port:hp[1]},function(d){
+      termCompLoading=false;
+      if(d.ok){ termCacheKey=key; termComps=d.completions||[]; }
+      else { termComps=TERM_KEYWORDS.slice(); termCacheKey=key; }
+      apply(termComps);
+    });
+  }
+  function replaceWord(val,start,caret,word,rep){
+    var i=document.getElementById("termInput");
+    i.value=val.slice(0,start)+rep+val.slice(caret);
+    var pos=(val.slice(0,start)+rep).length;
+    try{i.setSelectionRange(pos,pos);}catch(e){}
+  }
+  var HELP_TEXT="Custos 终端帮助：\n"
+    +"  ; 或 \\g    结束语句并执行\n"
+    +"  \\G         结束语句并以竖向格式显示\n"
+    +"  \\c         清空当前输入缓冲\n"
+    +"  \\h \\?      显示本帮助\n"
+    +"  \\s         显示当前连接状态\n"
+    +"  回车        发送当前行；未以 ;/\\g/\\G 结尾则续写多行(提示符 ->)\n"
+    +"  ↑/↓        历史命令    Tab  补全(库/表/列/关键字)\n"
+    +"支持全部 SQL（可读写）；高危 DDL/DML 会二次确认。";
+
+  rebuildMenus();
+  if(document.getElementById("logCluster") && document.getElementById("logCluster").value) loadCurrentLog();
+</script>
+{% endblock %}

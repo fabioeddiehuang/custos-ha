@@ -773,9 +773,28 @@
   checkVip();
   loadAlertCount();
   loadSwitchHistory();
+  function autoPickObsCluster(done) {
+    var sel = document.getElementById("obsCluster");
+    if (!sel || !sel.options.length) { if (done) done(); return; }
+    var opts = [].slice.call(sel.options).map(function (o) { return o.value; });
+    var i = 0;
+    (function step() {
+      if (i >= opts.length) { if (done) done(); return; }
+      var cid = opts[i];
+      fetch("/api/metric_history?cluster_id=" + cid + "&hours=24", { cache: "no-store", credentials: "same-origin" })
+        .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { return null; } }); })
+        .then(function (d) {
+          var rows = (d && d.rows) ? d.rows : [];
+          if (rows.length) { sel.value = cid; if (done) done(); }
+          else { i++; step(); }
+        })
+        .catch(function () { i++; step(); });
+    })();
+  }
+
   var _obsSel = document.getElementById("obsCluster");
   var _hasObs = !!(_obsSel && _obsSel.options && _obsSel.options.length);
-  if (_hasObs) { loadTrend(); loadSlow(); loadDrift(); }
+  if (_hasObs) { autoPickObsCluster(function () { loadTrend(); loadSlow(); loadDrift(); }); }
   loadActivity();
   setInterval(function () { refreshStatus(false); }, 10000);
   setInterval(checkVip, 15000);
