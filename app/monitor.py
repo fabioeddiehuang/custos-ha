@@ -2,7 +2,8 @@
 import concurrent.futures as _cf
 import threading
 import time
-from .config import CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENABLED
+from .config import (CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENABLED,
+                     HEARTBEAT_INTERVAL, METRICS_INTERVAL, DRIFT_INTERVAL)
 from .db import query, execute, get_setting
 from .ha_client import get_status, heal_replication, heal_io_gtid_gap
 from .state import get_current_master
@@ -22,8 +23,24 @@ _PREV = {}
 # 崩溃、永远不探活/不建复制/不漂 VIP（即「全离线」根因）。
 
 
+# 每个节点心跳(last_seen)上一次落库的 monotonic 时刻，用于 HEARTBEAT_INTERVAL 限频
+_HEARTBEAT_AT = {}
+
+
+def _same(a, b):
+    """归一化后比对：None 与空串视为等价，其余统一按字符串比较。"""
+    return ("" if a is None else str(a)) == ("" if b is None else str(b))
+
+
 def _update_host(h, st, is_master=False):
-    """把节点探活结果写回 hosts；在线但复制线程中断时，记录真实复制错误便于排错。"""
+    """把节点探活结果写回 hosts；在线但复制线程中断时，记录真实复制错误便于排错。
+
+    【空闲零写入】稳态（探活结果与库中已有记录完全一致）时**一次写都不做**。
+    旧实现每周期对每个节点无条件 UPDATE，且含 `last_seen=NOW()` —— 该字段每次必变，
+    导致稳态下每个节点每周期都产生一次真实行更新 + commit；管理库若开了
+    sync_binlog=1，就直接表现为持续的磁盘写入。
+    last_seen 改为按 HEARTBEAT_INTERVAL 限频（设为 0 则完全不写）。
+    """
     err = None
     if not st["alive"]:
         err = st.get("error") or "探活失败"
@@ -38,14 +55,44 @@ def _update_host(h, st, is_master=False):
             if st.get("slave_sql") != "Yes" and sql_err:
                 parts.append("SQL错误: " + sql_err)
             err = "；".join(parts) if parts else "复制线程异常(IO/SQL 非 Yes)"
-    execute(
-        """UPDATE hosts SET status=%s, role=%s, repl_delay=%s, slave_io=%s, slave_sql=%s,
-           err=%s, last_seen=NOW() WHERE cluster_id=%s AND host=%s AND port=%s""",
-        (("up" if st["alive"] else "down"), st["role"],
-         st["seconds_behind"], st["slave_io"], st["slave_sql"],
-         err,
-         h["cluster_id"], h["host"], int(h["port"])),
+
+    status = "up" if st["alive"] else "down"
+    role = st["role"]
+    delay = st["seconds_behind"]
+    s_io = st["slave_io"]
+    s_sql = st["slave_sql"]
+
+    # 与库中当前值逐字段比对，全部一致则视为「无变化」
+    changed = not (
+        _same(status, h.get("status")) and _same(role, h.get("role"))
+        and _same(delay, h.get("repl_delay")) and _same(s_io, h.get("slave_io"))
+        and _same(s_sql, h.get("slave_sql")) and _same(err, h.get("err"))
     )
+
+    hb_due = False
+    if HEARTBEAT_INTERVAL > 0:
+        _k = (h["cluster_id"], h["host"], int(h["port"]))
+        if time.monotonic() - _HEARTBEAT_AT.get(_k, 0.0) >= HEARTBEAT_INTERVAL:
+            hb_due = True
+            _HEARTBEAT_AT[_k] = time.monotonic()
+
+    if not changed and not hb_due:
+        return  # 稳态：不产生任何写库
+
+    if hb_due:
+        execute(
+            """UPDATE hosts SET status=%s, role=%s, repl_delay=%s, slave_io=%s, slave_sql=%s,
+               err=%s, last_seen=NOW() WHERE cluster_id=%s AND host=%s AND port=%s""",
+            (status, role, delay, s_io, s_sql, err,
+             h["cluster_id"], h["host"], int(h["port"])),
+        )
+    else:
+        execute(
+            """UPDATE hosts SET status=%s, role=%s, repl_delay=%s, slave_io=%s, slave_sql=%s,
+               err=%s WHERE cluster_id=%s AND host=%s AND port=%s""",
+            (status, role, delay, s_io, s_sql, err,
+             h["cluster_id"], h["host"], int(h["port"])),
+        )
 
 
 def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, cluster_id):
@@ -221,8 +268,10 @@ def _probe_all():
             continue  # 该集群尚未配置受管账号，跳过
         cur_h, cur_p = get_current_master(cid)
         cur_key = (cur_h, int(cur_p)) if cur_h else None
+        # 一并把「待比对」的当前值查出来：_update_host 需要它们做变更检测（空闲时不写库）
         hosts = query(
-            "SELECT host, port, cluster_id FROM hosts WHERE cluster_id=%s", (cid,))
+            "SELECT host, port, cluster_id, status, role, repl_delay, slave_io, slave_sql, err "
+            "FROM hosts WHERE cluster_id=%s", (cid,))
         for h in hosts:
             # 兼容历史数据：hosts.port 可能为 NULL/非法，跳过避免 int() 崩溃
             try:
@@ -401,27 +450,48 @@ def run_forever():
         time.sleep(int(get_setting("CHECK_INTERVAL", "2") or 2))
 
 
-# 周期计数：用于错峰触发采集任务（避免每周期都重连库写指标）。
+# 周期计数：慢日志仍按周期倍数（默认关闭，影响可忽略）
 _COLLECT_CYCLE = {"metrics": 0, "slow": 0, "drift": 0}
-# 采集周期倍数（相对于 CHECK_INTERVAL）：指标采样较频繁，慢日志/漂移较稀疏。
-_METRICS_EVERY = 3      # 约 CHECK_INTERVAL*3（默认 9s）采样一次指标
-_SLOW_EVERY = 20        # 约默认 60s 采集一次慢日志
-_DRIFT_EVERY = 20       # 约默认 60s 巡检一次配置漂移
+# 采集时间戳（monotonic，秒）：指标/漂移改为**按秒限频**，不随 CHECK_INTERVAL 变化而漂移
+_COLLECT_AT = {"metrics": 0.0, "slow": 0.0, "drift": 0.0}
+_SLOW_EVERY = 20        # 慢日志仍按周期倍数（约默认 60s 一次）
+
+
+def _collect_due(name, seconds=0, every_cycles=0):
+    """是否到了该采集的时候。
+
+    every_cycles > 0 时按「周期倍数」判定；否则按 wall-clock 秒限频。
+    指标/配置漂移之所以改用秒限频：按周期倍数的话，把 CHECK_INTERVAL 调小
+    （如 2s→1s）会让采集频率同步放大，管理库 INSERT 量随之线性增长。
+    """
+    _COLLECT_CYCLE[name] += 1
+    if every_cycles > 0:
+        if _COLLECT_CYCLE[name] < every_cycles:
+            return False
+        _COLLECT_CYCLE[name] = 0
+        return True
+    if seconds <= 0:
+        return True
+    now = time.monotonic()
+    if now - _COLLECT_AT.get(name, 0.0) < seconds:
+        return False
+    _COLLECT_AT[name] = now
+    return True
 
 
 def _maybe_collect():
-    """在后台 monitor 周期内错峰触发指标/慢日志/配置漂移采集（仅写入，无副作用）。"""
-    _COLLECT_CYCLE["metrics"] += 1
-    _COLLECT_CYCLE["slow"] += 1
-    _COLLECT_CYCLE["drift"] += 1
-    if _COLLECT_CYCLE["metrics"] >= _METRICS_EVERY:
-        _COLLECT_CYCLE["metrics"] = 0
+    """在后台 monitor 周期内错峰触发指标/慢日志/配置漂移采集（仅写入，无副作用）。
+
+    采集任务本身各自带「与上次一致的快照不写库」的变更检测（见 metrics.py /
+    config_drift.py），因此空闲时即使到点也不会产生 INSERT。
+    """
+    if _collect_due("metrics", METRICS_INTERVAL):
         try:
             metrics.collect_metrics()
         except Exception as e:
             print(f"[monitor] 指标采集异常: {e}", flush=True)
             import traceback; traceback.print_exc()
-    if _COLLECT_CYCLE["slow"] >= _SLOW_EVERY:
+    if _collect_due("slow", 0, _SLOW_EVERY):
         _COLLECT_CYCLE["slow"] = 0
         if slow_log.slowlog_enabled():
             try:
@@ -431,8 +501,7 @@ def _maybe_collect():
                 import traceback; traceback.print_exc()
         else:
             print("[monitor] 慢日志采集已暂停(SLOWLOG_ENABLED=0)", flush=True)
-    if _COLLECT_CYCLE["drift"] >= _DRIFT_EVERY:
-        _COLLECT_CYCLE["drift"] = 0
+    if _collect_due("drift", DRIFT_INTERVAL):
         try:
             for cl in list_clusters():
                 config_drift.check_cluster(cl["id"])

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}审计日志 · MySQL HA 管理器{% endblock %}
+{% block title %}审计日志 · Custos{% endblock %}
 {% block content %}
 <style>
   .audit-search{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -38,11 +38,11 @@
         </td>
       </tr>
       {% else %}
-      <tr id="noAuditRow"><td colspan="6" style="color:#9ca3af;text-align:center;padding:24px;">暂无审计记录</td></tr>
+      <tr id="noAuditRow"><td colspan="6" style="color:#8b9ac0;text-align:center;padding:24px;">暂无审计记录</td></tr>
       {% endfor %}
     </tbody>
   </table>
-  <div id="noMatchRow" style="display:none;color:#9ca3af;text-align:center;padding:18px;">无匹配记录</div>
+  <div id="noMatchRow" style="display:none;color:#8b9ac0;text-align:center;padding:18px;">无匹配记录</div>
 </div>
 
 <!-- 详情 drawer -->

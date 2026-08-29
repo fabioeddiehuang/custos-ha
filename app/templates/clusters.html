@@ -8,7 +8,7 @@
   .grid2 label input,.grid2 label select{font-weight:400}
   .grid2 .full{grid-column:1/-1}
   .form-foot{grid-column:1/-1;display:flex;justify-content:flex-end;gap:10px}
-  .hint{font-weight:400;font-size:11.5px;color:#94a3b8}
+  .hint{font-weight:400;font-size:11.5px;color:#8b9ac0}
   /* 数据库终端：黑屏交互（参考 V3 设计稿） */
   .term-modal{max-width:880px;width:94vw}
   .term-modal .body{display:flex;flex-direction:column}
@@ -16,34 +16,34 @@
      关键：必须清掉 v3.css 中 .modal 的 max-height:86vh —— 否则即便写 height:100vh 也只显示 86vh。
      用 top/left/right/bottom:0 + width/height:auto 撑满视口：
      避免 100vw 在 Firefox（存在纵向滚动条时）横向溢出，也规避 100vh 在 Safari 的视口差异。 */
-  .term-modal.term-full{position:fixed;top:0;left:0;right:0;bottom:0;width:auto;height:auto;max-width:none;max-height:none;border-radius:0;margin:0;display:flex;flex-direction:column;z-index:3000;background:#fff;overflow:hidden}
+  .term-modal.term-full{position:fixed;top:0;left:0;right:0;bottom:0;width:auto;height:auto;max-width:none;max-height:none;border-radius:0;margin:0;display:flex;flex-direction:column;z-index:3000;background:var(--surface);overflow:hidden}
   .term-modal.term-full .body{flex:1;min-height:0;overflow:hidden}
   .term-modal.term-full .term{flex:1;height:auto;min-height:0}
   body.term-fs{overflow:hidden}
-  .term{background:#0f172a;color:#e6edf3;border-radius:10px;padding:12px 14px;height:52vh;overflow:auto;font-family:var(--mono);font-size:13px;line-height:1.55}
+  .term{background:#060b16;color:#e8eefc;border-radius:10px;padding:12px 14px;height:52vh;overflow:auto;font-family:var(--mono);font-size:13px;line-height:1.55}
   .term-output{white-space:pre-wrap;word-break:break-word}
   .term-output>div{padding:1px 0}
   .term-table{white-space:pre}
-  .term-head{color:#7dd3fc;font-weight:700}
-  .term-err{color:#ff7b72}
-  .term-busy{color:#d29922}
-  .term-hint{color:#8b949e}
-  .term-cmd{color:#c9d1d9}
-  .term-cont{color:#8b949e}
-  .term-foot{color:#8b949e}
+  .term-head{color:#38bdf8;font-weight:700}
+  .term-err{color:#fb7185}
+  .term-busy{color:#fbbf24}
+  .term-hint{color:#8b9ac0}
+  .term-cmd{color:#e8eefc}
+  .term-cont{color:#8b9ac0}
+  .term-foot{color:#8b9ac0}
   .term-input-line{display:flex;align-items:center;gap:6px;margin-top:6px}
-  .term-prompt{color:#3fb950;font-family:var(--mono);font-weight:700;white-space:nowrap}
-  .term-input{flex:1;min-width:0;background:transparent;border:none;outline:none;color:#e6edf3;caret-color:#3fb950;font-weight:600;font-family:var(--mono);font-size:13px;line-height:1.55;-webkit-appearance:none;appearance:none}
-  .term-input::placeholder{color:#586069}
-  .ok-note{color:#16a34a;padding:10px}
-  .err-cell{color:#b91c1c;font-size:13px}
+  .term-prompt{color:#34d399;font-family:var(--mono);font-weight:700;white-space:nowrap}
+  .term-input{flex:1;min-width:0;background:transparent;border:none;outline:none;color:#e8eefc;caret-color:#34d399;font-weight:600;font-family:var(--mono);font-size:13px;line-height:1.55;-webkit-appearance:none;appearance:none}
+  .term-input::placeholder{color:#8b9ac0}
+  .ok-note{color:#34d399;padding:10px}
+  .err-cell{color:#fb7185;font-size:13px}
   .kv-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
   .kv-row .k{color:var(--muted)}
   .kv-row .v{font-family:var(--mono);font-weight:600}
-  .cred-row2{padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:#fafbff;margin-top:8px}
+  .cred-row2{padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface-2);margin-top:8px}
   .cr-label{font-size:12px;color:#7C2D52;font-weight:700;margin-bottom:4px}
   .cr-line{font-size:13px;padding:2px 0;color:var(--text)}
-  .cr-line .pw{font-family:var(--mono);background:#f1f5f9;padding:1px 6px;border-radius:6px}
+  .cr-line .pw{font-family:var(--mono);background:#1c2b47;padding:1px 6px;border-radius:6px}
   .btn-ico{background:none;border:none;cursor:pointer;font-size:15px;color:var(--muted)}
   .btn-ico:hover{color:var(--primary)}
   /* 节点详情抽屉：角色/参数/目录分区，统一 v3 配色 */
@@ -52,11 +52,11 @@
   .nd-section{margin-bottom:14px}
   .nd-title{font-size:13px;font-weight:600;color:var(--muted);margin-bottom:8px;letter-spacing:.3px}
   .nd-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-  .nd-cell{background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+  .nd-cell{background:#16233d;border:1px solid var(--border);border-radius:10px;padding:10px 12px}
   .nd-k{font-size:11px;color:var(--muted);margin-bottom:4px}
   .nd-v{font-size:14px;color:var(--text);word-break:break-all}
-  .nd-v.on{color:#0f9d6b;font-weight:700}
-  .nd-v.off{color:#e11d48;font-weight:700}
+  .nd-v.on{color:#34d399;font-weight:700}
+  .nd-v.off{color:#fb7185;font-weight:700}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -105,7 +105,7 @@
         </tr>
         {% endfor %}
       {% else %}
-        <tr><td colspan="6" style="color:#9ca3af;text-align:center;padding:24px;">暂无节点。请先在「＋ 新增集群」创建集群，再前往「节点管理」添加节点。</td></tr>
+        <tr><td colspan="6" style="color:#8b9ac0;text-align:center;padding:24px;">暂无节点。请先在「＋ 新增集群」创建集群，再前往「节点管理」添加节点。</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -130,7 +130,7 @@
   </div>
   <table class="tbl">
     <thead><tr><th>时间</th><th>节点</th><th>级别</th><th>内容</th></tr></thead>
-    <tbody id="logBody"><tr><td colspan="4" style="color:#9ca3af;text-align:center;">点击上方标签加载…</td></tr></tbody>
+    <tbody id="logBody"><tr><td colspan="4" style="color:#8b9ac0;text-align:center;">点击上方标签加载…</td></tr></tbody>
   </table>
   <div class="note">错误日志读取 mysql.error_log 表（不使用 SSH）；慢日志读取 mysql.slow_log 表，默认近 24h，支持导出 TXT。</div>
 </div>
@@ -216,7 +216,7 @@
     if(!t){t=document.createElement("div");t.id="toastBox";t.style.cssText="position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:2000;display:flex;flex-direction:column;gap:8px";document.body.appendChild(t);}
     var el=document.createElement("div");
     el.textContent=msg;
-    el.style.cssText="background:"+(kind==="err"?"#ef4444":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
+    el.style.cssText="background:"+(kind==="err"?"#fb7185":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
     t.appendChild(el);setTimeout(function(){el.remove();},2600);
   }
   function apiPost(url,body,cb){
@@ -250,7 +250,7 @@
       if(role==="slave") items.push('<a onclick="doManualSwitch(\''+host+'\')">提升 '+esc(host)+' 为主<span class="d">当前为从</span></a>');
       else items.push('<a onclick="alert(\''+esc(host)+' 已是当前主库\')">保持 '+esc(host)+' 为主<span class="d">当前为主</span></a>');
     });
-    m.innerHTML=items.join("")||'<a style="color:#9ca3af;cursor:default">暂无节点</a>';
+    m.innerHTML=items.join("")||'<a style="color:#8b9ac0;cursor:default">暂无节点</a>';
   }
   function doManualSwitch(hp){
     var p=hp.split(":");
@@ -345,7 +345,7 @@
     // 自愈
     html+='<div class="nd-section"><div class="nd-title">自愈操作</div><div style="display:flex;gap:8px;flex-wrap:wrap;">'
       +'<button class="btn btn-sm" onclick="showSelfhealSql('+cid+",'"+d.host+"',"+d.port+')">查看自愈 SQL</button>'
-      +'<a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+"&host="+encodeURIComponent(d.host)+"&port="+d.port+'&download=1" download="fix-node-creds.sql">下载修复 SQL</a>'
+      +'<a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+"&host="+encodeURIComponent(d.host)+"&port="+d.port+'&download=1" download="fix-node-creds.sql">下载修复 SQL</a>'
       +'</div></div>';
     body.innerHTML=html;
   }
@@ -355,14 +355,14 @@
     var box=document.createElement("div");
     box.id="sqlModal";
     box.style.cssText="position:fixed;inset:0;background:rgba(15,23,42,.5);z-index:200;display:flex;align-items:center;justify-content:center;";
-    box.innerHTML='<div style="background:#fff;width:min(720px,92vw);max-height:84vh;overflow:auto;border-radius:14px;padding:16px 18px;box-shadow:0 20px 60px rgba(0,0,0,.25);">'
+    box.innerHTML='<div style="background:var(--surface);width:min(720px,92vw);max-height:84vh;overflow:auto;border-radius:14px;padding:16px 18px;box-shadow:0 20px 60px rgba(0,0,0,.55);">'
       +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
       +'<h3 style="margin:0;">节点自愈 / 修复 SQL</h3>'
       +'<button class="btn btn-sm" onclick="closeSqlModal()">✕</button></div>'
-      +'<pre id="sqlModalBody" style="white-space:pre-wrap;max-height:58vh;overflow:auto;background:#0f172a;color:#e2e8f0;padding:14px;border-radius:10px;font-size:12.5px;margin:0;"></pre>'
+      +'<pre id="sqlModalBody" style="white-space:pre-wrap;max-height:58vh;overflow:auto;background:#060b16;color:#cbd5e1;padding:14px;border-radius:10px;font-size:12.5px;margin:0;"></pre>'
       +'<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end;">'
       +'<button class="btn btn-sm" onclick="copySql()">复制</button>'
-      +'<a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+'&host='+encodeURIComponent(host)+'&port='+port+'&download=1" download="fix-node-creds.sql">下载</a>'
+      +'<a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+'&host='+encodeURIComponent(host)+'&port='+port+'&download=1" download="fix-node-creds.sql">下载</a>'
       +'</div></div>';
     box.onclick=function(e){if(e.target===box)closeSqlModal();};
     document.body.appendChild(box);
@@ -394,25 +394,25 @@
     var cid=document.getElementById("logCluster").value;
     var cm=masterOfCluster(cid);
     var body=document.getElementById("logBody");
-    body.innerHTML='<tr><td colspan="4" style="color:#9ca3af;text-align:center;">加载中…</td></tr>';
-    if(!cm){body.innerHTML='<tr><td colspan="4" style="color:#9ca3af;text-align:center;">该集群无主库，无法读取日志</td></tr>';return;}
+    body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">加载中…</td></tr>';
+    if(!cm){body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">该集群无主库，无法读取日志</td></tr>';return;}
     var p=cm.split(":");
     if(_logTab==="slow"){
       fetch("/api/slow_log?cluster_id="+cid+"&host="+encodeURIComponent(p[0])+"&port="+p[1]+"&limit=200")
         .then(function(r){return r.json();}).then(function(d){
           var rows=(d.rows||[]).slice(0,50);
-          if(!rows.length){body.innerHTML='<tr><td colspan="4" style="color:#9ca3af;text-align:center;">慢日志为空（采集可能未开启）</td></tr>';return;}
+          if(!rows.length){body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">慢日志为空（采集可能未开启）</td></tr>';return;}
           body.innerHTML=rows.map(function(r){
             return '<tr><td>'+(r.ts||"—")+'</td><td class="mono">'+esc(cm)+'</td>'
               +'<td><span class="badge sky">Slow</span></td>'
               +'<td style="white-space:normal;word-break:break-word;">'+esc((r.sql_text||"").slice(0,300))+'</td></tr>';
           }).join("");
-        }).catch(function(e){body.innerHTML='<tr><td colspan="4" style="color:#b91c1c;">请求失败：'+esc(e)+'</td></tr>';});
+        }).catch(function(e){body.innerHTML='<tr><td colspan="4" style="color:#fb7185;">请求失败：'+esc(e)+'</td></tr>';});
     }else{
       apiPost("/api/node_error_log",{cluster_id:cid,host:p[0],port:p[1],limit:100},function(d){
-        if(!d.ok){body.innerHTML='<tr><td colspan="4" style="color:#b91c1c;">'+(d.path?"路径: "+esc(d.path)+"<br>":"")+esc(d.error||"加载失败")+'</td></tr>';return;}
+        if(!d.ok){body.innerHTML='<tr><td colspan="4" style="color:#fb7185;">'+(d.path?"路径: "+esc(d.path)+"<br>":"")+esc(d.error||"加载失败")+'</td></tr>';return;}
         var lines=(d.lines||[]).slice(-50);
-        if(!lines.length){body.innerHTML='<tr><td colspan="4" style="color:#9ca3af;text-align:center;">错误日志为空</td></tr>';return;}
+        if(!lines.length){body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">错误日志为空</td></tr>';return;}
         body.innerHTML=lines.map(function(l){
           var level=/error|aborted|GLIBCXX/i.test(l)?"down":(/warn/i.test(l)?"warn":"sky");
           return '<tr><td>'+esc(l.slice(0,19))+'</td><td class="mono">'+esc(cm)+'</td>'
@@ -458,7 +458,7 @@
     var o=document.getElementById("termOutput");
     if(o && !o.dataset.boot){
       o.dataset.boot="1";
-      termAppend("MySQL HA 交互终端（mysql CLI 风格）","term-hint");
+      termAppend("Custos 交互终端（mysql CLI 风格）","term-hint");
       termAppend("输入 SQL 以 ; 或 \\g 结束回车执行；多行续写；↑/↓ 历史；Tab 补全；\\h 帮助。","term-hint");
     }
     setTimeout(function(){var i=document.getElementById("termInput");if(i)i.focus();},60);
@@ -666,7 +666,7 @@
     try{i.setSelectionRange(pos,pos);}catch(e){}
   }
 
-  var HELP_TEXT="MySQL HA 终端帮助：\n"
+  var HELP_TEXT="Custos 终端帮助：\n"
     +"  ; 或 \\g    结束语句并执行\n"
     +"  \\G         结束语句并以竖向格式显示\n"
     +"  \\c         清空当前输入缓冲\n"

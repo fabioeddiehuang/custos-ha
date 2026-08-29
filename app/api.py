@@ -41,30 +41,30 @@ from .mysql_compat import detect_flavour, flavour_from_node_type, F_MARIADB
 _LOG_DIR = os.environ.get("LOG_DIR", "/app/data/logs")
 try:
     os.makedirs(_LOG_DIR, exist_ok=True)
-    _MANAGER_LOG = os.path.join(_LOG_DIR, "ha-manager.log")
+    _MANAGER_LOG = os.path.join(_LOG_DIR, "custos.log")
     _fh = RotatingFileHandler(_MANAGER_LOG, maxBytes=5 * 1024 * 1024,
                               backupCount=3, encoding="utf-8")
     _fh.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)s %(name)s: %(message)s"))
     _fh.setLevel(logging.INFO)
     _root = logging.getLogger()
-    _already = any(getattr(h, "baseFilename", "").endswith("ha-manager.log")
+    _already = any(getattr(h, "baseFilename", "").endswith("custos.log")
                    for h in _root.handlers)
     if not _already:
         _root.addHandler(_fh)
         if _root.level == logging.NOTSET:
             _root.setLevel(logging.INFO)
 except Exception:
-    _MANAGER_LOG = os.environ.get("LOG_DIR", "/app/data/logs") + "/ha-manager.log"
+    _MANAGER_LOG = os.environ.get("LOG_DIR", "/app/data/logs") + "/custos.log"
 
 # ---------------------------------------------------------------------------
 # 控制台日志落盘（Tee）
 # 应用内大量输出走 print()（entrypoint / ha_client / monitor / failover），
-# 这些不经过 logging 模块，导致 ha-manager.log 恒为空：docker.sock 不可用时
+# 这些不经过 logging 模块，导致 custos.log 恒为空：docker.sock 不可用时
 # 「容器日志」就完全没内容可读。这里把 stdout/stderr 同步写一份到控制台日志，
 # 终端输出照旧，同时保证文件兜底数据源始终有内容。
 # ---------------------------------------------------------------------------
-_MANAGER_CONSOLE_LOG = os.path.join(_LOG_DIR, "ha-manager-console.log")
+_MANAGER_CONSOLE_LOG = os.path.join(_LOG_DIR, "custos-console.log")
 try:
     import sys as _sys
 
@@ -1674,6 +1674,12 @@ def cluster_sync(cid: int, user=Depends(auth_required)):
 
 
 # ---------------- 节点一键部署 ----------------
+# Web 展示时剥离的「宿主机部署目录前缀」，按历史命名顺序兼容：
+#   mysql-ha-manager/（v2.1 及更早） → custos-ha/（当前） → custos/
+# 「custos-ha/」必须排在「custos/」之前，否则会被截断成 "-ha/generated_nodes/<ip>"。
+_DIR_PREFIXES = ("mysql-ha-manager/", "custos-ha/", "custos/")
+
+
 @app.get("/nodes")
 def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", error: str = "",
                cluster_id: int = 0):
@@ -1687,12 +1693,15 @@ def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", err
         vip=creds.get("vip") or "",
         port=get_setting("NODE_PORT") or "3307",
     )
-    # 附加集群名称与「去掉 mysql-ha-manager/ 前缀」的部署目录显示
+    # 附加集群名称与「去掉部署目录前缀」的展示（历史/当前前缀清单见 _DIR_PREFIXES）
     name_by_id = {c["id"]: c.get("name") or f"集群{c['id']}" for c in clusters}
     for n in nodes:
         n["cluster_name"] = name_by_id.get(n.get("cluster_id")) or "—"
         cp = n.get("compose_path") or ""
-        n["dir_display"] = cp.split("mysql-ha-manager/", 1)[-1] or cp
+        dp = cp
+        for _p in _DIR_PREFIXES:
+            dp = dp.split(_p, 1)[-1]
+        n["dir_display"] = dp or cp
     return render("nodes.html", request, user=user, nodes=nodes, clusters=clusters,
                   creds=creds, cfg=cfg, active_cluster=ac, msg=msg, error=error)
 
@@ -1972,7 +1981,7 @@ def api_srv_log(svc: str = "ha_manager", since: int = 86400, offset: int = 0,
     empty_hint = "" if incremental else "（最近 %d 秒内暂无日志）" % since
 
     # ---- 管理器自身 ----
-    if svc in ("ha_manager", "mysql-ha-manager", "__self__"):
+    if svc in ("ha_manager", "custos", "__self__"):
         # 1) 自身容器 stdout/stderr（最完整）
         try:
             cid = docker_helper.own_container_id()
@@ -2003,8 +2012,8 @@ def api_srv_log(svc: str = "ha_manager", since: int = 86400, offset: int = 0,
     # ---- 兄弟容器 ----
     TOKEN = {
         "keepalived": "keepalived",
-        "monitor": "ha-manager-monitor",
-        "ha_manager-mgmt": "mysql-ha-manager-mgmt",
+        "monitor": "custos-monitor",
+        "ha_manager-mgmt": "custos-ha-mgmt",
     }
     token = TOKEN.get(svc, svc)
     if not docker_helper.docker_available():
@@ -2038,7 +2047,7 @@ def api_srv_units(user=Depends(auth_required)):
         units = docker_helper.list_units()
     except Exception:
         units = []
-    items = [{"value": "ha_manager", "label": "mysql-ha-manager（管理器自身）"}]
+    items = [{"value": "ha_manager", "label": "Custos（管理器自身）"}]
     seen = {"ha_manager"}
     for u in units:
         name = u.get("name") or ""

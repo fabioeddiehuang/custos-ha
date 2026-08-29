@@ -710,6 +710,12 @@ def promote_to_master(host, port, user, password, root_user="root", root_pass=""
 
     必须先 STOP SLAVE + RESET SLAVE ALL，否则本节点仍挂着 SHOW SLAVE STATUS（指向旧主），
     monitor 会把它误判为 slave，且可能与新主形成环形复制（多次手动切换后「全变成从库」的根因）。
+
+    【空闲零写入】ensure_topology 每个监控周期都会调用本函数。旧实现对已经是主库的节点
+    仍会执行 STOP REPLICA / RESET REPLICA ALL / **FLUSH BINARY LOGS**；其中
+    FLUSH BINARY LOGS 会新建并 fsync 一个 binlog 文件（节点模板为 sync_binlog=1），
+    是「系统空闲却在节点上持续产生磁盘写入」的主因。
+    故先做一次**只读**快检：已「可写且无残留复制通道」时直接返回，不执行任何写操作。
     """
     conn = connect_robust(host, port, user, password, root_user, root_pass)
     if conn is None:
@@ -717,6 +723,17 @@ def promote_to_master(host, port, user, password, root_user="root", root_pass=""
     try:
         cur = conn.cursor()
         syntax = detect_syntax(cur)
+        # 只读快检：不产生任何写盘 / 不进 binlog
+        try:
+            cur.execute("SELECT @@GLOBAL.read_only")
+            _r = cur.fetchone()
+            if _r is not None and int(_r[0]) == 0:
+                cur.execute(show_replica_status_sql(syntax))
+                if cur.fetchone() is None:
+                    # 已是可写且无残留复制通道的主库：无需再做任何写操作
+                    return True, None
+        except Exception:
+            pass
         try:
             cur.execute(stop_replication_sql(syntax))
             cur.execute(reset_replica_sql(syntax))
@@ -1043,11 +1060,21 @@ def set_local_master_flag(host, port, user, password, master_str, root_user="roo
         # 会报 1062 Duplicate entry 卡死复制（Write_rows 而非 REPLACE 语义）。
         cur.execute("SET SESSION sql_log_bin=0")
         try:
-            cur.execute("CREATE DATABASE IF NOT EXISTS ha_local")
-            cur.execute(
-                "CREATE TABLE IF NOT EXISTS ha_local.state "
-                "(k VARCHAR(32) PRIMARY KEY, v VARCHAR(255))"
-            )
+            # 建库建表仅作兜底：ha_local.state 通常在节点初始化时已建好。
+            # ha_monitor 一般不持有 CREATE 权限，而 MySQL 对
+            # CREATE DATABASE/TABLE IF NOT EXISTS 也会先校验权限再判存在，
+            # 于是在「表已存在但账号无 CREATE」的节点上必然抛 1044，
+            # 被外层 except 吞掉后整个状态写入静默失败（ha_local.state 永远为空，
+            # keepalived 检查脚本读不到 current_master → VIP 无法归属）。
+            # 故这两句单独容错，失败不阻断后续的 SELECT/REPLACE。
+            try:
+                cur.execute("CREATE DATABASE IF NOT EXISTS ha_local")
+                cur.execute(
+                    "CREATE TABLE IF NOT EXISTS ha_local.state "
+                    "(k VARCHAR(32) PRIMARY KEY, v VARCHAR(255))"
+                )
+            except Exception:
+                pass
             # 空闲优化：当前主库未变化时不再 REPLACE，避免每个监控周期都在所有节点产生
             # 一次 InnoDB 提交（redo 强制刷盘 → 磁盘每秒写入）。仅值变化时写。
             cur.execute("SELECT v FROM ha_local.state WHERE k='current_master'")
@@ -1187,6 +1214,29 @@ def _has_all_privileges(cur, user, host):
     return _ALL_PRIV_SIG.issubset(have)
 
 
+def _ensure_local_state_grant(cur, ha_user):
+    """确保 ha_monitor 能读写节点本地状态库 ha_local（keepalived VIP 检查脚本依赖）。
+
+    根因：MySQL 8.0 分支授予 ha_monitor 的 *.* 权限里没有 INSERT/CREATE，
+    于是 set_local_master_flag 的 `REPLACE INTO ha_local.state` 报 1142，
+    被上层 `except: pass` 吞掉 —— ha_local.state 永远为空，
+    节点上的 keepalived 检查脚本读不到 current_master，VIP 无法归属/漂移。
+
+    这里按**最小权限**只授 ha_local 库（不放大 *.* 权限）。
+    返回是否授权成功（失败通常意味着当前连接无 GRANT OPTION）。
+    """
+    try:
+        cur.execute("CREATE DATABASE IF NOT EXISTS ha_local")
+    except Exception:
+        pass   # 无 CREATE 权限时，库通常已在节点初始化阶段建好
+    try:
+        cur.execute(
+            "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON ha_local.* TO '%s'@'%%'" % ha_user)
+        return True
+    except Exception:
+        return False
+
+
 def ensure_ha_creds(host, port, root_user, root_pass,
                     ha_user, ha_pass, repl_user, repl_pass,
                     app_user="", app_pass="", manager_ip="", manager_subnet=None):
@@ -1220,6 +1270,8 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             last_err = e
     if conn is None:
         return False, "连接失败(ha_monitor 与 root 均不可达): %s" % last_err
+    local_state_ok = [False]
+
     def _sync(cur):
         # 判定风味：MariaDB 与 MySQL 的账号/权限语法【不兼容】，必须分派。
         # MariaDB 无 SYSTEM_VARIABLES_ADMIN 等 MySQL 8.0 专有特权（直接 GRANT 会 1064）；
@@ -1295,6 +1347,8 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                     cur.execute("GRANT %s ON *.* TO '%s'@'%%'" % (extra, ha_user))
             except Exception:
                 pass
+        # 节点本地状态库 ha_local 的读写授权（见 _ensure_local_state_grant 说明）
+        local_state_ok[0] = _ensure_local_state_grant(cur, ha_user)
 
     cur = conn.cursor()
     used = used_for_connect
@@ -1319,6 +1373,15 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                                % (e, e2))
         else:
             return False, "校正失败(经 %s): %s" % (used_for_connect, e)
+    # ha_local 的库级 GRANT 需要 GRANT OPTION。_sync 若走的是 ha_monitor（通常没有
+    # GRANT OPTION），上面那步会静默失败，这里再用 root 补一次，确保 VIP 状态可写。
+    if not local_state_ok[0] and used_for_connect == "ha_monitor" and root_pass:
+        try:
+            _rc = connect(host, port, root_user, root_pass, timeout=5)
+            _ensure_local_state_grant(_rc.cursor(), ha_user)
+            _rc.close()
+        except Exception:
+            pass
     try:
         cur.execute("FLUSH PRIVILEGES")
     except Exception:

@@ -1,26 +1,27 @@
 {% extends "base.html" %}
-{% block title %}节点管理 · MySQL HA 管理器{% endblock %}
+{% block title %}节点管理 · Custos{% endblock %}
 {% block content %}
 <style>
   /* 账号掩码/显示/复制（mockup acc 组件补充） */
-  .acc-pwd .mask{font-family:var(--mono);color:#334155}
+  .acc-pwd .mask{font-family:var(--mono);color:#e8eefc}
   .acc-pwd .reveal{cursor:pointer;color:var(--primary);margin-left:8px;font-size:12px;background:none;border:none;padding:0}
   .acc-pwd .reveal:hover{color:var(--primary-dark)}
   .dd-actions{display:flex;gap:10px;flex-wrap:wrap}
   /* 每个节点一个配色：展开多个节点时，靠色块+底色区分细节与底部按钮归属 */
-  .na-0{--accent:#0ABAB5;--tint:#f3fdfc}
-  .na-1{--accent:#7C2D52;--tint:#fdf5f9}
-  .na-2{--accent:#2563eb;--tint:#f2f7ff}
-  .na-3{--accent:#d97706;--tint:#fffaf0}
-  .na-4{--accent:#7c3aed;--tint:#f8f6ff}
-  .dd{background:var(--tint,#f8fafc);border:1px solid var(--border);border-left:4px solid var(--accent,#0ABAB5);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:14px}
+  /* 深色底：accent 提亮一档，tint 改为同色低透明底（原为浅色底，深底上会成白块） */
+  .na-0{--accent:#0ABAB5;--tint:rgba(10,186,181,.12)}
+  .na-1{--accent:#C2416B;--tint:rgba(194,65,107,.16)}
+  .na-2{--accent:#60a5fa;--tint:rgba(96,165,250,.14)}
+  .na-3{--accent:#fbbf24;--tint:rgba(251,191,36,.13)}
+  .na-4{--accent:#a78bfa;--tint:rgba(167,139,250,.14)}
+  .dd{background:var(--tint,#16233d);border:1px solid var(--border);border-left:4px solid var(--accent,#0ABAB5);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:14px}
   .dd-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .dd-dot{width:9px;height:9px;border-radius:50%;background:var(--accent,#0ABAB5);flex:none}
   .dd-title{font-size:13.5px;font-weight:800;color:var(--text);font-family:var(--mono)}
   .dd-title small{font-weight:600;color:var(--muted);font-family:inherit;margin-left:8px}
   /* 基本信息：等宽网格 + 1px 细分隔线，取代原来拥挤的单行信息条 */
   .info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-  .ig-item{background:#fff;padding:11px 14px;min-width:0}
+  .ig-item{background:var(--surface-2);padding:11px 14px;min-width:0}
   .ig-item.wide{grid-column:span 2}
   @media (max-width:560px){ .ig-item.wide{grid-column:span 1} }
   .ig-k{font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.3px;margin-bottom:5px}
@@ -29,7 +30,7 @@
   .ig-v.tr{cursor:default}
   .ig-v.tr:hover{color:var(--primary)}
   /* 批量操作条 */
-  .batch-bar{display:none;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;padding:10px 14px;border-radius:12px;background:#f8fafc;border:1px solid var(--border)}
+  .batch-bar{display:none;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;padding:10px 14px;border-radius:12px;background:#16233d;border:1px solid var(--border)}
   .batch-bar.show{display:flex}
   .bb-count{font-size:13px;color:var(--muted)}
   .bb-count b{color:var(--text);font-size:14px}
@@ -40,12 +41,12 @@
   .grid2 label input,.grid2 label select{font-weight:400}
   .grid2 .full{grid-column:1/-1}
   .form-foot{grid-column:1/-1;display:flex;justify-content:flex-end;gap:10px}
-  .hint{font-weight:400;font-size:11.5px;color:#94a3b8}
+  .hint{font-weight:400;font-size:11.5px;color:#8b9ac0}
   .md5-list{margin:0;padding:0;list-style:none;max-height:320px;overflow:auto}
   .md5-list li{display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-bottom:1px dashed var(--border);font-size:12.5px}
-  .md5-list .f{color:#374151;font-family:var(--mono)}
+  .md5-list .f{color:#e8eefc;font-family:var(--mono)}
   .md5-list .m{color:#E11D74;font-family:var(--mono)}
-  .runcmd{background:#0f172a;color:#e2e8f0;padding:10px 12px;border-radius:8px;margin:10px 0 14px;font-family:var(--mono);font-size:12.5px;word-break:break-all}
+  .runcmd{background:#060b16;color:#cbd5e1;padding:10px 12px;border-radius:8px;margin:10px 0 14px;font-family:var(--mono);font-size:12.5px;word-break:break-all}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -84,7 +85,7 @@
           {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-left:4px">MariaDB</span>
           {% elif n.node_type == 'docker' %}<span class="badge emerald" style="margin-left:4px">Docker</span>{% endif %}
         </td>
-        <td data-f="status"><span class="badge" style="background:#f1f5f9;color:#64748b;">检测中…</span></td>
+        <td data-f="status"><span class="badge" style="background:#1c2b47;color:#8b9ac0;">检测中…</span></td>
         <td><button class="btn btn-sm" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button></td>
       </tr>
       <tr id="d{{ n.ip }}" class="detail-panel">
@@ -115,13 +116,13 @@
             <button class="btn btn-sm btn-primary" onclick="showSelfhealSql({{ n.cluster_id or 0 }}, '{{ n.ip }}', {{ n.port }})">查看/下载自愈 SQL</button>
             {% endif %}
             <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
-            <a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none" href="/nodes/{{ n.ip }}/creds_sql" download>下载修复SQL</a>
+            <a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none" href="/nodes/{{ n.ip }}/creds_sql" download>下载修复SQL</a>
             <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delNode('{{ n.ip }}')">删除节点</button>
           </div>
         </div></td>
       </tr>
       {% else %}
-      <tr><td colspan="6" style="color:#9ca3af;text-align:center;padding:24px;">暂无已添加节点。点击右上角「＋ 添加节点」生成部署单元。</td></tr>
+      <tr><td colspan="6" style="color:#8b9ac0;text-align:center;padding:24px;">暂无已添加节点。点击右上角「＋ 添加节点」生成部署单元。</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -158,7 +159,7 @@
             {% endfor %}
           </select>
         </label>
-        <div id="mariadbTip" class="full" style="display:none;padding:10px 12px;border:1px dashed #1d4ed8;border-radius:10px;background:#eff6ff;font-size:13px;color:#1e3a8a;">
+        <div id="mariadbTip" class="full" style="display:none;padding:10px 12px;border:1px dashed rgba(96,165,250,.45);border-radius:10px;background:rgba(37,99,235,.14);font-size:13px;color:#93c5fd;">
           <strong>MariaDB 节点部署流程（全量安装，脱离宝塔）：</strong>生成后目录内含 <code class="mono">Install-ha-mariadb-Node.sh</code>（唯一全量安装脚本，自包含）、<code class="mono">Uninstall-mariadb-Node.sh</code>、<code class="mono">my.cnf</code>、<code class="mono">init_mariadb.sql</code>。推荐顺序 ——
           ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/ha-node/&lt;本机IP&gt;/</code>），并把 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 放到同一目录（脚本会优先用本地包，跳过下载）；
           ② 执行 <code class="mono">sudo bash Install-ha-mariadb-Node.sh</code>（自动：解压 → 初始化 → 落盘 my.cnf → systemd 启动 → 跑 init/fix SQL → 起 keepalived）；
@@ -202,7 +203,7 @@
     if(!t){t=document.createElement("div");t.id="toastBox";t.style.cssText="position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:2000;display:flex;flex-direction:column;gap:8px";document.body.appendChild(t);}
     var el=document.createElement("div");
     el.textContent=msg;
-    el.style.cssText="background:"+(kind==="err"?"#ef4444":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
+    el.style.cssText="background:"+(kind==="err"?"#fb7185":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
     t.appendChild(el);setTimeout(function(){el.remove();},2600);
   }
   function onNodeTypeChange(){
@@ -233,7 +234,7 @@
       .then(function(r){return r.json();})
       .then(function(d){
         if(!d.ok){
-          tr.querySelector('[data-f="creds"]').innerHTML='<div class="obs-empty" style="color:#b91c1c;">'+esc(d.error||"加载失败")+'</div>';
+          tr.querySelector('[data-f="creds"]').innerHTML='<div class="obs-empty" style="color:#fb7185;">'+esc(d.error||"加载失败")+'</div>';
           return;
         }
         // 基本信息
@@ -265,7 +266,7 @@
           }).join('')+'</div>':'<div class="obs-empty">无账号信息</div>';
         }
       })
-      .catch(function(e){tr.querySelector('[data-f="creds"]').innerHTML='<div class="obs-empty" style="color:#b91c1c;">请求失败：'+esc(e)+'</div>';});
+      .catch(function(e){tr.querySelector('[data-f="creds"]').innerHTML='<div class="obs-empty" style="color:#fb7185;">请求失败：'+esc(e)+'</div>';});
   }
   function toggleMask(el,real){
     var m=el.parentNode.querySelector(".mask");
@@ -283,7 +284,7 @@
       '<div class="kv"><span class="k">节点地址</span><span class="v">'+esc(ip)+':'+esc(port)+'</span></div>'
       +'<div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;">'
       +'<button class="btn btn-sm btn-accent" onclick="regenNode(\''+ip+'\', this)">重新生成</button>'
-      +'<a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none;" href="/nodes/'+encodeURIComponent(ip)+'/creds_sql" download>下载修复SQL</a>'
+      +'<a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none;" href="/nodes/'+encodeURIComponent(ip)+'/creds_sql" download>下载修复SQL</a>'
       +'<button class="btn btn-sm btn-danger" style="background:var(--danger);color:#fff;" onclick="delNode(\''+ip+'\')">删除节点</button>'
       +'</div>';
     document.getElementById("cfgOverlay").classList.add("show");
@@ -398,14 +399,14 @@
     var box=document.createElement("div");
     box.id="sqlModal";
     box.style.cssText="position:fixed;inset:0;background:rgba(15,23,42,.5);z-index:200;display:flex;align-items:center;justify-content:center;";
-    box.innerHTML='<div style="background:#fff;width:min(720px,92vw);max-height:84vh;overflow:auto;border-radius:14px;padding:16px 18px;box-shadow:0 20px 60px rgba(0,0,0,.25);">'
+    box.innerHTML='<div style="background:var(--surface);width:min(720px,92vw);max-height:84vh;overflow:auto;border-radius:14px;padding:16px 18px;box-shadow:0 20px 60px rgba(0,0,0,.55);">'
       +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
       +'<h3 style="margin:0;">节点自愈 / 修复 SQL</h3>'
       +'<button class="btn btn-sm" onclick="closeSqlModal()">✕</button></div>'
-      +'<pre id="sqlModalBody" style="white-space:pre-wrap;max-height:58vh;overflow:auto;background:#0f172a;color:#e2e8f0;padding:14px;border-radius:10px;font-size:12.5px;margin:0;"></pre>'
+      +'<pre id="sqlModalBody" style="white-space:pre-wrap;max-height:58vh;overflow:auto;background:#060b16;color:#cbd5e1;padding:14px;border-radius:10px;font-size:12.5px;margin:0;"></pre>'
       +'<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end;">'
       +'<button class="btn btn-sm" onclick="copySql()">复制</button>'
-      +'<a class="btn btn-sm" style="background:#0ABAB5;color:#fff;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+'&host='+encodeURIComponent(host)+'&port='+port+'&download=1" download="fix-node-creds.sql">下载</a>'
+      +'<a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none;" href="/api/node_creds_sql?cluster_id='+cid+'&host='+encodeURIComponent(host)+'&port='+port+'&download=1" download="fix-node-creds.sql">下载</a>'
       +'</div></div>';
     box.onclick=function(e){if(e.target===box)closeSqlModal();};
     document.body.appendChild(box);

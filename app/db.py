@@ -202,17 +202,31 @@ def init_schema():
                 c.execute("ALTER TABLE hosts MODIFY port INT NOT NULL DEFAULT 3306")
             except Exception:
                 pass
-            # 兼容目录调整：将已生成节点的 compose_path 统一刷新为新基路径
-            # （generated_nodes 移到项目根目录后，旧的 data/Nodes-compose/<ip> 路径已失效）
+            # 兼容目录调整：将已生成节点的 compose_path 刷新为新基路径
+            # （generated_nodes 移到项目根目录、仓库改名为 custos-ha 后旧路径已失效）。
+            # 仅更新「当前值与目标值不一致」的行：既保留迁移能力，又避免每次启动
+            # 都对所有节点跑一遍 UPDATE（无谓写库 + 大集群启动变慢）。
             try:
                 from .config import NODES_HOST_BASE
-                for r in query("SELECT ip FROM nodes"):
-                    execute(
-                        "UPDATE nodes SET compose_path=%s WHERE ip=%s",
-                        (f"{NODES_HOST_BASE}/{r['ip']}", r["ip"]),
-                    )
+                for r in query("SELECT ip, compose_path FROM nodes"):
+                    want = f"{NODES_HOST_BASE}/{r['ip']}"
+                    if (r.get("compose_path") or "") != want:
+                        execute(
+                            "UPDATE nodes SET compose_path=%s WHERE ip=%s",
+                            (want, r["ip"]),
+                        )
             except Exception:
                 pass
+            # 空闲优化：为历史表的 ts 列补单列索引。
+            # metric_history / config_drift 的保留期清理按 ts 删除，而原索引
+            # (cluster_id,host,port,ts) 与 (cluster_id,ts) 的最左前缀都不是 ts，
+            # 导致每次 DELETE 都全表扫描，把整表页读进 buffer pool 产生脏页与
+            # 后续 checkpoint 写盘。补上索引后清理真正走索引删除。
+            for _tbl in ("metric_history", "config_drift"):
+                try:
+                    c.execute(f"ALTER TABLE {_tbl} ADD INDEX idx_ts (ts)")
+                except Exception:
+                    pass
             # 兼容旧 schema：新增 initial_role 列（记录节点生成时指定的初始主/从）
             try:
                 c.execute(

@@ -36,6 +36,16 @@ PROBE_TIMEOUT = int(env("PROBE_TIMEOUT", 2))
 # 注：主库失联切换延迟 ≈ FAIL_THRESHOLD×PROBE_TIMEOUT（当前 2×2=4s），已为安全下限，
 # 再调小易误切。如确需更快可临时设环境变量覆盖，不建议写死更小值。
 
+# 节点「最后心跳」(hosts.last_seen) 的最小落库间隔（秒）。
+# 稳态下探活结果全部不变，唯独 last_seen=NOW() 每次都变，是空闲时管理库持续写盘的主因。
+# 设为 0 = 完全不落库 last_seen（真正零写入，代价是页面「最后心跳」不再刷新）。
+HEARTBEAT_INTERVAL = int(env("HEARTBEAT_INTERVAL", 30))
+
+# 指标快照 / 配置漂移巡检的采集间隔（秒）。0 = 沿用原「按周期倍数」逻辑。
+# 这两个采集会向管理库 INSERT 历史行；空闲时值与上次完全一致则不写（见各模块内的变更检测）。
+METRICS_INTERVAL = int(env("METRICS_INTERVAL", 60))
+DRIFT_INTERVAL = int(env("DRIFT_INTERVAL", 300))
+
 # 节点生成目录（一键启动 compose 落地目录；建议挂卷持久化）
 NODES_DIR = env("NODES_DIR", "/app/generated_nodes")
 
@@ -45,7 +55,9 @@ NODES_DIR = env("NODES_DIR", "/app/generated_nodes")
 # （docker-compose.yaml / init.sql / keepalived/ 均相对本目录，MySQL 数据落在 ./MySQL-data），
 # 可直接拷贝到目标主机的 /home/docker/<ip>/ 运行，路径不会越级。
 # 该值用于 Web 展示与「到目标主机执行」命令，可通过 NODES_HOST_BASE 覆盖（如项目目录改名时）。
-NODES_HOST_BASE = env("NODES_HOST_BASE", "mysql-ha-manager/generated_nodes")
+# 仓库目录改名为 custos-ha 后此处默认值同步更新；也可在 docker-compose.yml 里显式设置
+# NODES_HOST_BASE 覆盖，无需改代码。
+NODES_HOST_BASE = env("NODES_HOST_BASE", "custos-ha/generated_nodes")
 
 # VIP / 网络（供节点生成使用，可在 Web「服务端配置」中设置）
 # VIP 必须由用户填写（需为节点同网段空闲 IP，无法自动探测），故默认留空；

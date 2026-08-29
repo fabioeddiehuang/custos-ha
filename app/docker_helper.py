@@ -3,8 +3,8 @@
 管理器自身运行在容器内，镜像未安装 docker CLI。直接经 Unix Socket 调用
 Docker HTTP API，无需在镜像内安装任何额外二进制，也无需 docker 命令行。
 
-用于「系统设置 -> 容器日志」读取管理端侧容器（keepalived / mysql-ha-manager /
-ha-manager-monitor / mysql-ha-manager-mgmt 等）的日志，支持 since 增量以实现实时刷新。
+用于「系统设置 -> 容器日志」读取管理端侧容器（keepalived / custos /
+custos-monitor / custos-mgmt 等）的日志，支持 since 增量以实现实时刷新。
 """
 import os
 import time

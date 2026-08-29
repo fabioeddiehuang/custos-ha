@@ -1,4 +1,4 @@
-# MySQL HA 管理器 —— 构建 / 部署快捷方式
+# Custos —— 构建 / 部署快捷方式
 #
 # 版本单一来源为 app/VERSION：make build 会经由 deploy.sh 把版本同步到 .env，
 # 因此 docker-compose.yml 不需要写死版本号（升版时不必改 compose 文件）。
@@ -35,10 +35,10 @@ restart:
 	@./deploy.sh up -d --build
 
 logs:
-	@docker compose logs -f --tail=200 ha-manager
+	@docker compose logs -f --tail=200 custos
 
 ps:
 	@docker compose ps
 
 shell:
-	@docker compose exec ha-manager sh
+	@docker compose exec custos sh

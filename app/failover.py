@@ -16,11 +16,29 @@ from .clusters import get_cluster_creds
 # 对主库建连比对账号，进一步降低管理器开销与主库 SELECT 压力。
 CRED_SELFHEAL_INTERVAL = 300
 _SELFHEAL_CRED_TS = {}
+# 节点参数自愈（gtid_mode / server_id）限频：fix_node_mysql_params 会连节点并做
+# SET GLOBAL/PERSIST 校验。环境性失败（如 ha_monitor 缺 SUPER/SYSTEM_VARIABLES_ADMIN）
+# 时原本每周期重跑一次并刷同一条警告日志（每 2s 一行），且对节点是持续的无谓负载。
+# 参数本就不需要每周期校验，改为每 PARAM_SELFHEAL_INTERVAL 秒最多一次。
+PARAM_SELFHEAL_INTERVAL = 300
+_SELFHEAL_PARAM_TS = {}
 
 # 节点重指向失败的告警按 (host, port) 做冷却（默认 5 分钟最多提示一次），
 # 避免 gtid_mode=OFF 等根因未解时，monitor 每个周期都刷同样的失败日志。
 _repoint_fail_ts = {}
 _REPOINT_WARN_COOLDOWN = 300
+
+# 拓扑修复动作限频：ensure_topology 每个监控周期（~2s）都会跑一遍，
+# 若某从库因环境问题始终「看起来没指向当前主」，会被无限次重挂复制
+# （STOP/RESET/CHANGE MASTER/START REPLICA），是空闲时节点写盘与日志刷屏的主因。
+# 故同一节点两次「拓扑修复」之间至少间隔 TOPO_REPAIR_INTERVAL 秒。
+# 真正的故障切换走 do_failover，不受此限频影响（切换后会主动清除限频）。
+TOPO_REPAIR_INTERVAL = 60
+_TOPO_AT = {}
+# 推送 current_master 到各节点本地 ha_local.state 的兜底间隔（秒）：
+# 值未变化时不推送；但节点重启可能丢失本地状态，故最长 PUSH_MAX_INTERVAL 强制推一次。
+PUSH_MAX_INTERVAL = 300
+_LAST_PUSH = {}
 
 
 def _warn_repoint(host, port, msg):
@@ -91,7 +109,17 @@ def push_current_master_to_nodes(cluster_id, master_str):
 
     供 keepalived 检查脚本本地读取判定 VIP 归属；完全本地，无需节点回连管理库。
     单节点失败不影响整体（下个监控周期会重试）。
+
+    【空闲零写入】旧实现每个监控周期（~2s）都无条件写一遍集群内**所有节点**的
+    ha_local.state —— 稳态下就是每 2 秒对每个节点做一次真实行更新，是「没有业务
+    数据交互却在持续写盘」最直接的来源。改为：值未变化则不写；仅当主库变更、
+    或距上次推送超过 PUSH_MAX_INTERVAL（兜底，防止节点重启丢失本地状态）才写。
     """
+    prev = _LAST_PUSH.get(cluster_id)
+    now = time.monotonic()
+    if prev and prev[0] == master_str and (now - prev[1]) < PUSH_MAX_INTERVAL:
+        return
+    _LAST_PUSH[cluster_id] = (master_str, now)
     creds = load_creds(cluster_id)
     try:
         rows = query("SELECT host, port FROM hosts WHERE cluster_id=%s", (cluster_id,))
@@ -205,6 +233,19 @@ def pick_best_master(cluster_id, hosts, creds):
     return best["host"], int(best["port"])
 
 
+def reset_topo_throttle(cluster_id):
+    """真实故障切换后主动清除该集群的拓扑修复限频与本地主库推送缓存。
+
+    限频是为了避免稳态下每 2s 重挂一次复制；一旦真的发生切换，必须放行
+    ensure_topology 立即重挂载其余节点，并立刻把新主推到各节点的 ha_local.state，
+    否则 VIP 漂移会被推迟到限频窗口结束。
+    """
+    for k in [k for k in _TOPO_AT
+              if k[0] in ("repoint", "promote") and k[1] == cluster_id]:
+        _TOPO_AT.pop(k, None)
+    _LAST_PUSH.pop(cluster_id, None)
+
+
 def do_failover(cluster_id, reason="auto"):
     """主库判定宕机后执行切换：fencing -> 提升延迟最小从库 -> 更新 current_master -> 其余节点重指向。"""
     cur_h, cur_p = get_current_master(cluster_id)
@@ -245,6 +286,8 @@ def do_failover(cluster_id, reason="auto"):
     promote_to_master(new_h, new_p, creds["ha_user"], creds["ha_pass"], ru, rp)
 
     # 3) 通知 keepalived：更新 current_master，并写入各节点本地 ha_local.state
+    #    先解除限频+清推送缓存，确保新主立刻到达各节点（否则 VIP 漂移会被推迟）
+    reset_topo_throttle(cluster_id)
     set_current_master(cluster_id, new_h, new_p)
     push_current_master_to_nodes(cluster_id, f"{new_h}:{new_p}")
 
@@ -272,6 +315,7 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
     """手动将指定节点提升为主库（保留手动指定 + 自动选延迟最小两种切换方式）。"""
     target_port = int(target_port)
     cur_h, cur_p = get_current_master(cluster_id)
+    reset_topo_throttle(cluster_id)   # 手动切换同样放行后续立即修复
     creds = load_creds(cluster_id)
     if not creds["ha_user"]:
         send_alert("切换中止", "未配置 ha_monitor 账号，无法切换。")
@@ -353,6 +397,7 @@ def _selfheal_cluster(cluster_id):
                         (cand, cluster_id, h["host"], int(h["port"])))
             except Exception:
                 pass
+    did_cred = False
     for h in hosts:
         ip, port = h["host"], int(h["port"])
         ru, rp = node_root(ip, cluster_id)
@@ -362,18 +407,23 @@ def _selfheal_cluster(cluster_id):
         # 周期性 binlog 出去自动纠正；server_id 已在节点初始化时设为唯一值。故直接跳过。
         if is_read_only(ip, port, creds["ha_user"], creds["ha_pass"], ru, rp):
             continue
-        ok, rep = fix_node_mysql_params(ip, port, ru, rp,
-                                        target_server_id=want_sid.get((ip, port)))
-        if ok and rep.get("changes"):
-            print(f"[selfheal] {ip}:{port} 已自愈: {', '.join(rep['changes'])}")
-        elif not ok:
-            print(f"[selfheal] {ip}:{port} 自愈失败: {rep.get('error')}")
-        for w in (rep.get("warns") or []):
-            print(f"[selfheal] {ip}:{port} 警告: {w}")
+        # 参数自愈限频（见 PARAM_SELFHEAL_INTERVAL 注释）
+        _pk = (cluster_id, ip, port)
+        if time.monotonic() - _SELFHEAL_PARAM_TS.get(_pk, 0.0) >= PARAM_SELFHEAL_INTERVAL:
+            _SELFHEAL_PARAM_TS[_pk] = time.monotonic()
+            ok, rep = fix_node_mysql_params(ip, port, ru, rp,
+                                            target_server_id=want_sid.get((ip, port)))
+            if ok and rep.get("changes"):
+                print(f"[selfheal] {ip}:{port} 已自愈: {', '.join(rep['changes'])}")
+            elif not ok:
+                print(f"[selfheal] {ip}:{port} 自愈失败: {rep.get('error')}")
+            for w in (rep.get("warns") or []):
+                print(f"[selfheal] {ip}:{port} 警告: {w}")
         # 账号自愈限频：每 CRED_SELFHEAL_INTERVAL 秒最多一次（稳定态 ensure_ha_creds 已幂等
         # 无写操作，限频仅为降低每监控周期对主库建连比对的额外开销）。
         # 优先用 ha_monitor（已知正确）连接，并把 root@'<管理器IP>' 密码校正为库存值，
         # 打破「root 密码漂移 -> 连不上 -> 自愈不跑」死循环。
+        # 注意：时间戳在整轮循环结束后统一更新，否则集群里只有第一个节点会被校正。
         _ts = _SELFHEAL_CRED_TS.get(cluster_id)
         if _ts is None or (time.time() - _ts) >= CRED_SELFHEAL_INTERVAL:
             cok, cmsg = ensure_ha_creds(ip, port, ru, rp,
@@ -382,9 +432,11 @@ def _selfheal_cluster(cluster_id):
                                         creds.get("app_user", ""), creds.get("app_pass", ""),
                                         manager_ip=get_manager_public_ip(),
                                         manager_subnet=get_manager_docker_subnet_wildcard())
-            _SELFHEAL_CRED_TS[cluster_id] = time.time()
+            did_cred = True
             if not cok:
                 print(f"[selfheal] {ip}:{port} 账号自愈失败: {cmsg}")
+    if did_cred:
+        _SELFHEAL_CRED_TS[cluster_id] = time.time()
 
 
 def ensure_topology(cluster_id):
@@ -425,7 +477,12 @@ def ensure_topology(cluster_id):
     if not ok:
         print(f"[topology][严重] 提升主库 {cur_h}:{cur_p} 为可写失败（VIP 将无法绑定到该节点，请检查账号权限/连接）：{perr}")
     else:
-        print(f"[topology] 主库 {cur_h}:{cur_p} 已置为可写(read_only=OFF)")
+        # 稳态下这行原本每周期必打一次（每 2s 一行），刷屏且掩盖真正的问题。
+        # 改为同一主库最多 5 分钟提示一次。
+        _pk = ("promote", cluster_id, cur_h, int(cur_p))
+        if time.monotonic() - _TOPO_AT.get(_pk, 0.0) >= 300:
+            _TOPO_AT[_pk] = time.monotonic()
+            print(f"[topology] 主库 {cur_h}:{cur_p} 已置为可写(read_only=OFF)")
     # 把当前主写入各节点本地 ha_local.state（keepalived 检查脚本据此持有/释放 VIP）
     push_current_master_to_nodes(cluster_id, f"{cur_h}:{cur_p}")
     for h in list_hosts(cluster_id):
@@ -443,6 +500,14 @@ def ensure_topology(cluster_id):
         # 残留自身 GTID）。GTID 自动定位会跳过它已执行过的事务，重入为从库时
         # 不会重放旧事务，因此无需 RESET MASTER（RESET MASTER 反而会因清空 GTID
         # 集合导致同名事务被新主重放而报「已存在」错误）。
+        # 拓扑修复限频：同一节点两次重挂复制之间至少间隔 TOPO_REPAIR_INTERVAL。
+        # 环境性故障（如复制账号漂移、1200 未配置复制通道）未解决时，原本会每 2s
+        # 重挂一次复制，既刷屏又在节点上持续产生复制启停写盘；限频后仍会自愈，
+        # 只是不再高频重试。真实切换走 do_failover，会主动清掉限频。
+        _rk = ("repoint", cluster_id, h["host"], int(h["port"]))
+        if time.monotonic() - _TOPO_AT.get(_rk, 0.0) < TOPO_REPAIR_INTERVAL:
+            continue
+        _TOPO_AT[_rk] = time.monotonic()
         was_stale_master = is_stale_master(st)
         ok = _repoint_slave(cluster_id, h, cur_h, cur_p, creds)
         if ok:
@@ -477,17 +542,25 @@ def ensure_topology(cluster_id):
     # （典型表现：仪表盘页头主库与节点列表中的当前主对不上；双主/脑裂时也以 current_master 表为准）。
     try:
         cm = query("SELECT host, port FROM current_master WHERE cluster_id=%s", (cluster_id,))
+        mh = mp = None
         if cm:
             mh, mp = cm[0]["host"], int(cm[0]["port"])
-            execute("UPDATE hosts SET is_current_master=0 WHERE cluster_id=%s", (cluster_id,))
-            execute("UPDATE hosts SET is_current_master=1 WHERE cluster_id=%s AND host=%s AND port=%s",
-                    (cluster_id, mh, mp))
         else:
             rows = query("SELECT host, port, role FROM hosts WHERE cluster_id=%s", (cluster_id,))
             live_masters = [r for r in rows if r["role"] == "master"]
             if len(live_masters) == 1:
                 mh, mp = live_masters[0]["host"], int(live_masters[0]["port"])
                 set_current_master(cluster_id, mh, mp)
+        if mh is not None:
+            # 【空闲零写入】仅当 hosts.is_current_master 与 current_master 表不一致时才写。
+            # 旧实现每周期无条件执行「全部置 0 + 主库置 1」，稳态下主库那一行会经历
+            # 1→0→1 的两次真实行更新，是空闲时管理库持续写盘的来源之一。
+            cur = query("SELECT host, port, is_current_master FROM hosts WHERE cluster_id=%s",
+                        (cluster_id,))
+            wrong = [r for r in cur
+                     if (int(r["is_current_master"] or 0) == 1)
+                     != (r["host"] == mh and int(r["port"]) == mp)]
+            if wrong:
                 execute("UPDATE hosts SET is_current_master=0 WHERE cluster_id=%s", (cluster_id,))
                 execute("UPDATE hosts SET is_current_master=1 WHERE cluster_id=%s AND host=%s AND port=%s",
                         (cluster_id, mh, mp))

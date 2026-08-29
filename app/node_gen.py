@@ -244,7 +244,7 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         # 默认域：统一使用 0（不推荐；generate_node 现已显式传入 server_id 作为非 0 域）
         gtid_domain_id = 0
     return (
-        "# ---- MySQL HA Manager 生成的 MariaDB 节点配置（完整 my.cnf，Install 脚本落盘）----\n"
+        "# ---- Custos 生成的 MariaDB 节点配置（完整 my.cnf，Install 脚本落盘）----\n"
         "[mysqld]\n"
         f"server-id = {server_id}\n"
         f"gtid_domain_id = {gtid_domain_id}\n"

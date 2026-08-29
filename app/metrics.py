@@ -8,6 +8,9 @@ monitor 周期性调用 collect_metrics()，把每个节点的复制状态快照
 from .db import query, execute, get_setting
 from .ha_client import get_status, connect_robust
 
+# 每个节点上一次落库快照的签名，用于变更检测（一致则不 INSERT）
+_LAST_SIG = {}
+
 
 def _cluster_ids(cluster_id=None):
     if cluster_id:
@@ -16,7 +19,11 @@ def _cluster_ids(cluster_id=None):
 
 
 def collect_metrics(cluster_id=None):
-    """采集全部（或指定）集群节点复制状态快照。返回采集节点数。
+    """采集全部（或指定）集群节点复制状态快照。返回**实际写入**的节点数。
+
+    【空闲零写入】某节点本次快照与上一条完全一致（延迟 / IO / SQL / read_only / 连接数
+    全相同）时**不 INSERT**。旧实现每 ~9s 对所有节点无条件插一行，是管理库空闲写入的
+    主要来源之一；稳态下现在一次写都不做。
 
     连接数/线程数由 get_status() 内统一用 ha_monitor 账号采集（无需节点 root），
     故此处直接取 st 的结果，不再单独探活。
@@ -38,6 +45,18 @@ def collect_metrics(cluster_id=None):
             ro = st.get("ro")
             connections = st.get("connections")
             threads_running = st.get("threads_running")
+            # 变更检测：与上次落库快照一致则整条跳过（稳态零写入）
+            sig = (
+                "" if seconds_behind is None else str(seconds_behind),
+                st.get("slave_io") or "",
+                st.get("slave_sql") or "",
+                "1" if ro else "0",
+                "" if connections is None else str(connections),
+            )
+            key = (cid, ip, port)
+            if _LAST_SIG.get(key) == sig:
+                continue
+            _LAST_SIG[key] = sig
             execute(
                 "INSERT INTO metric_history "
                 "(cluster_id, host, port, seconds_behind, slave_io, slave_sql, ro, connections, repl_delay) "
@@ -51,7 +70,17 @@ def collect_metrics(cluster_id=None):
     return count
 
 
+# 保留期清理限频：DELETE ... WHERE ts < ... 若缺 ts 单列索引会全表扫描，
+# 把整表页读进 buffer pool 造成脏页与后续 checkpoint 写盘。限频后影响可忽略
+# （索引已在 db.py 的迁移里补建：metric_history.idx_ts）。
+_LAST_PURGE = [0.0]
+
+
 def _purge():
+    import time
+    if time.monotonic() - _LAST_PURGE[0] < 3600:
+        return
+    _LAST_PURGE[0] = time.monotonic()
     try:
         days = int(get_setting("METRIC_RETENTION_DAYS") or 30)
         execute("DELETE FROM metric_history WHERE ts < DATE_SUB(NOW(), INTERVAL %s DAY)",

@@ -3,12 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>登录 · MySQL HA 管理器</title>
+  <title>登录 · Custos</title>
   <link rel="stylesheet" href="/static/styles.css">
   <link rel="stylesheet" href="/static/v3.css">
   <style>
     /* 登录页：深色质感底 + 毛玻璃双栏。
-       不再使用大面积玫红：玫红仅作为品牌点缀，主色交给蒂凡尼青，整体更沉稳大气。 */
+       不再使用大面积玫红：玫红仅作为品牌点缀，主色交给蒂凡尼青，整体更沉稳大气。
+       内页（v3.css / styles.css）已对齐本页同一套配色。 */
     :root{
       --bg-0:#070b14; --bg-1:#0e1830;
       --ink:#e8eefc; --muted:#8b9ac0;
@@ -37,14 +38,14 @@
               mask-image:radial-gradient(circle at 50% 40%, #000 0%, transparent 72%);
     }
     .auth-wrap{
-      position:relative; width:100%; max-width:960px;
-      display:grid; grid-template-columns:1.05fr .95fr;
+      position:relative; width:100%; max-width:980px;
+      display:grid; grid-template-columns:1fr 440px;
       border:1px solid var(--line); border-radius:22px; overflow:hidden;
       background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
       box-shadow:0 40px 90px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.07);
       -webkit-backdrop-filter:blur(18px); backdrop-filter:blur(18px);
     }
-    @media (max-width:860px){
+    @media (max-width:900px){
       .auth-wrap{grid-template-columns:1fr}
       .auth-side{display:none}
     }
@@ -56,12 +57,8 @@
         linear-gradient(160deg, rgba(124,45,82,.30), rgba(7,11,20,.10));
     }
     .brand{display:flex;align-items:center;gap:12px;font-size:19px;font-weight:800;letter-spacing:.4px}
-    .brand .mark{
-      width:38px;height:38px;border-radius:11px;display:grid;place-items:center;
-      font-size:19px;color:#04121a;
-      background:linear-gradient(135deg,var(--accent-2),var(--accent));
-      box-shadow:0 8px 22px rgba(10,186,181,.35);
-    }
+    .brand .mark{width:38px;height:38px;flex:0 0 auto;filter:drop-shadow(0 6px 16px rgba(10,186,181,.38))}
+    .brand .mark svg{width:38px;height:38px;display:block}
     .side-title{margin:28px 0 10px;font-size:26px;line-height:1.4;font-weight:800}
     .side-title em{
       font-style:normal;
@@ -80,14 +77,17 @@
     .auth-main{padding:40px 36px}
     .auth-main h1{margin:0 0 6px;font-size:22px;font-weight:800;letter-spacing:.3px}
     .auth-main .sub{margin:0 0 24px;color:var(--muted);font-size:13px}
-    .field{margin-bottom:15px}
-    .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px;font-weight:600}
-    .field input{
+    /* v3.css 的 .field 是设置页「标签左 / 控件右」的行式布局（display:flex）。
+       登录页必须改回块级上下排布 —— 否则 label 会被挤成极窄的一列，
+       「用户名 / 密码」被逐字竖向换行。 */
+    .auth-main .field{display:block;padding:0;border-bottom:0;margin-bottom:15px}
+    .auth-main .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px;font-weight:600;white-space:nowrap}
+    .auth-main .field input{
       width:100%;padding:12px 13px;border-radius:11px;font-size:14px;color:var(--ink);
       background:rgba(255,255,255,.05);border:1px solid var(--line);outline:none;transition:.18s;
     }
-    .field input::placeholder{color:rgba(139,154,192,.55)}
-    .field input:focus{
+    .auth-main .field input::placeholder{color:rgba(139,154,192,.55)}
+    .auth-main .field input:focus{
       border-color:rgba(34,211,238,.65);background:rgba(255,255,255,.08);
       box-shadow:0 0 0 4px rgba(10,186,181,.16);
     }
@@ -107,9 +107,31 @@
   </style>
 </head>
 <body>
+  <!-- Custos Logo：与内页（base.html）同一枚 -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="cs-grad" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#22d3ee"/>
+        <stop offset="1" stop-color="#0ABAB5"/>
+      </linearGradient>
+    </defs>
+    <symbol id="cs-logo" viewBox="0 0 32 32">
+      <path d="M16 2.2 27.5 6.4v9.4c0 6.8-4.8 12.0-11.5 14.0C9.3 27.8 4.5 22.6 4.5 15.8V6.4L16 2.2z"
+            fill="url(#cs-grad)"/>
+      <g fill="none" stroke="#04121a" stroke-width="1.7" stroke-linecap="round">
+        <ellipse cx="16" cy="12.2" rx="5.6" ry="2.2"/>
+        <path d="M10.4 12.2v6.6c0 1.2 2.5 2.2 5.6 2.2s5.6-1 5.6-2.2v-6.6"/>
+        <path d="M10.4 15.4c0 1.2 2.5 2.2 5.6 2.2s5.6-1 5.6-2.2"/>
+      </g>
+    </symbol>
+  </svg>
+
   <div class="auth-wrap">
     <aside class="auth-side">
-      <div class="brand"><span class="mark">◈</span><span>MySQL HA 管理器</span></div>
+      <div class="brand">
+        <span class="mark"><svg viewBox="0 0 32 32" aria-hidden="true"><use href="#cs-logo"/></svg></span>
+        <span>Custos</span>
+      </div>
       <h2 class="side-title">为数据库<br><em>永不中断</em>而设计</h2>
       <p class="side-sub">主库故障秒级切换、复制自愈、配置巡检，一套后台托管 MySQL / MariaDB 高可用集群。</p>
       <ul class="feat">
@@ -137,7 +159,7 @@
         <button type="submit" class="submit">登 录</button>
       </form>
 
-      <div class="foot">建议部署于内网环境 · 请妥善保管管理员凭证</div>
+      <div class="foot">Custos — Never let your database down · 建议部署于内网环境</div>
     </main>
   </div>
 </body>

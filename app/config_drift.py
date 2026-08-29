@@ -11,6 +11,9 @@
 from .db import query, execute
 from .ha_client import connect_robust
 
+# 每个集群上一次落库巡检结果的签名，用于变更检测（一致则不 INSERT）
+_LAST_SIG = {}
+
 
 def _var(conn, name):
     try:
@@ -51,7 +54,12 @@ def _fetch_all(ip, port, user, password, root_user="root", root_pass=""):
 
 
 def check_cluster(cluster_id):
-    """巡检指定集群，写入 config_drift，返回漂移项数。"""
+    """巡检指定集群，写入 config_drift，返回漂移项数。
+
+    【空闲零写入】本次巡检结果与上一次完全一致（含各项 OK）时**一条都不 INSERT**。
+    旧实现每 ~60s 对每个节点插入约 6 行（连 status='OK' 的正常项也照插），
+    稳态下管理库因此持续产生写入与表膨胀。
+    """
     rows = query(
         "SELECT n.ip, n.port, n.root_user, n.root_pass, h.role "
         "FROM nodes n LEFT JOIN hosts h ON h.host=n.ip AND h.cluster_id=n.cluster_id "
@@ -64,21 +72,19 @@ def check_cluster(cluster_id):
     ha_user = creds.get("ha_user") or "ha_monitor"
     ha_pass = creds.get("ha_pass") or ""
     snapshots = []
+    out = []   # 本次巡检结果行：(host, port, var_name, expected, actual, status)
     for n in rows:
         snap = _fetch_all(n["ip"], int(n["port"]), ha_user, ha_pass,
                           n.get("root_user") or "root", n.get("root_pass") or "")
         if snap is None:
             # 无法连接该节点，记为一条 DRIFT（连通性问题）
-            execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
-                    "VALUES (%s,%s,%s,'connectivity','reachable','unreachable','DRIFT')",
-                    (cluster_id, n["ip"], int(n["port"])))
+            out.append((n["ip"], int(n["port"]), "connectivity",
+                        "reachable", "unreachable", "DRIFT"))
             continue
         snap["_ip"] = n["ip"]
         snap["_port"] = int(n["port"])
         snap["_role"] = n.get("role") or "unknown"
         snapshots.append(snap)
-
-    drift = 0
 
     # 期望基准：第一个可达节点
     base = snapshots[0] if snapshots else None
@@ -87,17 +93,10 @@ def check_cluster(cluster_id):
     seen = set()
     for snap in snapshots:
         sid = snap.get("server_id")
-        if sid in seen:
-            # 重复 server_id：必为 DRIFT
-            drift += 1
-            execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
-                    "VALUES (%s,%s,%s,'server_id',%s,%s,'DRIFT')",
-                    (cluster_id, snap["_ip"], snap["_port"], f"unique(!={sid})", sid))
-        else:
-            seen.add(sid)
-            execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
-                    "VALUES (%s,%s,%s,'server_id',%s,%s,'OK')",
-                    (cluster_id, snap["_ip"], snap["_port"], f"unique(!={sid})", sid))
+        status = "DRIFT" if sid in seen else "OK"   # 重复 server_id：必为 DRIFT
+        seen.add(sid)
+        out.append((snap["_ip"], snap["_port"], "server_id",
+                    f"unique(!={sid})", str(sid), status))
 
     # 2) 一致性参数
     for snap in snapshots:
@@ -114,21 +113,13 @@ def check_cluster(cluster_id):
                 status = "OK" if str(actual).upper() not in ("0", "NONE", "") else "DRIFT"
             else:
                 status = "OK" if str(actual).upper() == exp else "DRIFT"
-            if status == "DRIFT":
-                drift += 1
-            execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                    (cluster_id, snap["_ip"], snap["_port"], var, exp, str(actual), status))
+            out.append((snap["_ip"], snap["_port"], var, exp, str(actual), status))
         # 3) read_only 与角色匹配（SHOW VARIABLES 返回 ON/OFF，需归一化为 0/1 再比对）
         ro = snap.get("read_only")
         exp_ro = "0" if snap["_role"] == "master" else "1"
         ro_norm = "1" if str(ro).strip().upper() in ("ON", "1", "TRUE", "YES") else "0"
-        status = "OK" if ro_norm == exp_ro else "DRIFT"
-        if status == "DRIFT":
-            drift += 1
-        execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
-                "VALUES (%s,%s,%s,'read_only',%s,%s,%s)",
-                (cluster_id, snap["_ip"], snap["_port"], exp_ro, str(ro), status))
+        out.append((snap["_ip"], snap["_port"], "read_only", exp_ro, str(ro),
+                    "OK" if ro_norm == exp_ro else "DRIFT"))
         # 4) 版本主版本一致
         if base:
             b_mm = (base.get("version") or "").split("-")[0]
@@ -136,18 +127,33 @@ def check_cluster(cluster_id):
             # 仅比较主版本.次版本（如 8.0 vs 8.4）
             b_mm = ".".join(b_mm.split(".")[:2])
             s_mm = ".".join(s_mm.split(".")[:2])
-            status = "OK" if b_mm == s_mm else "DRIFT"
-            if status == "DRIFT":
-                drift += 1
-            execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
-                    "VALUES (%s,%s,%s,'version',%s,%s,%s)",
-                    (cluster_id, snap["_ip"], snap["_port"], b_mm, s_mm, status))
+            out.append((snap["_ip"], snap["_port"], "version", b_mm, s_mm,
+                        "OK" if b_mm == s_mm else "DRIFT"))
 
+    # 变更检测：与上一次巡检结果完全一致 → 一条都不写（稳态零写入）
+    sig = tuple(out)
+    if _LAST_SIG.get(cluster_id) == sig:
+        return sum(1 for r in out if r[5] == "DRIFT")
+    _LAST_SIG[cluster_id] = sig
+
+    for host, port, var_name, expected, actual, status in out:
+        execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (cluster_id, host, port, var_name, expected, actual, status))
     _purge()
-    return drift
+    return sum(1 for r in out if r[5] == "DRIFT")
+
+
+_LAST_PURGE = [0.0]
 
 
 def _purge():
+    """保留期清理。限频 1 小时一次：DELETE ... WHERE ts < ... 若缺 ts 单列索引会全表扫描，
+    把整表页读进 buffer pool 产生脏页与后续 checkpoint 写盘（索引已在 db.py 迁移里补建）。"""
+    import time
+    if time.monotonic() - _LAST_PURGE[0] < 3600:
+        return
+    _LAST_PURGE[0] = time.monotonic()
     try:
         execute("DELETE FROM config_drift WHERE ts < DATE_SUB(NOW(), INTERVAL 7 DAY)")
     except Exception as e:

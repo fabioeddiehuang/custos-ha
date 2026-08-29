@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}系统设置 · MySQL HA 管理器{% endblock %}
+{% block title %}系统设置 · Custos{% endblock %}
 {% block content %}
 <style>
   .setting-item{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 0;border-bottom:1px solid var(--border)}
@@ -13,7 +13,7 @@
   .srv-actions{display:flex;align-items:center;gap:8px;flex-wrap:nowrap}
   .srv-actions .btn{flex:0 0 auto;white-space:nowrap}
   .srv-actions .mini-sel{flex:0 0 auto}
-  .srv-log{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:12px;max-height:420px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.6;white-space:pre-wrap;margin:0}
+  .srv-log{background:#060b16;color:#cbd5e1;padding:14px;border-radius:12px;max-height:420px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.6;white-space:pre-wrap;margin:0}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -44,7 +44,7 @@
     <div class="note">实时读取容器日志：管理器读取<b>自身容器</b>的 stdout/stderr（等价于 <code>docker logs</code>），其余容器经宿主 <code>/var/run/docker.sock</code> 读取。下拉为<b>本机实际存在的容器</b>（动态列举，不再出现本机没有的容器）。每 4 秒自动追加新增内容。</div>
     <div class="srv-actions">
       <select id="srvUnit" class="mini-sel" onchange="loadSrvLog()">
-        <option value="ha_manager">mysql-ha-manager（管理器自身）</option>
+        <option value="ha_manager">Custos（管理器自身）</option>
       </select>
       <button class="btn btn-sm btn-primary" onclick="loadSrvLog()">读取日志</button>
       <button class="btn btn-sm" onclick="exportSrvLog()">导出TXT（24h）</button>
@@ -62,7 +62,7 @@
     if(!t){t=document.createElement("div");t.id="toastBox";t.style.cssText="position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:2000;display:flex;flex-direction:column;gap:8px";document.body.appendChild(t);}
     var el=document.createElement("div");
     el.textContent=msg;
-    el.style.cssText="background:"+(kind==="err"?"#ef4444":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
+    el.style.cssText="background:"+(kind==="err"?"#fb7185":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
     t.appendChild(el);setTimeout(function(){el.remove();},2600);
   }
   function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
@@ -83,10 +83,10 @@
     var close=document.getElementById("fullClose");
     _full=!_full;
     if(_full){
-      log.style.cssText="position:fixed;inset:56px 16px 56px;z-index:150;max-height:none;background:#0f172a;border-radius:12px;overflow:auto;color:#e2e8f0;padding:14px;white-space:pre-wrap;font-family:var(--mono);font-size:12.5px";
-      close.style.cssText="position:fixed;top:16px;right:20px;z-index:200;display:inline-block;cursor:pointer;color:#fff;background:#b91c1c;border:none;border-radius:8px;padding:6px 12px;font-size:13px";
+      log.style.cssText="position:fixed;inset:56px 16px 56px;z-index:150;max-height:none;background:#060b16;border-radius:12px;overflow:auto;color:#cbd5e1;padding:14px;white-space:pre-wrap;font-family:var(--mono);font-size:12.5px";
+      close.style.cssText="position:fixed;top:16px;right:20px;z-index:200;display:inline-block;cursor:pointer;color:#fff;background:#fb7185;border:none;border-radius:8px;padding:6px 12px;font-size:13px";
     }else{
-      log.style.cssText="background:#0f172a;color:#e2e8f0;padding:14px;border-radius:12px;max-height:420px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.6;white-space:pre-wrap;margin:0;";
+      log.style.cssText="background:#060b16;color:#cbd5e1;padding:14px;border-radius:12px;max-height:420px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.6;white-space:pre-wrap;margin:0;";
       close.style.cssText="display:none";
     }
   }

@@ -2,6 +2,8 @@ FROM python:3.11-slim
 
 ARG VERSION
 LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.title="Custos"
+LABEL org.opencontainers.image.description="MySQL/MariaDB 高可用管理：故障切换、复制自愈、配置巡检"
 
 WORKDIR /app
 

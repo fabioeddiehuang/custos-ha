@@ -1,8 +1,8 @@
-# MySQL HA Manager
+# Custos
 
-> 当前版本：**v2.1.0**
+> 当前版本：**v2.2.2**
 > 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)。
-> 项目根目录指 `mysql-ha-manager/`（即本目录）。
+> 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
 
 基于 **Keepalived + MySQL 主从（GTID）** 的 MySQL 高可用方案，附带一个轻量管理器：
 - **决策器（monitor）**：探活主从、按策略自动选主、控制 VIP 漂移与脑裂保护；
@@ -28,8 +28,8 @@
 ## 1. 整体架构
 
 ```
-                  ┌─────────────── 管理端（部署 mysql-ha-manager 的机器）───────────────┐
-                  │  mysql-ha-manager（Web + 决策器 + 节点生成）                        │
+                  ┌─────────────── 管理端（部署 Custos 的机器）────────────────┐
+                  │  Custos（Web + 决策器 + 节点生成）                          │
                   │        │ 读取/写入拓扑、切换历史、账号                              │
                   │        ▼                                                            │
                   │  管理 MySQL（独立的外部库，存配置/拓扑/切换历史/账号）              │
@@ -49,16 +49,17 @@
 - **业务流量**：应用只连 `VIP:3307`，VIP 由 keepalived 漂移到当前主节点（keepalived 使用 host 网络，VIP 即绑定在节点主机的该端口上）。
 - **主从复制**：两节点互为 GTID 主从，`replication` 账号复制。
 - **选主 / 防脑裂**：keepalived 脚本读本地 MySQL 只读状态 + 管理库 `current_master` 共同判断是否升主；管理器也会按策略自动切换。
-- **数据目录**：一键生成的节点部署单元统一落在 `mysql-ha-manager/generated_nodes/<ip>/`（自包含，可直接拷到目标主机运行）；服务端可选演示库数据落在 `mysql-ha-manager/data/`。
+- **数据目录**：一键生成的节点部署单元统一落在 `custos-ha/generated_nodes/<ip>/`（自包含，可直接拷到目标主机运行）；服务端可选演示库数据落在 `custos-ha/data/`。
 
 ---
 
 ## 2. 目录结构
 
 ```
-mysql-ha-manager/
+custos-ha/
 ├── docker-compose.yml          # 服务端（管理器）编排
 ├── Dockerfile                  # 服务端镜像
+├── LICENSE                     # 开源许可证（MIT，版权 eddys.cn）
 ├── app/                        # 管理器源码（Web + 决策器 + 节点生成）
 │   ├── config.py               # 配置项（环境变量）
 │   ├── db.py / init_db.py      # 管理库连接与表结构初始化（含多集群迁移）
@@ -103,8 +104,8 @@ mysql-ha-manager/
 ## 4. 部署服务端（管理器）
 
 ```bash
-cd mysql-ha-manager
-docker compose up -d --build
+cd custos-ha
+./deploy.sh                     # 等价于 docker compose up -d --build（自动同步 app/VERSION 到 .env）
 ```
 
 启动后访问：`http://<管理端IP>:28888`（默认账号 `admin` / `admin`，生产请改 `WEB_PASS`）。
@@ -123,14 +124,14 @@ docker compose up -d --build
 | `CHECK_INTERVAL` / `FAIL_THRESHOLD` | 探活间隔(秒) / 连续失败阈值 | `3` / `2` |
 | `PROBE_TIMEOUT` | 单节点探活超时(秒) | `3` |
 | `NODES_DIR` | 容器内节点生成目录 | `/app/generated_nodes` |
-| `NODES_HOST_BASE` | 节点目录在宿主机的**显示路径**（Web 展示用） | `mysql-ha-manager/generated_nodes` |
+| `NODES_HOST_BASE` | 节点目录在宿主机的**显示路径**（Web 展示用） | `custos-ha/generated_nodes` |
 | `VIP` / `VIP_PREFIX` / `INTERFACE` / `VRID` / `VIP_PORT` | VIP / 掩码位 / 网卡 / 虚拟路由ID / VIP 对外访问端口 | 空 / `24` / `eth0` / `51` / `3307` |
 | `SMTP_*` / `ALERT_EMAIL` | 切换告警邮件（可选） | — |
 
 > 也支持通过文件注入敏感信息：`MGMT_MYSQL_PASS_FILE`、`WEB_PASS_FILE`（容器内路径）。
 
 ### 可选：自带演示用管理库
-取消 `docker-compose.yml` 中 `mgmt-mysql` 整段注释，并取消 `ha-manager` 的 `depends_on` 注释；数据落在 `./data/mysql-data`。生产推荐使用你已有的外部管理库。
+取消 `docker-compose.yml` 中 `mgmt-mysql` 整段注释，并取消 `custos` 的 `depends_on` 注释；数据落在 `./data/mysql-data`。生产推荐使用你已有的外部管理库。
 
 ---
 
@@ -244,7 +245,7 @@ docker compose up -d --build
 - 核对节点侧 `ha_check.conf` / `init.sql` 中的 `ha_monitor`、`replication` 密码，与「集群管理」中该集群设置的完全一致；可点「同步密码到节点」重新下发。
 
 **Q6. 刷新按钮卡顿 / 仪表盘不更新**
-- 刷新按钮只做并发探活 + 后台异步收敛，约单超时返回；仪表盘每 10s 轮询。若源码改动未生效，确认已 `docker compose up -d --build ha-manager` 重建镜像，且部署为单 worker（勿加 `--workers`）。
+- 刷新按钮只做并发探活 + 后台异步收敛，约单超时返回；仪表盘每 10s 轮询。若源码改动未生效，确认已 `docker compose up -d --build custos` 重建镜像，且部署为单 worker（勿加 `--workers`）。
 
 ---
 

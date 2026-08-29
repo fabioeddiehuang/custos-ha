@@ -1,4 +1,4 @@
-# MySQL HA 管理器 —— docker-compose 通用模板
+# Custos —— docker-compose 通用模板
 #
 # 部署前请将下列“示例 IP”（RFC 5737 文档保留段 192.0.2.0/24，仅占位、不可直连）
 # 替换为你的真实网络地址，三者必须互不相同：
@@ -8,9 +8,9 @@
 
 services:
   # ---- 本地管理库（可选参考，默认关闭）----
-  # 生产推荐用你已有的外部管理 MySQL，仅需在下方的 ha-manager.environment
+  # 生产推荐用你已有的外部管理 MySQL，仅需在下方的 custos.environment
   # 填好 MGMT_MYSQL_* 即可，无需启用本服务。
-  # 若想自带演示库：取消本段注释，并取消 ha-manager 的 depends_on 注释。
+  # 若想自带演示库：取消本段注释，并取消 custos 的 depends_on 注释。
   # 启用后须确保库内存在用户 ha@'%'（密码=MGMT_MYSQL_PASS）且已授权 ha.*。
   # mgmt-mysql:
   #   image: mysql:8.0
@@ -27,8 +27,8 @@ services:
   #     timeout: 5s
   #     retries: 5
 
-  # ---- MySQL HA 管理器（决策 + Web + 节点部署生成）----
-  ha-manager:
+  # ---- Custos（决策 + Web + 节点部署生成）----
+  custos:
     build: .
     restart: always
     # 启用上方 mgmt-mysql 时取消下一行注释
@@ -53,6 +53,10 @@ services:
 
       # 生成的节点部署文件持久化目录
       NODES_DIR: /app/generated_nodes
+      # 节点目录在宿主机上的「显示路径」（Web 展示用）。默认值按仓库目录名 custos-ha
+      # 推导；若你把项目放到别的目录名，请显式填成 <你的目录名>/generated_nodes，
+      # 否则 Web「节点管理」显示的路径会与实际落盘位置不符。
+      NODES_HOST_BASE: "custos-ha/generated_nodes"
 
       # 网络 / VIP（供“添加节点”生成的 compose 使用）
       VIP_PREFIX: "24"                # 子网掩码位数，按你的网段调整
