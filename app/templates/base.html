@@ -49,14 +49,14 @@
   </style>
 </head>
 <body>
-<!-- ===== Custos Logo（已定稿：8 号轨道环 · 天蓝，与登录页共用） ===== -->
+<!-- ===== Custos Logo 符号库（14 版方案，与登录页共用） ===== -->
 {% include "_logos.html" %}
 
 <div class="app">
   <!-- 左菜单 -->
   <aside class="sidebar">
     <div class="brand">
-      <span class="logo"><svg viewBox="0 0 32 32" aria-hidden="true"><use href="#cs-logo-8"/></svg></span>
+      <span class="logo"><svg viewBox="0 0 32 32" aria-hidden="true"><use href="#cs-logo-4" id="sideLogoUse"/></svg></span>
       <div><b>Custos</b><small>数据库高可用管家</small></div>
     </div>
     <nav class="side">
@@ -109,7 +109,18 @@
 {% block scripts %}{% endblock %}
 <script>
 (function(){
-var _p = location.pathname;
+  /* ===== Logo 方案：与登录页选型器共用 localStorage，全站保持一致 ===== */
+  (function(){
+    var DEFAULT = 4, MAX = 14;
+    var use = document.getElementById('sideLogoUse');
+    if(!use) return;
+    var v = DEFAULT;
+    try{ v = parseInt(localStorage.getItem('custos-logo-variant'), 10) || DEFAULT; }catch(e){}
+    if(!(v >= 1 && v <= MAX)) v = DEFAULT;
+    use.setAttribute('href', '#cs-logo-' + v);
+  })();
+
+  var _p = location.pathname;
   // 首页全屏：去掉内容区最大宽度限制，铺满可用宽度
   var _c = document.getElementById('content');
   if (_c && _p === '/') _c.classList.add('full-bleed');
