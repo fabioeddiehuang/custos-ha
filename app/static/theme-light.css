@@ -81,6 +81,10 @@ html[data-theme="light"] .overlay { background: rgba(15,23,42,.34); }
 /* ---------- 观测中心 / 表格：补齐 v3.css 中仍残留的深色字面量块 ---------- */
 html[data-theme="light"] .trend-svg      { background: var(--surface-3); }
 html[data-theme="light"] .slow-bar       { background: var(--surface-3); }
+/* 补齐 v3.css 中仍残留的深色 / 亮粉字面量块（浅色下低对比或不可见） */
+html[data-theme="light"] .dh-bar          { background: var(--surface-3); }
+html[data-theme="light"] .slow-rank       { background: var(--rose-bg); color: var(--rose); }
+html[data-theme="light"] .drift-node      { color: var(--plum); }
 html[data-theme="light"] .acc            { background: var(--surface-2); }
 html[data-theme="light"] .port-chip      { background: var(--surface-2); }
 html[data-theme="light"] .drift-item     { background: rgba(157,23,77,.10); }
