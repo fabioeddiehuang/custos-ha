@@ -173,30 +173,6 @@
       border-radius:11px;padding:10px 12px;margin-bottom:18px;font-size:13px;
     }
 
-    /* ---------- Logo 方案切换器（选型用，定稿后可整块删除） ---------- */
-    .lp-picker{
-      position:absolute; left:clamp(34px,4.6vw,72px); right:clamp(18px,3vw,40px); bottom:22px;
-      z-index:2; font-size:11.5px; color:var(--lp-muted);
-    }
-    .lp-picker .row{display:flex; align-items:center; flex-wrap:wrap; gap:6px}
-    .lp-picker b{font-weight:600;letter-spacing:.08em;margin-right:3px}
-    .lp-picker button{
-      width:26px;height:26px;border-radius:8px;cursor:pointer;
-      border:1px solid var(--lp-line); background:var(--lp-input);
-      color:var(--lp-muted); font-size:11.5px; font-weight:700;
-      transition:.16s; padding:0;
-    }
-    .lp-picker button:hover{color:var(--lp-ink);border-color:rgba(34,211,238,.5);transform:translateY(-1px)}
-    .lp-picker button.on{
-      background:linear-gradient(135deg,var(--accent-2),var(--accent));
-      color:var(--lp-ink-strong); border-color:transparent;
-      box-shadow:0 6px 16px rgba(10,186,181,.28);
-    }
-    .lp-picker .lp-name{
-      margin-top:9px; font-size:12px; color:var(--lp-ink); opacity:.8;
-    }
-    .lp-picker .lp-name span{color:var(--accent);font-weight:700}
-
     @media (max-width:920px){
       .auth{grid-template-columns:1fr}
       .brand-side{display:none}
@@ -206,7 +182,7 @@
 </head>
 <body>
 
-<!-- ===== Logo 14 版方案（1-4 既有盾牌系，5-14 彩色 / 非盾牌新方案） ===== -->
+<!-- ===== Logo：已定稿 8 号（轨道环 · 天蓝），与内页侧边栏共用 ===== -->
 {% include "_logos.html" %}
 
 <div class="auth">
@@ -214,11 +190,11 @@
   <aside class="brand-side">
     <!-- 水印（装饰） -->
     <span class="brand-wm" aria-hidden="true">
-      <svg viewBox="0 0 32 32"><use href="#cs-logo-1" id="wmUse"/></svg>
+      <svg viewBox="0 0 32 32"><use href="#cs-logo-8" id="wmUse"/></svg>
     </span>
 
     <div class="lockup">
-      <span class="mark"><svg viewBox="0 0 32 32" aria-hidden="true"><use href="#cs-logo-1" id="markUse"/></svg></span>
+      <span class="mark"><svg viewBox="0 0 32 32" aria-hidden="true"><use href="#cs-logo-8" id="markUse"/></svg></span>
       <div>
         <div class="wordmark">CUSTOS</div>
         <div class="tagline">Never let your database down</div>
@@ -234,27 +210,7 @@
       <li><span class="dot"></span><span>多集群统一观测与告警中心</span></li>
     </ul>
 
-    <!-- 选型切换器：点击编号实时预览（定稿后整块删除即可） -->
-    <div class="lp-picker" id="logoPicker">
-      <div class="row" id="logoPickerRow">
-        <b>Logo 方案</b>
-        <button type="button" data-v="1">1</button>
-        <button type="button" data-v="2">2</button>
-        <button type="button" data-v="3">3</button>
-        <button type="button" data-v="4" class="on">4</button>
-        <button type="button" data-v="5">5</button>
-        <button type="button" data-v="6">6</button>
-        <button type="button" data-v="7">7</button>
-        <button type="button" data-v="8">8</button>
-        <button type="button" data-v="9">9</button>
-        <button type="button" data-v="10">10</button>
-        <button type="button" data-v="11">11</button>
-        <button type="button" data-v="12">12</button>
-        <button type="button" data-v="13">13</button>
-        <button type="button" data-v="14">14</button>
-      </div>
-      <div class="lp-name" id="logoName"></div>
-    </div>
+
   </aside>
 
   <!-- ============ 右：登录表单 ============ -->
@@ -280,59 +236,6 @@
   </main>
 </div>
 
-<script>
-(function(){
-  var KEY='custos-logo-variant';
-  var DEFAULT=4;   // 当前保留方案：4（盾牌 + 字母 C）
-  var NAMES={
-    1:'盾牌 · 单盘（品牌青）',
-    2:'盾牌 · 双层盘（品牌青）',
-    3:'盾牌 · 守护环（品牌青）',
-    4:'盾牌 · 字母 C（品牌青）',
-    5:'六边形 · 数据库（青绿）',
-    6:'圆徽章 · 数据柱（琥珀橙）',
-    7:'菱形 · 数据库（靛蓝紫）',
-    8:'轨道环（天蓝）',
-    9:'四叶风车（翡翠绿）',
-    10:'心跳脉冲（玫红）',
-    11:'等距立方（暖橙）',
-    12:'无限符号（青 → 梅紫）',
-    13:'循环同步箭头（紫罗兰 → 青）',
-    14:'守护之星（金琥珀）'
-  };
-  var MAX=14;
 
-  var markUse=document.getElementById('markUse');
-  var wmUse=document.getElementById('wmUse');
-  var picker=document.getElementById('logoPicker');
-  var nameEl=document.getElementById('logoName');
-
-  function apply(v){
-    if(!(v>=1&&v<=MAX)) v=DEFAULT;
-    var href='#cs-logo-'+v;
-    if(markUse)markUse.setAttribute('href',href);
-    if(wmUse)wmUse.setAttribute('href',href);
-    if(picker){
-      picker.querySelectorAll('button[data-v]').forEach(function(b){
-        b.classList.toggle('on', b.getAttribute('data-v')===String(v));
-      });
-    }
-    if(nameEl) nameEl.innerHTML='<span>'+v+'.</span> '+NAMES[v];
-    try{ localStorage.setItem(KEY,String(v)); }catch(e){}
-  }
-
-  var saved=DEFAULT;
-  try{ saved=parseInt(localStorage.getItem(KEY),10)||DEFAULT; }catch(e){}
-  apply(saved);
-
-  if(picker){
-    picker.addEventListener('click',function(e){
-      var b=e.target.closest('button[data-v]');
-      if(!b)return;
-      apply(parseInt(b.getAttribute('data-v'),10)||DEFAULT);
-    });
-  }
-})();
-</script>
 </body>
 </html>

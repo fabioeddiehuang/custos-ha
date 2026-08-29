@@ -107,12 +107,21 @@ section{display:none}section.active{display:block}
 .btn-sm{padding:6px 12px;font-size:13px}
 .btn.green{background:var(--success);border-color:var(--success);color:#04121a}.btn.green:hover{opacity:.9;color:#04121a}
 /* 全局统一按钮 hover：刷新状态描边效果（高亮边框 + 外发光环） */
-.btn:hover,.btn-primary:hover,.btn-accent:hover,.btn-ghost:hover,.btn.green:hover{
+.btn:hover,
+.btn-primary:hover,
+.btn-accent:hover,
+.btn-ghost:hover,
+.btn.green:hover{
   border-color:var(--primary);
-  box-shadow:0 0 0 3px var(--primary-ring),0 2px 10px rgba(10,186,181,.18)}
-.btn-primary:hover,.btn-accent:hover,.btn.green:hover{color:#04121a;border-color:rgba(255,255,255,.9)}
-.btn-danger:hover,.btn.red:hover{background:var(--danger);color:#fff;border-color:#fff;
-  box-shadow:0 0 0 3px rgba(225,29,72,.20),0 3px 14px rgba(225,29,72,.30)}
+  box-shadow:0 0 0 3px var(--primary-ring),0 2px 10px rgba(10,186,181,.18)
+}
+/* 彩色实心按钮 hover：保持深墨字，仅靠外发光环体现刷新描边（不再用白边） */
+.btn-primary:hover,.btn-accent:hover,.btn.green:hover{color:#04121a}
+/* 危险按钮：保留红色描边体系（同款外发光环，仅换色，区别于常规刷新描边） */
+.btn-danger:hover,.btn.red:hover{
+  background:var(--danger);color:#fff;border-color:var(--danger);
+  box-shadow:0 0 0 3px var(--danger-border),0 3px 14px rgba(225,29,72,.30)
+}
 .toolbar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
 .toolbar .spacer{flex:1}
 input,select,textarea{font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:rgba(255,255,255,.05);color:var(--text);width:100%;transition:.15s}
