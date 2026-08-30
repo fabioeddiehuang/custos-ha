@@ -65,6 +65,14 @@
   .nd-v{font-size:14px;color:var(--text);word-break:break-all}
   .nd-v.on{color:var(--success);font-weight:700}
   .nd-v.off{color:var(--danger);font-weight:700}
+  /* 顶部工具栏重设计 */
+  .cd-toolbar{gap:9px}
+  .menu-label{font-size:11px;color:var(--muted);font-weight:700;padding:8px 14px 4px;letter-spacing:.4px}
+  .menu-sep{height:1px;background:var(--border);margin:6px 10px}
+  .auto-menu{min-width:250px;padding:6px}
+  .auto-row{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:9px 12px;font-size:13px;color:var(--text);cursor:default}
+  .auto-row:hover{background:var(--primary-light);border-radius:8px}
+  .auto-row>span{font-weight:500}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -75,25 +83,34 @@
 <input type="hidden" id="logCluster" value="{{ cluster.id }}">
 <input type="hidden" id="termCluster" value="{{ cluster.id }}">
 
-<div class="toolbar">
+<div class="toolbar cd-toolbar">
   <a class="btn" href="/clusters">← 集群总览</a>
   <button class="btn" onclick="location.reload()">⟳ 刷新状态</button>
-  <button class="btn" onclick="openEdit({{ cluster.id }})">⚙ 修改配置/密码</button>
-  <a class="btn" href="/clusters/{{ cluster.id }}/backup">⤓ 备份恢复</a>
   <button class="btn btn-primary" onclick="openTerm()">▷ 数据库终端</button>
-  <div class="menu-wrap"><button class="btn" onclick="toggleMenu('switchMenu',event)">⇄ 手动切换主从 ▾</button>
-    <div class="menu" id="switchMenu"></div>
-  </div>
-  <span style="display:flex;align-items:center;gap:8px">自动切换<label class="switch"><input type="checkbox" id="swFailover" {% if auto_failover %}checked{% endif %} onchange="toggleAuto('AUTO_FAILOVER', this)"><span class="slider"></span></label></span>
-  <span style="display:flex;align-items:center;gap:8px">自动修复<label class="switch"><input type="checkbox" id="swRepair" {% if auto_repair %}checked{% endif %} onchange="toggleAuto('AUTO_REPAIR', this)"><span class="slider"></span></label></span>
-  <span style="display:flex;align-items:center;gap:8px;white-space:nowrap" title="多数从库复制延迟持续 ≥ LAG_FAILOVER_SEC(默认60s) 且连续 LAG_FAILOVER_CYCLES(默认3) 个周期成立时，自动把延迟最小的从库提为主">延迟切换<label class="switch"><input type="checkbox" id="swLagFo" {% if lag_failover %}checked{% endif %} onchange="toggleAuto('LAG_FAILOVER_ENABLED', this)"><span class="slider"></span></label></span>
-  <span style="display:flex;align-items:center;gap:8px;white-space:nowrap" title="主库压力持续超阈值（Threads_running ≥ 50 或 行锁等待 ≥ 50 次/周期）且连续 3 个周期成立时，自动把压力最低的从库提为主">压力切换<label class="switch"><input type="checkbox" id="swPrsFo" {% if pressure_failover %}checked{% endif %} onchange="toggleAuto('PRESSURE_FAILOVER_ENABLED', this)"><span class="slider"></span></label></span>
-  <div class="menu-wrap"><button class="btn green" onclick="toggleMenu('fixMenu',event)">🛠 一键修复 ▾</button>
-    <div class="menu" id="fixMenu">
+  <div class="menu-wrap">
+    <button class="btn" onclick="toggleMenu('moreMenu',event)">⋯ 更多操作 ▾</button>
+    <div class="menu" id="moreMenu">
+      <a onclick="openEdit({{ cluster.id }})">⚙ 修改配置 / 密码</a>
+      <a href="/clusters/{{ cluster.id }}/backup">⤓ 备份恢复</a>
+      <div class="menu-sep"></div>
+      <div class="menu-label">一键修复</div>
       <a onclick="doRepair('heal_io')">修复复制延迟<span class="d">高延迟</span></a>
       <a onclick="doRepair('heal_sql')">修复复制中断<span class="d">IO/SQL 报错</span></a>
       <a onclick="doRepair('sync')">同步账号凭证<span class="d">支持自动</span></a>
       <a onclick="doRepair('push')">重新下发配置<span class="d">支持自动</span></a>
+    </div>
+  </div>
+  <div class="menu-wrap"><button class="btn" onclick="toggleMenu('switchMenu',event)">⇄ 手动切换主从 ▾</button>
+    <div class="menu" id="switchMenu"></div>
+  </div>
+  <div class="menu-wrap">
+    <button class="btn" onclick="toggleMenu('autoMenu',event)">⚙ 自动化 ▾</button>
+    <div class="menu auto-menu" id="autoMenu" onclick="event.stopPropagation()">
+      <div class="menu-label">自动运维开关</div>
+      <label class="auto-row"><span>自动切换</span><label class="switch"><input type="checkbox" id="swFailover" {% if auto_failover %}checked{% endif %} onchange="toggleAuto('AUTO_FAILOVER', this)"><span class="slider"></span></label></label>
+      <label class="auto-row" title="高延迟从库自动摘流量并触发修复"><span>自动修复</span><label class="switch"><input type="checkbox" id="swRepair" {% if auto_repair %}checked{% endif %} onchange="toggleAuto('AUTO_REPAIR', this)"><span class="slider"></span></label></label>
+      <label class="auto-row" title="多数从库复制延迟持续 ≥ LAG_FAILOVER_SEC(默认60s) 且连续 LAG_FAILOVER_CYCLES(默认3) 个周期成立时，自动把延迟最小的从库提为主"><span>延迟切换</span><label class="switch"><input type="checkbox" id="swLagFo" {% if lag_failover %}checked{% endif %} onchange="toggleAuto('LAG_FAILOVER_ENABLED', this)"><span class="slider"></span></label></label>
+      <label class="auto-row" title="主库压力持续超阈值（Threads_running ≥ 50 或 行锁等待 ≥ 50 次/周期）且连续 3 个周期成立时，自动把压力最低的从库提为主"><span>压力切换</span><label class="switch"><input type="checkbox" id="swPrsFo" {% if pressure_failover %}checked{% endif %} onchange="toggleAuto('PRESSURE_FAILOVER_ENABLED', this)"><span class="slider"></span></label></label>
     </div>
   </div>
   <span class="spacer"></span><span class="badge ok">复制正常</span>

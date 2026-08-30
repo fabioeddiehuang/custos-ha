@@ -16,6 +16,17 @@
   .drift-exp{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
   .drift-arrow{color:#8b9ac0;margin:0 4px}
   .drift-foot{font-size:11.5px;color:#8b9ac0;padding-top:2px}
+  /* 活动中心：实时活动 + 切换记录 合并卡片 */
+  .act-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  .act-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+  @media(max-width:980px){.act-grid{grid-template-columns:1fr}}
+  .act-col{display:flex;flex-direction:column;min-width:0}
+  .act-col-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+  .act-col-t{font-size:14px;font-weight:700;color:var(--text)}
+  .act-col-t .muted{font-weight:400;font-size:12px;margin-left:6px}
+  .act-filters{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+  .act-feed,.act-tl{max-height:330px;overflow:auto;padding-right:4px}
+  .act-pager{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}
 </style>
 
 <div class="dh-top">
@@ -120,10 +131,6 @@
 {% endfor %}
 </div>
 
-<div class="dh-bottom">
-  <div class="dh-sec-h">实时活动</div>
-  <div class="dh-feed" id="feedBody"><div class="obs-empty">加载中…</div></div>
-</div>
 
 <div class="card obs-wrap">
   <div class="obs-head">
@@ -186,24 +193,37 @@
 </div>
 
 <div class="card">
-  <h3 style="margin:0 0 12px;">切换记录 <span class="muted" id="swCount"></span></h3>
-  <div class="toolbar" style="margin-bottom:12px">
-    <select id="swCluster" class="mini-sel" onchange="loadSwitchHistory()">
-      <option value="0">集群：全部</option>
-      {% for c in clusters %}<option value="{{ c.cluster_id }}">{{ c.name }}</option>{% endfor %}
-    </select>
-    <select id="swHours" class="mini-sel" onchange="loadSwitchHistory()">
-      <option value="0">时间：全部</option>
-      <option value="24">近 24 小时</option>
-      <option value="168">近 7 天</option>
-      <option value="720">近 30 天</option>
-    </select>
-    <span class="spacer"></span>
-    <button class="btn btn-sm" id="swPrev" onclick="swPage(-1)">上一页</button>
-    <span id="swPageInfo" class="muted"></span>
-    <button class="btn btn-sm" id="swNext" onclick="swPage(1)">下一页</button>
+  <div class="act-head">
+    <h3 style="margin:0">活动中心</h3>
+    <button class="btn btn-sm btn-ghost" onclick="loadActivity()">刷新活动</button>
   </div>
-  <div class="dh-timeline" id="swBody"><div class="obs-empty">加载中…</div></div>
+  <div class="act-grid">
+    <section class="act-col">
+      <div class="act-col-h"><span class="act-col-t">实时活动</span></div>
+      <div class="dh-feed act-feed" id="feedBody"><div class="obs-empty">加载中…</div></div>
+    </section>
+    <section class="act-col">
+      <div class="act-col-h"><span class="act-col-t">切换记录 <span class="muted" id="swCount"></span></span></div>
+      <div class="act-filters">
+        <select id="swCluster" class="mini-sel" onchange="loadSwitchHistory()">
+          <option value="0">集群：全部</option>
+          {% for c in clusters %}<option value="{{ c.cluster_id }}">{{ c.name }}</option>{% endfor %}
+        </select>
+        <select id="swHours" class="mini-sel" onchange="loadSwitchHistory()">
+          <option value="0">时间：全部</option>
+          <option value="24">近 24 小时</option>
+          <option value="168">近 7 天</option>
+          <option value="720">近 30 天</option>
+        </select>
+      </div>
+      <div class="dh-timeline act-tl" id="swBody"><div class="obs-empty">加载中…</div></div>
+      <div class="act-pager">
+        <button class="btn btn-sm" id="swPrev" onclick="swPage(-1)">上一页</button>
+        <span id="swPageInfo" class="muted"></span>
+        <button class="btn btn-sm" id="swNext" onclick="swPage(1)">下一页</button>
+      </div>
+    </section>
+  </div>
 </div>
 
 <script>
