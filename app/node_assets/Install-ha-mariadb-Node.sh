@@ -151,6 +151,23 @@ if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" != "Disabled" ]];
 fi
 log "MariaDB 程序已就位：$INSTALL_DIR/bin/mariadbd"
 
+# ---------- 2.5) 运行前兼容性自检（关键）----------
+# MariaDB 12.3.3 的 linux-systemd 二进制要求宿主 glibc ≥ 2.28、libstdc++ 带
+# GLIBCXX_3.4.20+、libcrypt(XCRYPT_2.0)、libsystemd(LIBSYSTEMD_227)。
+# 老系统（如 CentOS 7 / glibc 2.17、Ubuntu 18.04 / glibc 2.27）会直接报
+# "... version `GLIBC_2.28' not found" 且 bootstrap 静默失败，极难看懂。
+# 这里在初始化前就验证二进制能真正被加载执行，给出明确指引。
+if ! out="$("$INSTALL_DIR/bin/mariadbd" --version 2>&1)"; then
+  err "本节点无法运行 $INSTALL_DIR/bin/mariadbd（操作系统 / 运行时库版本过低）。缺失的符号："
+  echo "$out" | grep -iE 'not found|version .* not|GLIBC|GLIBCXX|XCRYPT|LIBSYSTEMD|CXXABI' | head -8 | sed 's/^/      /' || true
+  die "该节点的 glibc/libstdc++ 低于 MariaDB 12.3.3(linux-systemd) 的要求（需 glibc≥2.28 等）。"\
+"此类老系统请改用 Docker 方式部署 MariaDB 12.3.3（容器自带运行时，不受宿主 glibc 限制）："\
+"在本节点目录用官方镜像 mariadb:12.3.3（host 网络，挂载 ./my.cnf 与 /data/mariadb），"\
+"再按裸机流程执行 init_mariadb.sql 并拉起 keepalived 客户端即可。"\
+"或升级该节点系统 / glibc 后重试裸机安装。"
+fi
+log "二进制兼容性自检通过：$(echo "$out" | head -1)"
+
 # ---------- 3) 初始化 data 目录 ----------
 log "初始化数据目录：$DATA_DIR"
 mkdir -p "$DATA_DIR"

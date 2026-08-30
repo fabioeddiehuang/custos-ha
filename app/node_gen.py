@@ -21,7 +21,7 @@ from pathlib import Path
 import pymysql
 
 from .db import get_setting, query, execute
-from .mysql_compat import default_auth_plugin
+from .mysql_compat import default_auth_plugin, is_mariadb_node
 from .config import NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
@@ -42,6 +42,15 @@ _vip_warn_ts = {}
 
 NODE_ASSETS = Path(__file__).parent / "node_assets" / "keepalived"
 NODE_SCRIPTS = Path(__file__).parent / "node_assets"
+
+# 容器化 MariaDB 节点（node_type='mariadb-docker'）使用的镜像。
+# 首选 UBI 构建（自带较新运行时，无需目标机装任何依赖）；拉取失败时脚本自动退到
+# Debian 构建的 12.3.2（体积更小，同为 12.3 系列，GTID/复制行为一致）。
+MARIADB_DOCKER_IMAGE = "mariadb:12.3.3-ubi"
+MARIADB_DOCKER_IMAGE_FALLBACK = "mariadb:12.3.2"
+# 容器化 MariaDB 节点的宿主数据目录（与裸机 MariaDB 保持一致，便于两种形态混部时运维统一）
+MARIADB_DOCKER_DATA_DIR = "/data/mariadb"
+MARIADB_DOCKER_CONTAINER = "mariadb-ha-node"
 
 
 def _valid_vip(vip):
@@ -291,6 +300,58 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
     )
 
 
+def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
+    """容器化 MariaDB 节点的配置片段（docker-my.cnf，由 Run 脚本挂载进容器）。
+
+    与裸机 my.cnf 的**唯一**差别：不写 datadir / socket / pid_file —— 这三个路径
+    在官方镜像内是 /var/lib/mysql 与 /run/mariadb/mariadb.sock，若沿用宿主的
+    /data/mariadb 会导致容器起不来。其余（server-id / gtid_domain_id / port /
+    bind-address / 复制与慢日志参数）与裸机完全一致，保证两种形态同集群混部时
+    复制行为一致。
+
+    落盘位置由 Run-mariadb-docker-Node.sh 决定：同时挂载到
+      - /etc/my.cnf.d/99-ha.cnf      （UBI 构建：/etc/my.cnf 里 !includedir /etc/my.cnf.d）
+      - /etc/mysql/conf.d/99-ha.cnf  （Debian 构建：/etc/mysql/my.cnf 里 !includedir）
+    两条都挂，使 12.3.3-ubi 与 12.3.2 任一镜像都能读到；99- 前缀保证最后加载、覆盖默认。
+    """
+    if gtid_domain_id is None:
+        gtid_domain_id = server_id
+    return (
+        "# ---- Custos 生成的容器化 MariaDB 节点配置（docker-my.cnf，由 Run 脚本挂载进容器）----\n"
+        "# 注意：容器内数据目录固定 /var/lib/mysql、socket 固定 /run/mariadb/mariadb.sock，\n"
+        "#       故本文件【不设】datadir / socket / pid_file，请到 Run 脚本改 MARIA_DATA_DIR。\n"
+        "[mysqld]\n"
+        f"server-id = {server_id}\n"
+        f"gtid_domain_id = {gtid_domain_id}\n"
+        "# MariaDB 默认启用 GTID，无需 gtid_mode（与 MySQL 不兼容，请勿添加）\n"
+        "log_bin = mysql-bin\n"
+        "log_slave_updates = ON\n"
+        "relay_log = relay-bin\n"
+        "relay_log_recovery = ON\n"
+        "sync_binlog = 1\n"
+        "innodb_flush_log_at_trx_commit = 1\n"
+        "binlog_format = ROW\n"
+        "read_only = ON\n"
+        "# 复制/性能（与裸机 MariaDB 节点保持一致）\n"
+        "innodb_buffer_pool_size = 1G\n"
+        "innodb_io_capacity = 2000\n"
+        "innodb_io_capacity_max = 4000\n"
+        "slave_parallel_threads = 4\n"
+        "slave_parallel_mode = optimistic\n"
+        "# 慢日志（供观测/排错）\n"
+        "slow_query_log = 1\n"
+        "long_query_time = 0.5\n"
+        "log_output = TABLE\n"
+        "log_queries_not_using_indexes = 0\n"
+        f"port = {port}\n"
+        "bind_address = 0.0.0.0\n"
+        "skip-name-resolve\n"
+        "# 字符集\n"
+        "character_set_server = utf8mb4\n"
+        "collation_server = utf8mb4_general_ci\n"
+    )
+
+
 def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass):
     """MariaDB 节点的 init.sql：创建 ha_monitor / replication / app 账号 + ha_local 状态库。
 
@@ -334,15 +395,21 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
 
 
 def render_baremetal_compose(node_name, vip_port=None):
-    """裸机 MariaDB 节点：只跑 keepalived 客户端（docker 模式），MySQL/MariaDB 由宿主机既有实例提供。
+    """MariaDB 节点（裸机 / 容器化）的 compose：只跑 keepalived 客户端。
+
+    - 裸机 MariaDB：mysqld 由宿主 systemd 提供；
+    - 容器化 MariaDB：MariaDB 容器由 Run-mariadb-docker-Node.sh 以 host 网络单独拉起
+      （不进 compose，是因为它需要先准备配置 / 执行 init SQL，再起 keepalived）。
 
     keepalived 容器使用 host 网络，连接 127.0.0.1:<port> 探活本机 MariaDB。
     """
     if vip_port is None:
         vip_port = VIP_PORT
     return (
-        "# 自动生成：裸机 MariaDB + keepalived-only 客户端节点部署\n"
-        "# 前置：目标机已按 my.cnf（含 server_id/gtid_domain_id）部署 MariaDB 并创建账号（init_mariadb.sql）。\n"
+        "# 自动生成：MariaDB 节点（裸机 / 容器化）的 keepalived-only 客户端部署\n"
+        "# 前置：目标机 MariaDB 已就绪并创建账号（init_mariadb.sql）——\n"
+        "#       裸机形态：由 Install-ha-mariadb-Node.sh 全量安装（宿主 systemd 管理 mysqld）；\n"
+        "#       容器形态：由 Run-mariadb-docker-Node.sh 以 host 网络拉起官方 MariaDB 容器。\n"
         "# 运行： cd 本目录 && docker compose up -d\n"
         "services:\n"
         "  keepalived:\n"
@@ -674,7 +741,8 @@ def regenerate_cluster_compose(cluster_id):
         if not p.exists():
             continue
         node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
-        if node_type == "mariadb":
+        if is_mariadb_node(node_type):
+            # 两种 MariaDB 形态的 compose 都只含 keepalived 客户端
             content = render_baremetal_compose(node_name, vip_port)
         else:
             content = _render_compose(
@@ -771,9 +839,9 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     server_id = get_next_server_id()
     node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
     peers = _peer_ips(ip, cluster_id)
-    # MariaDB 裸机模式 keepalived 容器在 host 网络，连本机 MariaDB 用 127.0.0.1；
-    # Docker 模式连节点 IP（容器已把端口发布到宿主机）。
-    local_host = "127.0.0.1" if node_type == "mariadb" else ip
+    # MariaDB 两种形态（裸机 / 容器 host 网络）的 keepalived 容器都在 host 网络，
+    # 连本机 MariaDB 用 127.0.0.1；MySQL Docker 模式连节点 IP（桥接网络靠端口发布）。
+    local_host = "127.0.0.1" if is_mariadb_node(node_type) else ip
 
     d = _safe_node_path(ip)
     d.mkdir(parents=True, exist_ok=True)
@@ -785,28 +853,46 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
                                 auth_plugin=_auth_plugin_for(mysql_version, node_type))
     extra_files = {}
-    if node_type == "mariadb":
-        # MariaDB 裸机：完全独立安装（脱离宝塔），由 Install 脚本全量安装 tarball。
-        # 服务端在此生成完整 my.cnf + init_mariadb.sql + 安装/卸载脚本，确保「配置一致性」。
+    if is_mariadb_node(node_type):
+        # MariaDB 两种形态（裸机 / 容器）共用：init_mariadb.sql + fix-node-creds.sql。
+        # 差异仅在「配置文件」与「部署脚本」，故此处先写公共部分，再按形态分支。
         _write(d / "init_mariadb.sql", render_mariadb_init_sql(
             ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass), mode=0o644)
-        # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
-        # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
-        # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
-        my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=server_id)
-        _write(d / "my.cnf", my_cnf, mode=0o644)
         # 账号/权限修复脚本（MariaDB 语法，native 密码）
         fix_sql = render_fix_node_creds_sql_mariadb(
             ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port,
             manager_subnet)
         _write(d / "fix-node-creds.sql", fix_sql, mode=0o644)
         extra_files["init_mariadb_sql"] = f"{NODES_HOST_BASE}/{ip}/init_mariadb.sql"
-        extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/my.cnf"
-        # MariaDB 全量安装 / 卸载脚本：随节点目录一同交付（用户操作：下载安装包 -> 执行 Install）
-        for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh"):
-            src = NODE_SCRIPTS / sf
-            if src.exists():
-                _write(d / sf, src.read_text(), mode=0o755)
+        # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
+        # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
+        if node_type == "mariadb-docker":
+            # 容器化 MariaDB：配置片段（不含 datadir/socket）+ Run/Uninstall 脚本
+            _write(d / "docker-my.cnf",
+                   render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=server_id),
+                   mode=0o644)
+            extra_files["docker_my_cnf"] = f"{NODES_HOST_BASE}/{ip}/docker-my.cnf"
+            extra_files["run_script"] = f"{NODES_HOST_BASE}/{ip}/Run-mariadb-docker-Node.sh"
+            extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-docker-Node.sh"
+            for sf in ("Run-mariadb-docker-Node.sh", "Uninstall-mariadb-docker-Node.sh"):
+                src = NODE_SCRIPTS / sf
+                if src.exists():
+                    _write(d / sf, src.read_text(), mode=0o755)
+        else:
+            # 裸机 MariaDB：完全独立安装（脱离宝塔），由 Install 脚本全量安装 tarball。
+            # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
+            my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=server_id)
+            _write(d / "my.cnf", my_cnf, mode=0o644)
+            extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/my.cnf"
+            extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/Install-ha-mariadb-Node.sh"
+            extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-Node.sh"
+            # Run-mariadb-docker-Node.sh 一并交付：裸机装不上（如 glibc 过低）时，
+            # 可在同一目录改跑容器方案，无需重新生成节点。
+            for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh",
+                       "Run-mariadb-docker-Node.sh"):
+                src = NODE_SCRIPTS / sf
+                if src.exists():
+                    _write(d / sf, src.read_text(), mode=0o755)
     else:
         # init.sql 会被 MySQL 容器以非 root 的 mysql 用户读取执行，
         # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。
@@ -849,16 +935,14 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             mode = 0o755 if f.endswith(".sh") else 0o644
             _write(kd / f, src.read_text(), mode=mode)
 
-    # 5) docker-compose.yaml（MariaDB 裸机仅 keepalived 客户端；Docker 才含 MySQL 容器）
-    if node_type == "mariadb":
+    # 5) docker-compose.yaml
+    #    MariaDB 两种形态都只跑 keepalived 客户端（裸机由宿主 systemd 起 mysqld，
+    #    容器化由 Run-mariadb-docker-Node.sh 起 MariaDB 容器）；MySQL Docker 才含 MySQL 容器。
+    if is_mariadb_node(node_type):
         compose = render_baremetal_compose(node_name, vip_port)
     else:
         compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
     _write(d / "docker-compose.yaml", compose)
-    if node_type == "mariadb":
-        # MariaDB 节点额外记录安装/卸载脚本的下载地址（前端可展示，便于用户操作）
-        extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/Install-ha-mariadb-Node.sh"
-        extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-Node.sh"
 
     # 6) 登记到 nodes 表 + hosts 表（供监控自动接入）
     #    compose_path 记录「宿主机路径」（便于 Web 展示与到目标主机执行），
@@ -892,14 +976,23 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # 7) 新增节点后刷新同集群所有节点的对等列表
     _refresh_all_keepalived_conf(cluster_id)
 
+    # MariaDB 裸机节点：宿主机已原生运行 MariaDB，只需拉起 keepalived 容器
+    # （否则会再起一个 MySQL 容器抢占 3306）。
+    # 容器化 MariaDB 节点：MariaDB 由 Run 脚本以 host 网络单独起，keepalived 由该脚本末尾拉起，
+    # 故入口统一是 Run 脚本（在里面已经包含 docker compose up -d）。
+    # MySQL docker 节点：MySQL 与 keepalived 都在容器里，整套一起拉起。
+    if node_type == "mariadb-docker":
+        run_cmd = f"cd {host_compose} && sudo bash Run-mariadb-docker-Node.sh"
+    elif node_type == "mariadb":
+        run_cmd = f"cd {host_compose} && docker compose up -d keepalived"
+    else:
+        run_cmd = f"cd {host_compose} && docker compose up -d"
+
     return dict(
         dir=host_compose, node_name=node_name, server_id=server_id, peers=peers,
         node_type=node_type,
-        # MariaDB 裸机节点：宿主机已原生运行 MariaDB，只需拉起 keepalived 容器（否则会再起一个 MySQL 容器抢占 3306）。
-        # docker 节点：MySQL 也在容器里，整套一起拉起。
-        _svc = "mariadb" if node_type.strip() == "mariadb" else "",
-        run_cmd=(f"cd {host_compose} && docker compose up -d"
-                 + (" keepalived" if node_type.strip() == "mariadb" else "")),
+        image=(MARIADB_DOCKER_IMAGE if node_type == "mariadb-docker" else ""),
+        run_cmd=run_cmd,
         **extra_files,
     )
 
@@ -1003,8 +1096,9 @@ def sync_node_creds(cluster_id=None):
                 continue
 
             # 重新生成该节点 ha_check.conf，保持与节点一致
-            # MariaDB 裸机节点 keepalived 探活连 127.0.0.1（宿主机既有 MariaDB）；docker 节点连宿主机 IP。
-            local_host = "127.0.0.1" if node_type == "mariadb" else ip
+            # MariaDB 两种形态的 keepalived 都在 host 网络，探活连 127.0.0.1；
+            # MySQL docker 节点走桥接端口发布，连宿主机 IP。
+            local_host = "127.0.0.1" if is_mariadb_node(node_type) else ip
             kd = _safe_node_path(ip) / "keepalived"
             kd.mkdir(parents=True, exist_ok=True)
             ha_check = (
@@ -1019,8 +1113,8 @@ def sync_node_creds(cluster_id=None):
             )
             _write(kd / "ha_check.conf", ha_check)
             # 同步重生成 init 凭证 SQL（仅凭证相关），保证后续「重部署」后执行时使用的仍是当前密码。
-            # MariaDB 节点写 init_mariadb.sql（MariaDB 语法）；docker 节点写 init.sql。
-            if node_type == "mariadb":
+            # MariaDB 节点（裸机/容器）写 init_mariadb.sql（MariaDB 语法）；docker 节点写 init.sql。
+            if is_mariadb_node(node_type):
                 init_sql = render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
                 _write(_safe_node_path(ip) / "init_mariadb.sql", init_sql, mode=0o644)
             else:
@@ -1029,7 +1123,7 @@ def sync_node_creds(cluster_id=None):
                 _write(_safe_node_path(ip) / "init.sql", init_sql, mode=0o644)
             # 同步修复脚本（凭证变更/权限回退时，可在节点本机重放）
             # MariaDB 用 MariaDB 语法修复脚本（native 密码，无 MySQL8 专有特权）；其余用通用版。
-            if node_type == "mariadb":
+            if is_mariadb_node(node_type):
                 fix_sql = render_fix_node_creds_sql_mariadb(
                     ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port,
                     manager_subnet)

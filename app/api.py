@@ -2051,10 +2051,14 @@ def nodes_add(
     if nt == "baremetal":
         extra_tip = ("（裸机 MySQL 节点已废弃，请改用 MariaDB 节点类型）")
     elif nt == "mariadb":
-        extra_tip = ("（MariaDB 节点：把目录与 MariaDB 安装包 mariadb-*-linux-*.tar.gz 放同一目录，"
+        extra_tip = ("（MariaDB 裸机节点：把目录与 MariaDB 安装包 mariadb-*-linux-*.tar.gz 放同一目录，"
                      "执行 sudo bash Install-ha-mariadb-Node.sh 全量安装；"
                      "各节点就绪后管理器自动建复制/选主/VIP 漂移；"
                      "卸载用 sudo bash Uninstall-mariadb-Node.sh，重装/改密直接重跑 Install 即可）")
+    elif nt == "mariadb-docker":
+        extra_tip = ("（MariaDB 容器版节点：把目录拷到目标机，执行 sudo bash Run-mariadb-docker-Node.sh；"
+                     "自动拉 mariadb:12.3.3-ubi，失败退 mariadb:12.3.2，host 网络起容器并拉起 keepalived；"
+                     "可与 MariaDB 裸机节点同集群混部；卸载用 sudo bash Uninstall-mariadb-docker-Node.sh）")
     return RedirectResponse(
         f"/nodes?msg=已生成节点 {info['node_name']}{role_tip}{extra_tip}，到目标主机执行：{info['run_cmd']}",
         status_code=303,

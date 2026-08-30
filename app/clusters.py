@@ -6,6 +6,7 @@
 """
 from .db import query, execute, get_setting
 from .config import rand_secret, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
+from .mysql_compat import node_family
 
 
 def list_clusters():
@@ -48,7 +49,14 @@ def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=N
 
 
 def validate_node_version(cluster_id, node_type, mysql_version):
-    """同集群「同构」校验：禁止 docker/mariadb 混部；同集群主版本须一致。
+    """同集群「同构」校验：按**引擎族**判定，同集群主版本须一致。
+
+    引擎族（见 mysql_compat.node_family）：
+      - mariadb 族：裸机 MariaDB(mariadb) 与 容器化 MariaDB(mariadb-docker) —— **允许混部**。
+        二者只是部署形态不同，服务端/复制/切换路径完全一致（都用 MariaDB GTID：
+        gtid_domain_id + MASTER_USE_GTID=slave_pos），且真实 flavour 由 SELECT VERSION()
+        在线探测，故混部安全。典型场景：新机跑裸机 12.3.3，老机（glibc 过低）跑容器。
+      - mysql 族 与 mariadb 族之间**禁止混部**（GTID 机制根本不兼容）。
 
     允许 mysql_version=None（老集群/自动探测）与已设版本共存，仅当两者都显式设置
     且主版本不一致时报错，避免跨大版本复制脆弱。
@@ -57,8 +65,13 @@ def validate_node_version(cluster_id, node_type, mysql_version):
     if not c:
         return
     exist_type = c.get("node_type") or "docker"
-    if node_type and exist_type != node_type:
-        raise ValueError(f"同集群禁止混部：集群已为 {exist_type}，不能加入 {node_type} 节点")
+    exist_family = node_family(exist_type)
+    new_family = node_family(node_type) if node_type else exist_family
+    if node_type and exist_family != new_family:
+        raise ValueError(
+            f"同集群禁止跨引擎混部：集群已为 {exist_type}（{exist_family}），"
+            f"不能加入 {node_type}（{new_family}）节点"
+        )
     exist_ver = c.get("mysql_version")
     if mysql_version and exist_ver and _major_minor(mysql_version) != _major_minor(exist_ver):
         raise ValueError(

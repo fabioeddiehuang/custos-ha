@@ -46,6 +46,31 @@ def is_mariadb(version_str):
     return "mariadb" in (version_str or "").lower()
 
 
+# 节点部署形态常量（nodes.node_type / clusters.node_type）
+NT_DOCKER = "docker"                  # 容器化 MySQL 8.0
+NT_MARIADB = "mariadb"                # 裸机 MariaDB（Install 脚本全量安装）
+NT_MARIADB_DOCKER = "mariadb-docker"  # 容器化 MariaDB（官方镜像 + Run 脚本）
+
+# 引擎族：同为 MariaDB 的两种形态可以同集群混部（复制/切换完全兼容），
+# 与 MySQL 之间仍然禁止混部（GTID 机制根本不兼容）。
+_MARIADB_NODE_TYPES = (NT_MARIADB, NT_MARIADB_DOCKER)
+
+
+def is_mariadb_node(node_type):
+    """node_type 是否属于 MariaDB 引擎族（裸机 MariaDB / 容器化 MariaDB）。"""
+    return (node_type or "").strip().lower() in _MARIADB_NODE_TYPES
+
+
+def node_family(node_type):
+    """把部署形态归一到引擎族：mariadb / mysql / 原值。用于同集群「同构」校验。"""
+    nt = (node_type or "").strip().lower()
+    if nt in _MARIADB_NODE_TYPES:
+        return "mariadb"
+    if nt in (NT_DOCKER, "mysql", "mysql-docker"):
+        return "mysql"
+    return nt
+
+
 def use_new_syntax(version_str=None):
     """按存储的 mysql_version 判定（None/空=旧语法，兼容 v2.0 老集群）。
 
@@ -123,8 +148,8 @@ def default_auth_plugin(version_str=None, node_type=None, prefer="auto"):
     if p in ("native", "mysql_native_password"):
         return "mysql_native_password"
     if not version_str:
-        # 版本未知：MariaDB 裸机节点可凭 node_type 判定；其余沿用既有行为
-        if (node_type or "").lower() == "mariadb":
+        # 版本未知：MariaDB 节点（裸机/容器）可凭 node_type 判定；其余沿用既有行为
+        if is_mariadb_node(node_type):
             return "mysql_native_password"
         # docker 节点固定 MySQL 8.0，但小版本未知（可能 < 8.0.34），不敢冒进改插件
         return "mysql_native_password"
@@ -149,14 +174,14 @@ def identify_clause(plugin, password, mariadb=False):
 def flavour_from_node_type(node_type):
     """把库里的 node_type 映射到 flavour（无连库时可用，作为 fallback）。
 
-    node_type: docker(MySQL8 docker) / mariadb(MariaDB 裸机)
-    注：docker 节点固定为 MySQL 8.0；mariadb 节点为 MariaDB（独立 GTID 机制，与 MySQL 不兼容）。
+    node_type: docker(MySQL8 容器) / mariadb(MariaDB 裸机) / mariadb-docker(MariaDB 容器)
+    注：docker 节点固定为 MySQL 8.0；两种 MariaDB 形态都是 MariaDB（独立 GTID 机制，与 MySQL 不兼容）。
     真实 flavour 仍建议连库 detect_flavour 确认。
     """
     nt = (node_type or "").lower()
-    if nt == "mariadb":
+    if nt in _MARIADB_NODE_TYPES:
         return F_MARIADB
-    if nt == "docker":
+    if nt == NT_DOCKER:
         return F_MYSQL8
     return F_OLD
 

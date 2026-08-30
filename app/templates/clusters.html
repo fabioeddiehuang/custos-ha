@@ -153,8 +153,9 @@
           <select name="node_type">
             <option value="docker" selected>Docker（容器化 MySQL + keepalived）</option>
             <option value="mariadb">MariaDB（裸机全量安装，脱离宝塔）</option>
+            <option value="mariadb-docker">MariaDB 容器版（官方镜像，老系统/免装环境首选）</option>
           </select>
-          <span class="hint">创建后该集群所有节点须为同一类型（禁止混部）</span>
+          <span class="hint">按引擎族校验：两种 MariaDB 形态可混部；MySQL 与 MariaDB 禁止混部</span>
         </label>
         <label>MySQL 版本（可选）<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0"></label>
         <label>HA 监控账号<input name="ha_user" placeholder="ha_monitor"></label>
