@@ -33,7 +33,10 @@ def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=N
     vrid = vrid or VRID
     if vip_port is None:
         vip_port = VIP_PORT
-    execute(
+    # 直接取 execute() 返回的 lastrowid：LAST_INSERT_ID() 是连接级的，
+    # 而 get_conn() 每次返回新连接，另开连接查询会稳定拿到 0，
+    # 导致「创建成功却跳转 /clusters/0 → 集群不存在」的假失败。
+    new_id = execute(
         """INSERT INTO clusters
         (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
          vip, vip_prefix, interface, vrid, vip_port, node_type, mysql_version)
@@ -41,8 +44,7 @@ def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=N
         (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
          vip, vip_prefix, interface, vrid, int(vip_port), node_type, mysql_version),
     )
-    rows = query("SELECT LAST_INSERT_ID() AS id")
-    return rows[0]["id"] if rows else None
+    return new_id
 
 
 def validate_node_version(cluster_id, node_type, mysql_version):

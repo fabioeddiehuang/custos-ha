@@ -402,11 +402,19 @@ def query(sql, args=None):
 
 
 def execute(sql, args=None):
+    """执行写操作并提交。
+
+    返回本次执行的 lastrowid（自增主键）。注意：get_conn() 每次返回新连接，
+    因此调用方**不能**再用另一个连接去查 LAST_INSERT_ID()（该值是连接级的，
+    换连接会拿到 0）。需要新主键时请直接使用本函数的返回值。
+    """
     conn = get_conn()
     try:
         with conn.cursor() as c:
             c.execute(sql, args)
+            lastrowid = c.lastrowid
         conn.commit()
+        return lastrowid
     finally:
         conn.close()
 

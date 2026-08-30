@@ -33,13 +33,39 @@ log(){ echo -e "\033[1;32m[mariadb-install]\033[0m $*"; }
 warn(){ echo -e "\033[1;33m[warn]\033[0m $*"; }
 err(){ echo -e "\033[1;31m[error]\033[0m $*"; }
 
+# ---- 静默退出兜底诊断 ----
+# 本脚本开启 set -euo pipefail，而 `VAR=$(grep ... | ...)` 这类赋值在 grep 无匹配时
+# （pipefail 会把失败状态传出来）会**一声不响地终止整个脚本**——在远程节点上表现为
+# 「打印到某一行后就没输出了、也没有任何报错」，极难定位。故：
+#   1) 用 die() 统一「已明确诊断」的失败（不触发下面的兜底提示，避免噪音）；
+#   2) 其余非预期失败由 ERR trap 打印行号与失败命令。
+_REPORTED=0
+die(){ _REPORTED=1; err "$*"; exit 1; }
+# 精确定位失败点（实测结论）：
+#   - EXIT trap 里的 ${BASH_LINENO[0]} 在顶层脚本恒为 0，不可用；
+#   - DEBUG trap 里的 $LINENO 恒为 trap 自身行号（1），同样不可用；
+#   - ERR trap 的 $LINENO / $BASH_COMMAND 才是真正的失败行与失败命令。
+# set -E（errtrace）让函数体内的失败也能触发 ERR；
+# _REPORTED 保证 die() 已给出明确诊断时不再追加兜底提示，避免重复噪音。
+set -E
+trap 'rc=$?; if [[ $_REPORTED -eq 0 ]]; then _REPORTED=1; err "脚本在第 $LINENO 行执行失败（退出码 $rc）：${BASH_COMMAND:0:200}"; fi' ERR
+trap 'rc=$?; if [[ $rc -ne 0 && $_REPORTED -eq 0 ]]; then err "脚本意外退出：退出码 $rc（无更多上下文）"; fi' EXIT
+
+# 安全读取 KEY=VALUE：文件不存在 / 键缺失 / 无匹配时返回空串，且**绝不**触发 set -e 退出
+conf_get() {
+  local f="$1" k="$2"
+  [[ -f "$f" ]] || return 0
+  grep -E "^${k}=" "$f" 2>/dev/null | tail -1 | cut -d= -f2- \
+    | sed -E "s/^'//; s/'$//" || true
+}
+
 if [[ $EUID -ne 0 ]]; then
-  err "请使用 root 执行：sudo bash Install-ha-mariadb-Node.sh"; exit 1
+  die "请使用 root 执行：sudo bash Install-ha-mariadb-Node.sh"
 fi
 
 # ---------- 0) 环境依赖检测 ----------
 for bin in curl tar gzip; do
-  command -v "$bin" >/dev/null 2>&1 || { err "缺少必要命令：$bin，请先安装（apt/yum install $bin）"; exit 1; }
+  command -v "$bin" >/dev/null 2>&1 || { die "缺少必要命令：$bin，请先安装（apt/yum install $bin）"; }
 done
 # MariaDB 二进制需要 libaio；缺失会导致启动即段错误
 if ! ldconfig -p 2>/dev/null | grep -q "libaio.so"; then
@@ -52,8 +78,7 @@ if ! ldconfig -p 2>/dev/null | grep -q "libaio.so"; then
     dnf install -y libaio 2>/dev/null || true
   fi
   if ! ldconfig -p 2>/dev/null | grep -q "libaio.so"; then
-    err "libaio 安装失败，请手动安装（apt install libaio1 / yum install libaio）后再运行。"
-    exit 1
+    die "libaio 安装失败，请手动安装（apt install libaio1 / yum install libaio）后再运行。"
   fi
 fi
 
@@ -70,15 +95,14 @@ if [[ -n "$PKG" ]]; then
   log "检测到本地安装包：$PKG（跳过下载）"
 else
   if [[ -z "$MARIADB_DOWNLOAD_URL" ]]; then
-    err "当前目录未找到 MariaDB 安装包，且未设置 MARIADB_DOWNLOAD_URL。请手动上传安装包到本目录后重试。"
-    exit 1
+    die "当前目录未找到 MariaDB 安装包，且未设置 MARIADB_DOWNLOAD_URL。请手动上传安装包到本目录后重试。"
   fi
   PKG="mariadb-install.tar.gz"
   log "未找到本地安装包，开始下载：$MARIADB_DOWNLOAD_URL"
   if command -v curl >/dev/null 2>&1; then
-    curl -fSL "$MARIADB_DOWNLOAD_URL" -o "$PKG" || { err "下载失败"; exit 1; }
+    curl -fSL "$MARIADB_DOWNLOAD_URL" -o "$PKG" || die "下载失败：$MARIADB_DOWNLOAD_URL"
   else
-    wget -O "$PKG" "$MARIADB_DOWNLOAD_URL" || { err "下载失败"; exit 1; }
+    wget -O "$PKG" "$MARIADB_DOWNLOAD_URL" || die "下载失败：$MARIADB_DOWNLOAD_URL"
   fi
   log "下载完成：$PKG"
 fi
@@ -134,15 +158,38 @@ mkdir -p "$DATA_DIR"
 if [[ -d "$DATA_DIR/mysql" ]]; then
   log "检测到 $DATA_DIR/mysql 已存在，跳过初始化（保留既有数据）"
 else
+  # 目录存在但非空、且没有 mysql 系统库 ⇒ 只可能是上次初始化失败留下的半成品
+  # （能用的库一定有 mysql/ 目录），不含任何可用数据，清理后重来；
+  # 否则 mariadb-install-db 会因 datadir 非空直接失败。
+  if [[ -n "$(ls -A "$DATA_DIR" 2>/dev/null || true)" ]]; then
+    warn "数据目录 $DATA_DIR 非空但无 mysql 系统库，判定为上次初始化失败的残留，清理后重新初始化。残留内容："
+    ls -A "$DATA_DIR" 2>/dev/null | head -20 | sed 's/^/      /' || true
+    rm -rf "$DATA_DIR"/* "$DATA_DIR"/.[!.]* 2>/dev/null || true
+  fi
   # 用 mariadb-install-db 初始化（MariaDB 12 用 mariadbd 而非 mysqld，但 install-db 脚本兼容）
   INSTALL_DB="$INSTALL_DIR/scripts/mariadb-install-db"
   [[ -x "$INSTALL_DB" ]] || INSTALL_DB="$INSTALL_DIR/bin/mariadb-install-db"
-  [[ -x "$INSTALL_DB" ]] || { err "未找到 mariadb-install-db，安装包可能不完整"; exit 1; }
+  [[ -x "$INSTALL_DB" ]] || die "未找到 mariadb-install-db，安装包可能不完整"
   # 创建系统用户（若不存在）
   id mysql >/dev/null 2>&1 || useradd -r -s /sbin/nologin mysql 2>/dev/null || true
-  "$INSTALL_DB" --user=mysql --datadir="$DATA_DIR" --auth-root-authentication-method=normal \
+  # --basedir 必须显式指定：bintar 解压到 /opt/mariadb 时，若让 install-db 自行推断，
+  # 极易找不到 share/english/errmsg.sys 等语言/字典文件，bootstrap 起不来
+  #（典型报错：Can't find error-message file / FATAL ERROR: Could not find ...）。
+  "$INSTALL_DB" --user=mysql --basedir="$INSTALL_DIR" --datadir="$DATA_DIR" \
+    --auth-root-authentication-method=normal \
     >/tmp/mariadb-install-db.log 2>&1 \
-    || { err "mariadb-install-db 失败，详见 /tmp/mariadb-install-db.log"; tail -20 /tmp/mariadb-install-db.log; exit 1; }
+    || {
+      err "mariadb-install-db 失败，日志：/tmp/mariadb-install-db.log"
+      echo "---------- 关键错误行 ----------"
+      grep -iE '\[error\]|\[fatal\]|error:|errno|fail|not find|cannot' \
+        /tmp/mariadb-install-db.log 2>/dev/null | tail -15 || true
+      echo "---------- 日志尾部（最后 40 行） ----------"
+      tail -40 /tmp/mariadb-install-db.log 2>/dev/null || true
+      echo "-------------------------------------------"
+      err "环境自检：$("$INSTALL_DIR/bin/mariadbd" --version 2>&1 || echo 'mariadbd 无法执行')"
+      err "basedir=$INSTALL_DIR  datadir=$DATA_DIR  user=mysql"
+      die "请按上述关键信息修复后重跑本脚本（数据目录残留会在下次自动清理）"
+    }
   log "数据目录初始化完成"
 fi
 chown -R mysql:mysql "$DATA_DIR"
@@ -151,8 +198,7 @@ chown -R mysql:mysql "$DATA_DIR"
 # ---------- 4) 落盘 my.cnf（服务端生成，确保配置一致性） ----------
 CNF_SRC="$SCRIPT_DIR/my.cnf"
 if [[ ! -f "$CNF_SRC" ]]; then
-  err "未找到服务端生成的 my.cnf（应在节点目录下）。请重新在管理器生成节点目录。"
-  exit 1
+  die "未找到服务端生成的 my.cnf（应在节点目录下：$CNF_SRC）。请重新在管理器生成节点目录。"
 fi
 # 备份可能已存在的 /etc/my.cnf（避免覆盖宿主既有 MySQL 配置）
 [[ -f /etc/my.cnf && ! -f /etc/my.cnf.before-mariadb-ha ]] && cp -a /etc/my.cnf /etc/my.cnf.before-mariadb-ha
@@ -162,18 +208,17 @@ log "已落盘 /etc/my.cnf（由服务端生成，含 server_id/gtid_domain_id/p
 # ---------- 5 前置：解析 root 密码（新密码取自 ha_check.conf；旧密码取自状态文件，便于重装更新） ----------
 # 新密码（服务端生成，覆盖配置后用于设密）：
 ROOT_PASS=""
-if [[ -f "$SCRIPT_DIR/keepalived/ha_check.conf" ]]; then
-  ROOT_PASS="$(grep -E '^LOCAL_ROOT_PASS=' "$SCRIPT_DIR/keepalived/ha_check.conf" | tail -1 | cut -d= -f2- | sed -E "s/^'//; s/'$//")"
-fi
+# 注意：这里不能用 `ROOT_PASS=$(grep ... | ...)` 裸写法——set -euo pipefail 下
+# grep 无匹配（文件存在但缺该键）会让赋值整条失败并**静默终止脚本**，
+# 表现为「打印到上一步就没有任何输出」。conf_get 已消除该风险。
+ROOT_PASS="$(conf_get "$SCRIPT_DIR/keepalived/ha_check.conf" LOCAL_ROOT_PASS || true)"
 if [[ -z "$ROOT_PASS" ]]; then
   ROOT_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
   warn "未从 ha_check.conf 读到 root 密码，已生成随机密码：$ROOT_PASS（请到管理器节点配置同步）"
 fi
 # 旧密码（来自上次安装写入的状态文件；重装/覆盖配置时用它先连上再改密）：
 OLD_ROOT_PASS=""
-if [[ -f /etc/ha-mysql-node/install-state-mariadb ]]; then
-  OLD_ROOT_PASS="$(grep -E '^LOCAL_ROOT_PASS=' /etc/ha-mysql-node/install-state-mariadb | tail -1 | cut -d= -f2- | sed -E "s/^'//; s/'$//")"
-fi
+OLD_ROOT_PASS="$(conf_get /etc/ha-mysql-node/install-state-mariadb LOCAL_ROOT_PASS || true)"
 # 探测当前实例可用的 root 凭证（首次安装 root 无密码；重装时可能已是旧密码）。
 # 命中后写入 MYSQL_PW（-pX 或空串表示免密 socket 可连）。
 MYSQL_PW=""
@@ -288,7 +333,8 @@ if [[ -f "$SCRIPT_DIR/fix-node-creds.sql" ]]; then
 fi
 
 # ---------- 8) 防火墙（MySQL 端口 + VRRP 112） ----------
-PORT="$(grep -E '^port =' /etc/my.cnf | tail -1 | awk -F= '{print $2}' | tr -d ' ')"
+# 同样避免裸 grep 触发 set -e 静默退出；正则兼容 "port=3307" 与 "port = 3307" 两种写法
+PORT="$(grep -E '^[[:space:]]*port[[:space:]]*=' /etc/my.cnf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' ' || true)"
 PORT="${PORT:-3306}"
 allow_port_vrrp() {
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
@@ -331,8 +377,8 @@ printf 'SYSTEMD_UNIT=%q\n'   "$SYSTEMD_UNIT" >> "$STATE"
 printf 'PORT=%q\n'           "$PORT"      >> "$STATE"
 # 程序目录指纹（文件数:总字节数），供卸载时判断是否被人工修改：
 # 未修改则保留 /opt/mariadb（不删除，便于快速重装/回滚）；被改过或 -f 才删除。
-FP_COUNT="$(find "$INSTALL_DIR" -type f 2>/dev/null | wc -l)"
-FP_BYTES="$(du -sb "$INSTALL_DIR" 2>/dev/null | cut -f1)"
+FP_COUNT="$(find "$INSTALL_DIR" -type f 2>/dev/null | wc -l || true)"
+FP_BYTES="$(du -sb "$INSTALL_DIR" 2>/dev/null | cut -f1 || true)"
 printf 'INSTALL_DIR_FP=%s:%s\n' "$FP_COUNT" "$FP_BYTES" >> "$STATE"
 chmod 600 "$STATE"
 log "已记录 MariaDB 安装状态到 $STATE"
