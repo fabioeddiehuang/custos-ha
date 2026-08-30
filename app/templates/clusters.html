@@ -105,7 +105,7 @@
     </div>
 
     <div class="cc-metrics">
-      <div class="cc-m"><div class="k">VIP 地址</div><div class="v">{{ c.vip or '—' }}</div></div>
+      <div class="cc-m"><div class="k">VIP 地址</div><div class="v" style="white-space:nowrap">{{ (c.vip ~ ':' ~ c.vip_port) if (c.vip and c.vip_port is not none) else (c.vip or '—') }}</div></div>
       <div class="cc-m"><div class="k">当前主库</div><div class="v {% if c.current_master == '未选举' %}bad{% else %}ok{% endif %}">{{ c.current_master }}</div></div>
       <div class="cc-m"><div class="k">节点</div><div class="v">{{ c.online }}/{{ c.node_count }} 在线</div></div>
       <div class="cc-m"><div class="k">从库</div><div class="v">{{ c.slaves|length }} 个</div></div>

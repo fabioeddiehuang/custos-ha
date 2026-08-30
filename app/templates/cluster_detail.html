@@ -99,7 +99,7 @@
 <!-- 集群概要 -->
 <div class="cd-summary">
   <div class="cd-sum"><div class="k">集群名称</div><div class="v">{{ cluster.name }}</div></div>
-  <div class="cd-sum"><div class="k">VIP 地址</div><div class="v">{{ cluster.vip or '—' }}</div></div>
+  <div class="cd-sum"><div class="k">VIP 地址</div><div class="v" style="white-space:nowrap">{{ (cluster.vip ~ ':' ~ cluster.vip_port) if (cluster.vip and cluster.vip_port is not none) else (cluster.vip or '—') }}</div></div>
   <div class="cd-sum"><div class="k">当前主库</div><div class="v {% if cluster.current_master == '未选举' %}bad{% else %}ok{% endif %}">{{ cluster.current_master }}</div></div>
   <div class="cd-sum"><div class="k">节点在线</div><div class="v">{{ cluster.online }}/{{ cluster.node_count }}</div></div>
   <div class="cd-sum"><div class="k">从库数量</div><div class="v">{{ cluster.slaves|length }}</div></div>

@@ -92,3 +92,10 @@ html[data-theme="light"] .port-chip      { background: var(--surface-2); }
 html[data-theme="light"] .drift-item     { background: rgba(157,23,77,.10); }
 html[data-theme="light"] .tbl tbody tr:hover { background: rgba(15,23,42,.05); }
 html[data-theme="light"] .btn-ghost:hover{ background: var(--surface-2); border-color: var(--primary); color: var(--primary); }
+
+/* ---------- 浅色下 banner 文字：原深色字面量（青/绿/红/黄）在浅底上对比不足 ---------- */
+html[data-theme="light"] .banner.ok{color:var(--success)}
+html[data-theme="light"] .banner.err{color:var(--danger)}
+html[data-theme="light"] .banner.warn{color:var(--warning)}
+/* 自动化说明等 info 横幅：深色青在浅底上几乎不可见，改为可读的深青 */
+html[data-theme="light"] .banner.info{color:var(--primary-dark)}

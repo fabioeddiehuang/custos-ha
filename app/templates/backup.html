@@ -245,7 +245,7 @@
     var btn=event.target; btn.disabled=true; btn.textContent="备份中…";
     post("/api/backup/run",{
       cluster_id:CID, host:n.host, port:n.port, scope:scope,
-      databases:dbs.join(","), with_data:document.getElementById("bkWithData").checked?"1":""
+      databases:dbs.join(","), with_data:document.getElementById("bkWithData").checked?"1":"0"
     },function(d){
       btn.disabled=false; btn.textContent="⤓ 立即备份";
       toast(d.msg||(d.ok?"备份完成":"备份失败"), d.ok?"ok":"err");

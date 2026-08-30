@@ -124,13 +124,28 @@ def _scalar(cur, sql, args=None):
     return row[0] if row else None
 
 
-def _dump_database(conn, cur, w, db, with_data: bool) -> dict:
-    """导出单个库（表结构 + 数据 + 视图），返回统计。"""
+def _dump_database(conn, cur, w, db, with_data: bool,
+                   host=None, port=None, cid=None) -> dict:
+    """导出单个库（表结构 + 数据 + 视图），返回统计。
+
+    数据流式读取使用「独立连接」上的服务端游标（SSCursor），与跑元数据的
+    `cur`（同一连接）彻底解耦——这正是之前「全库备份失败」的根因：
+    同一连接上 SSCursor 与常规游标交替使用会触发 MySQL
+    "Commands out of sync"。单表导出失败不再中断整库备份。
+    """
     stat = {"tables": 0, "views": 0, "rows": 0}
 
     w(f"CREATE DATABASE IF NOT EXISTS {_ident(db)} "
       f"/*!40100 DEFAULT CHARACTER SET utf8mb4 */;\n")
     w(f"USE {_ident(db)};\n\n")
+
+    # 单独开一个连接专供数据流式导出，避免与上面的元数据游标争用同一连接
+    sconn = None
+    if with_data:
+        try:
+            sconn = _conn(cid, host, port) if (cid is not None) else conn
+        except Exception as e:
+            w(f"-- 数据导出连接建立失败（仅跳过数据，结构仍会导出）：{e}\n")
 
     # ---- 基表 ----
     cur.execute(
@@ -139,47 +154,50 @@ def _dump_database(conn, cur, w, db, with_data: bool) -> dict:
     tables = [r[0] for r in cur.fetchall()]
 
     for t in tables:
-        cur.execute(f"SHOW CREATE TABLE {_ident(db)}.{_ident(t)}")
-        row = cur.fetchone()
-        if not row:
-            continue
-        ddl = row[1]
-        w(f"--\n-- 表结构 {db}.{t}\n--\n")
-        w(f"DROP TABLE IF EXISTS {_ident(t)};\n")
-        w(ddl + ";\n\n")
-        stat["tables"] += 1
-
-        if not with_data:
-            continue
-
-        # 用服务端游标流式读取：默认的缓冲游标会在 execute 时把整张表拉进内存，
-        # 大表会直接把管理器打爆。SSCursor 必须读完才能在该连接上执行下一条语句，
-        # 下面的 while 循环正是读到底。
-        with conn.cursor(SSCursor) as scur:
-            scur.execute(f"SELECT * FROM {_ident(db)}.{_ident(t)}")
-            cols = [d[0] for d in (scur.description or [])]
-            if not cols:
+        try:
+            cur.execute(f"SHOW CREATE TABLE {_ident(db)}.{_ident(t)}")
+            row = cur.fetchone()
+            if not row:
                 continue
-            prefix = (f"INSERT INTO {_ident(t)} ("
-                      + ",".join(_ident(c) for c in cols) + ") VALUES\n")
-            buf, bufsize, dumped = [], 0, 0
-            while True:
-                rows = scur.fetchmany(500)
-                if not rows:
-                    break
-                for r in rows:
-                    piece = "(" + ",".join(_lit(v) for v in r) + ")"
-                    buf.append(piece)
-                    bufsize += len(piece) + 2
-                    stat["rows"] += 1
-                    dumped += 1
-                if bufsize >= _INSERT_MAX_BYTES:
+            ddl = row[1]
+            w(f"--\n-- 表结构 {db}.{t}\n--\n")
+            w(f"DROP TABLE IF EXISTS {_ident(t)};\n")
+            w(ddl + ";\n\n")
+            stat["tables"] += 1
+
+            if not with_data or sconn is None:
+                continue
+
+            # 用独立连接上的服务端游标流式读取：缓冲游标会在 execute 时把整张表
+            # 拉进内存，大表会直接把管理器打爆；SSCursor 必须读完才能关闭结果集。
+            with sconn.cursor(SSCursor) as scur:
+                scur.execute(f"SELECT * FROM {_ident(db)}.{_ident(t)}")
+                cols = [d[0] for d in (scur.description or [])]
+                if not cols:
+                    continue
+                prefix = (f"INSERT INTO {_ident(t)} ("
+                          + ",".join(_ident(c) for c in cols) + ") VALUES\n")
+                buf, bufsize = [], 0
+                while True:
+                    rows = scur.fetchmany(500)
+                    if not rows:
+                        break
+                    for r in rows:
+                        piece = "(" + ",".join(_lit(v) for v in r) + ")"
+                        buf.append(piece)
+                        bufsize += len(piece) + 2
+                        stat["rows"] += 1
+                    if bufsize >= _INSERT_MAX_BYTES:
+                        w("--\n-- 数据 " + f"{db}.{t}\n--\n")
+                        w(prefix + ",\n".join(buf) + ";\n\n")
+                        buf, bufsize = [], 0
+                if buf:
                     w("--\n-- 数据 " + f"{db}.{t}\n--\n")
                     w(prefix + ",\n".join(buf) + ";\n\n")
-                    buf, bufsize = [], 0
-            if buf:
-                w("--\n-- 数据 " + f"{db}.{t}\n--\n")
-                w(prefix + ",\n".join(buf) + ";\n\n")
+        except Exception as e:
+            w(f"-- 表 {db}.{t} 导出失败（已跳过该表）：{e}\n")
+            stat["tables"] = max(0, stat["tables"] - 1)
+            continue
 
     # ---- 视图（放在表之后，视图可能依赖表）----
     cur.execute(
@@ -236,6 +254,12 @@ def _dump_database(conn, cur, w, db, with_data: bool) -> dict:
         except Exception as e:
             w(f"-- {rtype} {db}.{name} 导出失败: {e}\n")
 
+    if sconn is not None and sconn is not conn:
+        try:
+            sconn.close()
+        except Exception:
+            pass
+
     return stat
 
 
@@ -282,7 +306,8 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
                 w("SET AUTOCOMMIT=0;\n\n")
 
                 for db in targets:
-                    st = _dump_database(conn, cur, w, db, with_data)
+                    st = _dump_database(conn, cur, w, db, with_data,
+                                        host=host, port=port, cid=cid)
                     total["tables"] += st["tables"]
                     total["views"] += st["views"]
                     total["rows"] += st["rows"]
