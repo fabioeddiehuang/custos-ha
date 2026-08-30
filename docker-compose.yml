@@ -55,6 +55,8 @@ services:
       MGMT_MYSQL_USER: "ha"
       MGMT_MYSQL_PASS: "ha"             # 含特殊字符请用引号包裹
       MGMT_MYSQL_DB:   "ha"
+      # 全站统一中国时间（Asia/Shanghai = UTC+8）：影响备份时间戳、运行日志、页面时间
+      TZ: "Asia/Shanghai"
       WEB_PORT: 28888
       WEB_USER: admin
       WEB_PASS: admin #留空则首次启动随机生成并打印到日志；填写则以该密码为准（可改密码，每次启动同步）
@@ -83,7 +85,7 @@ services:
       # 持久化「添加节点」生成的部署文件，便于到目标主机 docker compose up。
       # 统一收敛到项目根下的 ./generated_nodes（每个 <ip> 为自包含部署单元，可直接拷到 /home/docker/<ip>/）。
       - ./generated_nodes:/app/generated_nodes
-      # 持久化「集群备份」产物：逻辑备份 SQL（gzip）落在项目根 ./backups/<集群ID>/ 下，
+      # 持久化「集群备份」产物：逻辑备份 SQL（gzip）落在项目根 ./backups/<集群名称>/ 下，
       # 容器重建不丢失。备份/恢复均为纯 Python 实现，容器内无需 mysqldump / mysql 客户端。
       - ./backups:/app/backups
       # 挂载宿主 docker.sock：使管理器能读取兄弟容器（keepalived / monitor 等）日志。

@@ -9,8 +9,10 @@ mysqldump 去连 MySQL 8.0 会撞上 caching_sha2_password 等鉴权/语法差�
 
 产物
 ----
-  /app/backups/<cluster_id>/<YYYYmmdd-HHMMSS>.sql.gz   备份内容
-  /app/backups/<cluster_id>/<YYYYmmdd-HHMMSS>.meta.json 备份元信息
+  /app/backups/<集群名称>/<库名>_<YYYYmmdd-HHMMSS>.sql.gz          指定库备份
+  /app/backups/<集群名称>/All-Databases_<YYYYmmdd-HHMMSS>.sql.gz   全库备份
+
+  同名 .meta.json 为备份元信息；所有时间戳一律为中国时间（Asia/Shanghai, UTC+8）。
 
 备份范围
 --------
@@ -28,7 +30,7 @@ import gzip
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -49,8 +51,40 @@ _INSERT_MAX_BYTES = 900 * 1024
 # --------------------------------------------------------------------------
 # 基础设施
 # --------------------------------------------------------------------------
+# 全站统一使用中国时间（Asia/Shanghai = UTC+8）：不依赖容器 TZ，直接做偏移。
+CN_TZ_OFFSET_HOURS = 8
+
+
+def now_cn() -> datetime:
+    """当前中国时间（naive datetime，已含 +08:00 偏移）。"""
+    return datetime.utcnow() + timedelta(hours=CN_TZ_OFFSET_HOURS)
+
+
+def from_ts_cn(ts: float) -> datetime:
+    """把文件 mtime 等 POSIX 时间戳换算成中国时间。"""
+    return datetime.utcfromtimestamp(ts) + timedelta(hours=CN_TZ_OFFSET_HOURS)
+
+
+def _safe_name(s) -> str:
+    """集群名可能含路径分隔符等字符，落盘前做安全化。"""
+    t = re.sub(r'[\\/:*?"<>|\s]+', "_", str(s or "")).strip("_")
+    return t or "cluster"
+
+
+def _cluster_dir_name(cid) -> str:
+    """备份目录按【集群名称】命名；查不到时退回集群 ID。"""
+    try:
+        from .db import query
+        rows = query("SELECT name FROM clusters WHERE id=%s", (cid,))
+        if rows and rows[0].get("name"):
+            return _safe_name(rows[0]["name"])
+    except Exception:
+        pass
+    return str(cid)
+
+
 def _dir(cid) -> Path:
-    d = BACKUP_ROOT / str(cid)
+    d = BACKUP_ROOT / _cluster_dir_name(cid)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -267,10 +301,8 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
                scope: str = "all"):
     """执行备份。databases 为空(None/[]) 且 scope='all' 时备份全部业务库。"""
     conn = _conn(cid, host, port, timeout=15)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = _dir(cid) / ts
-    sql_path = base.with_suffix(".sql.gz")
-    meta_path = base.with_suffix(".meta.json")
+    ts = now_cn().strftime("%Y%m%d-%H%M%S")
+    sql_path = None
 
     try:
         with conn.cursor() as cur:
@@ -285,15 +317,24 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
             if not targets:
                 return {"ok": False, "error": "没有可备份的业务库"}
 
-            total = {"tables": 0, "views": 0, "rows": 0}
+        # 命名规则：./backups/<集群名称>/<库名|All-Databases>_<时间戳>.sql.gz
+        # 注意：库名可能含 "."，不能用 Path.with_suffix（会从最后一个点截断）。
+        label = ("All-Databases" if scope == "all"
+                 else "+".join(str(t) for t in targets))
+        bdir = _dir(cid)
+        sql_path = bdir / f"{label}_{ts}.sql.gz"
+        meta_path = bdir / f"{label}_{ts}.meta.json"
+
+        total = {"tables": 0, "views": 0, "rows": 0}
+        with conn.cursor() as cur:
             with gzip.open(sql_path, "wt", encoding="utf-8", newline="\n") as f:
                 def w(s):
                     f.write(s)
 
                 w("-- Custos 逻辑备份\n")
-                w(f"-- 集群 ID   : {cid}\n")
+                w(f"-- 集群     : {_cluster_dir_name(cid)} (id={cid})\n")
                 w(f"-- 源节点    : {host}:{port}\n")
-                w(f"-- 生成时间  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                w(f"-- 生成时间  : {now_cn().strftime('%Y-%m-%d %H:%M:%S')} (UTC+8)\n")
                 w(f"-- 备份范围  : {'全库' if scope == 'all' else '指定库'}\n")
                 w(f"-- 包含数据  : {'是' if with_data else '否（仅结构）'}\n")
                 w(f"-- 数据库    : {', '.join(targets)}\n")
@@ -302,7 +343,7 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
                 w("/*!40101 SET NAMES utf8mb4 */;\n")
                 w("SET FOREIGN_KEY_CHECKS=0;\n")
                 w("SET UNIQUE_CHECKS=0;\n")
-                w("SET TIME_ZONE='+00:00';\n")
+                w("SET TIME_ZONE='+08:00';\n")
                 w("SET AUTOCOMMIT=0;\n\n")
 
                 for db in targets:
@@ -320,8 +361,11 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
         size = sql_path.stat().st_size
         meta = {
             "ts": ts,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time": now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+            "timezone": "Asia/Shanghai (UTC+8)",
             "cluster_id": int(cid),
+            "cluster_name": _cluster_dir_name(cid),
+            "label": label,
             "host": host, "port": int(port),
             "scope": scope,
             "databases": targets,
@@ -336,7 +380,7 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
     except Exception as e:
         # 备份失败要清理半截文件，避免留下不可用的残档
         try:
-            if sql_path.exists():
+            if sql_path is not None and sql_path.exists():
                 sql_path.unlink()
         except Exception:
             pass
@@ -363,7 +407,7 @@ def list_backups(cid):
         out.append({
             "file": p.name,
             "size": st.st_size,
-            "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "mtime": from_ts_cn(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
             "meta": meta,
         })
     return out

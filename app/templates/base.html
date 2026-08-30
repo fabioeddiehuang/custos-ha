@@ -46,6 +46,21 @@
     .theme-menu .ti{width:14px;text-align:center;font-size:13px}
     /* 集群子菜单：当前集群高亮 */
     nav.side .sub a.active{color:var(--primary);font-weight:700;background:var(--primary-light)}
+    /* 集群二级子菜单（每个集群各自的「备份恢复」） */
+    nav.side .sub a.sub2{
+      padding-left:26px;font-size:12.5px;color:var(--muted);
+      display:flex;align-items:center;gap:6px;
+    }
+    nav.side .sub a.sub2:hover{background:var(--primary-light);color:var(--primary)}
+    nav.side .sub a.sub2.active{background:var(--primary-light);color:var(--primary);font-weight:600}
+    /* 全站页尾 */
+    .site-foot{
+      border-top:1px solid var(--border);margin-top:8px;padding:14px 24px;
+      display:flex;align-items:center;justify-content:center;gap:6px;
+      font-size:12px;color:var(--muted);
+    }
+    .site-foot .sf-brand{font-weight:700;color:var(--text);letter-spacing:.3px}
+    .site-foot .sf-dash{color:var(--border-strong)}
   </style>
 </head>
 <body>
@@ -103,6 +118,12 @@
         {% block content %}{% endblock %}
       </div>
     </div>
+    <!-- 全站页尾 -->
+    <footer class="site-foot">
+      <span class="sf-brand">Custos</span>
+      <span class="sf-dash">—</span>
+      <span>Never let your database down</span>
+    </footer>
   </div>
 </div>
 
@@ -157,10 +178,14 @@ var _p = location.pathname;
   // 高亮当前所在的集群子菜单项（/clusters/{id}）
   function markSubActive(){
     var s = document.getElementById('clusterSub'); if(!s) return;
-    var m = _p.match(/^\/clusters\/(\d+)/);
+    // 兼容 /clusters/{id} 与 /clusters/{id}/backup 两级路由
+    var m = _p.match(/^\/clusters\/(\d+)(?:\/([a-zA-Z-]+))?/);
     var cur = m ? m[1] : '';
+    var sub = m ? (m[2] || '') : '';
     s.querySelectorAll('a[data-cid]').forEach(function(a){
-      a.classList.toggle('active', a.getAttribute('data-cid') === cur);
+      if(a.getAttribute('data-cid') !== cur){ a.classList.remove('active'); return; }
+      var isBackup = a.getAttribute('data-sub') === 'backup';
+      a.classList.toggle('active', isBackup ? (sub === 'backup') : (sub === ''));
     });
   }
 
@@ -174,7 +199,10 @@ var _p = location.pathname;
       s.innerHTML = cs.map(function(c){
         var id = (c.id != null && c.id !== '') ? c.id : c.cluster_id;
         var name = c.name || c.cluster_id || c.id || 'cluster';
-        return '<a href="/clusters/'+id+'" data-cid="'+id+'">'+name+'</a>';
+        // 每个集群各自带一个二级子菜单项：备份恢复 → /clusters/{id}/backup
+        return '<a href="/clusters/'+id+'" data-cid="'+id+'">'+name+'</a>'
+             + '<a class="sub2" href="/clusters/'+id+'/backup" data-cid="'+id+'" data-sub="backup">'
+             + '<span style="opacity:.55">└</span>备份恢复</a>';
       }).join('');
       markSubActive();
     }).catch(function(){ s.innerHTML = ''; });

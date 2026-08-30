@@ -22,11 +22,6 @@
   <div class="dh-brand">
     <span class="dh-brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><use href="#cs-logo"/></svg></span>
     <div>
-      <h1 class="dh-wordmark">
-        <span class="wm">Custos</span>
-        <span class="dh-dash">—</span>
-        <span class="dh-tagline">Never let your database down</span>
-      </h1>
       <div class="dh-sub">实时探活与故障切换由后台守护进程执行 · 数据每 10s 自动刷新</div>
     </div>
   </div>
@@ -214,7 +209,9 @@
 <script>
   function fmtTime(d) {
     function p(n){return (n<10?"0":"")+n;}
-    return p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds());
+    // 全站统一中国时间(UTC+8)：不依赖浏览器本地时区
+    var b = new Date(d.getTime() + 8*3600*1000);
+    return p(b.getUTCHours())+":"+p(b.getUTCMinutes())+":"+p(b.getUTCSeconds());
   }
   function esc(s) {
     return String(s == null ? "" : s)

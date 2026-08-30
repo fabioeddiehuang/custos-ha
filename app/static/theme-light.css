@@ -97,5 +97,5 @@ html[data-theme="light"] .btn-ghost:hover{ background: var(--surface-2); border-
 html[data-theme="light"] .banner.ok{color:var(--success)}
 html[data-theme="light"] .banner.err{color:var(--danger)}
 html[data-theme="light"] .banner.warn{color:var(--warning)}
-/* 自动化说明等 info 横幅：深色青在浅底上几乎不可见，改为可读的深青 */
-html[data-theme="light"] .banner.info{color:var(--primary-dark)}
+/* 自动化说明等 info 横幅：浅底上用正文深色，避免青/绿低对比看不清 */
+html[data-theme="light"] .banner.info{color:var(--text)}

@@ -4,7 +4,7 @@ FROM debian:bookworm-slim
 # 构建时可指定 keepalived 版本：docker compose build --build-arg KEEPALIVED_VERSION=2.2.7
 ARG KEEPALIVED_VERSION=2.2.7
 ENV DEBIAN_FRONTEND=noninteractive \
-    TZ=UTC
+    TZ=Asia/Shanghai
 
 # 国内镜像源（阿里云）加速 apt；同时覆盖 deb.debian.org 与 security.debian.org，
 # 并兼容 deb822（bookworm 的 debian.sources）与传统 sources.list 两种写法。

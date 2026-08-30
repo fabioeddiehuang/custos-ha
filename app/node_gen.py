@@ -167,8 +167,10 @@ services:
     restart: always
     environment:
       MYSQL_ROOT_PASSWORD: "{root_pass}"
+      # 全站统一中国时间：节点 MySQL 的 NOW()/错误日志时间均为北京时间(UTC+8)
+      TZ: "Asia/Shanghai"
       # 跳过官方镜像在初始化阶段对 /usr/share/zoneinfo 的全量装载（耗时数秒且会刷一堆
-      # "Unable to load ... as time zone" 警告；应用用 UTC/数字偏移即可，无需时区表）。
+      # "Unable to load ... as time zone" 警告；仅需系统时区，无需命名时区表）。
       MYSQL_INITDB_SKIP_TZINFO: "1"
     command:
       - --server-id={server_id}

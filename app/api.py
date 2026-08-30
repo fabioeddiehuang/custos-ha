@@ -8,7 +8,7 @@ import re
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +36,37 @@ from . import precheck, audit, metrics, slow_log, config_drift, docker_helper, b
 from .mysql_compat import detect_flavour, flavour_from_node_type, F_MARIADB
 
 # ---------------------------------------------------------------------------
+# 全站统一使用中国时间（Asia/Shanghai = UTC+8）
+#   1) 强制把本进程本地时区设为上海，使 datetime.now() 等一律返回北京时间；
+#   2) 日志 Formatter 单独挂 converter，即便系统时区未生效也保证日志为 +08:00。
+# ---------------------------------------------------------------------------
+CN_TZ_NAME = "Asia/Shanghai"
+CN_TZ_OFFSET_HOURS = 8
+
+
+def _set_cn_timezone():
+    """把本进程本地时区固定为中国时间（不依赖宿主机/容器 TZ 设置）。"""
+    try:
+        os.environ.setdefault("TZ", CN_TZ_NAME)
+        if hasattr(_time, "tzset"):
+            _time.tzset()
+    except Exception as e:  # 时区设置失败不应阻断启动
+        print(f"[warn] 设置中国时区失败：{e}")
+
+
+_set_cn_timezone()
+
+
+def _cn_time_converter(*args):
+    """logging.Formatter.converter：把 asctime 固定为北京时间(UTC+8)。"""
+    return (datetime.utcnow() + timedelta(hours=CN_TZ_OFFSET_HOURS)).timetuple()
+
+
+def now_cn() -> datetime:
+    """当前中国时间（naive datetime，已含 +08:00 偏移）。"""
+    return datetime.utcnow() + timedelta(hours=CN_TZ_OFFSET_HOURS)
+
+# ---------------------------------------------------------------------------
 # 管理器运行日志（「系统设置 → 服务端容器日志」读取此文件）
 # 容器内通常不挂载 docker.sock，故改为将运行日志写入本地文件，便于查看。
 # ---------------------------------------------------------------------------
@@ -45,8 +76,11 @@ try:
     _MANAGER_LOG = os.path.join(_LOG_DIR, "custos.log")
     _fh = RotatingFileHandler(_MANAGER_LOG, maxBytes=5 * 1024 * 1024,
                               backupCount=3, encoding="utf-8")
-    _fh.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _cn_fmt = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # 日志时间固定为中国时间(UTC+8)
+    _cn_fmt.converter = _cn_time_converter
+    _fh.setFormatter(_cn_fmt)
     _fh.setLevel(logging.INFO)
     _root = logging.getLogger()
     _already = any(getattr(h, "baseFilename", "").endswith("custos.log")
