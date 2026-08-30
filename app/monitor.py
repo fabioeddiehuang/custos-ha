@@ -7,7 +7,8 @@ from .config import (CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENAB
 from .db import query, execute, get_setting
 from .ha_client import get_status, heal_replication, heal_io_gtid_gap
 from .state import get_current_master
-from .failover import do_failover, ensure_topology, load_creds, node_root, _repoint_slave, promote_to_master
+from .failover import (do_failover, do_failover_to, ensure_topology, load_creds,
+                      node_root, _repoint_slave, promote_to_master)
 from .alerts import send_alert
 from .clusters import list_clusters
 from . import node_gen
@@ -437,11 +438,192 @@ def _act_once():
                 if do_failover(cid, "auto: master unreachable"):
                     run_once._fails[cid] = {}  # 重置，避免重复触发
                 break
+
+        # 高延迟 / 主库压力持续超阈值 -> 自动切换（默认关闭，需显式开启）
+        try:
+            _auto_switch_on_lag_or_pressure(cid, cluster_name, cache)
+        except Exception as e:
+            print(f"[monitor] 延迟/压力自动切换判定异常(可忽略): {e}")
+
         # 维护拓扑：切后对齐 + 旧主恢复重入
         try:
             ensure_topology(cid)
         except Exception as e:
             print(f"[monitor] ensure_topology 集群[{cluster_name}] 错误(可忽略): {e}")
+
+
+# ==========================================================================
+# 自动切换（高延迟 / 主库压力）
+# --------------------------------------------------------------------------
+# 节点在远程主机上，管理器只挂了本机 docker.sock，拿不到远程 CPU/内存/负载，
+# 故「资源紧张」改用【MySQL 侧压力代理指标】：Threads_running、Threads_connected、
+# Innodb_row_lock_waits 增量、Slow_queries 增量。
+# ==========================================================================
+# 压力类指标的上一轮原始累计值（用于做差得到「本周期增量」）
+_PRESSURE_RAW = {}
+_PRESSURE_AT = {}
+# 「连续达标」计数 与 上次自动切换时间（每集群独立）
+_SWITCH_STREAK = {}
+_LAST_AUTO_SWITCH = {}
+
+
+def _pressure_samples(cache, cid, now):
+    """把累计型计数器（行锁等待 / 慢查询）换算成本周期增量。
+
+    每个节点每周期只采样一次并一次性返回：重复采样会把增量算成 0。
+    """
+    out = {}
+
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _delta(cur, old):
+        if cur is None or old is None:
+            return None
+        d = cur - old
+        # 计数器回绕 / 实例重启：负值视为无效
+        return d if d >= 0 else None
+
+    for key, val in list(cache.items()):
+        if key[2] != cid:
+            continue
+        st = val[0]
+        rw = _int(st.get("row_lock_waits"))
+        sq = _int(st.get("slow_queries"))
+        prev = _PRESSURE_RAW.get(key) or {}
+        out[key] = {
+            "threads_running": _int(st.get("threads_running")),
+            "threads_connected": _int(st.get("connections")),
+            "row_lock_delta": _delta(rw, prev.get("row_lock_waits")),
+            "slow_delta": _delta(sq, prev.get("slow_queries")),
+        }
+        _PRESSURE_RAW[key] = {"row_lock_waits": rw, "slow_queries": sq}
+        _PRESSURE_AT[key] = now
+    return out
+
+
+def _auto_switch_on_lag_or_pressure(cid, cluster_name, cache):
+    """高延迟 / 主库压力「持续」超阈值时，自动把最优从库提升为主库。
+
+    需全部满足才动作（默认关闭，需显式开启）：
+      1. 总开关 AUTO_FAILOVER=1，且 LAG_FAILOVER_ENABLED 或 PRESSURE_FAILOVER_ENABLED 开启；
+      2. 主库在线（失联由既有「连续探活失败」逻辑处理）；
+      3. 延迟：≥2 个从库延迟 ≥ LAG_FAILOVER_SEC；或压力：主库 Threads_running /
+         行锁等待周期增量 超阈值；
+      4. 连续 LAG_FAILOVER_CYCLES 个周期成立（避免大事务/批量任务造成瞬时抖动误切）；
+      5. 距上次自动切换超过 FAILOVER_COOLDOWN_SEC（防反复切换）。
+
+    目标节点：复制正常(IO/SQL 双 Yes)、延迟最小、且自身不在压力中的从库。
+    """
+    if get_setting("AUTO_FAILOVER", "1") != "1":
+        return
+    lag_on = get_setting("LAG_FAILOVER_ENABLED", "0") == "1"
+    prs_on = get_setting("PRESSURE_FAILOVER_ENABLED", "0") == "1"
+    if not (lag_on or prs_on):
+        _SWITCH_STREAK[cid] = 0
+        return
+
+    def _int_setting(k, d):
+        try:
+            return int(get_setting(k, d))
+        except (TypeError, ValueError):
+            return int(d)
+
+    lag_sec = _int_setting("LAG_FAILOVER_SEC", 60)
+    cycles = max(1, _int_setting("LAG_FAILOVER_CYCLES", 3))
+    prs_threads = _int_setting("PRESSURE_THREADS_RUNNING", 50)
+    prs_locks = _int_setting("PRESSURE_ROW_LOCK_WAITS", 50)
+    cooldown = _int_setting("FAILOVER_COOLDOWN_SEC", 600)
+
+    now = time.time()
+    if now - _LAST_AUTO_SWITCH.get(cid, 0.0) < cooldown:
+        return
+
+    master_key = None
+    slaves = []
+    for key, val in list(cache.items()):
+        if key[2] != cid:
+            continue
+        st, is_master = val[0], val[1]
+        if is_master:
+            master_key = key
+        elif st.get("alive"):
+            slaves.append((key, st))
+    if master_key is None:
+        return
+    if not cache[master_key][0].get("alive"):
+        _SWITCH_STREAK[cid] = 0
+        return
+
+    samples = _pressure_samples(cache, cid, now)
+
+    # ---- 判据 A：多数从库复制延迟过高 ----
+    lag_hit, lag_detail = False, ""
+    if lag_on and slaves:
+        lagging = [k for k, s in slaves
+                   if s.get("seconds_behind") is not None
+                   and s["seconds_behind"] >= lag_sec]
+        # 至少 2 个从库（或过半，取较大者）同时高延迟才算，避免单节点抖动
+        need = max(2, (len(slaves) + 1) // 2)
+        if len(lagging) >= need:
+            lag_hit = True
+            lag_detail = f"{len(lagging)}/{len(slaves)} 个从库延迟 ≥ {lag_sec}s"
+
+    # ---- 判据 B：主库自身压力过高 ----
+    prs_hit, prs_detail = False, ""
+    if prs_on:
+        p = samples.get(master_key) or {}
+        tr, rld = p.get("threads_running"), p.get("row_lock_delta")
+        if tr is not None and tr >= prs_threads:
+            prs_hit = True
+            prs_detail = f"Threads_running={tr} ≥ {prs_threads}"
+        elif rld is not None and rld >= prs_locks:
+            prs_hit = True
+            prs_detail = f"行锁等待 {rld} 次/周期 ≥ {prs_locks}"
+
+    if not (lag_hit or prs_hit):
+        _SWITCH_STREAK[cid] = 0
+        return
+
+    _SWITCH_STREAK[cid] = _SWITCH_STREAK.get(cid, 0) + 1
+    if _SWITCH_STREAK[cid] < cycles:
+        return
+
+    # 选目标：自身不承压 + 复制正常 + 延迟最小
+    cands = []
+    for key, st in slaves:
+        if st.get("slave_io") != "Yes" or st.get("slave_sql") != "Yes":
+            continue
+        p = samples.get(key) or {}
+        over = ((p.get("threads_running") or 0) >= prs_threads
+                or (p.get("row_lock_delta") or 0) >= prs_locks)
+        d = st.get("seconds_behind")
+        cands.append(((1 if over else 0), (d if d is not None else 10 ** 9), key))
+    if not cands:
+        return
+    cands.sort(key=lambda x: (x[0], x[1]))
+    tkey = cands[0][2]
+
+    reason = "auto: " + "；".join([x for x in (lag_detail, prs_detail) if x])
+    print(f"[monitor] 集群[{cluster_name}] {reason}，连续 {_SWITCH_STREAK[cid]} 个周期达标，"
+          f"自动切换主库 → {tkey[0]}:{tkey[1]}")
+    try:
+        ok = do_failover_to(cid, tkey[0], tkey[1], reason)
+    except Exception as e:
+        print(f"[monitor] 自动切换异常: {e}")
+        return
+    _SWITCH_STREAK[cid] = 0
+    if ok:
+        _LAST_AUTO_SWITCH[cid] = now
+        try:
+            send_alert("自动切换主库",
+                       f"集群[{cluster_name}] {reason}，已切换主库至 {tkey[0]}:{tkey[1]}。",
+                       cluster_id=cid)
+        except Exception:
+            pass
 
 
 _MONITOR_THREAD = None

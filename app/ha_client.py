@@ -781,6 +781,8 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
         slave_io_err="", slave_sql_err="",
         master_host=None, master_port=None, error=None,
         connections=None, threads_running=None, qps=None,
+        # 压力代理指标（宿主机资源在远程节点上拿不到，改用 MySQL 侧压力信号）
+        row_lock_waits=None, slow_queries=None,
     )
     try:
         conn = connect_robust(host, port, user, password, root_user, root_pass, timeout=timeout)
@@ -838,6 +840,13 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
             cur.execute("SHOW GLOBAL STATUS LIKE 'Queries'")
             rq = cur.fetchone()
             result["qps"] = int(rq[1]) if rq else None
+            # 压力代理指标：均为累计计数器，由调用方按相邻样本做差得到「周期增量」
+            cur.execute("SHOW GLOBAL STATUS LIKE 'Innodb_row_lock_waits'")
+            rlk = cur.fetchone()
+            result["row_lock_waits"] = int(rlk[1]) if rlk else None
+            cur.execute("SHOW GLOBAL STATUS LIKE 'Slow_queries'")
+            rsq = cur.fetchone()
+            result["slow_queries"] = int(rsq[1]) if rsq else None
         except Exception:
             pass
         result["alive"] = True

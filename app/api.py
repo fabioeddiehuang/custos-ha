@@ -1195,6 +1195,8 @@ def cluster_detail_page(request: Request, cid: int, user=Depends(auth_required),
                   clusters=[c], msg=msg, error=error,
                   auto_failover=get_setting("AUTO_FAILOVER", "1") == "1",
                   auto_repair=get_setting("AUTO_REPAIR", "1") == "1",
+                  lag_failover=get_setting("LAG_FAILOVER_ENABLED", "0") == "1",
+                  pressure_failover=get_setting("PRESSURE_FAILOVER_ENABLED", "0") == "1",
                   slowlog_enabled=slow_log.slowlog_enabled())
 
 
@@ -1307,7 +1309,11 @@ def api_setting_set(key: str = Form(...), value: str = Form(...),
     """保存一个开关/配置项（如 AUTO_FAILOVER / AUTO_REPAIR）。"""
     allowed = {"AUTO_FAILOVER", "AUTO_REPAIR", "ALERT_COOLDOWN_SEC",
                "ALERT_MERGE", "ALERT_LAG_THRESHOLD", "ALERT_RECEIVERS",
-               "SLOWLOG_ENABLED"}
+               "SLOWLOG_ENABLED",
+               # 高延迟 / 压力自动切换（默认关闭）
+               "LAG_FAILOVER_ENABLED", "LAG_FAILOVER_SEC", "LAG_FAILOVER_CYCLES",
+               "PRESSURE_FAILOVER_ENABLED", "PRESSURE_THREADS_RUNNING",
+               "PRESSURE_ROW_LOCK_WAITS", "FAILOVER_COOLDOWN_SEC"}
     if key not in allowed:
         return JSONResponse({"ok": False, "error": "不允许修改该项"})
     upsert_setting(key, value)

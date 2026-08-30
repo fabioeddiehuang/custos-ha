@@ -13,9 +13,9 @@
   /* 层次背景 */
   --bg:#070b14; --bg-1:#0e1830;
   --surface:#111a2e; --surface-2:#16233d; --surface-3:#1c2b47;
-  /* 按钮 hover 底色：取「与 hover 前相近」的邻近色，
-     深色主题下不再用暗色主色底（原 --primary-light 在深底上发暗）。 */
-  --btn-hover-bg:var(--surface-3);
+  /* 按钮 hover 底色 = 方案 C「中性微叠加」：叠一层极淡的中性色，
+     不引入品牌色、也不改明度层次，深色主题下不会发暗（原 --primary-light 会）。 */
+  --btn-hover-bg:rgba(255,255,255,.09);
   --text:#e8eefc; --muted:#8b9ac0; --border:rgba(255,255,255,.10);
   --border-strong:rgba(255,255,255,.18);
   /* 语义色（深色底上统一用「亮色文字 + 低透明底」，保证对比度） */

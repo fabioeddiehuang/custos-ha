@@ -86,6 +86,8 @@
   </div>
   <span style="display:flex;align-items:center;gap:8px">自动切换<label class="switch"><input type="checkbox" id="swFailover" {% if auto_failover %}checked{% endif %} onchange="toggleAuto('AUTO_FAILOVER', this)"><span class="slider"></span></label></span>
   <span style="display:flex;align-items:center;gap:8px">自动修复<label class="switch"><input type="checkbox" id="swRepair" {% if auto_repair %}checked{% endif %} onchange="toggleAuto('AUTO_REPAIR', this)"><span class="slider"></span></label></span>
+  <span style="display:flex;align-items:center;gap:8px;white-space:nowrap" title="多数从库复制延迟持续 ≥ LAG_FAILOVER_SEC(默认60s) 且连续 LAG_FAILOVER_CYCLES(默认3) 个周期成立时，自动把延迟最小的从库提为主">延迟切换<label class="switch"><input type="checkbox" id="swLagFo" {% if lag_failover %}checked{% endif %} onchange="toggleAuto('LAG_FAILOVER_ENABLED', this)"><span class="slider"></span></label></span>
+  <span style="display:flex;align-items:center;gap:8px;white-space:nowrap" title="主库压力持续超阈值（Threads_running ≥ 50 或 行锁等待 ≥ 50 次/周期）且连续 3 个周期成立时，自动把压力最低的从库提为主">压力切换<label class="switch"><input type="checkbox" id="swPrsFo" {% if pressure_failover %}checked{% endif %} onchange="toggleAuto('PRESSURE_FAILOVER_ENABLED', this)"><span class="slider"></span></label></span>
   <div class="menu-wrap"><button class="btn green" onclick="toggleMenu('fixMenu',event)">🛠 一键修复 ▾</button>
     <div class="menu" id="fixMenu">
       <a onclick="doRepair('heal_io')">修复复制延迟<span class="d">高延迟</span></a>
