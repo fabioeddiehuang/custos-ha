@@ -22,6 +22,25 @@
     background:var(--surface-3);color:var(--text);border-radius:10px;padding:12px 14px;
     font-family:var(--mono);font-size:12px;line-height:1.6;max-height:52vh;overflow:auto;white-space:pre-wrap;
   }
+  /* 备份范围：分段卡片 */
+  .seg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:6px}
+  .seg-item{position:relative;display:block;cursor:pointer;margin:0}
+  .seg-item input{position:absolute;opacity:0;width:0;height:0}
+  .seg-card{display:block;border:1px solid var(--border);border-radius:10px;padding:11px 14px;background:var(--surface-2);transition:.15s}
+  .seg-title{display:block;font-size:13.5px;font-weight:600;color:var(--text)}
+  .seg-desc{display:block;font-size:11.5px;color:var(--muted);margin-top:2px}
+  .seg-item input:checked + .seg-card{border-color:var(--primary);background:var(--primary-light);box-shadow:0 0 0 1px var(--primary) inset}
+  .seg-item:hover .seg-card{border-color:var(--primary)}
+  /* 包含数据：开关 */
+  .switch-row{display:flex;align-items:center;gap:11px;margin-top:14px}
+  .switch{position:relative;display:inline-block;width:40px;height:22px;flex:0 0 auto}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;inset:0;background:var(--border);border-radius:22px;transition:.2s;cursor:pointer}
+  .slider:before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+  .switch input:checked + .slider{background:var(--primary)}
+  .switch input:checked + .slider:before{transform:translateX(18px)}
+  .switch-label{font-size:13px;color:var(--text);font-weight:500}
+  .switch-hint{font-size:11.5px;color:var(--muted)}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -52,19 +71,33 @@
       </select>
     </div>
 
-    <div style="display:flex;gap:22px;align-items:center;margin:12px 0 10px;flex-wrap:wrap">
-      <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;white-space:nowrap;flex:0 0 auto">
-        <input type="radio" name="bkScope" value="all" checked onchange="onScopeChange()" style="flex:0 0 auto">全库（所有业务库）
-      </label>
-      <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;white-space:nowrap;flex:0 0 auto">
-        <input type="radio" name="bkScope" value="custom" onchange="onScopeChange()" style="flex:0 0 auto">指定库
-      </label>
-      <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;white-space:nowrap;flex:0 0 auto">
-        <input type="checkbox" id="bkWithData" checked style="flex:0 0 auto">包含数据
-      </label>
+    <div class="field">
+      <label>备份范围</label>
+      <div class="seg">
+        <label class="seg-item">
+          <input type="radio" name="bkScope" value="all" checked onchange="onScopeChange()">
+          <span class="seg-card">
+            <span class="seg-title">全库（所有业务库）</span>
+            <span class="seg-desc">自动排除系统库</span>
+          </span>
+        </label>
+        <label class="seg-item">
+          <input type="radio" name="bkScope" value="custom" onchange="onScopeChange()">
+          <span class="seg-card">
+            <span class="seg-title">指定库</span>
+            <span class="seg-desc">仅勾选的库</span>
+          </span>
+        </label>
+      </div>
     </div>
 
-    <div id="dbWrap" style="display:none">
+    <label class="switch-row">
+      <span class="switch"><input type="checkbox" id="bkWithData" checked><span class="slider"></span></span>
+      <span class="switch-label">包含数据</span>
+      <span class="switch-hint">关闭则仅导出表结构</span>
+    </label>
+
+    <div id="dbWrap" style="display:none;margin-top:14px">
       <div class="db-bar">
         <span style="font-size:12.5px;color:var(--muted)">勾选要备份的库</span>
         <span class="sp"></span>
