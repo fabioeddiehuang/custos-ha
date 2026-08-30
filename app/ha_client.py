@@ -293,6 +293,190 @@ def heal_io_gtid_gap(slave_host, slave_port, ha_user, ha_pass,
             pass
 
 
+# IO 线程「认证类」错误特征：MySQL 8.0 的 caching_sha2_password 在明文 TCP、
+# 又未索取服务端 RSA 公钥时，会报 “Authentication requires secure connection”；
+# 连同账号密码不对 / 连不上源端一并归入此类，统一走「重建通道」自愈。
+_AUTH_IO_MARKERS = (
+    "caching_sha2_password",
+    "authentication requires secure connection",
+    "authentication plugin",
+    "access denied for user",
+    "error connecting to source",
+    "error connecting to master",
+    "2061",
+    "1045",
+)
+
+
+def _io_error_is_auth(io_err: str) -> bool:
+    s = (io_err or "").lower()
+    return any(m in s for m in _AUTH_IO_MARKERS)
+
+
+def _start_io_thread(cur):
+    """启动 IO 线程（MySQL 8.0 / 5.7 两种语法都试）。"""
+    for s in ("START REPLICA IO_THREAD", "START SLAVE IO_THREAD"):
+        try:
+            cur.execute(s)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _stop_io_thread(cur):
+    """停止 IO 线程（失败可忽略：未运行时本就会报错）。"""
+    for s in ("STOP REPLICA IO_THREAD", "STOP SLAVE IO_THREAD"):
+        try:
+            cur.execute(s)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def heal_io_auth(slave_host, slave_port, ha_user, ha_pass,
+                 slave_root_user="root", slave_root_pass="",
+                 repl_user=None, repl_pass=None,
+                 master_host=None, master_port=None,
+                 master_root_user="root", master_root_pass=""):
+    """自愈复制 IO 线程的【认证类】错误。
+
+    典型报错（MySQL 8.0 + caching_sha2_password + 非 TLS 复制）：
+        Authentication plugin 'caching_sha2_password' reported error:
+        Authentication requires secure connection.
+
+    根因：从库以明文 TCP 连主库，caching_sha2_password 在没有 TLS、也没有索取
+    服务端 RSA 公钥的情况下无法完成密码交换。原先这类错误会被
+    heal_io_gtid_gap 判为「非 GTID 缺失类」直接跳过，导致一键修复无效。
+
+    修复分两级：
+      1) 重建复制通道并带 SOURCE_PUBLIC_KEY=1（官方推荐：向服务端索取 RSA 公钥）；
+      2) 若仍失败（服务端未开启 RSA 自动密钥 / 不支持该选项），到【源端】把复制
+         账号改为 mysql_native_password，再重启 IO 线程。
+
+    返回 (acted, msg)。
+    """
+    sconn = connect_robust(slave_host, slave_port, ha_user, ha_pass,
+                           slave_root_user, slave_root_pass, timeout=5)
+    if sconn is None:
+        return False, "无法连接从库(ha_monitor/root均失败)"
+    try:
+        scur = sconn.cursor()
+        ssyntax = detect_syntax(scur)
+        scur.execute(show_replica_status_sql(ssyntax))
+        row = _one_dict(scur)
+        if not row:
+            return False, "从库无复制通道，无需处理"
+
+        def g(k):
+            return row.get(k)
+
+        io_err = (g("Last_IO_Error") or "") or ""
+        if not _io_error_is_auth(io_err):
+            return False, "IO 错误非认证类，跳过" + (("：" + io_err) if io_err else "")
+
+        target_host = g("Source_Host") or g("Master_Host") or master_host
+        try:
+            target_port = int(g("Source_Port") or g("Master_Port") or master_port or 0)
+        except (TypeError, ValueError):
+            target_port = 0
+        if not target_host or not target_port or not repl_user:
+            return False, "缺少源端地址或复制账号，无法重建复制通道"
+
+        flavour = detect_flavour(scur)
+        notes = []
+
+        # ---------- 第一级：带 SOURCE_PUBLIC_KEY=1 重建通道 ----------
+        _stop_io_thread(scur)
+        try:
+            scur.execute(change_replication_sql(
+                flavour, target_host, target_port, repl_user, repl_pass or "",
+                public_key=True, assign_anon_gtids=(flavour == F_MYSQL8)))
+            notes.append("已带 SOURCE_PUBLIC_KEY=1 重建复制通道")
+        except Exception as e_pub:
+            notes.append(f"带公钥重建失败({e_pub})，改为不带公钥重建")
+            try:
+                scur.execute(change_replication_sql(
+                    flavour, target_host, target_port, repl_user, repl_pass or "",
+                    public_key=False))
+            except Exception as e2:
+                return False, f"重建复制通道失败: {e2}"
+        _start_io_thread(scur)
+
+        _tiny_sleep(1.5)
+        scur.execute(show_replica_status_sql(ssyntax))
+        row2 = _one_dict(scur) or {}
+        if row2.get("Slave_IO_Running") == "Yes" or row2.get("Replica_IO_Running") == "Yes":
+            return True, "；".join(notes) + f"；IO 线程已恢复（源 {target_host}:{target_port}）"
+
+        io_err2 = (row2.get("Last_IO_Error") or "") or ""
+
+        # ---------- 第二级：到源端把复制账号降级为 mysql_native_password ----------
+        mconn = connect_robust(target_host, target_port, ha_user, ha_pass,
+                               master_root_user, master_root_pass, timeout=5)
+        if mconn is None:
+            return False, (f"重建通道后 IO 仍未恢复，且无法连接源端 {target_host}:{target_port} "
+                           f"做降级处理（当前错误：{io_err2 or '未知'}）")
+        try:
+            mcur = mconn.cursor()
+            quser = str(repl_user).replace("'", "''")
+            qpass = str(repl_pass or "").replace("'", "''")
+            last_err = None
+            # 常见两种 host 形态：'%' 与从库 IP
+            for host_part in ("'%'", f"'{slave_host}'"):
+                try:
+                    mcur.execute(
+                        f"ALTER USER '{quser}'@{host_part} "
+                        f"IDENTIFIED WITH mysql_native_password BY '{qpass}'")
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+            if last_err is not None:
+                # 账号可能根本不存在：直接按 native 插件创建并授权
+                try:
+                    mcur.execute(
+                        f"CREATE USER '{quser}'@'%' "
+                        f"IDENTIFIED WITH mysql_native_password BY '{qpass}'")
+                    mcur.execute(f"GRANT REPLICATION SLAVE ON *.* TO '{quser}'@'%'")
+                    last_err = None
+                except Exception as e2:
+                    return False, (f"源端改用 mysql_native_password 失败: {last_err} / {e2}"
+                                   f"（当前错误：{io_err2 or '未知'}）")
+            notes.append(f"已在源端把复制账号 {repl_user} 改为 mysql_native_password")
+        finally:
+            try:
+                mconn.close()
+            except Exception:
+                pass
+
+        # 源端改完后重建通道（此时不再需要公钥）并重启 IO 线程
+        _stop_io_thread(scur)
+        try:
+            scur.execute(change_replication_sql(
+                flavour, target_host, target_port, repl_user, repl_pass or "",
+                public_key=False))
+        except Exception as e:
+            notes.append(f"重建通道失败({e})")
+        _start_io_thread(scur)
+
+        _tiny_sleep(1.5)
+        scur.execute(show_replica_status_sql(ssyntax))
+        row3 = _one_dict(scur) or {}
+        if row3.get("Slave_IO_Running") == "Yes" or row3.get("Replica_IO_Running") == "Yes":
+            return True, "；".join(notes) + f"；IO 线程已恢复（源 {target_host}:{target_port}）"
+        return False, ("；".join(notes) + "；IO 仍未恢复："
+                       + (row3.get("Last_IO_Error") or "未知错误"))
+    except Exception as e:
+        return False, str(e)
+    finally:
+        try:
+            sconn.close()
+        except Exception:
+            pass
+
+
 def heal_anonymous_gtid_io(slave_host, slave_port, ha_user, ha_pass,
                            slave_root_user="root", slave_root_pass="",
                            master_host=None, master_port=None,

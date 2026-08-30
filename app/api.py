@@ -28,7 +28,8 @@ from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
                        render_fix_node_creds_sql_mariadb)
 from .clusters import list_clusters, validate_node_version, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
 from .alerts import send_alert, last_error
-from .ha_client import (connect, heal_replication, heal_io_gtid_gap, get_status, make_slave_of,
+from .ha_client import (connect, heal_replication, heal_io_gtid_gap, heal_io_auth,
+                       get_status, make_slave_of,
                        fix_node_mysql_params, reset_replication_creds_on_master,
                        restart_slave_io, connect_robust)
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
@@ -699,6 +700,25 @@ def api_heal(request: Request, user=Depends(auth_required),
                         steps.append(smsg)
             except Exception as e:
                 steps.append("复制密码重置异常: %s" % e)
+
+            # 3.6) IO 仍失败且为「认证类」错误（典型：caching_sha2_password 报
+            #      “Authentication requires secure connection”）。这类错误此前会被
+            #      heal_io_gtid_gap 判为「非 GTID 缺失类」直接跳过，导致一键修复无效。
+            #      处理：重建复制通道并带 SOURCE_PUBLIC_KEY=1；仍不行则到源端把复制
+            #      账号降级为 mysql_native_password。
+            try:
+                st_io2 = get_status(host, p, creds["ha_user"], creds["ha_pass"], ru, rp, timeout=10)
+                io_err_2 = (st_io2.get("slave_io_err") or "").strip()
+                if st_io2.get("slave_io") != "Yes" and io_err_2:
+                    mru2, mrp2 = node_root(cur_h, cluster_id)
+                    ok_a, msg_a = heal_io_auth(
+                        host, p, creds["ha_user"], creds["ha_pass"], ru, rp,
+                        repl_user=creds.get("repl_user"), repl_pass=creds.get("repl_pass"),
+                        master_host=cur_h, master_port=cur_p,
+                        master_root_user=mru2, master_root_pass=mrp2)
+                    steps.append("IO认证自愈: " + msg_a)
+            except Exception as e:
+                steps.append("IO认证自愈异常: %s" % e)
 
         # 重新读取，给出最终状态与真实错误（而非掩盖为「复制正常」）
         st2 = live()
@@ -1376,31 +1396,65 @@ def api_term(cluster_id: int = Form(...), host: str = Form(...), port: int = For
                                   "error": "无法连接节点(无 root 密码且缺 ha_monitor 凭证): " + str(e)})
         conn = connect(host, port, hu, hp, timeout=5)
         account = "ha_monitor(只读)"
-    t0 = _time.time()
-    try:
-        cur = conn.cursor()
+    # 权限类错误码：账号能连上但实际没有权限（如 root@'<manager ip>' 仅 USAGE，
+    # 执行 SHOW REPLICA STATUS 会报 1227）。此时回退 ha_monitor 重试一次。
+    _PRIV_ERRNOS = frozenset({1227, 1142, 1044, 1045, 1141, 1370})
+
+    def _errno_of(exc):
+        args = getattr(exc, "args", None)
+        if isinstance(args, (list, tuple)) and len(args) >= 1 and isinstance(args[0], int):
+            return args[0]
+        return None
+
+    def _err_resp(exc, acct, dur):
+        return JSONResponse({"ok": False, "account": acct, "error": str(exc),
+                             "error_code": _errno_of(exc),
+                             "sqlstate": getattr(exc, "sqlstate", None) or "HY000",
+                             "duration": dur})
+
+    def _run(c, acct):
+        t0 = _time.time()
+        cur = c.cursor()
         cur.execute(sql)
         dur = round(_time.time() - t0, 3)
         if cur.description:
             cols = [d[0] for d in cur.description]
             rows = [[_jsonable(v) for v in r] for r in cur.fetchall()]
-            return JSONResponse({"ok": True, "account": account, "cols": cols,
-                                  "rows": rows, "count": len(rows), "duration": dur})
-        conn.commit()
+            return JSONResponse({"ok": True, "account": acct, "cols": cols,
+                                 "rows": rows, "count": len(rows), "duration": dur})
+        c.commit()
         affected = cur.rowcount if cur.rowcount and cur.rowcount >= 0 else 0
-        return JSONResponse({"ok": True, "account": account, "cols": [], "rows": [],
-                              "count": affected, "info": "Query OK", "duration": dur})
+        return JSONResponse({"ok": True, "account": acct, "cols": [], "rows": [],
+                             "count": affected, "info": "Query OK", "duration": dur})
+
+    t_start = _time.time()
+    try:
+        return _run(conn, account)
     except Exception as e:
-        dur = round(_time.time() - t0, 3)
-        args = getattr(e, "args", None)
-        code = None
-        if isinstance(args, (list, tuple)) and len(args) >= 1 and isinstance(args[0], int):
-            code = args[0]
-        sqlstate = getattr(e, "sqlstate", None) or "HY000"
-        return JSONResponse({"ok": False, "account": account, "error": str(e),
-                              "error_code": code, "sqlstate": sqlstate, "duration": dur})
+        if account == "root" and _errno_of(e) in _PRIV_ERRNOS:
+            creds = get_cluster_creds(cluster_id) or {}
+            hu, hp = creds.get("ha_user"), creds.get("ha_pass")
+            if hu:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    conn = connect(host, port, hu, hp, timeout=5)
+                    account = "ha_monitor(只读)"
+                except Exception as e2:
+                    return _err_resp(e2, "ha_monitor(只读)",
+                                     round(_time.time() - t_start, 3))
+                try:
+                    return _run(conn, account)
+                except Exception as e3:
+                    return _err_resp(e3, account, round(_time.time() - t_start, 3))
+        return _err_resp(e, account, round(_time.time() - t_start, 3))
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 SQL_KEYWORDS = [
