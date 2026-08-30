@@ -347,6 +347,8 @@ textarea{resize:vertical;min-height:64px}
 .tag{display:inline-block;padding:1px 8px;border-radius:6px;font-size:11px;font-weight:700;line-height:1.5}
 .tag.on{background:var(--success-bg);color:var(--success)}
 .tag.off{background:var(--danger-bg);color:var(--danger)}
+/* 介于 on/off 之间：功能可用但有隐患（如 MariaDB 的 gtid_strict_mode=OFF） */
+.tag.warn{background:var(--warning-bg);color:var(--warning)}
 .k.hl{text-decoration:underline;text-decoration-color:var(--primary);text-decoration-thickness:2px;text-underline-offset:3px;font-weight:700}
 .dh-obs{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:14px}
 .dh-timeline{display:flex;flex-direction:column;gap:0}

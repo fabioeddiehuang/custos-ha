@@ -2,7 +2,7 @@
 # ============================================================================
 # Uninstall-mariadb-docker-Node.sh —— 容器化 MariaDB 节点卸载（交互式）
 # ----------------------------------------------------------------------------
-# 用途：卸载由 Run-mariadb-docker-Node.sh 部署的容器化 MariaDB 节点：
+# 用途：卸载由 Install-mariadb-docker-Node.sh 部署的容器化 MariaDB 节点：
 #   • 连接容器内 MariaDB 清理复制通道 / HA 账号 / 远程 root / ha_local
 #   • 停止并删除 MariaDB 容器、停止 keepalived 客户端容器
 #   • 回退防火墙（MySQL 端口 + VRRP）
@@ -167,4 +167,4 @@ rmdir "$STATE_DIR" >/dev/null 2>&1 || true
 echo
 log "==== 容器化 MariaDB 节点卸载完成 ===="
 echo "提醒：请到管理器 Web 界面删除该节点（避免后台继续探测/选主）。"
-echo "若仅需改密码或配置，无需卸载——重新生成节点目录后重跑 Run-mariadb-docker-Node.sh 即可（幂等更新）。"
+echo "若仅需改密码或配置，无需卸载——重新生成节点目录后重跑 Install-mariadb-docker-Node.sh 即可（幂等更新）。"

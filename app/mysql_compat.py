@@ -49,7 +49,7 @@ def is_mariadb(version_str):
 # 节点部署形态常量（nodes.node_type / clusters.node_type）
 NT_DOCKER = "docker"                  # 容器化 MySQL 8.0
 NT_MARIADB = "mariadb"                # 裸机 MariaDB（Install 脚本全量安装）
-NT_MARIADB_DOCKER = "mariadb-docker"  # 容器化 MariaDB（官方镜像 + Run 脚本）
+NT_MARIADB_DOCKER = "mariadb-docker"  # 容器化 MariaDB（官方镜像 + Install 脚本）
 
 # 引擎族：同为 MariaDB 的两种形态可以同集群混部（复制/切换完全兼容），
 # 与 MySQL 之间仍然禁止混部（GTID 机制根本不兼容）。
@@ -198,9 +198,9 @@ def change_replication_sql(flavour, host, port, user, password, channel=None,
         CHANGE REPLICATION SOURCE TO SOURCE_HOST=..., SOURCE_AUTO_POSITION=1
         [+ SOURCE_PUBLIC_KEY=1] [+ ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS=LOCAL]
     MariaDB (flavour=mariadb):
-        CHANGE MASTER TO MASTER_HOST=..., MASTER_USE_GTID=slave_pos
-        [+ MASTER_PUBLIC_KEY=1]
+        CHANGE MASTER TO MASTER_HOST=..., MASTER_USE_GTID=slave_pos, MASTER_SSL=0
         —— 不使用 AUTO_POSITION（MariaDB 无此概念，用基于 gtid_domain_id 的 slave_pos）。
+        —— MASTER_SSL=0 是必须的：见下方函数内注释（WolfSSL/OpenSSL 互操作问题）。
     Old (flavour=old, MySQL 5.7 等):
         CHANGE MASTER TO MASTER_HOST=..., MASTER_AUTO_POSITION=1
         [+ MASTER_PUBLIC_KEY=1]
@@ -222,9 +222,17 @@ def change_replication_sql(flavour, host, port, user, password, channel=None,
         # 注意：MariaDB（尤其 12.x）的 CHANGE MASTER TO 不支持 MASTER_PUBLIC_KEY 参数，
         # 且 MariaDB 使用 mysql_native_password（非 MySQL8 的 caching_sha2_password），
         # 非 TLS 复制也不需要索取服务端公钥，故 public_key 参数对 MariaDB 一律忽略。
+        #
+        # MASTER_SSL=0 必须显式写：MariaDB 官方 tarball/发行包（裸机安装路径）用的是
+        # **WolfSSL**，而 Docker Hub 官方镜像（mariadb:12.3.3-ubi / 12.3.2）用的是 **OpenSSL**。
+        # WolfSSL 客户端 → OpenSSL 服务端的 TLS 握手会失败，IO 线程一直 Connecting 并报
+        #     error connecting to master 'replication@x:3306' ... message: SSL connection error: ok
+        # 反过来（容器节点做从库、裸机节点做主库）却完全正常，所以典型现象是
+        # 「容器节点一旦被切成主库，所有裸机节点立刻连不上」。
+        # 内网复制无需 TLS，直接关掉绕开这个非对称互操作问题。
         return (f"CHANGE MASTER TO MASTER_HOST='{host}', MASTER_PORT={port}, "
                 f"MASTER_USER='{user}', MASTER_PASSWORD='{password}', "
-                f"MASTER_USE_GTID=slave_pos{_ch(channel)}")
+                f"MASTER_USE_GTID=slave_pos, MASTER_SSL=0{_ch(channel)}")
     # old (MySQL 5.7 等 legacy)
     pk = "MASTER_PUBLIC_KEY=1, " if public_key else ""
     return (f"CHANGE MASTER TO MASTER_HOST='{host}', MASTER_PORT={port}, "

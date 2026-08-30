@@ -57,6 +57,14 @@ def check_node(ip, port, user, password, role=None):
             if dom in (None, "", "0"):
                 findings.append({"level": "WARN", "var": "gtid_domain_id",
                                  "message": f"gtid_domain_id={dom}（MariaDB 建议显式指定非 0 域，避免跨节点 GTID 冲突）"})
+            # gtid_strict_mode：HA 场景必须 ON。OFF 时各 domain 的 GTID 不保证单调递增，
+            # 故障切换后从库可能停在旧位点而漏掉事务（数据静默丢失）。
+            strict = _var(conn, "gtid_strict_mode")
+            if str(strict).upper() != "ON":
+                findings.append({"level": "WARN", "var": "gtid_strict_mode",
+                                 "message": (f"gtid_strict_mode={strict}（HA 场景应为 ON：OFF 时故障切换后"
+                                             "从库可能因 GTID 乱序停在旧位点而漏事务。"
+                                             "在节点的 my.cnf / docker-my.cnf 加 gtid_strict_mode = ON 后重启生效）")})
         else:
             if str(gtid).upper() != "ON":
                 findings.append({"level": "ERR", "var": "gtid_mode",

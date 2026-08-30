@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Run-mariadb-docker-Node.sh —— 容器化 MariaDB 节点部署（node_type=mariadb-docker）
+# Install-mariadb-docker-Node.sh —— 容器化 MariaDB 节点部署（node_type=mariadb-docker）
 # ----------------------------------------------------------------------------
 # 适用：
 #   1) 目标机操作系统过老（如 CentOS 7 / glibc 2.17、Ubuntu 18.04 / glibc 2.27），
@@ -25,7 +25,7 @@
 #     同一个文件挂到两个目录，使 12.3.3-ubi 与 12.3.2 任一镜像都生效（99- 前缀最后加载）。
 #
 # 前置：docker 已安装（compose 可选，仅用于拉起 keepalived）。
-# 用法： sudo bash Run-mariadb-docker-Node.sh
+# 用法： sudo bash Install-mariadb-docker-Node.sh
 # 可选环境变量：
 #   MARIA_IMAGE=mariadb:12.3.3-ubi         # 主镜像（拉取失败自动退 12.3.2）
 #   MARIA_IMAGE_FALLBACK=mariadb:12.3.2    # 备用镜像
@@ -60,7 +60,7 @@ conf_get() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || die "无法进入脚本所在目录：$SCRIPT_DIR"
 
-[[ $EUID -eq 0 ]] || die "请使用 root 执行：sudo bash Run-mariadb-docker-Node.sh"
+[[ $EUID -eq 0 ]] || die "请使用 root 执行：sudo bash Install-mariadb-docker-Node.sh"
 
 command -v docker >/dev/null 2>&1 \
   || die "未找到 docker。请先安装 Docker（容器自带运行时，与宿主 glibc 版本无关）。"

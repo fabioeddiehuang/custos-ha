@@ -303,6 +303,9 @@ _AUTH_IO_MARKERS = (
     "access denied for user",
     "error connecting to source",
     "error connecting to master",
+    # WolfSSL(裸机 tarball) 客户端 → OpenSSL(官方镜像) 服务端的 TLS 握手失败会报这个，
+    # 属于「连接类」错误，同样靠重建通道（新 SQL 带 MASTER_SSL=0）自愈。
+    "ssl connection error",
     "2061",
     "1045",
 )
@@ -327,6 +330,24 @@ def _start_io_thread(cur):
 def _stop_io_thread(cur):
     """停止 IO 线程（失败可忽略：未运行时本就会报错）。"""
     for s in ("STOP REPLICA IO_THREAD", "STOP SLAVE IO_THREAD"):
+        try:
+            cur.execute(s)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _stop_replica(cur):
+    """完整停掉复制（IO + SQL 两个线程）。
+
+    ⚠ 执行 CHANGE MASTER TO / CHANGE REPLICATION SOURCE TO 之前必须用它，
+    只停 IO 线程是不够的：SQL 线程仍在跑时会直接报
+        1198: This operation cannot be performed as you have a running slave '';
+              run STOP SLAVE '' first
+    「一键修复 / 重建复制通道」曾因此整体失败（修复动作看起来毫无效果）。
+    """
+    for s in ("STOP REPLICA", "STOP SLAVE"):
         try:
             cur.execute(s)
             return True
@@ -388,7 +409,8 @@ def heal_io_auth(slave_host, slave_port, ha_user, ha_pass,
         notes = []
 
         # ---------- 第一级：带 SOURCE_PUBLIC_KEY=1 重建通道 ----------
-        _stop_io_thread(scur)
+        # 必须完整 STOP SLAVE（含 SQL 线程），否则 CHANGE MASTER TO 报 1198。
+        _stop_replica(scur)
         try:
             scur.execute(change_replication_sql(
                 flavour, target_host, target_port, repl_user, repl_pass or "",
@@ -452,7 +474,7 @@ def heal_io_auth(slave_host, slave_port, ha_user, ha_pass,
                 pass
 
         # 源端改完后重建通道（此时不再需要公钥）并重启 IO 线程
-        _stop_io_thread(scur)
+        _stop_replica(scur)
         try:
             scur.execute(change_replication_sql(
                 flavour, target_host, target_port, repl_user, repl_pass or "",
@@ -1247,6 +1269,30 @@ def set_local_master_flag(host, port, user, password, master_str, root_user="roo
         return False
     try:
         cur = conn.cursor()
+        # MariaDB 10.5+：SET SESSION sql_log_bin 需要 BINLOG ADMIN，仅 SUPER 不够。
+        # ha_monitor 账号若缺该权限，connect_robust 会以它连上（连接本身成功），
+        # 但下面这句报 1227 → 整个写入被静默吞掉 → ha_local.state 永远为空。
+        # 这里先自检一次，失败就主动改用 root 连接重来，而不是直接放弃。
+        try:
+            cur.execute("SET SESSION sql_log_bin=0")
+            cur.execute("SET SESSION sql_log_bin=1")
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if not root_user or not root_pass:
+                return False
+            conn2 = None
+            try:
+                conn2 = pymysql.connect(host=host, port=int(port), user=root_user,
+                                        password=root_pass, connect_timeout=4, autocommit=True)
+            except Exception:
+                return False
+            if conn2 is None:
+                return False
+            conn = conn2
+            cur = conn.cursor()
         # ha_local 是节点本地状态表（keepalived 检查脚本读本机 current_master 用），
         # 绝不参与复制：用 sql_log_bin=0 防止写入进 binlog 被复制到从库。
         # 否则管理端连主库写入 current_master 进 binlog，从库复制线程再 INSERT 同主键
@@ -1555,9 +1601,14 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             #  - 12.x 执行 CHANGE MASTER TO / START SLAVE 必须有 REPLICATION SLAVE ADMIN（仅 REPLICATION SLAVE 不够，报 1227）；
             #  - 12.x 执行 SHOW REPLICA STATUS / 读取复制状态必须有 SLAVE MONITOR（监控探活读复制状态用），否则报 1227；
             #  10.x 对这两项不强制，但显式授予对 10.5+ 兼容无害。
+            # BINLOG ADMIN：MariaDB 10.5+ 把 `SET SESSION/LOCAL sql_log_bin` 从 SUPER 中拆出，
+            # 缺它时 manager 写 ha_local.state（必须禁 binlog，否则从库 1062）会报 1227，
+            # 结果主库标记一直写不进去、keepalived 读不到 current_master 而退化判定。
+            # 与 node_gen 的 render_mariadb_init_sql / fix-node-creds.sql 保持一致。
             ha_grant = ("GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, "
                         "REPLICATION SLAVE, REPLICATION SLAVE ADMIN, SLAVE MONITOR, "
-                        "READ_ONLY ADMIN, REPLICATION CLIENT, PROCESS, SELECT, RELOAD, SUPER ON *.* "
+                        "READ_ONLY ADMIN, BINLOG ADMIN, REPLICATION CLIENT, PROCESS, "
+                        "SELECT, RELOAD, SUPER ON *.* "
                         "TO '%s'@'%%'" % ha_user)
             repl_grant = ("GRANT REPLICATION SLAVE, REPLICATION SLAVE ADMIN ON *.* "
                           "TO '%s'@'%%'" % repl_user)
@@ -1581,11 +1632,15 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                             conn_host=host, conn_port=port, plugin=auth_plugin)
         # 关键：把 root@'<管理器IP>' 与 root@'%' 密码校正为管理器库存 root_pass。
         #  - manager_ip 的 root 用于管理器自愈回退；
+        #  - 127.0.0.1 的 root 供 keepalived 的 check_mysql_master.sh 本机 TCP 探活使用
+        #    （安装脚本按当时密码建过它，节点 root 口令一旦变更就会漂移 → 探活 1045
+        #     → VIP 不上浮，故自愈必须把它刷成节点当前 root 口令）；
         #  - root@'%' 用于内网 Navicat/其它主机远程连接（用户要求可远程登录）。
         # manager_ip 为空时跳过该条，但 root@'%' 始终创建（便于内网运维）。
         root_targets = []
         if manager_ip:
             root_targets.append(manager_ip)
+        root_targets.append("127.0.0.1")
         if manager_subnet:
             # c/s 同机：管理器容器连【同机】节点时源 IP 是 docker 网关/容器网段，
             # 并非 manager_ip（真实宿主机 IP），故追加 docker 子网通配符白名单。
@@ -1606,7 +1661,9 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         #    覆盖 ALTER USER / DROP USER，无需也不能单独 GRANT ALTER/DROP USER——后者在
         #    MariaDB 不是可授权权限，GRANT 会报 1064）。
         #  - READ_ONLY ADMIN：MariaDB 10.11+ / MySQL 8.0 需要，提升主库时关 read_only 用。
-        for extra in ("CREATE USER", "READ_ONLY ADMIN"):
+        #  - BINLOG ADMIN：MariaDB 10.5+ 需要，写 ha_local.state 前关闭会话 binlog 用。
+        #    （对 MySQL 8.0 不存在该权限，GRANT 会失败但已被 except 吞掉，无副作用。）
+        for extra in ("CREATE USER", "READ_ONLY ADMIN", "BINLOG ADMIN"):
             try:
                 if extra.upper() not in _granted_privs(cur, ha_user, "%"):
                     cur.execute("GRANT %s ON *.* TO '%s'@'%%'" % (extra, ha_user))

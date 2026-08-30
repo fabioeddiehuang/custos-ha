@@ -52,6 +52,10 @@ MARIADB_DOCKER_IMAGE_FALLBACK = "mariadb:12.3.2"
 MARIADB_DOCKER_DATA_DIR = "/data/mariadb"
 MARIADB_DOCKER_CONTAINER = "mariadb-ha-node"
 
+# 节点侧 keepalived 客户端镜像名。项目由 mysql-ha-manager 更名为 Custos 后，
+# 镜像名也必须同步（否则新拉起的节点仍去找已废弃的 mysql-ha-keepalived:<版本>）。
+KEEPALIVED_IMAGE_NAME = "custos-node"
+
 
 def _valid_vip(vip):
     """校验 VIP 是否为合法 IPv4。
@@ -218,11 +222,11 @@ services:
       retries: 10
 
   keepalived:
-    # 模板化镜像：优先使用已编译并导入的镜像 mysql-ha-keepalived:<VERSION>（无需联网编译）。
+    # 模板化镜像：优先使用已编译并导入的镜像 custos-node:<VERSION>（无需联网编译）。
     # 若目标主机无法编译（如离线），可在可编译的机器上 `docker compose build keepalived`
-    # 后 `docker save mysql-ha-keepalived:latest -o keepalived.tar` 拷贝过来
-    # `docker load -i keepalived.tar`，再 `docker compose up --no-build` 启动。
-    image: mysql-ha-keepalived:{PKG_VERSION}
+    # 后 `docker save custos-node:latest -o custos-node.tar` 拷贝过来
+    # `docker load -i custos-node.tar`，再 `docker compose up --no-build` 启动。
+    image: {KEEPALIVED_IMAGE_NAME}:{PKG_VERSION}
     build: ./keepalived
     restart: always
     network_mode: host
@@ -238,7 +242,7 @@ services:
       - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro
       - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro
       - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro
-"""
+    """.replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME)
 
 
 def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/mariadb", install_dir="/opt/mariadb"):
@@ -261,6 +265,9 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         f"server-id = {server_id}\n"
         f"gtid_domain_id = {gtid_domain_id}\n"
         "# MariaDB 默认启用 GTID，无需 gtid_mode（与 MySQL 不兼容，请勿添加）\n"
+        "# gtid_strict_mode=ON：强制每个 domain 内 GTID 单调递增；默认 OFF 时切换后从库可能因\n"
+        "# 乱序 GTID 停在旧位点而漏事务，HA 场景必须开。（已存在乱序 GTID 的老集群需先核对再开）\n"
+        "gtid_strict_mode = ON\n"
         "log_bin = mysql-bin\n"
         "log_slave_updates = ON\n"
         "relay_log = relay-bin\n"
@@ -301,7 +308,7 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
 
 
 def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
-    """容器化 MariaDB 节点的配置片段（docker-my.cnf，由 Run 脚本挂载进容器）。
+    """容器化 MariaDB 节点的配置片段（docker-my.cnf，由 Install 脚本挂载进容器）。
 
     与裸机 my.cnf 的**唯一**差别：不写 datadir / socket / pid_file —— 这三个路径
     在官方镜像内是 /var/lib/mysql 与 /run/mariadb/mariadb.sock，若沿用宿主的
@@ -309,7 +316,7 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
     bind-address / 复制与慢日志参数）与裸机完全一致，保证两种形态同集群混部时
     复制行为一致。
 
-    落盘位置由 Run-mariadb-docker-Node.sh 决定：同时挂载到
+    落盘位置由 Install-mariadb-docker-Node.sh 决定：同时挂载到
       - /etc/my.cnf.d/99-ha.cnf      （UBI 构建：/etc/my.cnf 里 !includedir /etc/my.cnf.d）
       - /etc/mysql/conf.d/99-ha.cnf  （Debian 构建：/etc/mysql/my.cnf 里 !includedir）
     两条都挂，使 12.3.3-ubi 与 12.3.2 任一镜像都能读到；99- 前缀保证最后加载、覆盖默认。
@@ -317,13 +324,16 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
     if gtid_domain_id is None:
         gtid_domain_id = server_id
     return (
-        "# ---- Custos 生成的容器化 MariaDB 节点配置（docker-my.cnf，由 Run 脚本挂载进容器）----\n"
+        "# ---- Custos 生成的容器化 MariaDB 节点配置（docker-my.cnf，由 Install 脚本挂载进容器）----\n"
         "# 注意：容器内数据目录固定 /var/lib/mysql、socket 固定 /run/mariadb/mariadb.sock，\n"
-        "#       故本文件【不设】datadir / socket / pid_file，请到 Run 脚本改 MARIA_DATA_DIR。\n"
+        "#       故本文件【不设】datadir / socket / pid_file，请到 Install 脚本改 MARIA_DATA_DIR。\n"
         "[mysqld]\n"
         f"server-id = {server_id}\n"
         f"gtid_domain_id = {gtid_domain_id}\n"
         "# MariaDB 默认启用 GTID，无需 gtid_mode（与 MySQL 不兼容，请勿添加）\n"
+        "# gtid_strict_mode=ON：强制每个 domain 内 GTID 单调递增；默认 OFF 时切换后从库可能因\n"
+        "# 乱序 GTID 停在旧位点而漏事务，HA 场景必须开。（已存在乱序 GTID 的老集群需先核对再开）\n"
+        "gtid_strict_mode = ON\n"
         "log_bin = mysql-bin\n"
         "log_slave_updates = ON\n"
         "relay_log = relay-bin\n"
@@ -367,8 +377,12 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
         # 注意：MariaDB 中 ALTER USER / DROP USER **不是**可授权权限——它们由 CREATE USER 权限
         # 隐含覆盖（CREATE USER 特权即允许对任意用户 CREATE/ALTER/DROP USER）。若把它们写进
         # GRANT 会直接报 1064 语法错误，导致 init 整段失败。故只授 CREATE USER。
+        # BINLOG ADMIN 必须显式授予：MariaDB 10.5+ 把 `SET SESSION sql_log_bin` 从 SUPER 中拆出，
+        # 缺它时管理器写 ha_local.state（需禁 binlog）会报 1227，主库标记一直写不进去、
+        # keepalived 只能拿到空状态退化判定。
         "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
-        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, REPLICATION CLIENT, PROCESS, "
+        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
+        "REPLICATION CLIENT, PROCESS, "
         "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         # replication 复制账号（从库从其自身 IP 连，必须 @'%%'）
@@ -398,7 +412,7 @@ def render_baremetal_compose(node_name, vip_port=None):
     """MariaDB 节点（裸机 / 容器化）的 compose：只跑 keepalived 客户端。
 
     - 裸机 MariaDB：mysqld 由宿主 systemd 提供；
-    - 容器化 MariaDB：MariaDB 容器由 Run-mariadb-docker-Node.sh 以 host 网络单独拉起
+    - 容器化 MariaDB：MariaDB 容器由 Install-mariadb-docker-Node.sh 以 host 网络单独拉起
       （不进 compose，是因为它需要先准备配置 / 执行 init SQL，再起 keepalived）。
 
     keepalived 容器使用 host 网络，连接 127.0.0.1:<port> 探活本机 MariaDB。
@@ -409,11 +423,11 @@ def render_baremetal_compose(node_name, vip_port=None):
         "# 自动生成：MariaDB 节点（裸机 / 容器化）的 keepalived-only 客户端部署\n"
         "# 前置：目标机 MariaDB 已就绪并创建账号（init_mariadb.sql）——\n"
         "#       裸机形态：由 Install-ha-mariadb-Node.sh 全量安装（宿主 systemd 管理 mysqld）；\n"
-        "#       容器形态：由 Run-mariadb-docker-Node.sh 以 host 网络拉起官方 MariaDB 容器。\n"
+        "#       容器形态：由 Install-mariadb-docker-Node.sh 以 host 网络拉起官方 MariaDB 容器。\n"
         "# 运行： cd 本目录 && docker compose up -d\n"
         "services:\n"
         "  keepalived:\n"
-        "    image: mysql-ha-keepalived:{PKG_VERSION}\n"
+        "    image: {KEEPALIVED_IMAGE_NAME}:{PKG_VERSION}\n"
         "    build: ./keepalived\n"
         "    restart: always\n"
         "    network_mode: host\n"
@@ -427,7 +441,8 @@ def render_baremetal_compose(node_name, vip_port=None):
         "      - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro\n"
         "      - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro\n"
         "      - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro\n"
-    ).replace("{PKG_VERSION}", PKG_VERSION)
+    ).replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME) \
+     .replace("{PKG_VERSION}", PKG_VERSION)
 
 
 def render_docker_my_cnf():
@@ -557,6 +572,11 @@ def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user,
         "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         "ALTER USER '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
         "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION;\n"
+        #    root@'127.0.0.1'：keepalived 本机 TCP 探活账号，同 MariaDB 版说明——
+        #    节点 root 口令变更后必须同步刷这个账号，否则探活 1045、VIP 不上浮。
+        "CREATE USER IF NOT EXISTS '%s'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "ALTER USER '%s'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY '%s';\n"
+        "GRANT ALL PRIVILEGES ON *.* TO '%s'@'127.0.0.1' WITH GRANT OPTION;\n"
         # 3) replication：复制通道账号（从库从其自身 IP 连，必须 @'%'）。
         #    ⚠ 关键：CREATE 之后必须再 ALTER 强制密码——否则节点曾用旧 repl_pass 安装、
         #    重装/跑修复脚本时 CREATE IF NOT EXISTS 不覆盖已存在账号 → 密码仍是旧的 →
@@ -572,6 +592,7 @@ def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user,
         root_user, manager_ip, root_pass,
         root_user, manager_ip, root_pass,
         root_user, manager_ip,
+        root_user, root_pass, root_user, root_pass, root_user,
         repl_user, repl_pass, repl_user, repl_user, repl_pass,
     )
     if manager_subnet:
@@ -610,17 +631,27 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
         "SET SQL_LOG_BIN=0;\n"
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        # BINLOG ADMIN：见 render_mariadb_init_sql 的说明，缺它 ha_local.state 写不进去。
         "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
-        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, REPLICATION CLIENT, PROCESS, "
+        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
+        "REPLICATION CLIENT, PROCESS, "
         "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
         "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "ALTER USER '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
-        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, REPLICATION CLIENT, PROCESS, "
+        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
+        "REPLICATION CLIENT, PROCESS, "
         "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%s';\n"
         "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "ALTER USER '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION;\n"
+        # root@'127.0.0.1'：keepalived 的 check_mysql_master.sh 是容器内的本机 TCP 探活
+        # （LOCAL_HOST=127.0.0.1），命中这个账号。安装脚本按当时密码建过它，之后节点
+        # root 口令一旦变更（改密/重新生成），该账号就会口令漂移 → 探活 1045 → VIP 不上浮。
+        # 故每次重放修复脚本都必须把它刷成节点当前 root 口令。
+        "CREATE USER IF NOT EXISTS '%s'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "ALTER USER '%s'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
+        "GRANT ALL PRIVILEGES ON *.* TO '%s'@'127.0.0.1' WITH GRANT OPTION;\n"
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "GRANT REPLICATION SLAVE, REPLICATION SLAVE ADMIN ON *.* TO '%s'@'%%';\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
@@ -634,6 +665,7 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
         root_user, manager_ip, root_pass,
         root_user, manager_ip, root_pass,
         root_user, manager_ip,
+        root_user, root_pass, root_user, root_pass, root_user,
         repl_user, repl_pass, repl_user, repl_user, repl_pass,
     )
     if manager_subnet:
@@ -867,14 +899,14 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
         # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
         if node_type == "mariadb-docker":
-            # 容器化 MariaDB：配置片段（不含 datadir/socket）+ Run/Uninstall 脚本
+            # 容器化 MariaDB：配置片段（不含 datadir/socket）+ Install/Uninstall 脚本
             _write(d / "docker-my.cnf",
                    render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=server_id),
                    mode=0o644)
             extra_files["docker_my_cnf"] = f"{NODES_HOST_BASE}/{ip}/docker-my.cnf"
-            extra_files["run_script"] = f"{NODES_HOST_BASE}/{ip}/Run-mariadb-docker-Node.sh"
+            extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/Install-mariadb-docker-Node.sh"
             extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-docker-Node.sh"
-            for sf in ("Run-mariadb-docker-Node.sh", "Uninstall-mariadb-docker-Node.sh"):
+            for sf in ("Install-mariadb-docker-Node.sh", "Uninstall-mariadb-docker-Node.sh"):
                 src = NODE_SCRIPTS / sf
                 if src.exists():
                     _write(d / sf, src.read_text(), mode=0o755)
@@ -886,10 +918,10 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/my.cnf"
             extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/Install-ha-mariadb-Node.sh"
             extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-Node.sh"
-            # Run-mariadb-docker-Node.sh 一并交付：裸机装不上（如 glibc 过低）时，
+            # Install-mariadb-docker-Node.sh 一并交付：裸机装不上（如 glibc 过低）时，
             # 可在同一目录改跑容器方案，无需重新生成节点。
             for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh",
-                       "Run-mariadb-docker-Node.sh"):
+                       "Install-mariadb-docker-Node.sh"):
                 src = NODE_SCRIPTS / sf
                 if src.exists():
                     _write(d / sf, src.read_text(), mode=0o755)
@@ -937,7 +969,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
 
     # 5) docker-compose.yaml
     #    MariaDB 两种形态都只跑 keepalived 客户端（裸机由宿主 systemd 起 mysqld，
-    #    容器化由 Run-mariadb-docker-Node.sh 起 MariaDB 容器）；MySQL Docker 才含 MySQL 容器。
+    #    容器化由 Install-mariadb-docker-Node.sh 起 MariaDB 容器）；MySQL Docker 才含 MySQL 容器。
     if is_mariadb_node(node_type):
         compose = render_baremetal_compose(node_name, vip_port)
     else:
@@ -978,11 +1010,11 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
 
     # MariaDB 裸机节点：宿主机已原生运行 MariaDB，只需拉起 keepalived 容器
     # （否则会再起一个 MySQL 容器抢占 3306）。
-    # 容器化 MariaDB 节点：MariaDB 由 Run 脚本以 host 网络单独起，keepalived 由该脚本末尾拉起，
-    # 故入口统一是 Run 脚本（在里面已经包含 docker compose up -d）。
+    # 容器化 MariaDB 节点：MariaDB 由 Install 脚本以 host 网络单独起，keepalived 由该脚本末尾拉起，
+    # 故入口统一是 Install 脚本（在里面已经包含 docker compose up -d）。
     # MySQL docker 节点：MySQL 与 keepalived 都在容器里，整套一起拉起。
     if node_type == "mariadb-docker":
-        run_cmd = f"cd {host_compose} && sudo bash Run-mariadb-docker-Node.sh"
+        run_cmd = f"cd {host_compose} && sudo bash Install-mariadb-docker-Node.sh"
     elif node_type == "mariadb":
         run_cmd = f"cd {host_compose} && docker compose up -d keepalived"
     else:

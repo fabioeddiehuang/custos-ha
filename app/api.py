@@ -1643,14 +1643,23 @@ def api_node_detail(cluster_id: int = Form(...), host: str = Form(...), port: in
         "app_user": creds.get("app_user"), "app_pass": creds.get("app_pass"),
         "server_id": None, "datadir": None, "gtid_mode": None,
         "read_only": None, "enforce_gtid_consistency": None,
+        "gtid_strict_mode": None, "gtid_domain_id": None,
     }
     try:
         conn = connect(host, port, root_user, root_pass, timeout=5)
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SHOW VARIABLES WHERE Variable_name IN "
-                    "('server_id','datadir','gtid_mode','read_only','enforce_gtid_consistency')")
+                # MariaDB 没有 gtid_mode 变量（GTID 天然开启，靠 gtid_domain_id 区分域）。
+                # 不加区分地只查 gtid_mode，节点页会把 MariaDB 的 GTID 显示成"—/OFF"，
+                # 让人误以为 GTID 没开。这里按 flavour 查 MariaDB 的真实语义变量。
+                _is_maria = False
+                try:
+                    _is_maria = (detect_flavour(cur) == F_MARIADB)
+                except Exception:
+                    pass
+                _vars = ("('server_id','datadir','read_only','enforce_gtid_consistency'"
+                         + (",'gtid_strict_mode','gtid_domain_id')" if _is_maria else ",'gtid_mode')"))
+                cur.execute("SHOW VARIABLES WHERE Variable_name IN " + _vars)
                 for name, val in cur.fetchall():
                     if name == "server_id":
                         out["server_id"] = val
@@ -1662,6 +1671,14 @@ def api_node_detail(cluster_id: int = Form(...), host: str = Form(...), port: in
                         out["read_only"] = val
                     elif name == "enforce_gtid_consistency":
                         out["enforce_gtid_consistency"] = val
+                    elif name == "gtid_strict_mode":
+                        out["gtid_strict_mode"] = val
+                    elif name == "gtid_domain_id":
+                        out["gtid_domain_id"] = val
+                if _is_maria:
+                    # MariaDB 的 GTID 是否可用 = gtid_domain_id 已配（非 0）
+                    out["gtid_mode"] = ("ON" if str(out.get("gtid_domain_id") or "0") != "0"
+                                        else "OFF")
         finally:
             conn.close()
     except Exception as e:
@@ -2056,7 +2073,7 @@ def nodes_add(
                      "各节点就绪后管理器自动建复制/选主/VIP 漂移；"
                      "卸载用 sudo bash Uninstall-mariadb-Node.sh，重装/改密直接重跑 Install 即可）")
     elif nt == "mariadb-docker":
-        extra_tip = ("（MariaDB 容器版节点：把目录拷到目标机，执行 sudo bash Run-mariadb-docker-Node.sh；"
+        extra_tip = ("（MariaDB 容器版节点：把目录拷到目标机，执行 sudo bash Install-mariadb-docker-Node.sh；"
                      "自动拉 mariadb:12.3.3-ubi，失败退 mariadb:12.3.2，host 网络起容器并拉起 keepalived；"
                      "可与 MariaDB 裸机节点同集群混部；卸载用 sudo bash Uninstall-mariadb-docker-Node.sh）")
     return RedirectResponse(
