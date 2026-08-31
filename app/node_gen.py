@@ -1162,15 +1162,22 @@ def sync_node_creds(cluster_id=None):
             local_host = "127.0.0.1" if is_mariadb_node(node_type) else ip
             kd = _safe_node_path(ip) / "keepalived"
             kd.mkdir(parents=True, exist_ok=True)
+            # 口令必须用 _shq() 做 shell 转义！旧实现裸写，口令含 空格/#/$/引号 时
+            # 生成的 `LOCAL_ROOT_PASS=abc def#123` 被 source 后会被截断或整行变成注释，
+            # 变量实际为空 -> notify 脚本以 MYSQL_PWD="" 连接，报
+            #   ERROR 1045: Access denied for user 'root'@'localhost' (using password: NO)
+            # 置可写失败 -> 节点保持只读 -> 业务经 VIP 写入报 1290。
+            # 注意：LOCAL_PORT 是数字且要与 check 脚本做 `${MY_NODE}:${LOCAL_PORT}` 字符串比较，
+            #       加引号会变成 '3306' 导致比较失败，故这里【不能】加引号。
             ha_check = (
-                f"LOCAL_HOST={local_host}\n"
+                f"LOCAL_HOST={_shq(local_host)}\n"
                 f"LOCAL_PORT={port}\n"
-                f"NODE_IP={ip}\n"
-                f"MANAGER_IP={manager_public_ip}\n"
-                f"LOCAL_USER={ha_user}\n"
-                f"LOCAL_PASS={ha_pass}\n"
-                f"LOCAL_ROOT_USER={root_user}\n"
-                f"LOCAL_ROOT_PASS={root_pass}\n"
+                f"NODE_IP={_shq(ip)}\n"
+                f"MANAGER_IP={_shq(manager_public_ip)}\n"
+                f"LOCAL_USER={_shq(ha_user)}\n"
+                f"LOCAL_PASS={_shq(ha_pass)}\n"
+                f"LOCAL_ROOT_USER={_shq(root_user)}\n"
+                f"LOCAL_ROOT_PASS={_shq(root_pass)}\n"
             )
             _write(kd / "ha_check.conf", ha_check)
             # 同步重生成 init 凭证 SQL（仅凭证相关），保证后续「重部署」后执行时使用的仍是当前密码。

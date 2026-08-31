@@ -95,6 +95,15 @@ fi
 attempt() {
   # $1=标签  $2=账号  $3=密码
   local tag="$1" u="$2" pw="$3" i out rc
+  if [ -z "$pw" ]; then
+    # 典型诱因：ha_check.conf 中 *_PASS 未做 shell 转义，口令含 空格/#/$/引号 时被
+    # 截断或整行变注释，source 后变量为空 -> 以空口令连接，报
+    #   ERROR 1045: Access denied for user 'root'@'localhost' (using password: NO)
+    log "FAIL [$tag] 口令为空！ha_check.conf 中该账号的口令变量为空或已被 shell 解析破坏。"
+    log "       请检查 /etc/keepalived/ha_check.conf 的 LOCAL_PASS / LOCAL_ROOT_PASS；"
+    log "       若口令含 空格 # \$ ' 等特殊字符，须在管理端【重新生成节点目录】并重新下发 keepalived/ 目录。"
+    return 1
+  fi
   for i in $(seq 1 "$RETRY"); do
     # 必须拆成两次独立调用，绝不能写成 `-e "SET ...; SET ...;"`！
     # 客户端执行多语句时，第一条报错就会中止、后续语句【根本不会执行】。
