@@ -277,12 +277,46 @@ run_sql() {
 }
 if [[ -f init_mariadb.sql ]]; then
   log "执行 init_mariadb.sql ..."
-  run_sql < init_mariadb.sql || warn "init_mariadb.sql 执行有告警，请检查"
+  run_sql < init_mariadb.sql || warn "init_mariadb.sql 执行有告警，请检查（以随后账号校验结果为准）"
 fi
 if [[ -f fix-node-creds.sql ]]; then
   log "执行 fix-node-creds.sql ..."
-  run_sql < fix-node-creds.sql || warn "fix-node-creds.sql 执行有告警，请检查"
+  run_sql < fix-node-creds.sql || warn "fix-node-creds.sql 执行有告警，请检查（以随后账号校验结果为准）"
 fi
+
+# ---------- 6.5) 初始化结果校验（关键：账号缺失必须判失败） ----------
+# 历史 bug：init SQL 执行失败时脚本只 warn 并继续，最后仍打印「部署完成」，
+# 节点看似成功实则缺 ha_monitor / replication 账号 —— 表现为「本节点不能作为主库
+# （其余节点连不上它的复制账号，全部主从失败）」+ 管理端连接报 1045。
+# 故必须实查 mysql.user 校验账号是否真正建出来；不只看退出码，以免把无害告警误判为致命。
+verify_init_accounts() {
+  local sqls=() missing=() u cnt
+  [[ -f init_mariadb.sql ]] && sqls+=(init_mariadb.sql)
+  [[ -f fix-node-creds.sql ]] && sqls+=(fix-node-creds.sql)
+  ((${#sqls[@]})) || return 0
+  # 从两个 SQL 中提取被创建的账号名并去重（只取 CREATE USER，避免误抓 ALTER/GRANT）
+  local users
+  users="$(grep -hoE "CREATE USER( IF NOT EXISTS)? '[^']+'" "${sqls[@]}" 2>/dev/null \
+           | sed -E "s/.*'([^']+)'/\1/" | sort -u || true)"
+  [[ -z "$users" ]] && return 0
+  while IFS= read -r u; do
+    [[ -z "$u" ]] && continue
+    cnt="$(run_sql -N -e "SELECT COUNT(*) FROM mysql.user WHERE user='${u}'" 2>/dev/null \
+           | tail -1 | tr -d '[:space:]')"
+    if ! [[ "$cnt" =~ ^[0-9]+$ ]] || (( cnt < 1 )); then
+      missing+=("$u")
+    fi
+  done <<< "$users"
+  if ((${#missing[@]})); then
+    err "初始化校验失败：以下账号未创建成功 -> ${missing[*]}"
+    err "后果：管理端连不上本节点(1045)；本节点一旦作为主库，其余节点会因连不上复制账号而全部主从失败。"
+    err "请检查上方 init_mariadb.sql / fix-node-creds.sql 的实际报错后重跑本脚本。"
+    return 1
+  fi
+  log "初始化校验通过：账号已就位（$(printf '%s' "$users" | tr '\n' ' ')）。"
+  return 0
+}
+verify_init_accounts || die "节点初始化未完成，已中止部署（避免产出『看似成功实则不可用』的节点）。"
 
 # ---------- 7) 防火墙（MySQL 端口 + VRRP 112） ----------
 allow_port_vrrp() {
@@ -302,6 +336,40 @@ allow_port_vrrp() {
   fi
 }
 allow_port_vrrp
+
+# ---------- 7.2) 业务端口转发（VIP 端口 -> 本机 MySQL 端口） ----------
+# MariaDB 节点形态下 keepalived 只做三层 IP 漂移、**不做端口转换**：
+# 业务连「VIP:VIP_PORT」（默认 3307），而本机 MariaDB 监听的是自己的端口（如 3306），
+# 二者不一致时 VIP 上根本无人监听 —— 表现为「VIP 能 ping 通，但业务账号连不上库」。
+# 故在本机加一条端口转发；仅当本机持有 VIP 时才会收到该流量，对非 VIP 持有者无副作用。
+setup_vip_port_forward() {
+  local vip_port
+  vip_port="$(conf_get "$SCRIPT_DIR/keepalived/ha_check.conf" VIP_PORT || true)"
+  if [[ -z "$vip_port" ]]; then
+    warn "ha_check.conf 未下发 VIP_PORT，跳过业务端口转发（如业务连 VIP 端口与 $PORT 不同，请重新生成节点目录）"
+    return 0
+  fi
+  if [[ "$vip_port" == "$PORT" ]]; then
+    log "业务端口与本机 MySQL 端口一致（$PORT），无需端口转发。"
+    return 0
+  fi
+  log "配置业务端口转发：VIP 端口 $vip_port -> 本机 $PORT ..."
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-forward-port="port=${vip_port}:proto=tcp:toport=${PORT}" >/dev/null 2>&1 \
+      && firewall-cmd --reload >/dev/null 2>&1 \
+      && log "firewalld: 已配置端口转发 ${vip_port} -> ${PORT}" \
+      || warn "firewalld 端口转发失败，请手动：firewall-cmd --permanent --add-forward-port=port=${vip_port}:proto=tcp:toport=${PORT} && firewall-cmd --reload"
+  else
+    if ! iptables -t nat -C PREROUTING -p tcp --dport "$vip_port" -j REDIRECT --to-port "$PORT" >/dev/null 2>&1; then
+      iptables -t nat -A PREROUTING -p tcp --dport "$vip_port" -j REDIRECT --to-port "$PORT" 2>/dev/null \
+        && log "iptables: 已配置端口转发 ${vip_port} -> ${PORT}（重启后需重跑本脚本恢复）" \
+        || warn "iptables 端口转发失败，请手动添加 NAT 规则"
+    else
+      log "iptables: 端口转发 ${vip_port} -> ${PORT} 已存在，跳过。"
+    fi
+  fi
+}
+setup_vip_port_forward
 
 # ---------- 7.5) 错误日志可读化（供管理器「错误日志」面板 LOAD_FILE 读取） ----------
 # MariaDB 生成的 error.log 默认权限 0660，而 SQL LOAD_FILE 要求文件 world-readable(644)，

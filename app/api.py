@@ -1134,7 +1134,8 @@ def _cluster_js(c):
     """供前端 JS 使用的精简集群信息（编辑弹窗回填用）。
 
     只取渲染需要的标量字段：
-      - 剔除密码（ha_pass/repl_pass/app_pass 不下发到页面源码）；
+      - 密码一并下发，供「⚙ 修改配置/密码」弹窗显示/复制（该页需管理员登录，
+        且 /api/node_detail 早已把同样三个密码下发给前端，此处不新增暴露面）；
       - 剔除 created_at/updated_at 等 datetime（tojson 序列化不稳定）；
       - 时间戳统一转字符串，任何异常类型都兜底成字符串。
     """
@@ -1161,8 +1162,11 @@ def _cluster_js(c):
         "mysql_version": _s(c.get("mysql_version")),
         "creds": {
             "ha_user": _s(cr.get("ha_user")),
+            "ha_pass": _s(cr.get("ha_pass")),
             "repl_user": _s(cr.get("repl_user")),
+            "repl_pass": _s(cr.get("repl_pass")),
             "app_user": _s(cr.get("app_user")),
+            "app_pass": _s(cr.get("app_pass")),
         },
     }
 
@@ -1361,8 +1365,12 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
             try:
                 cur.execute("SELECT LOAD_FILE(%s)", (path,))
                 blob = (cur.fetchone() or ("",))[0] or ""
+                # LOAD_FILE 返回 BLOB(bytes)：此前直接按 str 的 "\n" 分割会抛
+                # "a bytes-like object is required, not 'str'"，导致错误日志面板必然读失败。
+                if isinstance(blob, (bytes, bytearray)):
+                    blob = bytes(blob).decode("utf-8", "replace")
                 if blob:
-                    lines = [l for l in blob.split("\n") if l.strip()]
+                    lines = [l for l in str(blob).split("\n") if l.strip()]
                     lines = lines[-int(limit):]
             except Exception as e2:
                 return JSONResponse({"ok": False, "path": path,
@@ -1678,7 +1686,15 @@ def api_node_detail(cluster_id: int = Form(...), host: str = Form(...), port: in
         "gtid_strict_mode": None, "gtid_domain_id": None,
     }
     try:
-        conn = connect(host, port, root_user, root_pass, timeout=5)
+        # 优先 ha_monitor、回退 root：此前只拿 root 连，节点 root 密码一旦漂移（典型
+        # root@'<管理器IP>' 不存在/密码不符 → 1045）就整体连不上，抽屉显示「无法连接节点」，
+        # 且下面 GTID 因取不到值被显示成 OFF，而实际主从是正常的 —— 完全是误报。
+        conn = connect_robust(host, port,
+                              creds.get("ha_user") or "", creds.get("ha_pass") or "",
+                              root_user, root_pass, timeout=5)
+        if conn is None:
+            # 两条路都失败时，单独用 root 再连一次，把真实错误（如 1045）抛出来给用户看
+            conn = connect(host, port, root_user, root_pass, timeout=5)
         try:
             with conn.cursor() as cur:
                 # MariaDB 没有 gtid_mode 变量（GTID 天然开启，靠 gtid_domain_id 区分域）。
@@ -1928,7 +1944,10 @@ def cluster_update(
         return RedirectResponse(
             f"/clusters/{cid}?error={quote('保存失败: ' + str(e))}", status_code=303)
     synced = 0
-    if any(k in fields for k in ("ha_pass", "repl_pass", "app_pass")):
+    # 账号【用户名】变更同样必须同步到节点：此前只判断密码字段，导致「只改用户名」时
+    # 管理库改了、节点上仍是旧账号 —— 表现为新用户名登不上、页面显示与节点实际不一致。
+    if any(k in fields for k in ("ha_pass", "repl_pass", "app_pass",
+                                 "ha_user", "repl_user", "app_user")):
         try:
             synced = sync_node_creds(cid)
         except Exception:

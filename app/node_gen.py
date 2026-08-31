@@ -952,6 +952,11 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     ha_check = (
         f"LOCAL_HOST={_shq(local_host)}\n"
         f"LOCAL_PORT={port}\n"
+        # VIP_PORT：业务连接「VIP:VIP_PORT」的端口。MariaDB 节点形态下 keepalived 只做
+        # 三层 IP 漂移、不做端口转换，若业务端口与本机 MySQL 端口不同（如 VIP 3307 /
+        # 本机 3306），VIP 上根本无人监听 —— 表现为「VIP 能 ping 通但连不上库」。
+        # 安装脚本据此在本机加一条端口转发（firewalld forward-port 或 iptables REDIRECT）。
+        f"VIP_PORT={vip_port}\n"
         f"NODE_IP={_shq(ip)}\n"
         f"MANAGER_IP={_shq(manager_public_ip)}\n"
         f"LOCAL_USER={_shq(ha_user)}\n"
