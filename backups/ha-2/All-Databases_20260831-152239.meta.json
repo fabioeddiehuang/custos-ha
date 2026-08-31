@@ -1,0 +1,24 @@
+{
+  "ts": "20260831-152239",
+  "time": "2026-08-31 15:22:40",
+  "timezone": "Asia/Shanghai (UTC+8)",
+  "cluster_id": 4,
+  "cluster_name": "ha-2",
+  "label": "All-Databases",
+  "host": "192.168.1.213",
+  "port": 3306,
+  "scope": "all",
+  "databases": [
+    "ha_local",
+    "test-ha",
+    "test177",
+    "test213",
+    "test33"
+  ],
+  "with_data": true,
+  "tables": 1,
+  "views": 0,
+  "rows": 1,
+  "size": 679,
+  "file": "All-Databases_20260831-152239.sql.gz"
+}

@@ -248,7 +248,7 @@ for i in $(seq 1 180); do
       done
     fi
     if [[ -n "$CLIENT_BIN" ]] && docker exec "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" \
-         -h 127.0.0.1 -P "$PORT" --protocol=tcp -e "SELECT 1" >/dev/null 2>&1; then
+         -h 127.0.0.1 -P "$PORT" --protocol=tcp --ssl=0 -e "SELECT 1" >/dev/null 2>&1; then
       ready=1; break
     fi
   fi
@@ -270,7 +270,10 @@ log "MariaDB 已就绪（$CLIENT_BIN 客户端可用）。"
 
 # ---------- 6) 执行初始化 / 账号修复 SQL ----------
 run_sql() {
-  docker exec -i "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" -h 127.0.0.1 -P "$PORT" --protocol=tcp
+  # --ssl=0：强制明文连接，规避容器内 127.0.0.1 连 MariaDB 时偶发的 TLS 握手被重置
+  #（ERROR 2026 TLS/SSL error: Connection reset by peer），否则 init_mariadb.sql /
+  # fix-node-creds.sql 跑不上，导致节点账号/权限未初始化、管理端连不上(1045)。
+  docker exec -i "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" -h 127.0.0.1 -P "$PORT" --protocol=tcp --ssl=0
 }
 if [[ -f init_mariadb.sql ]]; then
   log "执行 init_mariadb.sql ..."
@@ -299,6 +302,24 @@ allow_port_vrrp() {
   fi
 }
 allow_port_vrrp
+
+# ---------- 7.5) 错误日志可读化（供管理器「错误日志」面板 LOAD_FILE 读取） ----------
+# MariaDB 生成的 error.log 默认权限 0660，而 SQL LOAD_FILE 要求文件 world-readable(644)，
+# 否则 /api/node_error_log 读到 NULL → 面板永远为空。故每分钟确保容器内 error.log 为 644。
+setup_errorlog_chmod() {
+  local mark="custos-errorlog-chmod"
+  if command -v crontab >/dev/null 2>&1; then
+    ( crontab -l 2>/dev/null | grep -v "$mark"; \
+      echo "# $mark"; \
+      echo "*/1 * * * * docker exec $CT_NAME chmod 644 /var/lib/mysql/error.log >/dev/null 2>&1 || true" ) | crontab - 2>/dev/null \
+      && log "已配置定时任务：每分钟确保错误日志 world-readable（供面板读取）。"
+  else
+    # 无 crontab：退而求其次，当前立即 chmod 一次（容器重建后请重跑本脚本恢复可读）
+    docker exec "$CT_NAME" chmod 644 /var/lib/mysql/error.log >/dev/null 2>&1 || true
+    warn "未检测到 crontab，已对当前错误日志做一次 chmod 644；容器重建后请重跑本脚本以恢复可读。"
+  fi
+}
+setup_errorlog_chmod
 
 # ---------- 8) 拉起 keepalived 客户端 ----------
 # 本目录的 docker-compose.yaml 仅含 keepalived（host 网络探活 127.0.0.1:$PORT）。
