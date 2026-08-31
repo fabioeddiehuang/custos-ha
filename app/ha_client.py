@@ -968,6 +968,13 @@ def promote_to_master(host, port, user, password, root_user="root", root_pass=""
             cur.execute(reset_replica_sql(syntax))
         except Exception:
             pass
+        # MySQL 8.0 专有：super_read_only=ON 会强制 read_only=ON 并拒绝业务写入（报 1290），
+        # 且不关闭它就直接关 read_only 会被拒绝/无效。故必须先关 super_read_only。
+        # MariaDB 无该变量，语句报错属正常，忽略即可（不影响后一句执行）。
+        try:
+            cur.execute("SET GLOBAL super_read_only=0")
+        except Exception:
+            pass
         cur.execute("SET GLOBAL read_only=0")
         # 轮转 binlog：若该节点此前以从库/独立主形态运行，其当前 binlog 可能是在
         # gtid_mode=OFF/OFF_PERMISSIVE 时期写入、含匿名事务。提升为主库后，新从库以

@@ -765,11 +765,18 @@ def regenerate_cluster_compose(cluster_id):
         kd = _safe_node_path(ip) / "keepalived"
         if not kd.exists():
             continue
-        # 确保 notify 脚本存在（早期版本缺失，导致 keepalived 起不来 / VIP 不上浮）
-        for nf in ("notify_master.sh", "notify_backup.sh"):
+        # 刷新 keepalived 运行期脚本。
+        # v2.2.12 关键：改为【总是覆盖】而非「仅在缺失时补齐」。
+        # 原因：把节点置为可写的动作在 notify_master.sh 里，而旧版把错误全部静默吞掉
+        # （`>/dev/null 2>&1 || true`），导致 VIP 停留在只读节点、业务写入报 1290。
+        # 若只在脚本缺失时才补，升级后存量节点仍跑旧脚本 —— 修复不生效、故障照旧复现
+        # （这正是「修改管理器代码后再重装，1290 依旧」的原因：真凶在节点本地脚本）。
+        for nf in ("notify_master.sh", "notify_backup.sh",
+                   "check_mysql_master.sh", "entrypoint.sh", "Dockerfile"):
             src = NODE_ASSETS / nf
-            if src.exists() and not (kd / nf).exists():
-                _write(kd / nf, src.read_text(), mode=0o755)
+            if src.exists():
+                _write(kd / nf, src.read_text(),
+                       mode=0o755 if nf.endswith(".sh") else 0o644)
         # 重渲染 keepalived.conf：同步最新 VIP / 网卡 / VRID / unicast_peer。
         # 修复此前改 VIP 只刷新 docker-compose、漏刷 keepalived.conf，导致节点配置文件里
         # virtual_ipaddress 仍为空（只剩 /24），keepalived 报 “No VIP specified” / 解析到

@@ -27,8 +27,24 @@ CONF="${HA_CHECK_CONF:-/etc/keepalived/ha_check.conf}"
 [ -f "$CONF" ] && source "$CONF"
 MY_NODE="${NODE_IP:-${LOCAL_HOST:-127.0.0.1}}"
 
+# ---- 客户端命令探测（MariaDB 12.x 关键适配）----
+# MariaDB 11+ 官方把 `mysql` 标记为废弃、12.x 只提供 `mariadb`；而 Debian 的
+# default-mysql-client 又可能只提供 `mysql`。硬编码任一命令，在另一种环境下就是
+# `command not found` —— 旧版脚本把这种失败也一并静默吞掉，表现为「探活永远失败、
+# 节点永远放弃 VIP」，或 notify 置可写失败、业务写入报 1290。
+# 故统一探测：优先 mariadb，回退 mysql；都找不到则明确报错而不是假装失败。
+MYSQL_BIN=""
+for _b in mariadb mysql; do
+  if command -v "$_b" >/dev/null 2>&1; then MYSQL_BIN="$_b"; break; fi
+done
+if [ -z "$MYSQL_BIN" ]; then
+  log "FAIL@0 容器内未找到 mariadb/mysql 客户端，无法探活：放弃VIP。"
+  log "       请在 keepalived 镜像中安装 mariadb-client（或 default-mysql-client）后重建。"
+  exit 1
+fi
+
 # 本机 MySQL 探活连接（127.0.0.1 走宿主机回环，由 keepalived 容器 host 网络映射）
-MYSQL_LOCAL="mysql -h127.0.0.1 -P${LOCAL_PORT} -u${LOCAL_ROOT_USER:-root} -N --connect-timeout=2"
+MYSQL_LOCAL="${MYSQL_BIN} -h127.0.0.1 -P${LOCAL_PORT} -u${LOCAL_ROOT_USER:-root} -N --connect-timeout=2"
 
 # 用 timeout 硬封装每个 mysql 调用，防止任何连接异常挂死、拖累 keepalived（避免 already running）
 TO=""
@@ -59,6 +75,24 @@ if [ "$RO" = "1" ] || [ "$RO" = "ON" ]; then
     exit 1
 fi
 log "OK@2 本机read_only=$RO（可写主库）"
+
+# 2b) super_read_only 必须关闭（MySQL 8.0 专有）。
+#     陷阱：super_read_only=ON 会强制 read_only=ON 并拒绝普通业务写入（同样报 1290）。
+#     若只查 read_only，会出现「read_only=OFF 但实际不可写」的假主节点持有 VIP，
+#     业务经 VIP 写入报 1290 而 VIP 却不会漂移。
+#     MariaDB 无该变量（返回 Unknown system variable），视为不支持并跳过，不影响判定。
+SRO=$(MYSQL_PWD="${LOCAL_ROOT_PASS}" $TO $MYSQL_LOCAL -e "SELECT @@super_read_only" 2>&1 | tr '[:lower:]' '[:upper:]')
+if echo "$SRO" | grep -qiE "UNKNOWN SYSTEM VARIABLE|UNKNOWN VARIABLE"; then
+    log "OK@2b 本机不支持 super_read_only（MariaDB）：跳过该项检查"
+elif echo "$SRO" | grep -qiE "ERROR|ACCESS DENIED|CAN'T CONNECT|TIMED OUT"; then
+    log "FAIL@2b 读取 super_read_only 异常 (host=127.0.0.1 port=$LOCAL_PORT)：$SRO"
+    exit 1
+elif [ "$SRO" = "1" ] || [ "$SRO" = "ON" ]; then
+    log "FAIL@2b 本机super_read_only=$SRO（超级只读，业务写入会报1290）：放弃VIP"
+    exit 1
+else
+    log "OK@2b 本机super_read_only=$SRO"
+fi
 
 # 3) 本机必须被管理端标记为当前主库（防脑裂）。
 #    读取【本机本地】MySQL 的 ha_local.state.current_master，无需回连管理库。
