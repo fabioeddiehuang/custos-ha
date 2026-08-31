@@ -21,8 +21,9 @@
 #   - --user root：mariadb:*-ubi 镜像默认 USER=mysql(uid 999)，无法 chown 宿主数据目录，
 #     导致 "Can't create/write to file ... (Errcode: 13 Permission denied)" 起不来；
 #     以 root 启动后入口脚本会自动 chown 数据目录再降权到 mysql。
-#   - 配置双挂：UBI 构建读 /etc/my.cnf.d/*.cnf，Debian 构建读 /etc/mysql/conf.d/*.cnf。
-#     同一个文件挂到两个目录，使 12.3.3-ubi 与 12.3.2 任一镜像都生效（99- 前缀最后加载）。
+#   - 配置三挂：UBI 构建读 /etc/my.cnf.d/*.cnf，Debian 构建读 /etc/mysql/conf.d/*.cnf 与
+#     /etc/mysql/mariadb.conf.d/*.cnf（后者在 Debian 中先于 conf.d 加载，故把同一文件也挂到此处
+#     以保证 bind_address=0.0.0.0 / port 等必定最后生效）。99- 前缀确保最后加载、覆盖默认。
 #
 # 前置：docker 已安装（compose 可选，仅用于拉起 keepalived）。
 # 用法： sudo bash Install-mariadb-docker-Node.sh
@@ -214,6 +215,7 @@ docker run -d --name "$CT_NAME" \
   -e TZ=Asia/Shanghai \
   -v "$CNF_TMP:/etc/my.cnf.d/99-ha.cnf:ro${SELINUX_FLAG}" \
   -v "$CNF_TMP:/etc/mysql/conf.d/99-ha.cnf:ro${SELINUX_FLAG}" \
+  -v "$CNF_TMP:/etc/mysql/mariadb.conf.d/99-ha.cnf:ro${SELINUX_FLAG}" \
   -v "$MARIA_DATA_DIR:/var/lib/mysql${SELINUX_FLAG}" \
   "$MARIA_IMAGE" >/dev/null
 
@@ -257,7 +259,7 @@ EOSQL
 }
 
 CLIENT_BIN=""
-ready=0
+proc_up=0
 for i in $(seq 1 180); do
   st=$(docker inspect -f '{{.State.Status}}' "$CT_NAME" 2>/dev/null || echo "")
   rc=$(docker inspect -f '{{.RestartCount}}' "$CT_NAME" 2>/dev/null || echo 0)
@@ -265,8 +267,8 @@ for i in $(seq 1 180); do
     warn "容器状态=$st RestartCount=$rc（若持续上涨=崩溃循环）；最近日志："
     docker logs --tail 15 "$CT_NAME" 2>&1 | sed 's/^/      /' || true
   fi
-  # 重启次数持续上涨 -> 崩溃循环（真因：OOM / 端口冲突 / 旧数据目录损坏）。注意：secure 步骤
-  # 偶发 TLS 失败属瞬时、会在一次重启后自愈，不会把 rc 推到这么高，故阈值放宽到 8。
+  # 重启次数持续上涨 -> 崩溃循环（真因：OOM / 端口冲突 / 旧数据目录损坏）。secure 步骤偶发
+  # TLS 失败属瞬时、一次重启后自愈，不会把 rc 推到这么高，故阈值放宽到 8。
   if [[ "$rc" -gt 8 ]]; then
     err "容器疑似崩溃重启循环（RestartCount=$rc），常见真因是 OOM（buffer pool 过大）或端口/权限/旧数据目录损坏。最近日志："
     docker ps -a --filter "name=$CT_NAME" --format '      {{.Names}} | {{.Image}} | {{.Status}}' || true
@@ -281,20 +283,20 @@ for i in $(seq 1 180); do
       done
     fi
     if [[ -n "$CLIENT_BIN" ]]; then
-      # 就绪判据：socket 免密 或 密码登录 任一能连上即视为服务端已起（放宽以兼容 secure 步骤偶发失败）
+      # 阶段A：仅判断「进程活着」（socket 免密 或 密码 任一能连）—— 不等同于业务 TCP 就绪
       if docker exec "$CT_NAME" "$CLIENT_BIN" -uroot --connect-timeout=3 -e "SELECT 1" >/dev/null 2>&1 \
          || docker exec "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" --connect-timeout=3 -e "SELECT 1" >/dev/null 2>&1; then
-        ready=1; break
+        proc_up=1; break
       fi
     fi
   fi
   if [[ $((i % 10)) -eq 0 ]]; then
-    log "等待 MariaDB 就绪…（已 ${i}s，状态=$st，客户端=${CLIENT_BIN:-未发现}）"
+    log "等待 MariaDB 进程起来…（已 ${i}s，状态=$st，客户端=${CLIENT_BIN:-未发现}）"
   fi
   sleep 1
 done
-if [[ $ready -ne 1 ]]; then
-  err "等待 180s 后 MariaDB 仍未就绪。"
+if [[ $proc_up -ne 1 ]]; then
+  err "等待 180s 后 MariaDB 进程仍未起来。"
   if [[ -z "$CLIENT_BIN" ]]; then
     err "（容器内未找到 mariadb/mysql 客户端——精简镜像可能未带 CLI；可改用宿主 mysql 客户端或换完整镜像。）"
   fi
@@ -302,20 +304,48 @@ if [[ $ready -ne 1 ]]; then
   docker logs --tail 40 "$CT_NAME" 2>&1 | sed 's/^/      /' || true
   die "请检查：docker logs $CT_NAME"
 fi
-log "MariaDB 已就绪（$CLIENT_BIN 客户端可用）。"
+log "MariaDB 进程已起来（$CLIENT_BIN 客户端可用）。"
 
-# root 账号自愈：仅当官方镜像 secure 步骤偶发失败、root 仍 unix_socket 免密时才修复；
-# 正常情况（secure 步骤成功、root 已是密码登录）socket 免密连不上，跳过，无副作用。
+# 阶段B：root 账号自愈（仅当官方镜像 secure 步骤偶发失败、root 仍 unix_socket 免密时才修复；
+# 正常情况 socket 免密连不上，跳过，无副作用）。
 if docker exec "$CT_NAME" "$CLIENT_BIN" -uroot --connect-timeout=3 -e "SELECT 1" >/dev/null 2>&1; then
   ensure_root_accounts || warn "root 密码自愈失败（可忽略；若后续初始化报 1045 请在管理端重跑或检查日志）。"
 fi
 
+# 阶段C：真实端口 TCP 就绪门禁（业务真正连法：-h 127.0.0.1 -P $PORT --protocol=tcp）。
+# 关键：socket 通 ≠ TCP 在真实端口通。必须用它验证业务侧能连上，否则后面 init SQL 必 2002。
+tcp_ready=0
+for attempt in 1 2; do
+  for i in $(seq 1 40); do
+    if docker exec "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" -h 127.0.0.1 -P "$PORT" \
+         --protocol=tcp --ssl=0 --connect-timeout=3 -e "SELECT 1" >/dev/null 2>&1; then
+      tcp_ready=1; break 2
+    fi
+    sleep 2
+  done
+  # 首轮不通：残留数据目录/配置未加载常致服务端没绑 0.0.0.0，重启一次让配置生效后再试
+  if [[ $tcp_ready -eq 0 && $attempt -eq 1 ]]; then
+    warn "真实端口 TCP 127.0.0.1:$PORT 首轮未通，尝试 docker restart $CT_NAME 让配置生效（应对残留数据目录/配置未加载）..."
+    docker restart "$CT_NAME" >/dev/null 2>&1 || true
+    sleep 8
+  fi
+done
+if [[ $tcp_ready -ne 1 ]]; then
+  err "真实端口 TCP 127.0.0.1:$PORT 始终连不上（socket 可能已通，但业务 TCP 连不上）。"
+  err "服务端真实状态（用于定位 bind/port 问题）："
+  docker exec "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" -e "SELECT @@port, @@bind_address, @@skip_name_resolve;" 2>&1 | sed 's/^/      /' || true
+  docker exec "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" -e "SELECT GROUP_CONCAT(DISTINCT host SEPARATOR ',') FROM mysql.user WHERE user='root';" 2>&1 | sed 's/^/      root 可登录来源 hosts: /' || true
+  docker exec "$CT_NAME" sh -c "command -v ss >/dev/null 2>&1 && ss -ltnp 2>/dev/null | grep -E '3306|3307' || netstat -ltnp 2>/dev/null | grep -E '3306|3307'" 2>&1 | sed 's/^/      /' || true
+  die "请检查：服务端是否监听在 0.0.0.0:$PORT（应看到 0.0.0.0:$PORT 监听行）。若只绑了某个具体 IP，说明 99-ha.cnf 的 bind_address=0.0.0.0 未生效——请在管理端重新生成节点目录并重新下载安装脚本后重跑（确保配置含 bind_address=0.0.0.0），或 docker restart $CT_NAME 后重跑。"
+fi
+log "MariaDB TCP 就绪（127.0.0.1:$PORT 可连）。"
+
 # ---------- 6) 执行初始化 / 账号修复 SQL ----------
 run_sql() {
   # --ssl=0：强制明文连接，规避容器内 127.0.0.1 连 MariaDB 时偶发的 TLS 握手被重置
-  #（ERROR 2026 TLS/SSL error: Connection reset by peer），否则 init_mariadb.sql /
-  # fix-node-creds.sql 跑不上，导致节点账号/权限未初始化、管理端连不上(1045)。
-  docker exec -i "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" -h 127.0.0.1 -P "$PORT" --protocol=tcp --ssl=0
+  #（ERROR 2026 TLS/SSL error: Connection reset by peer）。
+  # 阶段C 已确认 TCP 127.0.0.1:$PORT 可连，这里直接执行；单次失败不再重试以避免重复执行 SQL。
+  docker exec -i "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" -h 127.0.0.1 -P "$PORT" --protocol=tcp --ssl=0 "$@"
 }
 if [[ -f init_mariadb.sql ]]; then
   log "执行 init_mariadb.sql ..."
