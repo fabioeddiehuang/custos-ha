@@ -303,8 +303,8 @@ textarea{resize:vertical;min-height:64px}
 .dh-kpi-ico{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-size:16px;flex:0 0 auto}
 .dh-kpi-num{font-size:23px;font-weight:800;line-height:1.1}
 .dh-kpi-lab{font-size:12px;color:var(--muted);font-weight:600}
-.dh-clusters{display:grid;grid-template-columns:repeat(auto-fit,minmax(600px,1fr));gap:14px;margin-bottom:18px;align-items:start}
-@media (max-width:720px){.dh-clusters{grid-template-columns:1fr}}
+/* 集群健康卡片：改为上下排列（单列全宽），彻底避免并排时的半宽/错位偏移。 */
+.dh-clusters{display:flex;flex-direction:column;gap:16px;margin-bottom:18px}
 .dh-bottom{margin-bottom:18px}
 .dh-sec-h{font-size:14px;font-weight:700;margin:0 0 12px;display:flex;align-items:center;gap:8px}
 .dh-sec-h::before{content:"";width:4px;height:15px;border-radius:3px;background:linear-gradient(var(--accent),var(--primary))}
@@ -371,7 +371,7 @@ textarea{resize:vertical;min-height:64px}
 .dh-tl-dot{width:13px;height:13px;border-radius:50%;margin-top:3px;flex:0 0 auto;border:3px solid var(--surface);box-shadow:0 0 0 1px var(--border)}
 .dh-tl-dot.ok{background:var(--success)}.dh-tl-dot.err{background:var(--danger)}
 .dh-tl-t{font-size:13.5px;font-weight:700}.dh-tl-d{font-size:12.5px;color:var(--muted)}
-@media(max-width:980px){.dh-kpis{grid-template-columns:repeat(2,1fr)}.dh-clusters{grid-template-columns:1fr}.dh-bottom{grid-template-columns:1fr}.dh-obs{grid-template-columns:1fr}.dh-wordmark .wm{font-size:24px}}
+@media(max-width:980px){.dh-kpis{grid-template-columns:repeat(2,1fr)}.dh-bottom{grid-template-columns:1fr}.dh-obs{grid-template-columns:1fr}.dh-wordmark .wm{font-size:24px}}
 
 /* ===== 外壳补充（base.html 使用） ===== */
 .nav-group{display:block;margin-bottom:4px}

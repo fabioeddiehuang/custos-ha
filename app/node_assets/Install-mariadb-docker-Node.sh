@@ -103,17 +103,19 @@ log "数据目录(宿主)：$MARIA_DATA_DIR"
 CNF_TMP="/tmp/mariadb-docker-99-ha.cnf"
 grep -viE '^[[:space:]]*(datadir|socket|pid[_-]?file)[[:space:]]*=' "$CONF_SRC" > "$CNF_TMP"
 grep -qiE '^[[:space:]]*port[[:space:]]*=' "$CNF_TMP" || printf '\n[mysqld]\nport = %s\n' "$PORT" >> "$CNF_TMP"
-# 小内存机保护：服务端默认给 1G buffer pool，2G 内存的机器容易 OOM。
-# 用 MARIA_BUFFER_POOL=512M 覆盖即可（后写的值覆盖前面的同名项）。
+# 小内存机保护：服务端默认给 1G buffer pool，小内存机器极易被 OOM 杀掉导致容器崩溃重启。
+# 未显式指定 MARIA_BUFFER_POOL 时，按物理内存自动收敛到安全上限（≤512M），避免 OOM。
+TOTAL_MEM_MB="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+if [[ -z "${MARIA_BUFFER_POOL:-}" && "$TOTAL_MEM_MB" -gt 0 && "$TOTAL_MEM_MB" -lt 3000 ]]; then
+  BP=$(( TOTAL_MEM_MB * 40 / 100 ))
+  [[ "$BP" -gt 512 ]] && BP=512
+  [[ "$BP" -lt 128 ]] && BP=128
+  MARIA_BUFFER_POOL="${BP}M"
+  warn "本机物理内存约 ${TOTAL_MEM_MB}MB，已自动将 innodb_buffer_pool_size 收敛为 ${MARIA_BUFFER_POOL}（避免 OOM 崩溃）。可用 MARIA_BUFFER_POOL= 覆盖。"
+fi
 if [[ -n "${MARIA_BUFFER_POOL:-}" ]]; then
   printf '\n[mysqld]\ninnodb_buffer_pool_size = %s\n' "$MARIA_BUFFER_POOL" >> "$CNF_TMP"
-  log "已覆盖 innodb_buffer_pool_size = $MARIA_BUFFER_POOL（由 MARIA_BUFFER_POOL 指定）"
-else
-  TOTAL_MEM_MB="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
-  if [[ "$TOTAL_MEM_MB" -gt 0 && "$TOTAL_MEM_MB" -lt 3000 ]]; then
-    warn "本机物理内存仅约 ${TOTAL_MEM_MB}MB，而服务端生成的 buffer pool 为 1G，有 OOM 风险。"
-    warn "建议改小后重跑，例如：MARIA_BUFFER_POOL=512M sudo bash $0"
-  fi
+  log "已设置 innodb_buffer_pool_size = $MARIA_BUFFER_POOL"
 fi
 # 必须以 0644 落盘：容器内 mariadbd 最终以 mysql(uid 999) 运行，需要能读该挂载文件。
 chmod 644 "$CNF_TMP"
@@ -216,35 +218,53 @@ docker run -d --name "$CT_NAME" \
   -v "$MARIA_DATA_DIR:/var/lib/mysql${SELINUX_FLAG}" \
   "$MARIA_IMAGE" >/dev/null
 
-# ---------- 5) 等待就绪 ----------
-# 容器内客户端：MariaDB 10.4.6+ 提供 mariadb，旧包只有 mysql，两者都试。
-# 注意：容器若在启动瞬间就退出（CPU 指令集不支持 / 端口冲突 / 数据目录权限），
-# 这里会表现为「两个客户端都找不到」，必须把容器状态和日志打出来，否则极难定位。
+# ---------- 5) 等待就绪 + 客户端探活（含崩溃重启循环探测） ----------
+# 关键修复：旧逻辑在 `docker run -d` 之后立刻 `docker exec` 找客户端，若恰好命中容器的
+# 重启间隙就会误报「容器内未找到客户端」。现改为单轮询：
+#   - 用 `docker inspect` 的 RestartCount 探测「崩溃重启循环」（以前只靠 status 看不出）；
+#   - 容器真正 running 后再去找客户端；找到后跑 SELECT 1 确认就绪。
 CLIENT_BIN=""
-for b in mariadb mysql; do
-  if docker exec "$CT_NAME" command -v "$b" >/dev/null 2>&1; then CLIENT_BIN="$b"; break; fi
-done
-if [[ -z "$CLIENT_BIN" ]]; then
-  err "容器内未找到 mariadb/mysql 客户端 —— 通常是容器根本没跑起来。当前容器状态："
-  docker ps -a --filter "name=$CT_NAME" --format '      {{.Names}} | {{.Image}} | {{.Status}}' || true
-  err "容器日志："
-  docker logs --tail 30 "$CT_NAME" 2>&1 | sed 's/^/      /' || true
-  die "请按上面日志排查（常见：CPU 不支持镜像指令集 / 端口 $PORT 被占用 / $MARIA_DATA_DIR 权限 / SELinux）。"
-fi
-
-log "等待 MariaDB 就绪（最多 180s）..."
 ready=0
 for i in $(seq 1 180); do
-  if docker exec "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" -h 127.0.0.1 -P "$PORT" \
-       --protocol=tcp -e "SELECT 1" >/dev/null 2>&1; then
-    ready=1; break
+  st=$(docker inspect -f '{{.State.Status}}' "$CT_NAME" 2>/dev/null || echo "")
+  rc=$(docker inspect -f '{{.RestartCount}}' "$CT_NAME" 2>/dev/null || echo 0)
+  # 实时把「重启/崩溃」苗头展示出来，避免看起来像卡死
+  if [[ "$rc" -gt 0 && $((i % 5)) -eq 0 ]]; then
+    warn "容器状态=$st RestartCount=$rc（若持续上涨=崩溃循环）；最近日志："
+    docker logs --tail 15 "$CT_NAME" 2>&1 | sed 's/^/      /' || true
+  fi
+  # 重启次数持续上涨 → 崩溃循环（最常见真因：buffer pool 过大被 OOM 杀 / 端口冲突 / 旧数据目录损坏）
+  if [[ "$rc" -gt 3 ]]; then
+    err "容器疑似崩溃重启循环（RestartCount=$rc），常见真因是 OOM（buffer pool 过大）或端口/权限/旧数据目录损坏。最近日志："
+    docker ps -a --filter "name=$CT_NAME" --format '      {{.Names}} | {{.Image}} | {{.Status}}' || true
+    docker logs --tail 40 "$CT_NAME" 2>&1 | sed 's/^/      /' || true
+    die "容器起不来。请检查：docker logs $CT_NAME（内存不足被 OOM / 端口 $PORT 被占用 / $MARIA_DATA_DIR 权限 / SELinux / 旧数据目录损坏需清空 $MARIA_DATA_DIR）。"
+  fi
+  if [[ "$st" == "running" ]]; then
+    if [[ -z "$CLIENT_BIN" ]]; then
+      for b in mariadb mysql; do
+        # 注意：command -v 是 shell 内建，必须经由 sh -c 执行；直接 docker exec command -v 会去 exec 不存在的 command 程序而永远失败。
+        if docker exec "$CT_NAME" sh -c "command -v $b || which $b" >/dev/null 2>&1; then CLIENT_BIN="$b"; break; fi
+      done
+    fi
+    if [[ -n "$CLIENT_BIN" ]] && docker exec "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" \
+         -h 127.0.0.1 -P "$PORT" --protocol=tcp -e "SELECT 1" >/dev/null 2>&1; then
+      ready=1; break
+    fi
+  fi
+  if [[ $((i % 10)) -eq 0 ]]; then
+    log "等待 MariaDB 就绪…（已 ${i}s，状态=$st，客户端=${CLIENT_BIN:-未发现}）"
   fi
   sleep 1
 done
 if [[ $ready -ne 1 ]]; then
-  err "MariaDB 容器未能在 180s 内就绪，最近日志如下："
+  err "等待 180s 后 MariaDB 仍未就绪。"
+  if [[ -z "$CLIENT_BIN" ]]; then
+    err "（容器内未找到 mariadb/mysql 客户端——精简镜像可能未带 CLI；可改用宿主 mysql 客户端或换完整镜像。）"
+  fi
+  docker ps -a --filter "name=$CT_NAME" --format '      {{.Names}} | {{.Image}} | {{.Status}}' || true
   docker logs --tail 40 "$CT_NAME" 2>&1 | sed 's/^/      /' || true
-  die "请检查：docker logs $CT_NAME（常见原因：宿主 $PORT 端口被占用 / 数据目录权限 / SELinux）"
+  die "请检查：docker logs $CT_NAME"
 fi
 log "MariaDB 已就绪（$CLIENT_BIN 客户端可用）。"
 
