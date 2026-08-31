@@ -325,7 +325,7 @@
               + '<td>' + esc(atype(r.alert_type)) + '</td>'
               + '<td><span class="badge ' + lvCls + '">' + esc(lv) + '</span></td>'
               + '<td>' + st + '</td>'
-              + '<td style="max-width:380px;word-break:break-all">' + esc(r.message||'') + '</td>'
+              + '<td class="alert-detail-td"><div class="alert-detail">' + esc(r.message||'') + '</div></td>'
               + '<td>' + act + '</td>'
               + '</tr>';
           }).join('');

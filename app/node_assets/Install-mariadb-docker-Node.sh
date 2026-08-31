@@ -138,7 +138,18 @@ if [[ -d "$MARIA_DATA_DIR" && -n "$(ls -A "$MARIA_DATA_DIR" 2>/dev/null || true)
 fi
 mkdir -p "$MARIA_DATA_DIR"
 
-# ---------- 3) 拉取镜像（失败自动退备用镜像） ----------
+# ---------- 3) 拉取镜像 + CPU 指令集兼容性预检（失败自动退备用镜像） ----------
+# ⚠ 关键点：官方 MariaDB 镜像按**不同的 x86-64 微架构级别**分发 glibc，拉取成功 ≠ 能跑：
+#     mariadb:12.3.3-ubi  按 x86-64-v3 编译（需 AVX2/BMI2/FMA/MOVBE...）
+#     mariadb:12.3.2      按 Ubuntu 24.04 基线编译（要求低得多）
+#   老 CPU / 保守的虚拟机 CPU 模型（如 QEMU Virtual CPU 2.5+）跑 v3 镜像会直接
+#     Fatal glibc error: CPU does not support x86-64-v3
+#   且容器秒退 —— 表现为后续 `docker exec` 全部失败，报「容器内未找到客户端」这种误导性错误。
+#   故在真正起容器前先跑一次 `--version` 探测它到底能不能加载。
+probe_image() {
+  docker run --rm --entrypoint mariadbd "$1" --version >/dev/null 2>&1
+}
+
 log "拉取镜像 $MARIA_IMAGE ..."
 if ! docker pull "$MARIA_IMAGE" >/dev/null 2>&1; then
   warn "拉取 $MARIA_IMAGE 失败（离线或无法访问镜像仓库），尝试备用镜像 $MARIA_IMAGE_FALLBACK ..."
@@ -149,6 +160,29 @@ if ! docker pull "$MARIA_IMAGE" >/dev/null 2>&1; then
     die "主/备镜像均拉取失败。请确认可访问镜像仓库，或在可联网机器 docker save 后 docker load 导入本节点。"
   fi
 fi
+
+if ! probe_image "$MARIA_IMAGE"; then
+  warn "$MARIA_IMAGE 在本机无法运行（最常见原因：CPU 指令集不满足该镜像的 glibc 要求）。"
+  docker run --rm --entrypoint mariadbd "$MARIA_IMAGE" --version 2>&1 | head -3 | sed 's/^/      /' || true
+  if [[ "$MARIA_IMAGE" != "$MARIA_IMAGE_FALLBACK" ]]; then
+    log "改用备用镜像 $MARIA_IMAGE_FALLBACK 并重新预检 ..."
+    if ! docker pull "$MARIA_IMAGE_FALLBACK" >/dev/null 2>&1; then
+      die "备用镜像 $MARIA_IMAGE_FALLBACK 拉取失败，无法继续。"
+    fi
+    if probe_image "$MARIA_IMAGE_FALLBACK"; then
+      MARIA_IMAGE="$MARIA_IMAGE_FALLBACK"
+      log "已改用备用镜像：$MARIA_IMAGE（预检通过）"
+    else
+      docker run --rm --entrypoint mariadbd "$MARIA_IMAGE_FALLBACK" --version 2>&1 | head -3 | sed 's/^/      /' || true
+      die "主/备镜像在本机都无法运行：本机 CPU 不满足官方 MariaDB 镜像的指令集要求。
+      该节点请改用【裸机】方案：在管理器把节点类型改为「MariaDB 裸机」后重新生成，
+      执行 sudo bash Install-ha-mariadb-Node.sh（裸机 tarball 按通用基线编译，无此限制）。"
+    fi
+  else
+    die "$MARIA_IMAGE 在本机无法运行，且已无备用镜像可退。该节点请改用裸机安装 Install-ha-mariadb-Node.sh。"
+  fi
+fi
+log "镜像预检通过：$MARIA_IMAGE"
 
 # ---------- 4) 启动容器 ----------
 # host 网络下容器直接占用宿主端口：若端口已被占用（残留 mysqld / 面板 MySQL / 上次失败实例），
@@ -184,11 +218,19 @@ docker run -d --name "$CT_NAME" \
 
 # ---------- 5) 等待就绪 ----------
 # 容器内客户端：MariaDB 10.4.6+ 提供 mariadb，旧包只有 mysql，两者都试。
+# 注意：容器若在启动瞬间就退出（CPU 指令集不支持 / 端口冲突 / 数据目录权限），
+# 这里会表现为「两个客户端都找不到」，必须把容器状态和日志打出来，否则极难定位。
 CLIENT_BIN=""
 for b in mariadb mysql; do
   if docker exec "$CT_NAME" command -v "$b" >/dev/null 2>&1; then CLIENT_BIN="$b"; break; fi
 done
-[[ -n "$CLIENT_BIN" ]] || die "容器内未找到 mariadb/mysql 客户端，请检查镜像 $MARIA_IMAGE"
+if [[ -z "$CLIENT_BIN" ]]; then
+  err "容器内未找到 mariadb/mysql 客户端 —— 通常是容器根本没跑起来。当前容器状态："
+  docker ps -a --filter "name=$CT_NAME" --format '      {{.Names}} | {{.Image}} | {{.Status}}' || true
+  err "容器日志："
+  docker logs --tail 30 "$CT_NAME" 2>&1 | sed 's/^/      /' || true
+  die "请按上面日志排查（常见：CPU 不支持镜像指令集 / 端口 $PORT 被占用 / $MARIA_DATA_DIR 权限 / SELinux）。"
+fi
 
 log "等待 MariaDB 就绪（最多 180s）..."
 ready=0

@@ -2137,7 +2137,6 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
         return JSONResponse({"ok": False, "msg": f"重新生成失败: {e}"})
 
 
-@app.get("/nodes/{ip}/creds_sql")
 def _render_node_fix_sql(n, creds, manager_ip, manager_subnet=None):
     """按节点真实风味（MySQL / MariaDB）生成 fix-node-creds.sql。
 
@@ -2189,6 +2188,7 @@ def _render_node_fix_sql(n, creds, manager_ip, manager_subnet=None):
         auth_plugin=_auth_plugin_for(n.get("mysql_version"), n.get("node_type")))
 
 
+@app.get("/nodes/{ip}/creds_sql")
 def node_creds_sql(ip: str, user=Depends(auth_required)):
     """下载该节点的「账号/权限修复脚本」fix-node-creds.sql。
 

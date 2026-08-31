@@ -74,7 +74,8 @@ nav.side .sub a.active{color:var(--primary);font-weight:600}
 /* 首页全屏：去掉最大宽度限制，铺满可用宽度 */
 .content.full-bleed{max-width:none;padding:22px 24px 40px}
 .content.full-bleed .container{max-width:none;padding:0}
-@media (min-width:1700px){ .content.full-bleed .dh-clusters{grid-template-columns:1fr 1fr;align-items:start} }
+/* 集群卡片自适应多列：auto-fit + minmax 让宽屏自动排 2~3 列，窄屏回落单列。
+   （旧实现固定单列，3 个集群会把页面拉得极长；仅在 ≥1700px 才分两列也太迟钝。） */
 section{display:none}section.active{display:block}
 /* ===== 通用组件 ===== */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:20px 22px;margin-bottom:18px}
@@ -100,6 +101,9 @@ section{display:none}section.active{display:block}
 .tbl th{color:var(--muted);font-weight:600;font-size:12.5px;background:var(--surface-2)}
 .tbl tbody tr:hover{background:rgba(255,255,255,.04)}
 .repl-bad{color:var(--danger);font-weight:700}
+/* 告警中心「详情」列：覆盖 .tbl td 的 nowrap，长文本放进可滚动框，避免撑破页面。 */
+.alert-detail-td{white-space:normal;vertical-align:top}
+.alert-detail{max-height:140px;overflow:auto;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:12.5px;line-height:1.55;color:var(--text);background:rgba(0,0,0,.18);border-radius:8px;padding:7px 9px}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:9px 16px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface-2);color:var(--text);font-size:14px;font-weight:600;cursor:pointer;transition:.15s;font-family:inherit}
 .btn:hover{background:var(--btn-hover-bg);color:var(--primary);border-color:var(--primary)}
 /* 主按钮 = 登录页 .submit 同款青色渐变 + 深墨文字 */
@@ -299,7 +303,8 @@ textarea{resize:vertical;min-height:64px}
 .dh-kpi-ico{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-size:16px;flex:0 0 auto}
 .dh-kpi-num{font-size:23px;font-weight:800;line-height:1.1}
 .dh-kpi-lab{font-size:12px;color:var(--muted);font-weight:600}
-.dh-clusters{display:grid;grid-template-columns:1fr;gap:14px;margin-bottom:18px}
+.dh-clusters{display:grid;grid-template-columns:repeat(auto-fit,minmax(600px,1fr));gap:14px;margin-bottom:18px;align-items:start}
+@media (max-width:720px){.dh-clusters{grid-template-columns:1fr}}
 .dh-bottom{margin-bottom:18px}
 .dh-sec-h{font-size:14px;font-weight:700;margin:0 0 12px;display:flex;align-items:center;gap:8px}
 .dh-sec-h::before{content:"";width:4px;height:15px;border-radius:3px;background:linear-gradient(var(--accent),var(--primary))}
@@ -308,6 +313,15 @@ textarea{resize:vertical;min-height:64px}
 .dh-clus.ok .dh-clus-bar{background:var(--success)}
 .dh-clus.issue .dh-clus-bar{background:var(--warning)}
 .dh-clus-head{display:flex;flex-direction:column;align-items:flex-start;gap:8px}
+/* 表格包一层横向滚动容器：卡片在小屏下不再裁掉最右侧「操作」列（设为主库/修复复制）。 */
+.dh-clus .tbl-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.dh-clus .tbl-scroll .tbl{min-width:720px}
+/* 操作列吸右：滚动时「设为主库」按钮始终可见，不再被裁掉。 */
+.dh-clus .tbl th:last-child,.dh-clus .tbl td:last-child{position:sticky;right:0}
+.dh-clus .tbl th:last-child{background:var(--surface-2);z-index:2}
+.dh-clus .tbl td:last-child{background:var(--surface);z-index:2}
+.dh-clus .tbl tbody tr:hover td:last-child{background:var(--surface-2)}
+.dh-clus .tbl .op-cell{white-space:nowrap}
 .dh-master-status{margin-top:14px;padding-top:14px;border-top:1px dashed var(--border)}
 .dh-ms-h{font-size:13px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:8px}
 .dh-ms-h::before{content:"";width:4px;height:14px;border-radius:3px;background:var(--success)}

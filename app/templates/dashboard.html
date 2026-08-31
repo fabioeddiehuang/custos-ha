@@ -85,6 +85,7 @@
       <div><span class="dh-m-num" id="online-{{ c.cluster_id }}">{{ c.online }}/{{ c.total_nodes }}</span><span class="dh-m-lab">在线/总数</span></div>
       <div><span class="dh-m-num" id="maxdelay-{{ c.cluster_id }}">—</span><span class="dh-m-lab">最大延迟</span></div>
     </div>
+    <div class="tbl-scroll">
     <table class="tbl" style="margin-top:14px">
       <thead>
         <tr>
@@ -122,6 +123,7 @@
         {% endfor %}
       </tbody>
     </table>
+    </div>
     <div class="dh-master-status">
       <div class="dh-ms-h">主库状态 · <span class="mono">{{ c.current_master }}</span></div>
       <div id="mres-{{ c.cluster_id }}"></div>
