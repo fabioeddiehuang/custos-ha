@@ -1372,18 +1372,39 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
         conn.close()
 
 
+# 终端「当前库」按节点持久（跨请求）：每条 SQL 新建连接，use 不持久，故按节点记录当前库，
+# 非 USE 语句执行前先在同连接上重发 USE <当前库>，使多请求 `use db` 后 `show tables` 生效。
+_TERM_DB = {}
+_TERM_DB_LOCK = threading.Lock()
+
+
 @app.post("/api/term")
 def api_term(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(...),
              sql: str = Form(...), user=Depends(auth_required)):
     """SQL 终端：优先用节点 root 账号执行（可读写，支持全部 SQL）；
     若节点未配置 root 密码，则回退到 ha_monitor 只读账号。"""
-    sql = (sql or "").strip()
-    if not sql:
+    s = (sql or "").strip()
+    if not s:
         return JSONResponse({"ok": False, "error": "请输入 SQL"})
     try:
         port = int(port)
     except (TypeError, ValueError):
         return JSONResponse({"ok": False, "error": "端口无效"})
+    # 跨请求保持「当前库」：每条请求新建连接，use 不持久，故按节点记录当前库，
+    # 非 USE 语句执行前先在同连接上重发 USE <当前库>，使多请求 `use db` 后 `show tables` 生效。
+    tkey = (int(cluster_id), str(host), int(port))
+    _m = re.match(r"\s*(\w+)", s)
+    first_kw = _m.group(1).upper() if _m else ""
+    is_use = first_kw == "USE"
+    apply_db = None
+    record_db = None
+    if is_use:
+        _dbm = re.match(r"\s*USE\s+([^\s;]+)", s, re.IGNORECASE)
+        if _dbm:
+            record_db = _dbm.group(1).strip().strip("`").strip("'").strip('"')
+    else:
+        with _TERM_DB_LOCK:
+            apply_db = _TERM_DB.get(tkey)
     # 先取节点 root 凭证（可读写）
     node = query("SELECT root_user, root_pass FROM nodes "
                  "WHERE cluster_id=%s AND ip=%s AND port=%s", (cluster_id, host, port))
@@ -1418,24 +1439,35 @@ def api_term(cluster_id: int = Form(...), host: str = Form(...), port: int = For
                              "sqlstate": getattr(exc, "sqlstate", None) or "HY000",
                              "duration": dur})
 
-    def _run(c, acct):
+    def _run(c, acct, apply_db=None, record_db=None):
         t0 = _time.time()
         cur = c.cursor()
+        if apply_db:
+            try:
+                cur.execute("USE `{}`".format(apply_db.replace("`", "")))
+            except Exception:
+                pass
         cur.execute(sql)
         dur = round(_time.time() - t0, 3)
         if cur.description:
             cols = [d[0] for d in cur.description]
             rows = [[_jsonable(v) for v in r] for r in cur.fetchall()]
+            if record_db is not None:
+                with _TERM_DB_LOCK:
+                    _TERM_DB[tkey] = record_db
             return JSONResponse({"ok": True, "account": acct, "cols": cols,
                                  "rows": rows, "count": len(rows), "duration": dur})
         c.commit()
+        if record_db is not None:
+            with _TERM_DB_LOCK:
+                _TERM_DB[tkey] = record_db
         affected = cur.rowcount if cur.rowcount and cur.rowcount >= 0 else 0
         return JSONResponse({"ok": True, "account": acct, "cols": [], "rows": [],
                              "count": affected, "info": "Query OK", "duration": dur})
 
     t_start = _time.time()
     try:
-        return _run(conn, account)
+        return _run(conn, account, apply_db=apply_db, record_db=record_db)
     except Exception as e:
         if account == "root" and _errno_of(e) in _PRIV_ERRNOS:
             creds = get_cluster_creds(cluster_id) or {}
@@ -1452,7 +1484,7 @@ def api_term(cluster_id: int = Form(...), host: str = Form(...), port: int = For
                     return _err_resp(e2, "ha_monitor(只读)",
                                      round(_time.time() - t_start, 3))
                 try:
-                    return _run(conn, account)
+                    return _run(conn, account, apply_db=apply_db, record_db=record_db)
                 except Exception as e3:
                     return _err_resp(e3, account, round(_time.time() - t_start, 3))
         return _err_resp(e, account, round(_time.time() - t_start, 3))

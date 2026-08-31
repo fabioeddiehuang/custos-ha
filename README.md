@@ -1,6 +1,6 @@
 # Custos
 
-> 当前版本：**v2.2.2**
+> 当前版本：**v2.2.11**
 > 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
 
@@ -18,7 +18,7 @@
 | 多集群隔离管理 | 每个集群独立 HA 监控账号 / 复制账号 / 业务账号、VIP、网卡、VRID；切换与监控按 `cluster_id` 隔离。 |
 | 自动高可用与故障切换 | 探活主从、GTID 感知选主（`pick_best_master`）、VIP 漂移、脑裂保护；主库失联约 6s 触发切换（默认 `CHECK_INTERVAL=3` / `FAIL_THRESHOLD=2`）。 |
 | 复制自愈 | 在线修复 SQL（1007/1050/1061/1062/1396/1032/1146）与 IO（13114/1236）复制错误（注入空事务跳过冲突）；支持手动 `/api/heal` 重指向 + 自愈。 |
-| 节点一键部署 | 两种模式：① Docker 模式（MySQL 8.0 + keepalived 容器，`docker compose up -d`）；② 裸机 MariaDB 模式（MariaDB 12.x 全量安装，一条 `sudo bash Install-ha-mariadb-Node.sh` 完成 MariaDB 安装 + 账号初始化 + keepalived 启动）。账号/GTID 统一初始化，首次安装即可部署成功。 |
+| 节点一键部署 | **三种形态**：① Docker MySQL 8.0（`Install-mysql-docker-Node.sh`）；② Docker MariaDB 12.3.x（`Install-mariadb-docker-Node.sh`，内置 **CPU 指令集预检**，不满足 x86-64-v3 自动回退 `mariadb:12.3.2`；小内存机自动收敛 `innodb_buffer_pool_size`）；③ 裸机 MariaDB 12.x（`Install-ha-mariadb-Node.sh` 一条命令完成安装+账号初始化+keepalived 启动）。账号/GTID 统一初始化，首次安装即可部署成功。 |
 | Web 控制台 | 仪表盘（实时拓扑 / 统计 / 刷新）、集群管理（单色系卡片 + SVG 图标 + 按集群配置凭证与 VIP）、节点配置（生成 / 重新生成 / 删除）、系统配置（SMTP 多收件人告警 + 按集群路由）。 |
 | 切换历史与告警 | 记录每次切换（from→to + 原因）；支持邮件告警与异常日志一键复制排错。 |
 | 安全 | 账号密码可自动生成、明文不回显；「同步密码到节点」用 root 自愈全部节点；`SECRET_KEY` / `WEB_PASS` 生产须改。 |
@@ -75,11 +75,14 @@ custos-ha/
 │   ├── templates/              # Web 页面（base/login/dashboard/clusters/nodes/settings/change_password）
 │   ├── static/                 # 样式与脚本
 │   └── node_assets/            # 节点部署资源唯一来源（Web 生成节点目录时从这里渲染/复制）
-│       ├── keepalived/         # keepalived 资源（keepalived.conf / ha_check.conf / check_mysql_master.sh / entrypoint.sh / notify 脚本）
+│       ├── keepalived/         # keepalived 资源（keepalived.conf / ha_check.conf / check_mysql_master.sh / entrypoint.sh / notify 脚本）— keepalived 镜像已统一命名为 `custos-node`
+│       ├── Install-mysql-docker-Node.sh       # 节点一键安装脚本（Docker MySQL 8.0）
+│       ├── Install-mariadb-docker-Node.sh     # 节点一键安装脚本（Docker MariaDB 12.3.x：CPU 指令集预检回退 12.3.2 + 小内存 buffer pool 自动收敛）
 │       ├── Install-ha-mariadb-Node.sh     # 节点一键安装脚本（裸机：自动应用 my.cnf 片段 + 初始化账号 + 起 keepalived）
 │       ├── Uninstall-mariadb-Node.sh   # 节点一键卸载脚本
 │       ├── init_mariadb.sql  # 裸机节点初始化 SQL（建账号 / 授权 / 启 GTID / 本地状态库）
 │       └── fix-node-creds.sql  # 节点账号/权限修复 SQL（节点本机真实 root 执行，校正漂移凭证）
+├── app/mysql_compat.py        # 按 mysql_version 选择复制语法（MySQL8.0 CHANGE MASTER TO ↔ MariaDB CHANGE REPLICATION SOURCE TO）
 ├── generated_nodes/            # 一键生成的节点部署单元（已 gitignore，内容含敏感信息）
 │   └── <ip>/                   # 自包含：Install-ha-mariadb-Node.sh / init_mariadb.sql / fix-node-creds.sql / docker-compose.yaml / keepalived/ / my.cnf.ha-fragment / ha_check.conf
 └── data/                       # 运行时产物（已 gitignore）

@@ -1,8 +1,8 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> 当前版本：**v2.2.2**（镜像标签 `custos:v2.2.2`）
+> 当前版本：**v2.2.11**（镜像标签 `custos:v2.2.11`，keepalived 镜像 `custos-node:v2.2.11`）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
-> 配套文档：`README.md`
+> 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
 
 ---
 
@@ -119,6 +119,32 @@
 
 ---
 
+## 〇之四、v2.2.11 节点形态扩展 + 安装/控制台缺陷修复
+
+### 节点部署形态扩展（三种）
+
+1. **新增 Docker MariaDB 12.3.x 支持**：新增 `Install-mariadb-docker-Node.sh`（端口 3306），与管理器既有 Docker MySQL 8.0、裸机 MariaDB 12.x 并列，实现「裸机 MariaDB 12.3.3 ↔ Docker MariaDB 12.3.3」组 HA。
+2. **CPU 指令集预检 + 镜像回退**：`mariadb:12.3.3-ubi` 按 x86-64-v3 编译，老旧 CPU（如 QEMU 虚拟 CPU，仅到 v2）会直接 `Fatal glibc error: CPU does not support x86-64-v3` 秒退。安装脚本起容器前用 `docker run --rm --entrypoint mariadbd <img> --version` 预检（glibc 的 v3 检查在进程加载阶段即触发，探测可靠），失败自动回退备用镜像 `mariadb:12.3.2`，两者皆失败才报错并提示改用裸机方案。
+3. **小内存机保护**：物理内存 < 3000MB 时，脚本自动把 `innodb_buffer_pool_size` 收敛为 `内存×40%`（≤512M、≥128M），避免被 OOM 杀掉崩溃重启；亦可用 `MARIA_BUFFER_POOL=512M` 手动覆盖。
+4. **keepalived 镜像统一命名**：随项目更名，keepalived 镜像由 `mysql-ha-keepalived` 统一改为 `custos-node`（与管理器 `custos` 对齐）。
+
+### 安装脚本缺陷修复（Install-mariadb-docker-Node.sh）
+
+- **误报「未找到客户端」根因修复**：原探测写成 `docker exec <ct> command -v mariadb`，而 `command -v` 是 shell 内建、**不是可执行文件**，`docker exec` 默认不经由 shell，于是去 exec 不存在的 `command` 程序 → 永远失败 → 误报。改为 `docker exec <ct> sh -c "command -v $b || which $b"`（经 shell 执行内建）。
+- **OOM 崩溃重启不再被掩盖**：原逻辑在 `docker run -d` 后立刻找客户端，命中重启间隙就误报「未找到客户端」。新增 `docker inspect` 的 `RestartCount>3` 探测崩溃重启循环，直接打印 `docker logs` 真实错误（OOM/端口/权限/旧数据目录损坏）。
+
+### Web 控制台缺陷修复
+
+- **仪表盘集群卡片布局偏移**：原 `repeat(auto-fit,minmax(600px,1fr))` 在 3 集群时排成「2+1」，第 3 张卡独占半宽造成错位。改为**上下排列单列全宽**（`display:flex;flex-direction:column`），并移除旧媒体查询里的 `grid-template-columns` 覆盖；表格仍带 `.tbl-scroll` 横向滚动 + 操作列 `position:sticky` 吸右。
+- **告警中心详情超出页面**：`.tbl td` 默认 `white-space:nowrap` 压制了详情列换行。详情改为 `<div class="alert-detail">` 包裹，`max-height:140px;overflow:auto` 框内滚动，并加深色底纹。
+- **节点管理「下载/查看自愈 SQL」422**：`@app.get("/nodes/{ip}/creds_sql")` 装饰器误挂到内部辅助函数 `_render_node_fix_sql` 上，真正路由 `node_creds_sql` 无装饰器 → FastAPI 把辅助函数当路由、参数不匹配 → 422。装饰器移回 `node_creds_sql` 后正常（200 `application/sql`）。
+
+### 文档
+
+- 新增 `doc/`：`用户操作手册.md`、`API接口文档.md`、`数据库字段说明.md`、`业务流程图.xmind`（含裸机/容器与判断分支）；清理旧 `mysql编译版安装说明.md`。
+
+---
+
 ## 一、v2.1.0 已实现并部署功能
 
 ### 仪表盘（Dashboard）
@@ -178,4 +204,5 @@
 ## 四、版本历史
 
 - **v2.1.0**：补齐 v3 高保真稿剩余模块——主库状态 gauge、实时活动 feed、系统设置（轮询间隔 / 内网 IP）、告警已自愈 / 未恢复标记、集群节点自愈 SQL 查看 / 下载。新增 `alerts`、`audit_log` 持久化与 `/api/node_resources`、`/api/activity_feed`、`/api/node_creds_sql` 等端点。
+- **v2.2.11**：节点形态扩展至三种（新增 Docker MariaDB 12.3.x，含 CPU 指令集预检回退 12.3.2 与小内存 buffer pool 自动收敛）；修复安装脚本误报「未找到客户端」(command -v 误用)、OOM 崩溃循环掩盖；修复仪表盘卡片布局偏移、告警详情溢出、节点自愈 SQL 下载 422；新增 doc/ 用户手册 / API 文档 / 数据库字段 / 业务流程图。
 - **v2.0.x**：基础 HA 管理能力（监控 / 自愈 / 切换 / VIP / 告警 / 预检 / 慢日志 / 配置漂移 / 审计）。
