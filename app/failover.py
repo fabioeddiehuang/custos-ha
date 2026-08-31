@@ -475,7 +475,18 @@ def ensure_topology(cluster_id):
     # keepalived 检查脚本会判定本机只读而放弃 VIP，导致 VIP 永不绑定。
     ok, perr = promote_to_master(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], ru, rp)
     if not ok:
-        print(f"[topology][严重] 提升主库 {cur_h}:{cur_p} 为可写失败（VIP 将无法绑定到该节点，请检查账号权限/连接）：{perr}")
+        errmsg = (f"提升主库 {cur_h}:{cur_p} 为可写失败（VIP 将无法绑定到该节点，请检查账号权限/连接）：{perr}")
+        print(f"[topology][严重] {errmsg}")
+        # 只 print 到日志文件，生产侧是看不见的：主库若仍是 read_only=ON，
+        # 业务经 VIP 写入会直接报 1290（The MariaDB server is running with the
+        # --read-only=ON option）。故必须同时告警到管理端 UI（同一主库限频 5 分钟防刷屏）。
+        _pk = ("promote_fail", cluster_id, cur_h, int(cur_p))
+        if time.monotonic() - _TOPO_AT.get(_pk, 0.0) >= 300:
+            _TOPO_AT[_pk] = time.monotonic()
+            try:
+                send_alert("主库置可写失败", errmsg, cluster_id=cluster_id)
+            except Exception:
+                pass
     else:
         # 稳态下这行原本每周期必打一次（每 2s 一行），刷屏且掩盖真正的问题。
         # 改为同一主库最多 5 分钟提示一次。

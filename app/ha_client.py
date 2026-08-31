@@ -988,6 +988,36 @@ def promote_to_master(host, port, user, password, root_user="root", root_pass=""
             pass
 
 
+def _addr_eq(addr, host, port):
+    """比较形如 'IP:port' 的字符串与 (host, port) 是否指向同一个实例。"""
+    try:
+        s = str(addr or "").strip()
+        if not s:
+            return False
+        if ":" in s:
+            h, _, p = s.rpartition(":")
+        else:
+            h, p = s, str(port)
+        return h.strip() == str(host).strip() and int(p) == int(port)
+    except Exception:
+        return False
+
+
+def _local_state_self_master(cur, host, port):
+    """读取节点本机 ha_local.state（keepalived 检查脚本判定 VIP 归属的唯一依据）。
+
+    返回 (is_self, recorded)：recorded 为形如 'IP:port' 的字符串或 None。
+    读不到表/无记录时返回 (False, ...)，不阻断正常流程。
+    """
+    try:
+        cur.execute("SELECT v FROM ha_local.state WHERE k='current_master'")
+        row = cur.fetchone()
+    except Exception:
+        return False, None
+    rec = (row[0] if row else None)
+    return _addr_eq(rec, host, port), rec
+
+
 def make_slave_of(host, port, user, password, master_host, master_port,
                   repl_user, repl_pass, root_user="root", root_pass=""):
     """把本节点改造为 master_host 的从库（GTID 自动定位）。
@@ -1007,6 +1037,43 @@ def make_slave_of(host, port, user, password, master_host, master_port,
     try:
         cur = conn.cursor()
         flavour = detect_flavour(cur)
+        # ---- VIP 守卫（必须先于任何复制改动执行）----
+        # ha_local.state 是 keepalived 检查脚本判定 VIP 归属的**唯一**依据。若本节点该表
+        # 记录的 current_master 指向自己，说明 VIP 正绑在本机、业务正在经 VIP 写它。
+        # 此时若继续把它挂成从库并 SET GLOBAL read_only=1，业务写入会立刻报
+        #   1290 - The MariaDB server is running with the --read-only=ON option
+        # 这正是「管理器视角的 current_master」与「keepalived 视角」分裂的典型后果：
+        # 例如 ha_local.state 写入失败（缺 BINLOG ADMIN / ha_local 库权限 → 1227/1142），
+        # 节点便一直自认主、VIP 不释放，而管理器已选了别的主，于是把它当从库压成只读。
+        # 分裂时保持其可写并告警，远好于静默压只读导致业务整体不可写。
+        _self_m, _rec = _local_state_self_master(cur, host, port)
+        if _self_m and not _addr_eq("%s:%s" % (master_host, int(master_port)), host, port):
+            # 仅在节点【当前可写】时才拦截：把可写的 VIP 持有者压成只读，业务才会 1290。
+            # 若它已被 fencing 置为只读（read_only=1），改造为从库不会让情况更糟，
+            # 反而能让它重新入集群并恢复复制，故放行。
+            try:
+                cur.execute("SELECT @@GLOBAL.read_only")
+                _ro = cur.fetchone()
+                _writable = (_ro is None) or int(_ro[0]) == 0
+            except Exception:
+                _writable = True
+            if not _writable:
+                print(f"[vip-guard] {host}:{port} 自认主(ha_local={_rec!r})但已为只读，"
+                      f"放行重挂载为 {master_host}:{master_port} 的从库以恢复复制。")
+                _self_m = False
+        if _self_m and not _addr_eq("%s:%s" % (master_host, int(master_port)), host, port):
+            msg = (f"[vip-guard] 拒绝把 {host}:{port} 改造为从库：其本机 ha_local.state 仍记录 "
+                   f"current_master={_rec!r}（keepalived 据此把 VIP 绑在该节点），与本次要挂载的"
+                   f"主库 {master_host}:{master_port} 不一致。已跳过本次重指向并保留其可写状态，"
+                   f"避免业务经 VIP 写入报 1290。请检查该节点 ha_local.state 写入是否失败"
+                   f"（常见：ha_monitor 缺 BINLOG ADMIN / ha_local 库权限）。")
+            print(msg)
+            try:
+                from .alerts import send_alert   # 局部导入，避免模块级循环依赖
+                send_alert("VIP 与主库视角分裂", msg)
+            except Exception:
+                pass
+            return False, msg
         # MariaDB 与 MySQL 双路径完全独立：
         #  - MySQL 8.0：用 MASTER_AUTO_POSITION=1，要求 gtid_mode=ON；匿名事务用
         #    ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS=LOCAL 根治 1236。
