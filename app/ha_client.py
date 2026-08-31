@@ -442,8 +442,8 @@ def heal_io_auth(slave_host, slave_port, ha_user, ha_pass,
                            f"做降级处理（当前错误：{io_err2 or '未知'}）")
         try:
             mcur = mconn.cursor()
-            quser = str(repl_user).replace("'", "''")
-            qpass = str(repl_pass or "").replace("'", "''")
+            quser = _esc_sql(repl_user)
+            qpass = _esc_sql(repl_pass or "")
             last_err = None
             # 常见两种 host 形态：'%' 与从库 IP
             for host_part in ("'%'", f"'{slave_host}'"):
@@ -620,23 +620,25 @@ def reset_replication_creds_on_master(master_host, master_port, ha_user, ha_pass
     优先 ha_monitor，连上但缺权限（典型 USAGE-only）时回退 root。返回 (ok, msg)。
     """
     def _do(cur):
-        hosts = ["'%'"]
+        # 用参数化执行，避免 repl_pass 含 ' / \ 时破坏语句（自定义密码场景）。
+        hosts = ["%"]
         if slave_ip and slave_ip != master_host:
-            hosts.append("'%s'" % slave_ip)
+            hosts.append(slave_ip)
         for h in hosts:
             try:
                 cur.execute(
-                    "CREATE USER IF NOT EXISTS '%s'@%s IDENTIFIED WITH mysql_native_password BY '%s'"
-                    % (repl_user, h, repl_pass))
+                    "CREATE USER IF NOT EXISTS %s@%s "
+                    "IDENTIFIED WITH mysql_native_password BY %s",
+                    (repl_user, h, repl_pass))
             except Exception:
                 # 5.7/MariaDB 不支持 CREATE USER 作 GRANT 项等：忽略，后面用 ALTER 兜底
                 pass
             cur.execute(
-                "ALTER USER '%s'@%s IDENTIFIED WITH mysql_native_password BY '%s'"
-                % (repl_user, h, repl_pass))
+                "ALTER USER %s@%s IDENTIFIED WITH mysql_native_password BY %s",
+                (repl_user, h, repl_pass))
             cur.execute(
-                "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '%s'@%s"
-                % (repl_user, h))
+                "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO %s@%s",
+                (repl_user, h))
         cur.execute("FLUSH PRIVILEGES")
 
     who = None
@@ -708,6 +710,18 @@ def restart_slave_io(host, port, user, password, root_user="root", root_pass="",
 # (172.x.x.x)，节点侧已授权 root@'<MANAGER_PUBLIC_IP>' + root@'<docker子网通配符>'
 # 双白名单，且防火墙放行 docker 网段到 MySQL 端口，故无需改写 host（摒弃
 # host.docker.internal + extra_hosts 临时方案，裸机 MariaDB 上该主机名无法解析）。
+
+
+def _esc_sql(s):
+    """转义 SQL 字符串字面量（反斜杠 + 单引号），供所有把凭证/辨识名拼进 SQL 的语句使用。
+
+    集群账号名/密码允许管理员自定义，含 `'` 或 `\\` 时若不转义，整条语句语法错误 ->
+    账号静默建不出来（表现为「自定义用户名密码登不上」）。参数化 execute 已安全，此处
+    仅用于少数无法参数化、必须用字符串拼装的授权/降级语句（用户名无特殊字符但为稳妥也转义）。
+    """
+    return str(s if s is not None else "").replace("\\", "\\\\").replace("'", "''")
+
+
 def connect(host, port, user, password, timeout=5):
     """建立连接；失败时抛 RuntimeError（带原始异常信息）。
 
@@ -1609,21 +1623,21 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                         "REPLICATION SLAVE, REPLICATION SLAVE ADMIN, SLAVE MONITOR, "
                         "READ_ONLY ADMIN, BINLOG ADMIN, REPLICATION CLIENT, PROCESS, "
                         "SELECT, RELOAD, SUPER ON *.* "
-                        "TO '%s'@'%%'" % ha_user)
+                        "TO '%s'@'%%'" % _esc_sql(ha_user))
             repl_grant = ("GRANT REPLICATION SLAVE, REPLICATION SLAVE ADMIN ON *.* "
-                          "TO '%s'@'%%'" % repl_user)
+                          "TO '%s'@'%%'" % _esc_sql(repl_user))
         else:
             idn = "IDENTIFIED WITH " + auth_plugin + " BY %s"
             idn_root = "IDENTIFIED WITH " + auth_plugin + " BY %s"
             ha_grant = ("GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
                         "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* "
-                        f"TO '{ha_user}'@'%'")
-            repl_grant = f"GRANT REPLICATION SLAVE ON *.* TO '{repl_user}'@'%'"
+                        f"TO '{_esc_sql(ha_user)}'@'%'")
+            repl_grant = f"GRANT REPLICATION SLAVE ON *.* TO '{_esc_sql(repl_user)}'@'%'"
         accts = [(ha_user, ha_pass, ha_grant), (repl_user, repl_pass, repl_grant)]
         if app_user and app_pass:
             app_grant = (f"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, "
                          f"REFERENCES, EXECUTE, SHOW VIEW, CREATE TEMPORARY TABLES ON *.* "
-                         f"TO '{app_user}'@'%'")
+                         f"TO '{_esc_sql(app_user)}'@'%'")
             accts.append((app_user, app_pass, app_grant))
         # 幂等：账号/密码/权限无变化则不写任何语句（见 _ensure_account），
         # 彻底消除「主库每周期 ALTER/GRANT -> binlog -> 副本重放再写盘」的空闲写盘。
@@ -1653,7 +1667,7 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             # （自身无 GRANT OPTION，无法自行补齐），root 回退也救不了，
             # 账号自愈就彻底锁死成死循环。
             root_grant = ("GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION"
-                          % (root_user, rh))
+                          % (_esc_sql(root_user), rh))
             _ensure_account(cur, root_user, rh, root_pass, idn_root, root_grant,
                             conn_host=host, conn_port=port, plugin=auth_plugin)
         # 补授 ha_monitor 的额外特权（已授权时跳过，避免每周期重复 GRANT 写 binlog）。
@@ -1666,7 +1680,7 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         for extra in ("CREATE USER", "READ_ONLY ADMIN", "BINLOG ADMIN"):
             try:
                 if extra.upper() not in _granted_privs(cur, ha_user, "%"):
-                    cur.execute("GRANT %s ON *.* TO '%s'@'%%'" % (extra, ha_user))
+                    cur.execute("GRANT %s ON *.* TO '%s'@'%%'" % (extra, _esc_sql(ha_user)))
             except Exception:
                 pass
         # 节点本地状态库 ha_local 的读写授权（见 _ensure_local_state_grant 说明）

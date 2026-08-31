@@ -366,6 +366,19 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
     )
 
 
+def _q(s):
+    """转义 SQL 字符串字面量（反斜杠 + 单引号），供所有把凭证拼进 SQL 的模板使用。
+
+    背景（重要）：集群的账号名/密码允许管理员自定义，一旦含 `'` 或 `\\`，此前直接以
+    `'%s'` 拼进 `CREATE/ALTER USER ... IDENTIFIED BY '...'` 会**破坏整条语句的语法**，
+    该语句执行失败 -> 这个账号就静默建不出来。表现为：
+      - 「我自己设置的用户名/密码怎么都登不上」（账号根本不存在）；
+      - 安装脚本账号校验报「账号未创建成功」。
+    注意：仅用于字符串字面量；主机名/掩码等标识符不在此列。
+    """
+    return str(s if s is not None else "").replace("\\", "\\\\").replace("'", "''")
+
+
 def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass):
     """MariaDB 节点的 init.sql：创建 ha_monitor / replication / app 账号 + ha_local 状态库。
 
@@ -403,12 +416,12 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
         "CREATE TABLE IF NOT EXISTS ha_local.state (k VARCHAR(32) PRIMARY KEY, v VARCHAR(255));\n"
         "FLUSH PRIVILEGES;\n"
     ) % (
-        ha_user, ha_pass, ha_user,
-        ha_user, ha_pass,
-        repl_user, repl_pass, repl_user,
-        repl_user, repl_pass,
-        app_user, app_pass, app_user,
-        app_user, app_pass,
+        _q(ha_user), _q(ha_pass), _q(ha_user),
+        _q(ha_user), _q(ha_pass),
+        _q(repl_user), _q(repl_pass), _q(repl_user),
+        _q(repl_user), _q(repl_pass),
+        _q(app_user), _q(app_pass), _q(app_user),
+        _q(app_user), _q(app_pass),
     )
 
 
@@ -531,12 +544,12 @@ def _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
         "CREATE TABLE IF NOT EXISTS ha_local.state (k VARCHAR(32) PRIMARY KEY, v VARCHAR(255));\n"
         "FLUSH PRIVILEGES;\n"
     ) % (
-        ha_user, ha_pass, ha_user,
-        ha_user, ha_pass,
-        repl_user, repl_pass, repl_user,
-        repl_user, repl_pass,
-        app_user, app_pass, app_user,
-        app_user, app_pass,
+        _q(ha_user), _q(ha_pass), _q(ha_user),
+        _q(ha_user), _q(ha_pass),
+        _q(repl_user), _q(repl_pass), _q(repl_user),
+        _q(repl_user), _q(repl_pass),
+        _q(app_user), _q(app_pass), _q(app_user),
+        _q(app_user), _q(app_pass),
     )
     return _apply_auth_plugin(content, auth_plugin)
 
@@ -591,13 +604,13 @@ def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user,
         "FLUSH PRIVILEGES;\n"
         "SET SQL_LOG_BIN=1;\n"
     ) % (
-        ha_user, ha_pass, ha_user, ha_pass, ha_user,
-        ha_user, manager_ip, ha_pass, ha_user, manager_ip, ha_pass, ha_user, manager_ip,
-        root_user, manager_ip, root_pass,
-        root_user, manager_ip, root_pass,
-        root_user, manager_ip,
-        root_user, root_pass, root_user, root_pass, root_user,
-        repl_user, repl_pass, repl_user, repl_user, repl_pass,
+        _q(ha_user), _q(ha_pass), _q(ha_user), _q(ha_pass), _q(ha_user),
+        _q(ha_user), _q(manager_ip), _q(ha_pass), _q(ha_user), _q(manager_ip), _q(ha_pass), _q(ha_user), _q(manager_ip),
+        _q(root_user), _q(manager_ip), _q(root_pass),
+        _q(root_user), _q(manager_ip), _q(root_pass),
+        _q(root_user), _q(manager_ip),
+        _q(root_user), _q(root_pass), _q(root_user), _q(root_pass), _q(root_user),
+        _q(repl_user), _q(repl_pass), _q(repl_user), _q(repl_user), _q(repl_pass),
     )
     if manager_subnet:
         # 同机（管理器容器与本节点同宿主机）场景：连接源是 docker 网关/容器 IP，
@@ -607,9 +620,9 @@ def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user,
             "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
             "ALTER USER '%s'@'%s' IDENTIFIED WITH mysql_native_password BY '%s';\n"
             "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION;\n"
-        ) % (root_user, manager_subnet, root_pass,
-             root_user, manager_subnet, root_pass,
-             root_user, manager_subnet)
+        ) % (_q(root_user), _q(manager_subnet), _q(root_pass),
+             _q(root_user), _q(manager_subnet), _q(root_pass),
+             _q(root_user), _q(manager_subnet))
     return _apply_auth_plugin(content, auth_plugin)
 
 
@@ -664,13 +677,13 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
         "FLUSH PRIVILEGES;\n"
         "SET SQL_LOG_BIN=1;\n"
     ) % (
-        ha_user, ha_pass, ha_user, ha_pass, ha_user,
-        ha_user, manager_ip, ha_pass, ha_user, manager_ip, ha_pass, ha_user, manager_ip,
-        root_user, manager_ip, root_pass,
-        root_user, manager_ip, root_pass,
-        root_user, manager_ip,
-        root_user, root_pass, root_user, root_pass, root_user,
-        repl_user, repl_pass, repl_user, repl_user, repl_pass,
+        _q(ha_user), _q(ha_pass), _q(ha_user), _q(ha_pass), _q(ha_user),
+        _q(ha_user), _q(manager_ip), _q(ha_pass), _q(ha_user), _q(manager_ip), _q(ha_pass), _q(ha_user), _q(manager_ip),
+        _q(root_user), _q(manager_ip), _q(root_pass),
+        _q(root_user), _q(manager_ip), _q(root_pass),
+        _q(root_user), _q(manager_ip),
+        _q(root_user), _q(root_pass), _q(root_user), _q(root_pass), _q(root_user),
+        _q(repl_user), _q(repl_pass), _q(repl_user), _q(repl_user), _q(repl_pass),
     )
     if manager_subnet:
         # 同机（管理器容器与本节点同宿主机）场景：连接源是 docker 网关/容器 IP，
@@ -680,9 +693,9 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
             "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
             "ALTER USER '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
             "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION;\n"
-        ) % (root_user, manager_subnet, root_pass,
-             root_user, manager_subnet, root_pass,
-             root_user, manager_subnet)
+        ) % (_q(root_user), _q(manager_subnet), _q(root_pass),
+             _q(root_user), _q(manager_subnet), _q(root_pass),
+             _q(root_user), _q(manager_subnet))
     return content
 
 

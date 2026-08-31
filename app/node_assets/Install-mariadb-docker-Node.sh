@@ -290,7 +290,7 @@ fi
 # （其余节点连不上它的复制账号，全部主从失败）」+ 管理端连接报 1045。
 # 故必须实查 mysql.user 校验账号是否真正建出来；不只看退出码，以免把无害告警误判为致命。
 verify_init_accounts() {
-  local sqls=() missing=() u cnt
+  local sqls=() u cnt
   [[ -f init_mariadb.sql ]] && sqls+=(init_mariadb.sql)
   [[ -f fix-node-creds.sql ]] && sqls+=(fix-node-creds.sql)
   ((${#sqls[@]})) || return 0
@@ -299,21 +299,33 @@ verify_init_accounts() {
   users="$(grep -hoE "CREATE USER( IF NOT EXISTS)? '[^']+'" "${sqls[@]}" 2>/dev/null \
            | sed -E "s/.*'([^']+)'/\1/" | sort -u || true)"
   [[ -z "$users" ]] && return 0
+  # HA 关键账号缺失 -> 致命（管理端 1045 / 本节点无法当主库，其余节点复制全部失败）。
+  # 业务账号（app）缺失仅影响业务连接、不影响 HA，降级为告警（管理器自愈会补建）。
+  local CRIT=" ha_monitor replication root "
+  local fatal_missing=() warn_missing=()
   while IFS= read -r u; do
     [[ -z "$u" ]] && continue
     cnt="$(run_sql -N -e "SELECT COUNT(*) FROM mysql.user WHERE user='${u}'" 2>/dev/null \
            | tail -1 | tr -d '[:space:]')"
     if ! [[ "$cnt" =~ ^[0-9]+$ ]] || (( cnt < 1 )); then
-      missing+=("$u")
+      if [[ "$CRIT" == *" $u "* ]]; then
+        fatal_missing+=("$u")
+      else
+        warn_missing+=("$u")
+      fi
     fi
   done <<< "$users"
-  if ((${#missing[@]})); then
-    err "初始化校验失败：以下账号未创建成功 -> ${missing[*]}"
+  if ((${#fatal_missing[@]})); then
+    err "初始化校验失败：HA 关键账号未创建成功 -> ${fatal_missing[*]}"
     err "后果：管理端连不上本节点(1045)；本节点一旦作为主库，其余节点会因连不上复制账号而全部主从失败。"
     err "请检查上方 init_mariadb.sql / fix-node-creds.sql 的实际报错后重跑本脚本。"
     return 1
   fi
-  log "初始化校验通过：账号已就位（$(printf '%s' "$users" | tr '\n' ' ')）。"
+  if ((${#warn_missing[@]})); then
+    warn "以下业务账号未创建成功（不影响 HA，仅业务连接受限）：${warn_missing[*]}"
+    warn "可在管理端『集群→修改配置/密码』重新保存一次，由管理器自愈补建；或检查 app 账号密码是否含不支持字符。"
+  fi
+  log "初始化校验通过：HA 关键账号已就位（$(printf '%s' "$users" | tr '\n' ' ')）。"
   return 0
 }
 verify_init_accounts || die "节点初始化未完成，已中止部署（避免产出『看似成功实则不可用』的节点）。"
