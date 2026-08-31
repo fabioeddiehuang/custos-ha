@@ -27,8 +27,8 @@
 # 前置：docker 已安装（compose 可选，仅用于拉起 keepalived）。
 # 用法： sudo bash Install-mariadb-docker-Node.sh
 # 可选环境变量：
-#   MARIA_IMAGE=mariadb:12.3.3-ubi         # 主镜像（拉取失败自动退 12.3.2）
-#   MARIA_IMAGE_FALLBACK=mariadb:12.3.2    # 备用镜像
+#   MARIA_IMAGE=mariadb:12.3.3             # 主镜像（Debian/OpenSSL，避开 12.3.x-ubi 的 WolfSSL 偶发 TLS 握手失败）
+#   MARIA_IMAGE_FALLBACK=mariadb:12.3.2    # 备用镜像（同为 Debian 版）
 #   MARIA_DATA_DIR=/data/mariadb           # 宿主数据目录（与裸机 MariaDB 保持一致）
 #   CT_NAME=mariadb-ha-node                # 容器名
 #   MARIA_BUFFER_POOL=1G                   # 覆盖 innodb_buffer_pool_size（小内存机务必调小）
@@ -66,7 +66,7 @@ command -v docker >/dev/null 2>&1 \
   || die "未找到 docker。请先安装 Docker（容器自带运行时，与宿主 glibc 版本无关）。"
 
 # ---------- 可变参数（可用环境变量覆盖） ----------
-MARIA_IMAGE="${MARIA_IMAGE:-mariadb:12.3.3-ubi}"
+MARIA_IMAGE="${MARIA_IMAGE:-mariadb:12.3.3}"
 MARIA_IMAGE_FALLBACK="${MARIA_IMAGE_FALLBACK:-mariadb:12.3.2}"
 MARIA_DATA_DIR="${MARIA_DATA_DIR:-/data/mariadb}"
 CT_NAME="${CT_NAME:-mariadb-ha-node}"
@@ -141,12 +141,11 @@ fi
 mkdir -p "$MARIA_DATA_DIR"
 
 # ---------- 3) 拉取镜像 + CPU 指令集兼容性预检（失败自动退备用镜像） ----------
-# ⚠ 关键点：官方 MariaDB 镜像按**不同的 x86-64 微架构级别**分发 glibc，拉取成功 ≠ 能跑：
-#     mariadb:12.3.3-ubi  按 x86-64-v3 编译（需 AVX2/BMI2/FMA/MOVBE...）
-#     mariadb:12.3.2      按 Ubuntu 24.04 基线编译（要求低得多）
-#   老 CPU / 保守的虚拟机 CPU 模型（如 QEMU Virtual CPU 2.5+）跑 v3 镜像会直接
-#     Fatal glibc error: CPU does not support x86-64-v3
-#   且容器秒退 —— 表现为后续 `docker exec` 全部失败，报「容器内未找到客户端」这种误导性错误。
+# ⚠ 关键点：官方 MariaDB 镜像按**不同的 x86-64 微架构级别**分发 glibc，拉取成功 ≠ 能跑。
+#   默认主镜像已改为 Debian 版 mariadb:12.3.3（OpenSSL 客户端/服务端，避开 12.3.x-ubi 的
+#   WolfSSL 偶发 TLS 握手失败 ERROR 2026 Broken pipe）；Debian 构建按通用 x86-64 基线编译，
+#   CPU 兼容性优于 UBI 的 x86-64-v3。若你强制 MARIA_IMAGE=...-ubi 且本机 CPU 过老，会直接
+#     Fatal glibc error: CPU does not support x86-64-v3  且容器秒退。
 #   故在真正起容器前先跑一次 `--version` 探测它到底能不能加载。
 probe_image() {
   docker run --rm --entrypoint mariadbd "$1" --version >/dev/null 2>&1
@@ -218,23 +217,57 @@ docker run -d --name "$CT_NAME" \
   -v "$MARIA_DATA_DIR:/var/lib/mysql${SELINUX_FLAG}" \
   "$MARIA_IMAGE" >/dev/null
 
-# ---------- 5) 等待就绪 + 客户端探活（含崩溃重启循环探测） ----------
-# 关键修复：旧逻辑在 `docker run -d` 之后立刻 `docker exec` 找客户端，若恰好命中容器的
-# 重启间隙就会误报「容器内未找到客户端」。现改为单轮询：
-#   - 用 `docker inspect` 的 RestartCount 探测「崩溃重启循环」（以前只靠 status 看不出）；
-#   - 容器真正 running 后再去找客户端；找到后跑 SELECT 1 确认就绪。
+# ---------- 5) 等待就绪 + 客户端探活 + secure 步骤偶发失败的 root 自愈 ----------
+# 关键修复：
+#   a) 旧逻辑在 `docker run -d` 之后立刻 `docker exec` 找客户端，若恰好命中容器的重启间隙
+#      会误报「容器内未找到客户端」。现统一轮询：用 docker inspect 的 RestartCount 探测崩溃
+#      循环，容器真正 running 后再探活。
+#   b) 官方镜像「Securing system users」步骤偶发失败（典型：12.3.x-ubi 的 WolfSSL 握手
+#      ERROR 2026 TLS/SSL error: Broken pipe）。该步骤负责给 root 各账号设密码——若它失败，
+#      容器因 --restart always 重启后跳过该步骤、服务端能起来，但 root 无密码 -> 后续用
+#      ROOT_PASS 连会 1045。故就绪判据放宽为「能连上即可」（socket 免密 或 密码 任一），就绪后
+#      再 ensure_root_accounts 把 root 密码对齐为 ROOT_PASS（仅当 root 仍 unix_socket 免密
+#      时才执行修复，正常情况不触发，幂等无副作用）。
+# root 账号自愈：通过 unix_socket 免密登录（root 默认 plugin），把 root@localhost / 127.0.0.1 /
+# ::1 的密码对齐为 ROOT_PASS（secure 步骤偶发失败时 root 无密码，会导致初始化 SQL 用 ROOT_PASS
+# 连不上 1045；此处补设）。正常情况（secure 步骤成功、root 已是密码登录）不会调用本函数。
+ensure_root_accounts() {
+  local sqlf rp
+  sqlf="$(mktemp)"
+  # ROOT_PASS 可能含特殊字符，写进 SQL 前转义（反斜杠 + 单引号）
+  rp="$(printf '%s' "$ROOT_PASS" | sed "s/\\\\/\\\\\\\\/g; s/'/''/g")"
+  cat > "$sqlf" <<EOSQL
+SET SQL_LOG_BIN=0;
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${rp}';
+CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY '${rp}';
+ALTER USER 'root'@'127.0.0.1' IDENTIFIED BY '${rp}';
+CREATE USER IF NOT EXISTS 'root'@'::1' IDENTIFIED BY '${rp}';
+ALTER USER 'root'@'::1' IDENTIFIED BY '${rp}';
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION;
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'::1' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+SET SQL_LOG_BIN=1;
+EOSQL
+  docker exec -i "$CT_NAME" mariadb -uroot --binary-mode mysql < "$sqlf" >/dev/null 2>&1 \
+    || docker exec -i "$CT_NAME" mysql -uroot --binary-mode mysql < "$sqlf" >/dev/null 2>&1
+  local rc=$?
+  rm -f "$sqlf"
+  return $rc
+}
+
 CLIENT_BIN=""
 ready=0
 for i in $(seq 1 180); do
   st=$(docker inspect -f '{{.State.Status}}' "$CT_NAME" 2>/dev/null || echo "")
   rc=$(docker inspect -f '{{.RestartCount}}' "$CT_NAME" 2>/dev/null || echo 0)
-  # 实时把「重启/崩溃」苗头展示出来，避免看起来像卡死
   if [[ "$rc" -gt 0 && $((i % 5)) -eq 0 ]]; then
     warn "容器状态=$st RestartCount=$rc（若持续上涨=崩溃循环）；最近日志："
     docker logs --tail 15 "$CT_NAME" 2>&1 | sed 's/^/      /' || true
   fi
-  # 重启次数持续上涨 → 崩溃循环（最常见真因：buffer pool 过大被 OOM 杀 / 端口冲突 / 旧数据目录损坏）
-  if [[ "$rc" -gt 3 ]]; then
+  # 重启次数持续上涨 -> 崩溃循环（真因：OOM / 端口冲突 / 旧数据目录损坏）。注意：secure 步骤
+  # 偶发 TLS 失败属瞬时、会在一次重启后自愈，不会把 rc 推到这么高，故阈值放宽到 8。
+  if [[ "$rc" -gt 8 ]]; then
     err "容器疑似崩溃重启循环（RestartCount=$rc），常见真因是 OOM（buffer pool 过大）或端口/权限/旧数据目录损坏。最近日志："
     docker ps -a --filter "name=$CT_NAME" --format '      {{.Names}} | {{.Image}} | {{.Status}}' || true
     docker logs --tail 40 "$CT_NAME" 2>&1 | sed 's/^/      /' || true
@@ -247,9 +280,12 @@ for i in $(seq 1 180); do
         if docker exec "$CT_NAME" sh -c "command -v $b || which $b" >/dev/null 2>&1; then CLIENT_BIN="$b"; break; fi
       done
     fi
-    if [[ -n "$CLIENT_BIN" ]] && docker exec "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" \
-         -h 127.0.0.1 -P "$PORT" --protocol=tcp --ssl=0 -e "SELECT 1" >/dev/null 2>&1; then
-      ready=1; break
+    if [[ -n "$CLIENT_BIN" ]]; then
+      # 就绪判据：socket 免密 或 密码登录 任一能连上即视为服务端已起（放宽以兼容 secure 步骤偶发失败）
+      if docker exec "$CT_NAME" "$CLIENT_BIN" -uroot --connect-timeout=3 -e "SELECT 1" >/dev/null 2>&1 \
+         || docker exec "$CT_NAME" "$CLIENT_BIN" -uroot -p"$ROOT_PASS" --connect-timeout=3 -e "SELECT 1" >/dev/null 2>&1; then
+        ready=1; break
+      fi
     fi
   fi
   if [[ $((i % 10)) -eq 0 ]]; then
@@ -267,6 +303,12 @@ if [[ $ready -ne 1 ]]; then
   die "请检查：docker logs $CT_NAME"
 fi
 log "MariaDB 已就绪（$CLIENT_BIN 客户端可用）。"
+
+# root 账号自愈：仅当官方镜像 secure 步骤偶发失败、root 仍 unix_socket 免密时才修复；
+# 正常情况（secure 步骤成功、root 已是密码登录）socket 免密连不上，跳过，无副作用。
+if docker exec "$CT_NAME" "$CLIENT_BIN" -uroot --connect-timeout=3 -e "SELECT 1" >/dev/null 2>&1; then
+  ensure_root_accounts || warn "root 密码自愈失败（可忽略；若后续初始化报 1045 请在管理端重跑或检查日志）。"
+fi
 
 # ---------- 6) 执行初始化 / 账号修复 SQL ----------
 run_sql() {
