@@ -30,7 +30,7 @@
 # 可选环境变量：
 #   MARIA_IMAGE=mariadb:12.3.3             # 主镜像（Debian/OpenSSL，避开 12.3.x-ubi 的 WolfSSL 偶发 TLS 握手失败）
 #   MARIA_IMAGE_FALLBACK=mariadb:12.3.2    # 备用镜像（同为 Debian 版）
-#   MARIA_DATA_DIR=/data/mariadb           # 宿主数据目录（与裸机 MariaDB 保持一致）
+#   MARIA_DATA_DIR=/data/custos-ha/mariadb12 # 宿主数据目录（与纯 compose 部署保持一致）
 #   CT_NAME=mariadb-ha-node                # 容器名
 #   MARIA_BUFFER_POOL=1G                   # 覆盖 innodb_buffer_pool_size（小内存机务必调小）
 #                                          # 建议 ≈ 物理内存的 40%~50%，如 2G 内存用 512M
@@ -69,7 +69,7 @@ command -v docker >/dev/null 2>&1 \
 # ---------- 可变参数（可用环境变量覆盖） ----------
 MARIA_IMAGE="${MARIA_IMAGE:-mariadb:12.3.3}"
 MARIA_IMAGE_FALLBACK="${MARIA_IMAGE_FALLBACK:-mariadb:12.3.2}"
-MARIA_DATA_DIR="${MARIA_DATA_DIR:-/data/mariadb}"
+MARIA_DATA_DIR="${MARIA_DATA_DIR:-/data/custos-ha/mariadb12}"
 CT_NAME="${CT_NAME:-mariadb-ha-node}"
 STATE_DIR=/etc/ha-mysql-node
 STATE="$STATE_DIR/install-state-mariadb-docker"
@@ -100,7 +100,7 @@ log "数据目录(宿主)：$MARIA_DATA_DIR"
 
 # ---------- 1) 生成容器用配置 ----------
 # 剔除 datadir / socket / pid_file：容器内固定为 /var/lib/mysql 与 /run/mariadb/mariadb.sock，
-# 沿用宿主 /data/mariadb 会导致容器起不来。
+# 沿用宿主 /data/custos-ha/mariadb12 会导致容器起不来。
 CNF_TMP="/tmp/mariadb-docker-99-ha.cnf"
 grep -viE '^[[:space:]]*(datadir|socket|pid[_-]?file)[[:space:]]*=' "$CONF_SRC" > "$CNF_TMP"
 grep -qiE '^[[:space:]]*port[[:space:]]*=' "$CNF_TMP" || printf '\n[mysqld]\nport = %s\n' "$PORT" >> "$CNF_TMP"

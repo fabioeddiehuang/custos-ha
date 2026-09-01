@@ -202,9 +202,9 @@
           <strong>注意：MariaDB 与 MySQL GTID 机制不兼容，MariaDB 集群所有节点必须都是 MariaDB 类型。</strong>
         </div>
         <div id="mariadbDockerTip" class="full" style="display:none;padding:10px 12px;border:1px dashed rgba(96,165,250,.45);border-radius:10px;background:rgba(37,99,235,.14);font-size:13px;color:#93c5fd;">
-          <strong>MariaDB 容器版部署流程（官方镜像，无需宿主装 MariaDB）：</strong>生成后目录内含 <code class="mono">Install-mariadb-docker-Node.sh</code>、<code class="mono">docker-my.cnf</code>、<code class="mono">init_mariadb.sql</code>。推荐顺序 ——
+          <strong>MariaDB 容器版部署流程（官方镜像，无需宿主装 MariaDB，纯 compose）：</strong>生成后目录内含 <code class="mono">docker-compose.yaml</code>、<code class="mono">docker-my.cnf</code>、<code class="mono">init_mariadb.sql</code>、<code class="mono">Uninstall-mariadb-docker-Node.sh</code>。推荐顺序 ——
           ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/ha-node/&lt;本机IP&gt;/</code>）；
-          ② 执行 <code class="mono">sudo bash Install-mariadb-docker-Node.sh</code>（自动：拉镜像 <code class="mono">mariadb:12.3.3-ubi</code>，失败自动退 <code class="mono">mariadb:12.3.2</code> → host 网络起容器 → 挂配置 → 跑 init/fix SQL → 放行防火墙 → 起 keepalived）；
+          ② 执行 <code class="mono">docker compose up -d</code>（自动：拉镜像 <code class="mono">mariadb:12.3.3</code>，失败自动退 <code class="mono">mariadb:12.3.2</code> → 起 MariaDB + keepalived 容器 → 挂配置 → 跑 init/fix SQL）；
           ③ 各节点都起来后，管理器自动建复制、选主、漂移 VIP。
           <strong>可与「MariaDB 裸机」节点同集群混部</strong>（同为 MariaDB GTID 复制路径），适合新机跑裸机、老机（glibc 过低）跑容器的混合环境。
         </div>

@@ -44,12 +44,22 @@ NODE_ASSETS = Path(__file__).parent / "node_assets" / "keepalived"
 NODE_SCRIPTS = Path(__file__).parent / "node_assets"
 
 # 容器化 MariaDB 节点（node_type='mariadb-docker'）使用的镜像。
-# 首选 UBI 构建（自带较新运行时，无需目标机装任何依赖）；拉取失败时脚本自动退到
-# Debian 构建的 12.3.2（体积更小，同为 12.3 系列，GTID/复制行为一致）。
-MARIADB_DOCKER_IMAGE = "mariadb:12.3.3-ubi"
+#
+# 选型原则：**统一使用 Debian 构建的官方镜像**，以同时兼容 Anolis(RHEL 系) 与 Ubuntu(Debian 系)。
+# UBI 构建（mariadb:12.3.3-ubi）有两个跨发行版兼容性大坑，实测正是 Ubuntu 节点异常的诱因：
+#   1) UBI 镜像默认 USER=mysql(uid 999)：宿主数据目录属主为 root 时直接
+#      "Errcode: 13 Permission denied" 起不来，必须靠 --user root + 入口脚本 chown 兜底；
+#   2) UBI 镜像没有 /etc/mysql/my.cnf，mariadbd 只读 /etc/my.cnf（!includedir /etc/my.cnf.d），
+#      与 Debian 构建的 /etc/mysql/conf.d 路径不同，配置挂载易失效。
+# 另：Debian 构建的 12.3.3 不要求 UBI 的 x86-64-v3 指令集，【老 CPU 兼容性已优于 UBI】；
+# 12.3.2 作为同系列（Debian 构建、版本更保守）的备用，拉取失败或个别老 CPU 不兼容时自动回退。
+# 口径与 Install-mariadb-docker-Node.sh 保持一致（该文件同样以 12.3.3 为主、12.3.2 为备）。
+MARIADB_DOCKER_IMAGE = "mariadb:12.3.3"
 MARIADB_DOCKER_IMAGE_FALLBACK = "mariadb:12.3.2"
-# 容器化 MariaDB 节点的宿主数据目录（与裸机 MariaDB 保持一致，便于两种形态混部时运维统一）
-MARIADB_DOCKER_DATA_DIR = "/data/mariadb"
+
+# 宿主数据目录：统一收敛到 /data/custos-ha/<引擎>，便于备份/巡检时按引擎识别。
+MARIADB_DOCKER_DATA_DIR = "/data/custos-ha/mariadb12"
+MYSQL_DOCKER_DATA_DIR = "/data/custos-ha/mysql8"
 MARIADB_DOCKER_CONTAINER = "mariadb-ha-node"
 
 # 节点侧 keepalived 客户端镜像名。项目由 mysql-ha-manager 更名为 Custos 后，
@@ -209,8 +219,10 @@ services:
     ports:
 {port_lines}
     volumes:
-      # MySQL 数据目录：统一落在节点目录内的 ./MySQL-data（自包含，可直接拷到 /home/docker/<ip>/ 运行）
-      - ./MySQL-data:/var/lib/mysql
+      # MySQL 数据目录：统一 /data/custos-ha/mysql8（与 MariaDB 节点的 mariadb12 对齐）。
+      # :z 供 Anolis 等 SELinux=Enforcing 系统重打标签；未启用 SELinux 的 Ubuntu 会忽略该标记，
+      # 故同一份 compose 同时兼容两类系统。
+      - {MYSQL_DOCKER_DATA_DIR}:/var/lib/mysql:z
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       # 慢日志覆盖配置（slow_query_log=1 + log_output=TABLE），供 slow_log 采集 mysql.slow_log。
       # 必须挂载，否则节点慢查询不入库，/api/slow_log 永远空（节点默认 slow_query_log=OFF）。
@@ -316,7 +328,7 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
     bind-address / 复制与慢日志参数）与裸机完全一致，保证两种形态同集群混部时
     复制行为一致。
 
-    落盘位置由 Install-mariadb-docker-Node.sh 决定：同时挂载到
+    落盘位置由 compose（render_mariadb_compose）决定：同时挂载到
       - /etc/my.cnf.d/99-ha.cnf      （UBI 构建：/etc/my.cnf 里 !includedir /etc/my.cnf.d）
       - /etc/mysql/conf.d/99-ha.cnf  （Debian 构建：/etc/mysql/my.cnf 里 !includedir）
     两条都挂，使 12.3.3-ubi 与 12.3.2 任一镜像都能读到；99- 前缀保证最后加载、覆盖默认。
@@ -343,7 +355,9 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
         "binlog_format = ROW\n"
         "read_only = ON\n"
         "# 复制/性能（与裸机 MariaDB 节点保持一致）\n"
-        "innodb_buffer_pool_size = 1G\n"
+        "# 缓冲池默认 512M（而非官方/裸机模板的 1G）：小内存主机（如 2G）用 1G 极易 OOM。\n"
+        "# 内存充足可调大：compose 场景改 MARIADB_INNODB_BUFFER_POOL_SIZE 环境变量即可覆盖。\n"
+        "innodb_buffer_pool_size = 512M\n"
         "innodb_io_capacity = 2000\n"
         "innodb_io_capacity_max = 4000\n"
         "slave_parallel_threads = 4\n"
@@ -426,11 +440,11 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
 
 
 def render_baremetal_compose(node_name, vip_port=None):
-    """MariaDB 节点（裸机 / 容器化）的 compose：只跑 keepalived 客户端。
+    """裸机 MariaDB 节点（node_type=mariadb）的 keepalived-only compose（容器化 MariaDB 走 render_mariadb_compose），只跑 keepalived 客户端。
 
     - 裸机 MariaDB：mysqld 由宿主 systemd 提供；
-    - 容器化 MariaDB：MariaDB 容器由 Install-mariadb-docker-Node.sh 以 host 网络单独拉起
-      （不进 compose，是因为它需要先准备配置 / 执行 init SQL，再起 keepalived）。
+    - 容器化 MariaDB（node_type=mariadb-docker）已改为纯 compose（见 render_mariadb_compose），
+       本函数只服务裸机形态（keepalived-only）；裸机装不上 tarball 时仍可改跑 Install-mariadb-docker-Node.sh 回退。
 
     keepalived 容器使用 host 网络，连接 127.0.0.1:<port> 探活本机 MariaDB。
     """
@@ -440,7 +454,7 @@ def render_baremetal_compose(node_name, vip_port=None):
         "# 自动生成：MariaDB 节点（裸机 / 容器化）的 keepalived-only 客户端部署\n"
         "# 前置：目标机 MariaDB 已就绪并创建账号（init_mariadb.sql）——\n"
         "#       裸机形态：由 Install-ha-mariadb-Node.sh 全量安装（宿主 systemd 管理 mysqld）；\n"
-        "#       容器形态：由 Install-mariadb-docker-Node.sh 以 host 网络拉起官方 MariaDB 容器。\n"
+        "#       （注：容器化 MariaDB 节点 node_type=mariadb-docker 已改用 render_mariadb_compose 纯 compose，不走本函数）。\n"
         "# 运行： cd 本目录 && docker compose up -d\n"
         "services:\n"
         "  keepalived:\n"
@@ -460,6 +474,96 @@ def render_baremetal_compose(node_name, vip_port=None):
         "      - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro\n"
     ).replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME) \
      .replace("{PKG_VERSION}", PKG_VERSION)
+
+
+def render_mariadb_compose(node_name, root_pass, port, server_id, vip_port=None,
+                           data_dir=None, image=None, buffer_pool="512M"):
+    """容器化 MariaDB 节点的【纯 compose】部署文件（推荐方式）。
+
+    与 render_baremetal_compose()（只跑 keepalived、MariaDB 由安装脚本另起）不同，
+    本函数把 MariaDB 容器与 keepalived 容器一并纳入 compose，节点部署即一条
+    `docker compose up -d`，与 MySQL 8.0 容器节点（_render_compose）的形式完全对齐。
+
+    关键设计（对应「兼容 Anolis / Ubuntu / Anolis 7.9 / 老 CPU / 低内存」）：
+      1) 端口：容器内 MariaDB 监听 port（由 docker-my.cnf 的 port= 决定，与裸机形态一致），
+         宿主同时把「节点端口」与「VIP 端口」映射到容器同一端口 —— 业务连 VIP:VIP_PORT
+         无需在节点上配 iptables/firewalld 转发（避开 firewalld 与 ufw/iptables 差异，
+         Ubuntu 与 Anolis 行为统一）。
+      2) 配置：docker-my.cnf 同时挂到 /etc/my.cnf.d 与 /etc/mysql/conf.d，
+         Debian 构建与 UBI 构建任一镜像都能读到（99- 前缀保证最后加载、覆盖默认值）。
+      3) 权限：以 root(uid 0) 启动，官方 entrypoint 先 chown 数据目录再 gosu 降权为 mysql，
+         规避 UBI 构建默认 USER=mysql(uid 999) 时宿主目录属主不符导致的 Errcode 13。
+      4) 低内存：buffer pool 默认 512M（官方默认与裸机模板的 1G 在小内存机易 OOM），
+         可按宿主机内存调整 MARIADB_INNODB_BUFFER_POOL_SIZE。
+      5) 挂载 :z 兼顾 Anolis 的 SELinux=Enforcing；未启用 SELinux 的 Ubuntu 会忽略该标记。
+    """
+    if vip_port is None:
+        vip_port = VIP_PORT
+    if data_dir is None:
+        data_dir = MARIADB_DOCKER_DATA_DIR
+    if image is None:
+        image = MARIADB_DOCKER_IMAGE
+    # 端口映射：节点自身端口 + VIP 端口 -> 容器内同一端口
+    port_lines = f'      - "{port}:{port}"\n'
+    if str(vip_port) != str(port):
+        port_lines += f'      - "{vip_port}:{port}"\n'
+    return f"""# 自动生成：MariaDB 容器 + keepalived 合一节点部署（纯 compose）
+# 前置：目标主机已安装 Docker / Docker Compose（无需预装 MariaDB 及任何依赖）。
+# 运行： cd 本目录 && docker compose up -d
+# 镜像：{image}（Debian 构建，同时兼容 Anolis 与 Ubuntu；老 CPU 主机请勿改用 UBI 构建）
+services:
+  mariadb:
+    image: {image}
+    container_name: {node_name}
+    restart: always
+    # 以 root 启动：官方 entrypoint 会先把数据目录 chown 给 mysql，再 gosu 降权运行 mariadbd。
+    # 规避 UBI 构建默认 USER=mysql(uid 999) 时宿主数据目录属主为 root 导致的 Errcode 13。
+    user: "0:0"
+    environment:
+      MARIADB_ROOT_PASSWORD: "{root_pass}"
+      # 全站统一中国时间：节点 NOW()/日志时间均为北京时间(UTC+8)
+      TZ: "Asia/Shanghai"
+      # 低内存主机友好：官方默认与裸机模板为 1G，小内存机易 OOM。内存充足可调至 1G/2G。
+      MARIADB_INNODB_BUFFER_POOL_SIZE: "{buffer_pool}"
+      # 跨小版本升级时自动执行 mariadb-upgrade，避免数据字典未升级导致起不来
+      MARIADB_AUTO_UPGRADE: "1"
+    ports:
+{port_lines}    volumes:
+      # 数据目录：统一 /data/custos-ha/mariadb12
+      - {data_dir}:/var/lib/mysql:z
+      # 配置双挂：Debian 构建读 /etc/mysql/conf.d，UBI 构建读 /etc/my.cnf.d，两条都挂
+      # 可让任一镜像都生效；99- 前缀保证最后加载、覆盖镜像默认值。
+      - ./docker-my.cnf:/etc/my.cnf.d/99-ha.cnf:ro,z
+      - ./docker-my.cnf:/etc/mysql/conf.d/99-ha.cnf:ro,z
+      # 初始化 SQL：仅在数据目录为空的首次启动执行；已初始化节点改由 fix-node-creds.sql
+      # 或管理器 ensure_ha_creds 自愈校正账号（不会重复执行导致报错）。
+      - ./init_mariadb.sql:/docker-entrypoint-initdb.d/init_mariadb.sql:ro,z
+    healthcheck:
+      # 用镜像自带 healthcheck.sh：正确处理账密，规避密码含特殊字符时的解析问题
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  keepalived:
+    image: {KEEPALIVED_IMAGE_NAME}:{PKG_VERSION}
+    build: ./keepalived
+    restart: always
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_BROADCAST
+      - NET_RAW
+    depends_on:
+      - mariadb
+    volumes:
+      - ./keepalived/keepalived.conf:/etc/keepalived/keepalived.conf:ro
+      - ./keepalived/check_mysql_master.sh:/etc/keepalived/check_mysql_master.sh:ro
+      - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro
+      - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro
+      - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro
+"""
 
 
 def render_docker_my_cnf():
@@ -923,17 +1027,17 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
         # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
         if node_type == "mariadb-docker":
-            # 容器化 MariaDB：配置片段（不含 datadir/socket）+ Install/Uninstall 脚本
+            # 容器化 MariaDB：纯 compose 部署（render_mariadb_compose 已含 mariadb + keepalived），
+            # 故只交付配置片段（不含 datadir/socket）+ 卸载脚本，不再生成安装脚本
+            # （部署入口即 docker compose up -d）；安装脚本仅作「裸机装不上 tarball」回退在裸机分支交付。
             _write(d / "docker-my.cnf",
                    render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=server_id),
                    mode=0o644)
             extra_files["docker_my_cnf"] = f"{NODES_HOST_BASE}/{ip}/docker-my.cnf"
-            extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/Install-mariadb-docker-Node.sh"
             extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-docker-Node.sh"
-            for sf in ("Install-mariadb-docker-Node.sh", "Uninstall-mariadb-docker-Node.sh"):
-                src = NODE_SCRIPTS / sf
-                if src.exists():
-                    _write(d / sf, src.read_text(), mode=0o755)
+            src = NODE_SCRIPTS / "Uninstall-mariadb-docker-Node.sh"
+            if src.exists():
+                _write(d / "Uninstall-mariadb-docker-Node.sh", src.read_text(), mode=0o755)
         else:
             # 裸机 MariaDB：完全独立安装（脱离宝塔），由 Install 脚本全量安装 tarball。
             # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
@@ -997,10 +1101,13 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             _write(kd / f, src.read_text(), mode=mode)
 
     # 5) docker-compose.yaml
-    #    MariaDB 两种形态都只跑 keepalived 客户端（裸机由宿主 systemd 起 mysqld，
-    #    容器化由 Install-mariadb-docker-Node.sh 起 MariaDB 容器）；MySQL Docker 才含 MySQL 容器。
-    if is_mariadb_node(node_type):
+    #    MariaDB 裸机（mariadb）：compose 只跑 keepalived 客户端（mysqld 由宿主 systemd 起）；
+    #    MariaDB 容器化（mariadb-docker）：纯 compose（mariadb + keepalived 合一）；
+    #    仅 MySQL Docker 才在 compose 内单独含 MySQL 容器。
+    if node_type == "mariadb":
         compose = render_baremetal_compose(node_name, vip_port)
+    elif node_type == "mariadb-docker":
+        compose = render_mariadb_compose(node_name, root_pass, port, server_id, vip_port)
     else:
         compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
     _write(d / "docker-compose.yaml", compose)
@@ -1039,12 +1146,10 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
 
     # MariaDB 裸机节点：宿主机已原生运行 MariaDB，只需拉起 keepalived 容器
     # （否则会再起一个 MySQL 容器抢占 3306）。
-    # 容器化 MariaDB 节点：MariaDB 由 Install 脚本以 host 网络单独起，keepalived 由该脚本末尾拉起，
-    # 故入口统一是 Install 脚本（在里面已经包含 docker compose up -d）。
+    # 容器化 MariaDB 节点（mariadb-docker）：纯 compose 部署，入口即 docker compose up -d
+    # （mariadb + keepalived 合一，无需安装脚本）。
     # MySQL docker 节点：MySQL 与 keepalived 都在容器里，整套一起拉起。
-    if node_type == "mariadb-docker":
-        run_cmd = f"cd {host_compose} && sudo bash Install-mariadb-docker-Node.sh"
-    elif node_type == "mariadb":
+    if node_type == "mariadb":
         run_cmd = f"cd {host_compose} && docker compose up -d keepalived"
     else:
         run_cmd = f"cd {host_compose} && docker compose up -d"
@@ -1123,6 +1228,11 @@ def sync_node_creds(cluster_id=None):
         repl_pass = creds["repl_pass"] or ""
         app_user = creds["app_user"] or "app"
         app_pass = creds["app_pass"] or ""
+        # 业务端口必须下发到节点：节点侧 setup_vip_port_forward() 从 ha_check.conf 读
+        # VIP_PORT 来配置「VIP 端口 -> 本机 MySQL 端口」转发。此前本路径未写 VIP_PORT，
+        # 导致重新生成节点目录后转发被跳过 -> 业务连 VIP:VIP_PORT 无监听
+        #（表现为 VIP 能 ping 通，但业务账号连不上库）。
+        vip_port = creds.get("vip_port") or VIP_PORT
         if not ha_pass or not repl_pass:
             continue
         rows = query(
@@ -1178,6 +1288,8 @@ def sync_node_creds(cluster_id=None):
                 f"LOCAL_PASS={_shq(ha_pass)}\n"
                 f"LOCAL_ROOT_USER={_shq(root_user)}\n"
                 f"LOCAL_ROOT_PASS={_shq(root_pass)}\n"
+                # VIP_PORT 为纯数字端口，不加引号（与 LOCAL_PORT 一致，供端口转发使用）
+                f"VIP_PORT={vip_port}\n"
             )
             _write(kd / "ha_check.conf", ha_check)
             # 同步重生成 init 凭证 SQL（仅凭证相关），保证后续「重部署」后执行时使用的仍是当前密码。

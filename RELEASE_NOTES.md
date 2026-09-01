@@ -1,8 +1,34 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> 当前版本：**v2.2.11**（镜像标签 `custos:v2.2.11`，keepalived 镜像 `custos-node:v2.2.11`）
+> 当前版本：**v2.2.15**（镜像标签 `custos:v2.2.15`，keepalived 镜像 `custos-node:v2.2.15`）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
 > 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
+
+---
+
+## 一、v2.2.15 容器化 MariaDB 节点清理安装脚本
+
+- **生成节点不再含安装脚本**：`generate_node` 对 `mariadb-docker` 不再生成 `Install-mariadb-docker-Node.sh`（部署早已是纯 compose，入口即 `docker compose up -d`）；仅保留 `Uninstall-mariadb-docker-Node.sh`。
+- **安装脚本保留为回退**：`Install-mariadb-docker-Node.sh` 文件不删除，仍作为「裸机 MariaDB 装不上 tarball（如 glibc 过低）」时的逃生通道，在裸机（mariadb）节点生成目录中一并交付。
+- 同步修正 Web 生成提示与操作手册中仍指向安装脚本的过期文案。
+
+---
+
+## 〇之一、v2.2.13 容器化 MariaDB 部署方式改造（纯 compose）
+
+> 部署方式重大变更：容器化 MariaDB 节点（`node_type=mariadb-docker`）从「安装脚本 + host 网络单独拉起容器」改为与容器化 MySQL 8.0 一致的**纯 compose** 部署；安装脚本仅保留给「裸机 + 容器混部」场景。
+
+- **部署形态统一**：`generate_node` 对 `mariadb-docker` 直接生成含 `mariadb` + `keepalived` 双服务的 compose，部署入口即 `docker compose up -d`（原入口为 `sudo bash Install-mariadb-docker-Node.sh`）。
+- **跨发行版镜像**：默认镜像改为 **Debian 构建**的 `mariadb:12.3.3`（备选 `mariadb:12.3.2`），规避 UBI 构建（`12.3.x-ubi`）的 `USER=mysql(uid 999)` 权限拒绝、无 `/etc/mysql/my.cnf` 配置路径不一等坑（实测是 Ubuntu 节点异常主因）；同时不再要求 x86-64-v3 指令集，兼容老 CPU（Anolis 7.9 等）。
+- **数据目录统一**：容器化 MariaDB → `/data/custos-ha/mariadb12`，容器化 MySQL 8.0 → `/data/custos-ha/mysql8`。
+- **VIP 端口在 compose 层解决**：compose 同时映射「节点端口」与「VIP 端口」到容器同一端口，业务连 `VIP:VIP_PORT` 直连容器，**不再依赖节点 iptables/firewalld 转发**，避开 firewalld 与 ufw 差异（Ubuntu / Anolis 行为一致）。
+- **挂载 `:z` 兼顾 SELinux=Enforcing 的 Anolis/RHEL；未启用 SELinux 的 Ubuntu 忽略该标记**，同一份 compose 兼容两类系统。
+- **低内存兼容**：容器化 MariaDB 的 `innodb_buffer_pool_size` 默认降至 512M（官方/裸机模板为 1G，小内存机易 OOM）。
+- **卸载脚本同步改造**：`Uninstall-mariadb-docker-Node.sh` 现自动识别「纯 compose」与「安装脚本」两种来源，分别走 `docker compose down` 与 `docker rm -f` + keepalived 停止，并清理可能的 VIP 端口转发。
+
+### 升级注意
+- 重新生成节点会生成 `custos-node:v2.2.13` 的 keepalived 镜像 tag，首次 `docker compose up -d` 会在节点侧 `build` 新镜像。
+- 存量容器化 MariaDB 节点重生成后，数据目录由 `/data/mariadb` 变为 `/data/custos-ha/mariadb12`，旧数据不会自动迁移（目录均在同一宿主机，需按需手动处理）。
 
 ---
 

@@ -2124,8 +2124,8 @@ def nodes_add(
                      "各节点就绪后管理器自动建复制/选主/VIP 漂移；"
                      "卸载用 sudo bash Uninstall-mariadb-Node.sh，重装/改密直接重跑 Install 即可）")
     elif nt == "mariadb-docker":
-        extra_tip = ("（MariaDB 容器版节点：把目录拷到目标机，执行 sudo bash Install-mariadb-docker-Node.sh；"
-                     "自动拉 mariadb:12.3.3-ubi，失败退 mariadb:12.3.2，host 网络起容器并拉起 keepalived；"
+        extra_tip = ("（MariaDB 容器版节点：纯 compose 部署，把目录拷到目标机后执行 docker compose up -d 即可"
+                     "（镜像 mariadb:12.3.3，自动兼容 Anolis/Ubuntu/老 CPU）；"
                      "可与 MariaDB 裸机节点同集群混部；卸载用 sudo bash Uninstall-mariadb-docker-Node.sh）")
     return RedirectResponse(
         f"/nodes?msg=已生成节点 {info['node_name']}{role_tip}{extra_tip}，到目标主机执行：{info['run_cmd']}",
