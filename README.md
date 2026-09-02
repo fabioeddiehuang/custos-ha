@@ -1,6 +1,6 @@
 # Custos
 
-> 当前版本：**v2.2.11**
+> 当前版本：**v2.2.15**
 > 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
 
@@ -80,6 +80,7 @@ custos-ha/
 │       ├── Install-mariadb-docker-Node.sh     # 裸机 MariaDB 装不上时的回退脚本（Docker MariaDB 12.3.x：CPU 指令集预检回退 12.3.2 + 小内存 buffer pool 自动收敛）
 │       ├── Install-ha-mariadb-Node.sh     # 节点一键安装脚本（裸机：自动应用 my.cnf 片段 + 初始化账号 + 起 keepalived）
 │       ├── Uninstall-mariadb-Node.sh   # 节点一键卸载脚本
+│       ├── Uninstall-mariadb-docker-Node.sh  # 容器化 MariaDB 卸载脚本（v2.2.13 起，自动识别纯 compose / 安装脚本两种来源）
 │       ├── init_mariadb.sql  # 裸机节点初始化 SQL（建账号 / 授权 / 启 GTID / 本地状态库）
 │       └── fix-node-creds.sql  # 节点账号/权限修复 SQL（节点本机真实 root 执行，校正漂移凭证）
 ├── app/mysql_compat.py        # 按 mysql_version 选择复制语法（MySQL8.0 CHANGE MASTER TO ↔ MariaDB CHANGE REPLICATION SOURCE TO）
@@ -149,13 +150,13 @@ cd custos-ha
 
 ---
 
-## 6. 添加被管节点（两种部署模式）
+## 6. 添加被管节点（三种部署形态）
 
-无论哪种模式，流程都是：Web「集群管理」建集群 →「节点配置」添加节点（选部署模式）→ 生成自包含节点目录 → 拷到目标机执行一条安装命令。
+无论哪种形态，流程都是：Web「集群管理」建集群 →「节点管理」添加节点（选 `node_type`）→ 生成自包含节点目录 → 拷到目标机执行部署命令。
 
-### 6.1 模式一：Docker 容器部署（MySQL 跑在容器里，推荐新环境）
+### 6.1 形态一：docker（容器化 MySQL 8.0，推荐新环境）
 
-1. 「节点配置」选部署模式 `docker`，填：节点 IP、MySQL **容器端口**（默认 3307，避免与宿主机可能存在的 3306 冲突）、root 密码、初始角色；
+1. 「节点配置」选 `node_type=docker`，填：节点 IP、MySQL **容器端口**（默认 3307，避免与宿主机 3306 冲突）、root 密码、初始角色；
 2. 生成目录 `generated_nodes/<ip>/`（含 `docker-compose.yaml`：MySQL + keepalived，host 网络 + `NET_RAW`；以及 `init.sql`、`keepalived/`、`MySQL-data` 数据卷）；
 3. 整体拷到目标机 `/home/docker/<ip>/`，执行：
 
@@ -165,40 +166,53 @@ cd custos-ha
    ```
 
 4. 节点启动后由 `init.sql` 初始化账号并启 GTID；管理端自动发现并纳入拓扑。
+5. 数据目录：`/data/custos-ha/mysql8`。
 
-> 该目录自包含，路径均相对本目录（`MySQL-data` / `keepalived/` / `init.sql`），拷贝后无需改动即可运行。
+> 该目录自包含，路径均相对本目录，拷贝后无需改动即可运行。
 
-### 6.2 模式二：裸机部署（节点机已自带 MySQL，仅 keepalived 跑容器）
+### 6.2 形态二：mariadb-docker（容器化 MariaDB 12.3.x，纯 compose）
 
-适用于生产机已有 MySQL（如宝塔安装的 MySQL 8.0），希望复用宿主机 MySQL、只把 VIP/选主交给 keepalived 容器的场景。
+**v2.2.13 起改为纯 compose 部署**：生成目录**不再包含安装脚本**，入口即 `docker compose up -d`。
 
-1. 「节点配置」选部署模式 `baremetal`，填：节点 IP、MySQL **端口**（如 3306）、root 用户/密码、初始角色；
+1. 选 `node_type=mariadb-docker`，填：节点 IP、**端口**（默认 3306）、root 密码、初始角色；
+2. 生成目录含：`docker-compose.yaml`（`mariadb` + `keepalived` 双服务）、`docker-my.cnf`、`init_mariadb.sql`、`fix-node-creds.sql`、`keepalived/`、`Uninstall-mariadb-docker-Node.sh`；
+3. 拷到目标机后执行：
+
+   ```bash
+   cd /home/docker/<ip>
+   docker compose up -d
+   ```
+
+4. 镜像：Debian 构建 `mariadb:12.3.3`（首选），老 CPU / 拉取失败自动回退 `mariadb:12.3.2`；**已弃用 UBI 构建**。
+5. 数据目录：`/data/custos-ha/mariadb12`；`innodb_buffer_pool_size` 默认 512M（低内存机友好）。
+6. VIP 端口在 compose 层映射，业务连 `VIP:VIP_PORT` 直连容器，**不依赖节点 iptables/firewalld 转发**。
+7. 卸载：`sudo bash Uninstall-mariadb-docker-Node.sh`。
+
+> `Install-mariadb-docker-Node.sh` 仍保留在 `app/node_assets`，作为「裸机装不上 tarball（glibc 过低）」时的回退，在裸机（`mariadb`）节点生成目录中一并交付。
+
+### 6.3 形态三：mariadb（裸机 MariaDB，仅 keepalived 跑容器）
+
+适用于生产机已有 MariaDB，希望复用宿主机实例、只把 VIP/选主交给 keepalived 容器的场景。
+
+1. 选 `node_type=mariadb`，填：节点 IP、端口（如 3306）、root 用户/密码、初始角色；
 2. 生成目录 `generated_nodes/<ip>/`，内含：
-   - `Install-ha-mariadb-Node.sh` —— **一键安装脚本**（核心）；
+   - `Install-ha-mariadb-Node.sh` —— 一键安装脚本（核心）；
    - `init_mariadb.sql` —— 初始化账号/授权/启 GTID/建本地状态库；
-   - `fix-node-creds.sql` —— 账号/权限修复脚本（节点本机真实 root 执行，校正漂移凭证）；
+   - `fix-node-creds.sql` —— 账号/权限修复脚本（节点本机真实 root 执行）；
    - `my.cnf.ha-fragment` —— 需追加到宿主机 `my.cnf` 的 GTID/复制片段；
    - `docker-compose.yaml`（仅 keepalived 容器）、`keepalived/`、`ha_check.conf`；
-3. 把目录整体拷到目标机 `/home/docker/<ip>/`，**只需一条命令**完成安装：
+   - `Install-mariadb-docker-Node.sh` —— 裸机装不上 tarball 时的回退通道；
+3. 拷到目标机后**一条命令**完成安装：
 
    ```bash
    cd /home/docker/<ip>
    sudo bash Install-ha-mariadb-Node.sh
    ```
 
-   安装脚本会自动完成：读取 `ha_check.conf` 的 `MANAGER_IP` / `LOCAL_ROOT_PASS` / `PORT` →
-   将 `my.cnf.ha-fragment` 追加到宿主机 `my.cnf`（带备份与 `HA-MYSQL-NODE-SETUP` 标记，幂等）→
-   重启 MySQL 使 GTID 持久生效 → 以真实 root 跑 `init_mariadb.sql`（建 `ha_monitor`/`replication`/`app`
-   账号，强制 `mysql_native_password`，避免 MySQL 8.0 `caching_sha2` 非 TLS 复制失败）→
-   跑 `fix-node-creds.sql` 校正账号 → `docker compose up -d` 起 keepalived（VIP 漂移）。
-
-   > **统一初始化**：首次安装即可部署成功——账号、GTID、复制参数全部由安装脚本统一落地，无需手工改配置。
-   > 若日后出现账号漂移（如 `Access denied` / `caching_sha2` 报错），在节点本机重跑该脚本，或 Web
-   > 「节点配置」点「下载修复SQL」取 `fix-node-creds-<ip>.sql` 以真实 root 执行即可。
-
+   脚本自动完成：读 `ha_check.conf` → 追加 `my.cnf` HA 片段（幂等，带 `HA-MYSQL-NODE-SETUP` 标记）→ 重启 MySQL 使 GTID 生效 → 以真实 root 跑 `init_mariadb.sql`（建 `ha_monitor`/`replication`/`app`，强制 `mysql_native_password`）→ 跑 `fix-node-creds.sql` → `docker compose up -d` 起 keepalived。
 4. 卸载：`sudo bash Uninstall-mariadb-Node.sh`（还原 `my.cnf`、停 keepalived、保留 MySQL 数据与账号）。
 
-### 6.3 账号与加密说明（重要）
+### 6.4 账号与加密说明（重要）
 
 - 所有服务账号（`ha_monitor` / `replication` / `app`）统一强制 `mysql_native_password`，以兼容 MySQL 8.0 默认 `caching_sha2_password` 在**非 TLS 复制**下报 `Authentication requires secure connection` 的问题。
 - 管理端每个周期对在线节点执行自愈（`ensure_ha_creds`）：优先 `ha_monitor` 校正账号，若 `ha_monitor` 缺 `CREATE/ALTER USER` 权限则回退 `root` 重做——确保复制账号密码与各节点始终与集群库存一致。
