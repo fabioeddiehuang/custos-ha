@@ -346,17 +346,17 @@ textarea{resize:vertical;min-height:64px}
           <div class="dh-clus ok">
             <div class="dh-clus-bar"></div>
             <div class="dh-clus-head"><div class="dh-clus-name">prod-cluster-01</div>
-              <div class="dh-clus-tags"><span class="vip-mon"><span class="vip-dot on"></span>VIP 192.168.1.30:3306</span><span class="badge drift-ok">配置一致</span><span class="status-pill">正常</span><button class="btn btn-sm btn-ghost" onclick="alert('预检 prod-cluster-01')">预检</button></div></div>
+              <div class="dh-clus-tags"><span class="vip-mon"><span class="vip-dot on"></span>VIP 192.0.2.30:3306</span><span class="badge drift-ok">配置一致</span><span class="status-pill">正常</span><button class="btn btn-sm btn-ghost" onclick="alert('预检 prod-cluster-01')">预检</button></div></div>
             <div class="dh-clus-metrics"><div><span class="dh-m-num">1/1</span><span class="dh-m-lab">主/从</span></div><div><span class="dh-m-num">2</span><span class="dh-m-lab">在线</span></div><div><span class="dh-m-num" style="color:var(--success)">0.3s</span><span class="dh-m-lab">最大延迟</span></div></div>
             <table class="tbl" style="margin-top:14px">
               <thead><tr><th>主机</th><th>角色</th><th>状态</th><th>复制延迟</th><th>IO线程</th><th>SQL线程</th><th>最后心跳</th><th>操作</th></tr></thead>
               <tbody>
-                <tr><td class="mono">192.168.1.203:3306</td><td><span class="role role-master">主</span></td><td><span class="pill up">● up</span></td><td>0s</td><td>—</td><td>—</td><td>10:01:20</td><td><span class="badge" style="background:#e8f5e9;color:#16d39a">当前主</span></td></tr>
-                <tr><td class="mono">192.168.1.204:3306</td><td><span class="role role-slave">从</span></td><td><span class="pill up">● up</span></td><td>0.3s</td><td>Yes</td><td>Yes</td><td>10:01:21</td><td><button class="btn btn-sm" onclick="alert('设为主库 192.168.1.204')">设为主库</button></td></tr>
+                <tr><td class="mono">192.0.2.203:3306</td><td><span class="role role-master">主</span></td><td><span class="pill up">● up</span></td><td>0s</td><td>—</td><td>—</td><td>10:01:20</td><td><span class="badge" style="background:#e8f5e9;color:#16d39a">当前主</span></td></tr>
+                <tr><td class="mono">192.0.2.204:3306</td><td><span class="role role-slave">从</span></td><td><span class="pill up">● up</span></td><td>0.3s</td><td>Yes</td><td>Yes</td><td>10:01:21</td><td><button class="btn btn-sm" onclick="alert('设为主库 192.0.2.204')">设为主库</button></td></tr>
               </tbody>
             </table>
             <div class="dh-master-status">
-              <div class="dh-ms-h">主库状态 · 192.168.1.203</div>
+              <div class="dh-ms-h">主库状态 · 192.0.2.203</div>
               <div class="dh-gauge"><span class="dh-gauge-lab">CPU 38%</span><div class="dh-bar"><i style="width:38%;background:var(--accent)"></i></div></div>
               <div class="dh-gauge"><span class="dh-gauge-lab">内存 61%</span><div class="dh-bar"><i style="width:61%;background:var(--primary)"></i></div></div>
               <div class="dh-gauge"><span class="dh-gauge-lab">磁盘 47%</span><div class="dh-bar"><i style="width:47%;background:var(--emerald)"></i></div></div>
@@ -366,17 +366,17 @@ textarea{resize:vertical;min-height:64px}
           <div class="dh-clus issue">
             <div class="dh-clus-bar"></div>
             <div class="dh-clus-head"><div class="dh-clus-name">prod-cluster-02</div>
-              <div class="dh-clus-tags"><span class="vip-mon"><span class="vip-dot on"></span>VIP 192.168.1.40:3306</span><span class="badge drift-bad">漂移 1</span><span class="status-pill">复制延迟</span><button class="btn btn-sm btn-ghost" onclick="alert('预检 prod-cluster-02')">预检</button></div></div>
+              <div class="dh-clus-tags"><span class="vip-mon"><span class="vip-dot on"></span>VIP 192.0.2.40:3306</span><span class="badge drift-bad">漂移 1</span><span class="status-pill">复制延迟</span><button class="btn btn-sm btn-ghost" onclick="alert('预检 prod-cluster-02')">预检</button></div></div>
             <div class="dh-clus-metrics"><div><span class="dh-m-num">1/1</span><span class="dh-m-lab">主/从</span></div><div><span class="dh-m-num">2</span><span class="dh-m-lab">在线</span></div><div><span class="dh-m-num" style="color:var(--danger)">12.4s</span><span class="dh-m-lab">最大延迟</span></div></div>
             <table class="tbl" style="margin-top:14px">
               <thead><tr><th>主机</th><th>角色</th><th>状态</th><th>复制延迟</th><th>IO线程</th><th>SQL线程</th><th>最后心跳</th><th>操作</th></tr></thead>
               <tbody>
-                <tr><td class="mono">192.168.1.205:3306</td><td><span class="role role-master">主</span></td><td><span class="pill up">● up</span></td><td>0s</td><td>—</td><td>—</td><td>10:01:19</td><td><span class="badge" style="background:#e8f5e9;color:#16d39a">当前主</span></td></tr>
-                <tr><td class="mono">192.168.1.206:3306</td><td><span class="role role-slave">从</span></td><td><span class="pill up">● up</span></td><td class="repl-bad">12.4s</td><td>Yes</td><td class="repl-bad">No</td><td>10:01:18</td><td><button class="btn btn-sm" onclick="alert('设为主库 192.168.1.206')">设为主库</button></td></tr>
+                <tr><td class="mono">192.0.2.205:3306</td><td><span class="role role-master">主</span></td><td><span class="pill up">● up</span></td><td>0s</td><td>—</td><td>—</td><td>10:01:19</td><td><span class="badge" style="background:#e8f5e9;color:#16d39a">当前主</span></td></tr>
+                <tr><td class="mono">192.0.2.206:3306</td><td><span class="role role-slave">从</span></td><td><span class="pill up">● up</span></td><td class="repl-bad">12.4s</td><td>Yes</td><td class="repl-bad">No</td><td>10:01:18</td><td><button class="btn btn-sm" onclick="alert('设为主库 192.0.2.206')">设为主库</button></td></tr>
               </tbody>
             </table>
             <div class="dh-master-status">
-              <div class="dh-ms-h">主库状态 · 192.168.1.205</div>
+              <div class="dh-ms-h">主库状态 · 192.0.2.205</div>
               <div class="dh-gauge"><span class="dh-gauge-lab">CPU 55%</span><div class="dh-bar"><i style="width:55%;background:var(--accent)"></i></div></div>
               <div class="dh-gauge"><span class="dh-gauge-lab">内存 72%</span><div class="dh-bar"><i style="width:72%;background:var(--primary)"></i></div></div>
               <div class="dh-gauge"><span class="dh-gauge-lab">磁盘 63%</span><div class="dh-bar"><i style="width:63%;background:var(--emerald)"></i></div></div>
@@ -425,7 +425,7 @@ textarea{resize:vertical;min-height:64px}
         <div class="card">
           <h3>切换记录</h3>
           <div class="dh-timeline">
-            <div class="dh-tl"><span class="dh-tl-dot ok"></span><div class="dh-tl-body"><div class="dh-tl-t">08-26 22:40 · prod-cluster-01</div><div class="dh-tl-d">凭证漂移已自愈 · 192.168.1.203 保持主</div></div></div>
+            <div class="dh-tl"><span class="dh-tl-dot ok"></span><div class="dh-tl-body"><div class="dh-tl-t">08-26 22:40 · prod-cluster-01</div><div class="dh-tl-d">凭证漂移已自愈 · 192.0.2.203 保持主</div></div></div>
             <div class="dh-tl"><span class="dh-tl-dot err"></span><div class="dh-tl-body"><div class="dh-tl-t">08-25 03:12 · prod-cluster-02</div><div class="dh-tl-d">主库宕机自动切换 · 205 → 206</div></div></div>
           </div>
         </div>
@@ -437,7 +437,7 @@ textarea{resize:vertical;min-height:64px}
           <button class="btn btn-primary" onclick="alert('新增集群向导')">＋ 新增集群</button>
           <button class="btn" onclick="alert('刷新状态')">⟳ 刷新状态</button>
           <div class="menu-wrap"><button class="btn" onclick="toggleMenu('switchMenu',event)">⇄ 手动切换主从 ▾</button>
-            <div class="menu" id="switchMenu"><a onclick="alert('提升 192.168.1.204 为主')">提升 192.168.1.204 为主<span class="d">当前为从</span></a><a onclick="alert('保持 192.168.1.203 为主')">提升 192.168.1.203 为主<span class="d">当前为主</span></a></div></div>
+            <div class="menu" id="switchMenu"><a onclick="alert('提升 192.0.2.204 为主')">提升 192.0.2.204 为主<span class="d">当前为从</span></a><a onclick="alert('保持 192.0.2.203 为主')">提升 192.0.2.203 为主<span class="d">当前为主</span></a></div></div>
           <span style="display:flex;align-items:center;gap:8px">自动切换<label class="switch"><input type="checkbox" checked><span class="slider"></span></label></span>
           <span style="display:flex;align-items:center;gap:8px">自动修复<label class="switch"><input type="checkbox" checked><span class="slider"></span></label></span>
           <div class="menu-wrap"><button class="btn green" onclick="toggleMenu('fixMenu',event)">🛠 一键修复 ▾</button>
@@ -448,8 +448,8 @@ textarea{resize:vertical;min-height:64px}
         <div class="card">
           <h3>节点状态</h3>
           <table class="tbl"><thead><tr><th>节点</th><th>角色</th><th>在线状态</th><th>复制</th><th>延迟</th><th>操作</th></tr></thead>
-            <tbody><tr><td class="mono">192.168.1.203:3306</td><td><span class="role role-master">主</span></td><td><span class="badge up">在线</span></td><td><span class="badge ok">正常</span></td><td>0s</td><td><button class="btn btn-sm" onclick="openDrawer('192.168.1.203')">详情</button></td></tr>
-              <tr><td class="mono">192.168.1.204:3306</td><td><span class="role role-slave">从</span></td><td><span class="badge up">在线</span></td><td><span class="badge ok">正常</span></td><td>0.3s</td><td><button class="btn btn-sm" onclick="openDrawer('192.168.1.204')">详情</button></td></tr></tbody></table>
+            <tbody><tr><td class="mono">192.0.2.203:3306</td><td><span class="role role-master">主</span></td><td><span class="badge up">在线</span></td><td><span class="badge ok">正常</span></td><td>0s</td><td><button class="btn btn-sm" onclick="openDrawer('192.0.2.203')">详情</button></td></tr>
+              <tr><td class="mono">192.0.2.204:3306</td><td><span class="role role-slave">从</span></td><td><span class="badge up">在线</span></td><td><span class="badge ok">正常</span></td><td>0.3s</td><td><button class="btn btn-sm" onclick="openDrawer('192.0.2.204')">详情</button></td></tr></tbody></table>
         </div>
         <div class="card">
           <h3>最近 24 小时数据库日志</h3>
@@ -460,8 +460,8 @@ textarea{resize:vertical;min-height:64px}
             <button class="btn btn-sm" onclick="alert('导出')">导出</button>
           </div>
           <table class="tbl"><thead><tr><th>时间</th><th>节点</th><th>级别</th><th>内容</th></tr></thead>
-            <tbody id="logBody"><tr><td>08-27 09:12</td><td>192.168.1.204</td><td><span class="badge warn">Warn</span></td><td>Aborted connection 4821</td></tr>
-              <tr><td>08-26 22:40</td><td>192.168.1.203</td><td><span class="badge down">Error</span></td><td>GLIBCXX not found（已自愈）</td></tr></tbody></table>
+            <tbody id="logBody"><tr><td>08-27 09:12</td><td>192.0.2.204</td><td><span class="badge warn">Warn</span></td><td>Aborted connection 4821</td></tr>
+              <tr><td>08-26 22:40</td><td>192.0.2.203</td><td><span class="badge down">Error</span></td><td>GLIBCXX not found（已自愈）</td></tr></tbody></table>
           <div class="note">错误日志读取 mysql.error_log 表（不使用 SSH）；慢日志读取 mysql.slow_log 表，默认近 24h，支持导出 CSV。</div>
         </div>
         <div class="toolbar" style="margin-top:4px"><button class="btn btn-primary" onclick="openTerminal()">▷ 数据库终端</button><span class="spacer"></span><span class="badge sky">终端复用 ha_monitor（只读）</span></div>
@@ -472,7 +472,7 @@ textarea{resize:vertical;min-height:64px}
         <div class="card"><h3>已添加节点</h3>
           <table class="tbl"><thead><tr><th>集群名</th><th>节点</th><th>版本</th><th>状态</th><th>操作</th></tr></thead>
             <tbody>
-              <tr><td>prod-01</td><td class="mono">192.168.1.203:3306</td><td>MariaDB 11.4</td><td><span class="badge up">在线</span></td><td><button class="btn btn-sm" onclick="toggleDetail('d203')">展开详情</button></td></tr>
+              <tr><td>prod-01</td><td class="mono">192.0.2.203:3306</td><td>MariaDB 11.4</td><td><span class="badge up">在线</span></td><td><button class="btn btn-sm" onclick="toggleDetail('d203')">展开详情</button></td></tr>
               <tr id="d203" class="detail-panel"><td colspan="5"><div class="dd">
                 <div class="dd-sec"><div class="dd-sec-t">基本信息</div>
                   <div class="dd-grid">
@@ -492,7 +492,7 @@ textarea{resize:vertical;min-height:64px}
                 </div>
                 <div class="dd-actions"><button class="btn btn-sm" onclick="alert('节点配置')">节点配置</button><button class="btn btn-sm btn-primary" onclick="alert('查看/下载自愈 SQL')">查看/下载自愈 SQL</button></div>
               </div></td></tr>
-              <tr><td>prod-01</td><td class="mono">192.168.1.204:3306</td><td>MariaDB 11.4</td><td><span class="badge up">在线</span></td><td><button class="btn btn-sm" onclick="toggleDetail('d204')">展开详情</button></td></tr>
+              <tr><td>prod-01</td><td class="mono">192.0.2.204:3306</td><td>MariaDB 11.4</td><td><span class="badge up">在线</span></td><td><button class="btn btn-sm" onclick="toggleDetail('d204')">展开详情</button></td></tr>
               <tr id="d204" class="detail-panel"><td colspan="5"><div class="dd">
                 <div class="dd-sec"><div class="dd-sec-t">基本信息</div>
                   <div class="dd-grid">
@@ -550,7 +550,7 @@ textarea{resize:vertical;min-height:64px}
       <!-- ============ 系统设置 ============ -->
       <section id="settings">
         <div class="card"><h3>系统设置</h3>
-          <div class="field"><div class="lbl"><b>管理器内网 IP</b><small>MANAGER_PUBLIC_IP，节点连接来源</small></div><div><input value="192.168.1.66" style="width:180px"></div></div>
+          <div class="field"><div class="lbl"><b>管理器内网 IP</b><small>MANAGER_PUBLIC_IP，节点连接来源</small></div><div><input value="192.0.2.66" style="width:180px"></div></div>
           <div class="field"><div class="lbl"><b>监控轮询间隔</b><small>对节点探活、复制状态、配置漂移的轮询周期。过短增加节点与 manager 负载；过长则告警发现延迟。建议 5–15 秒。</small></div><div><input value="10" style="width:80px"> 秒</div></div>
           <div class="note">说明：轮询间隔越小发现故障越快，但会提高节点的 SELECT / 连接开销。生产环境推荐 10s；大规模集群可适当增大。</div>
         </div>
@@ -572,7 +572,7 @@ textarea{resize:vertical;min-height:64px}
     <header><b>数据库终端 · prod-cluster-01</b>
       <span style="display:flex;gap:14px;align-items:center"><span class="badge ok">已连接</span><span class="close" onclick="toggleTermFull()" title="全屏">⛶</span><span class="close" onclick="closeTerminal()">×</span></span></header>
     <div class="body">
-      <div class="toolbar"><select style="width:220px"><option>192.168.1.203:3306（主）</option><option>192.168.1.204:3306（从）</option></select><span class="badge sky">账号 ha_monitor（只读）</span></div>
+      <div class="toolbar"><select style="width:220px"><option>192.0.2.203:3306（主）</option><option>192.0.2.204:3306（从）</option></select><span class="badge sky">账号 ha_monitor（只读）</span></div>
       <div class="term" id="term" onclick="document.getElementById('termInput').focus()"><span class="res">mysql> SELECT NOW();
 +---------------------+
 | NOW()               |
@@ -602,8 +602,8 @@ function toggleMenu(id,e){e.stopPropagation();document.getElementById(id).classL
 document.addEventListener('click',()=>document.querySelectorAll('.menu').forEach(m=>m.classList.remove('show')));
 function switchLogTab(el,kind){document.querySelectorAll('.history-tabs .tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');
   var body=document.getElementById('logBody'),src=document.getElementById('logSrc');
-  if(kind==='slow'){src.className='badge sky';src.textContent='来源：mysql.slow_log';body.innerHTML='<tr><td>08-27 08:30</td><td>192.168.1.203</td><td><span class="badge sky">Slow</span></td><td>SELECT ... 2.31s</td></tr><tr><td>08-26 19:10</td><td>192.168.1.204</td><td><span class="badge sky">Slow</span></td><td>UPDATE ... 1.87s</td></tr>';}
-  else{src.className='badge sky';src.textContent='来源：mysql.error_log';body.innerHTML='<tr><td>08-27 09:12</td><td>192.168.1.204</td><td><span class="badge warn">Warn</span></td><td>Aborted connection 4821</td></tr><tr><td>08-26 22:40</td><td>192.168.1.203</td><td><span class="badge down">Error</span></td><td>GLIBCXX not found（已自愈）</td></tr>';}}
+  if(kind==='slow'){src.className='badge sky';src.textContent='来源：mysql.slow_log';body.innerHTML='<tr><td>08-27 08:30</td><td>192.0.2.203</td><td><span class="badge sky">Slow</span></td><td>SELECT ... 2.31s</td></tr><tr><td>08-26 19:10</td><td>192.0.2.204</td><td><span class="badge sky">Slow</span></td><td>UPDATE ... 1.87s</td></tr>';}
+  else{src.className='badge sky';src.textContent='来源：mysql.error_log';body.innerHTML='<tr><td>08-27 09:12</td><td>192.0.2.204</td><td><span class="badge warn">Warn</span></td><td>Aborted connection 4821</td></tr><tr><td>08-26 22:40</td><td>192.0.2.203</td><td><span class="badge down">Error</span></td><td>GLIBCXX not found（已自愈）</td></tr>';}}
 function openTerminal(){document.getElementById('termOverlay').classList.add('show');setTimeout(()=>document.getElementById('termInput').focus(),50);}
 function closeTerminal(){document.getElementById('termOverlay').classList.remove('show');}
 function toggleTermFull(){document.getElementById('termModal').classList.toggle('full');}
@@ -647,7 +647,7 @@ function loadSlow(){
 }
 /* 配置一致性巡检 */
 function loadDrift(){
-  var rows=[{node:'192.168.1.206:3306',varn:'innodb_buffer_pool_size',exp:'2G',act:'1G'}];var body=document.getElementById('driftBody');var sum=document.getElementById('driftSum');
+  var rows=[{node:'192.0.2.206:3306',varn:'innodb_buffer_pool_size',exp:'2G',act:'1G'}];var body=document.getElementById('driftBody');var sum=document.getElementById('driftSum');
   if(sum)sum.innerHTML='<span class="bad">1 项漂移</span>';
   body.innerHTML=rows.map(function(r){return '<div class="drift-item"><div><span class="drift-node">'+r.node+'</span><span class="drift-var">'+r.varn+'</span></div><div>期望 '+r.exp+' <span style="color:#94a3b8">→</span> <span class="drift-act">实际 '+r.act+'</span></div></div>';}).join('')+'<div style="font-size:11.5px;color:#94a3b8;padding-top:4px">其余 5 项一致</div>';
 }
@@ -657,7 +657,7 @@ document.querySelectorAll('#historyTabs .tab').forEach(function(t){t.onclick=fun
 refreshStatus(false);refreshObs();
 function toggleSmtp(edit){document.getElementById('smtpResult').style.display=edit?'none':'block';document.getElementById('smtpForm').style.display=edit?'block':'none';}
 function saveSmtp(){toggleSmtp(false);}
-function loadSrvLog(){var p=document.getElementById('srvLog');p.style.display='block';p.textContent='[2026-08-27 10:01] INFO  poll: node 192.168.1.203 up (0.31s)\n[2026-08-27 10:01] INFO  poll: node 192.168.1.204 up (0.29s)\n[2026-08-27 10:00] WARN  replica lag 192.168.1.206 12.4s\n[2026-08-27 09:12] ERROR replica io thread stopped 192.168.1.206\n[2026-08-27 09:00] INFO  config check 5/6 consistent';}
+function loadSrvLog(){var p=document.getElementById('srvLog');p.style.display='block';p.textContent='[2026-08-27 10:01] INFO  poll: node 192.0.2.203 up (0.31s)\n[2026-08-27 10:01] INFO  poll: node 192.0.2.204 up (0.29s)\n[2026-08-27 10:00] WARN  replica lag 192.0.2.206 12.4s\n[2026-08-27 09:12] ERROR replica io thread stopped 192.0.2.206\n[2026-08-27 09:00] INFO  config check 5/6 consistent';}
 function clearSrvLog(){var p=document.getElementById('srvLog');p.style.display='none';p.textContent='';}
 function toggleSrvFull(){var p=document.getElementById('srvLog'),b=document.getElementById('srvFullClose');var f=p.classList.toggle('full');b.style.display=f?'block':'none';}
 loadSrvLog();

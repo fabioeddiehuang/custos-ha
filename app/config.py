@@ -15,7 +15,7 @@ def rand_secret(n=16):
 # 管理 MySQL（独立容器，存配置/拓扑/切换历史/账号）
 # 默认库用户/密码/库名统一为 "ha"（compose 也以 ha 作为默认值）
 MGMT = dict(
-    host=env("MGMT_MYSQL_HOST", "192.168.1.88"),
+    host=env("MGMT_MYSQL_HOST", "192.0.2.88"),
     port=int(env("MGMT_MYSQL_PORT", 3306)),
     user=env("MGMT_MYSQL_USER", "ha"),
     password=env("MGMT_MYSQL_PASS", "ha"),
@@ -92,7 +92,7 @@ def get_mgmt_host():
 
 # 管理器对外 IP（裸机节点实际看到的【连接来源 IP】）。
 # 这是「运行管理器的服务端后台」的 IP —— 节点只允许该 IP 连入；
-# 它与「管理端自建的后台 MySQL（MGMT_MYSQL_HOST，如 192.168.1.88）」是**两回事**：
+# 它与「管理端自建的后台 MySQL（MGMT_MYSQL_HOST，如 192.0.2.88）」是**两回事**：
 # 管理库仅用于管理器自身存储，绝不作为集群节点、也绝不写入节点配置。
 # 生产环境强烈建议显式指定（docker 部署填运行 docker 那台宿主机的对外 IP，
 # 即节点看到的连接源 IP），避免 docker SNAT / 多网卡下自动探测到错误地址。

@@ -989,7 +989,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     if not vip:
         raise ValueError("请先在「集群管理」中为该集群设置 VIP（节点同网段空闲 IP）后再添加节点")
     if not _valid_vip(vip):
-        raise ValueError("集群 VIP 格式非法（%r），应为合法 IPv4，如 192.168.1.10" % vip)
+        raise ValueError("集群 VIP 格式非法（%r），应为合法 IPv4，如 192.0.2.10" % vip)
     vip_prefix = creds["vip_prefix"] or VIP_PREFIX
     interface = creds["interface"] or INTERFACE
     vrid = creds["vrid"] or VRID
@@ -1067,7 +1067,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     _write(kd / "keepalived.conf", keep_conf)
 
     # 3) ha_check.conf（仅含节点本地探活凭证 + 管理器服务端后台 IP；限制权限）
-    #    - 管理端后台 MySQL（MGMT_MYSQL_HOST，如 192.168.1.88）仅管理器自身存储使用，
+    #    - 管理端后台 MySQL（MGMT_MYSQL_HOST，如 192.0.2.88）仅管理器自身存储使用，
     #      绝不作为集群节点，也不写入此处（节点脚本不会、也不应回连管理库）。
     #    - MANAGER_IP 是「运行管理器的服务端后台」的 IP，节点只允许该 IP 连入；
     #      它与管理库 IP 是两回事，请勿混淆。

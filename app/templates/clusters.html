@@ -149,7 +149,7 @@
     <div class="body">
       <form method="post" action="/clusters" class="grid2">
         <label>集群名称<input name="name" placeholder="如 prod-bj" required></label>
-        <label>VIP 地址<input name="vip" placeholder="192.168.1.10"></label>
+        <label>VIP 地址<input name="vip" placeholder="192.0.2.10"></label>
         <label>VIP 掩码位<input name="vip_prefix" value="24" placeholder="24"><span class="hint">keepalived 虚拟 IP 的子网掩码位</span></label>
         <label>网卡<input name="interface" placeholder="eth0"></label>
         <label>VRID<input name="vrid" placeholder="51"></label>
@@ -185,7 +185,7 @@
     <div class="body">
       <form method="post" id="editForm" class="grid2">
         <label>集群名称<input name="name" id="ed_name" placeholder="如 prod-bj"></label>
-        <label>VIP 地址<input name="vip" id="ed_vip" placeholder="192.168.1.10"></label>
+        <label>VIP 地址<input name="vip" id="ed_vip" placeholder="192.0.2.10"></label>
         <label>VRID<input name="vrid" id="ed_vrid" placeholder="51"></label>
         <label>VIP 端口<input name="vip_port" id="ed_vip_port" type="number" min="1" max="65535" placeholder="3307"></label>
 

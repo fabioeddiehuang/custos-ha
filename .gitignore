@@ -6,3 +6,9 @@ venv/
 *.egg-info/
 .pytest_cache/
 .DS_Store
+
+# 集群备份产物（含业务数据 SQL 转储，切勿入库）
+backups/
+
+# 本地 compose 配置备份（含真实地址，切勿入库）
+docker-compose.yml.bak.*

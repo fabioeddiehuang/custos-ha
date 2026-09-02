@@ -40,7 +40,7 @@
 ┌─────────────── 节点 A ───────────────┐          │          ┌─────────────── 节点 B ───────────────┐
 │  mysql（端口 3307，GTID 主从）        │          │          │  mysql（端口 3307，GTID 主从）        │
 │  keepalived（vrrp，探测主/切 VIP）    │◄─ unicast ┼─ unicast►│  keepalived（vrrp，探测主/切 VIP）    │
-│  VIP 192.168.1.10/24（漂移）          │          │          │  VIP 192.168.1.10/24（漂移）          │
+│  VIP 192.0.2.10/24（漂移）          │          │          │  VIP 192.0.2.10/24（漂移）          │
 └──────────────────────────────────────┘          │          └──────────────────────────────────────┘
                                                   │
                                  业务连接统一走 VIP:3307（VIP 端口 = 节点 MySQL 端口，默认 3307，可配）
@@ -100,7 +100,7 @@ custos-ha/
 - 管理端机器：Linux + Docker + docker compose v2；
 - 每台节点机器：Linux + Docker + docker compose v2，且**节点机器到管理库 3306 端口网络可达**；
 - 一个**独立的外部管理 MySQL**（推荐），用户/密码/库名统一约定为 `ha`（也可自定义）；
-- 一个与节点同网段、**当前空闲**的 VIP（如 `192.168.1.10`），本工具无法自动探测，必须填写。
+- 一个与节点同网段、**当前空闲**的 VIP（如 `192.0.2.10`），本工具无法自动探测，必须填写。
 - 节点机器的 Docker 必须允许给容器附加 `NET_ADMIN` / `NET_BROADCAST` / **`NET_RAW`** 能力（`keepalived` 用原始套接字发 VRRP 通告，缺 `NET_RAW` 会报 `Cant send advert ... Operation not permitted` 并导致双主/split-brain）。节点 `docker-compose.yaml`（由 `app/node_assets` 渲染）已显式 `cap_add: - NET_RAW`。
 
 ---
@@ -120,7 +120,7 @@ cd custos-ha
 
 | 变量 | 说明 | 默认 |
 |------|------|------|
-| `MGMT_MYSQL_HOST` | 管理库可达 IP（**务必填外部库真实 IP，不要写 auto / 127.0.0.1**） | `192.168.1.88` |
+| `MGMT_MYSQL_HOST` | 管理库可达 IP（**务必填外部库真实 IP，不要写 auto / 127.0.0.1**） | `192.0.2.88` |
 | `MGMT_MYSQL_PORT` / `USER` / `PASS` / `DB` | 管理库连接 | `3306` / `ha` / `ha` / `ha` |
 | `WEB_PORT` | Web 端口 | `28888` |
 | `WEB_USER` / `WEB_PASS` | Web 登录（默认 `admin`/`admin`，生产务必修改） | `admin` / `admin` |

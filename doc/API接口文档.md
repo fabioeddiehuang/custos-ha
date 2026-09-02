@@ -198,19 +198,19 @@ curl -b ck.txt -X POST http://127.0.0.1:28888/api/refresh
 
 # 手动切换（指定提升目标）
 curl -b ck.txt -X POST http://127.0.0.1:28888/api/failover/to \
-  -d 'cluster_id=4&host=192.168.1.213&port=3306'
+  -d 'cluster_id=1&host=192.0.2.213&port=3306'
 
 # 复制自愈
 curl -b ck.txt -X POST http://127.0.0.1:28888/api/heal \
-  -d 'cluster_id=4&host=192.168.1.213&port=3306'
+  -d 'cluster_id=1&host=192.0.2.213&port=3306'
 
 # 下载节点凭证修复 SQL
 curl -b ck.txt -o node213.sql \
-  'http://127.0.0.1:28888/api/node_creds_sql?cluster_id=4&host=192.168.1.213&port=3306&download=1'
+  'http://127.0.0.1:28888/api/node_creds_sql?cluster_id=1&host=192.0.2.213&port=3306&download=1'
 
 # 在线终端执行 SQL
 curl -b ck.txt -X POST http://127.0.0.1:28888/api/term \
-  -d 'cluster_id=4&host=192.168.1.213&port=3306&sql=SHOW REPLICA STATUS'
+  -d 'cluster_id=1&host=192.0.2.213&port=3306&sql=SHOW REPLICA STATUS'
 
 # 开启延迟自动切换
 curl -b ck.txt -X POST http://127.0.0.1:28888/api/setting_set \

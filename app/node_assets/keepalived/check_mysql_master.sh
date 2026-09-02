@@ -109,7 +109,7 @@ if echo "$CM" | grep -qiE "ERROR|ACCESS DENIED|CAN'T CONNECT|UNKNOWN TABLE|TIMED
     CM=""
 fi
 # 本节点的「对外标识」：裸机场景本地探活走 127.0.0.1，但管理器写入的 current_master
-# 是节点注册用的真实 IP（如 192.168.1.203:33065），故以 NODE_IP 为主、LOCAL_HOST 兜底，
+# 是节点注册用的真实 IP（如 192.0.2.203:33065），故以 NODE_IP 为主、LOCAL_HOST 兜底，
 # 二者任一命中即视为「本机就是当前主库」，避免裸机节点永远拿不到 VIP。
 # 为兼容 current_master 可能不带端口（早期写入格式），同时按「IP 段」比较。
 MY_NODE="${NODE_IP:-$LOCAL_HOST}"
