@@ -19,10 +19,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 from urllib.parse import quote
 
-from .config import SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT
+from .config import (SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT, validate_config, hash_pwd, verify_pwd, FAILOVER_COOLDOWN_SEC)
 from .db import query, execute, get_conn, get_setting, upsert_setting
 from .state import get_current_master
-from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root
+from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root, _LAST_FAILOVER_TS
 from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
                        sync_node_creds, render_fix_node_creds_sql,
                        render_fix_node_creds_sql_mariadb)
@@ -153,6 +153,8 @@ try:
 except Exception:
     TEMPLATES.globals["APP_VERSION"] = ""
 serializer = URLSafeTimedSerializer(SECRET_KEY)
+# 启动期安全校验：SECRET_KEY 为默认值则拒绝加载（避免会话被伪造）
+validate_config()
 COOKIE = "ha_session"
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
@@ -161,8 +163,6 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")
 start_in_background()
 
 
-def hash_pwd(p):
-    return hashlib.sha256((p + SECRET_KEY).encode()).hexdigest()
 
 
 def auth_required(request: Request):
@@ -220,7 +220,8 @@ def _build_status_payload():
     jsonable_encoder 抛 500（函数内 try 捕获不到序列化阶段异常）。"""
     hosts = query(
         "SELECT h.host, h.port, h.cluster_id, h.role, h.status, h.is_current_master, "
-        "h.initial_role, h.repl_delay, h.slave_io, h.slave_sql, h.last_seen, h.err "
+        "h.initial_role, h.repl_delay, h.slave_io, h.slave_sql, h.last_seen, h.err, "
+        "h.semi_sync, h.semi_clients, h.semi_no_times, h.semi_no_tx, h.semi_yes_tx "
         "FROM hosts h ORDER BY h.id"
     )
     cms = {}
@@ -284,7 +285,7 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
                 row = c.fetchone()
         finally:
             conn.close()
-        if not row or row["password_hash"] != hash_pwd(password):
+        if not row or not verify_pwd(row["password_hash"], password):
             return render("login.html", request, error="用户名或密码错误")
     except Exception as e:
         return render("login.html", request, error=f"管理库错误: {e}")
@@ -310,7 +311,8 @@ def dashboard(request: Request, user=Depends(auth_required)):
             cid = cl["id"]
             hosts = query(
                 "SELECT h.host, h.port, h.role, h.status, h.is_current_master, h.initial_role, "
-                "h.repl_delay, h.slave_io, h.slave_sql, h.last_seen, h.err "
+                "h.repl_delay, h.slave_io, h.slave_sql, h.last_seen, h.err, "
+                "h.semi_sync, h.semi_clients, h.semi_no_times, h.semi_no_tx, h.semi_yes_tx "
                 "FROM hosts h WHERE h.cluster_id=%s ORDER BY h.id", (cid,)
             )
             cm = query("SELECT host, port FROM current_master WHERE cluster_id=%s", (cid,))
@@ -754,12 +756,33 @@ def api_heal(request: Request, user=Depends(auth_required),
         return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"})
 
 
+def _failover_cooldown_sec():
+    """故障切换冷却秒数：优先取运行时设置（Web / API 可即时调整），未设置则回退环境变量默认值。
+
+    与 monitor 的「延迟/压力自动切换」共用同一个 key，保证两条路径口径一致。
+    """
+    try:
+        v = get_setting("FAILOVER_COOLDOWN_SEC", "")
+        if v not in ("", None):
+            return int(v)
+    except (TypeError, ValueError):
+        pass
+    return FAILOVER_COOLDOWN_SEC
+
+
 @app.post("/api/failover")
 def api_failover(cluster_id: int = Form(...), user=Depends(auth_required)):
     try:
         run_once()  # 先按现状刷新，确保切换基于最新拓扑
     except Exception:
         pass
+    # 手动切换冷却：避免与刚发生的切换（自动或手动）在冷却期内重复触发
+    _last = _LAST_FAILOVER_TS.get(cluster_id, 0)
+    _cd = _failover_cooldown_sec()
+    if _time.time() - _last < _cd:
+        return JSONResponse({"ok": False,
+                             "msg": f"切换冷却中：距上次切换仅 {int(_time.time() - _last)}s"
+                                    f"（冷却 {_cd}s），请稍后再试"})
     try:
         ok = do_failover(cluster_id, "manual")
         msg = "已触发手动切换" if ok else "切换未执行(检查配置/日志)"
@@ -790,6 +813,13 @@ def api_failover_to(host: str = Form(...), port: int = Form(...),
         run_once()
     except Exception:
         pass
+    # 手动切换冷却：避免与刚发生的切换（自动或手动）在冷却期内重复触发
+    _last = _LAST_FAILOVER_TS.get(cid, 0)
+    _cd = _failover_cooldown_sec()
+    if _time.time() - _last < _cd:
+        return JSONResponse({"ok": False,
+                             "msg": f"切换冷却中：距上次切换仅 {int(_time.time() - _last)}s"
+                                    f"（冷却 {_cd}s），请稍后再试"})
     try:
         ok = do_failover_to(cid, host, int(port), "manual: 指定主库")
         msg = ("已将 %s:%s 设为主库" % (host, port)) if ok else "设置失败(确认节点在线且已配置账号)"
@@ -900,6 +930,7 @@ def api_node_resources(cluster_id: int = 0, host: str = "", port: int = 0,
             data_bytes = _val("SELECT SUM(DATA_LENGTH+INDEX_LENGTH) FROM information_schema.TABLES")
             queries = _val("SHOW GLOBAL STATUS LIKE 'Queries'")
             uptime = _val("SHOW GLOBAL STATUS LIKE 'Uptime'")
+            slow_q = _val("SHOW GLOBAL STATUS LIKE 'Slow_queries'")
             try:
                 conn_pct = round(int(connections) / int(max_conn) * 100, 1) if (connections and max_conn) else None
             except Exception:
@@ -923,6 +954,7 @@ def api_node_resources(cluster_id: int = 0, host: str = "", port: int = 0,
                 "buf_pct": buf_pct,
                 "data_bytes": int(data_bytes) if data_bytes else 0,
                 "qps": qps,
+                "slow_queries": int(slow_q) if slow_q is not None else 0,
             })
         finally:
             try:
@@ -1057,7 +1089,7 @@ def change_password(
         with conn.cursor() as c:
             c.execute("SELECT password_hash FROM users WHERE username=%s", (user,))
             row = c.fetchone()
-            if not row or row["password_hash"] != hash_pwd(current_password):
+            if not row or not verify_pwd(row["password_hash"], current_password):
                 return render("change_password.html", request, user=user,
                               msg="", error="当前密码错误")
             c.execute("UPDATE users SET password_hash=%s WHERE username=%s",
@@ -1339,11 +1371,34 @@ def _jsonable(v):
 _READONLY_RE = re.compile(r"^\s*(SELECT|SHOW|EXPLAIN|DESCRIBE|DESC|WITH|USE|HELP)\b", re.IGNORECASE)
 
 
+_ERR_TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2})?)')
+_ERR_LV_RE = re.compile(r'\[([A-Za-z]+)\]')
+def _parse_err_line(line):
+    """解析节点原始错误日志行，尽量抽出 (time, level, message)。"""
+    t = ""
+    m = _ERR_TS_RE.match(line)
+    if m:
+        t = m.group(1)
+    rest = line[m.end():].lstrip() if m else line
+    lv = ""
+    lm = _ERR_LV_RE.search(rest)
+    if lm:
+        lv = lm.group(1).upper()
+        msg = rest[lm.end():].lstrip()
+    else:
+        msg = rest
+    return t, lv, msg
+
+
 @app.post("/api/node_error_log")
 def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(...),
                        limit: int = Form(500), user=Depends(auth_required)):
-    """读取节点 MySQL 错误日志（mysql.error_log）。尽力而为：用节点 root 连入，
-    查 @@log_error 路径，尝试 LOAD_FILE 读取最近 limit 行；无 FILE 权限则降级返回路径提示。"""
+    """读取节点错误日志（mysql.error_log 优先，文件 LOAD_FILE 兜底）。
+
+    一级：错误日志表 mysql.error_log（MySQL 8.0 / MariaDB 均支持，纯 SELECT，
+    容器/裸机通用，无需 FILE 权限，也不受 secure_file_priv 限制）。
+    二级：原始错误日志文件（LOAD_FILE @@log_error），兼容未开启表日志的节点。
+    """
     try:
         port = int(port)
     except (TypeError, ValueError):
@@ -1358,24 +1413,58 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
         return JSONResponse({"ok": False, "error": "无法连接节点: " + str(e)})
     try:
         cur = conn.cursor()
-        cur.execute("SELECT @@log_error")
-        path = (cur.fetchone() or ("",))[0] or ""
-        lines = []
-        if path:
-            try:
-                cur.execute("SELECT LOAD_FILE(%s)", (path,))
-                blob = (cur.fetchone() or ("",))[0] or ""
-                # LOAD_FILE 返回 BLOB(bytes)：此前直接按 str 的 "\n" 分割会抛
-                # "a bytes-like object is required, not 'str'"，导致错误日志面板必然读失败。
-                if isinstance(blob, (bytes, bytearray)):
-                    blob = bytes(blob).decode("utf-8", "replace")
-                if blob:
-                    lines = [l for l in str(blob).split("\n") if l.strip()]
-                    lines = lines[-int(limit):]
-            except Exception as e2:
-                return JSONResponse({"ok": False, "path": path,
-                                      "error": "读取错误日志失败(可能无 FILE 权限): " + str(e2)})
-        return JSONResponse({"ok": True, "path": path, "lines": lines})
+        rows = []
+        source = None
+        # 一级：错误日志表 mysql.error_log（容器/裸机通用，纯 SELECT，不受 secure_file_priv 限制）
+        try:
+            cur.execute(
+                "SELECT COLUMN_NAME FROM information_schema.columns "
+                "WHERE table_schema='mysql' AND table_name='error_log'"
+            )
+            cols = {r[0].lower() for r in cur.fetchall()}
+            if "time" in cols and "message" in cols:
+                level_col = next((c for c in ("prio", "level", "priority") if c in cols), None)
+                sel = ("time, %s, message" % level_col) if level_col else "time, message"
+                cur.execute(
+                    "SELECT %s FROM mysql.error_log ORDER BY time DESC LIMIT %%s" % sel,
+                    (int(limit),),
+                )
+                for r in cur.fetchall():
+                    t = r[0]; lv = r[1] if level_col else ""; msg = r[-1]
+                    rows.append({"time": (str(t) if t is not None else ""),
+                                 "level": (lv or "").upper(),
+                                 "message": msg or ""})
+                if rows:
+                    source = "table"
+        except Exception:
+            rows = []
+            source = None
+        # 二级：原始错误日志文件（LOAD_FILE），兼容未开启表日志的节点
+        path = ""
+        if not rows:
+            cur.execute("SELECT @@log_error")
+            path = (cur.fetchone() or ("",))[0] or ""
+            if path:
+                try:
+                    cur.execute("SELECT LOAD_FILE(%s)", (path,))
+                    blob = (cur.fetchone() or ("",))[0] or ""
+                    if isinstance(blob, (bytes, bytearray)):
+                        blob = bytes(blob).decode("utf-8", "replace")
+                    if blob:
+                        lines = [l for l in str(blob).split("\n") if l.strip()]
+                        lines = lines[-int(limit):]
+                        for ln in reversed(lines):
+                            t, lv, msg = _parse_err_line(ln)
+                            rows.append({"time": t, "level": lv, "message": msg})
+                        source = "file"
+                except Exception as e2:
+                    return JSONResponse({"ok": False, "path": path,
+                                         "error": "读取错误日志失败(可能无 FILE 权限或 secure_file_priv 限制): " + str(e2)})
+        if not rows:
+            return JSONResponse({"ok": True, "source": source or "none", "rows": [],
+                                 "note": "该节点未开启错误日志表(mysql.error_log)，且无法读取错误日志文件"
+                                         "(LOAD_FILE 被 secure_file_priv 限制，或 log_error 指向 stdout)。"})
+        return JSONResponse({"ok": True, "source": source, "rows": rows})
     finally:
         conn.close()
 
@@ -2008,6 +2097,25 @@ def cluster_sync(cid: int, user=Depends(auth_required)):
 # 「custos-ha/」必须排在「custos/」之前，否则会被截断成 "-ha/generated_nodes/<ip>"。
 _DIR_PREFIXES = ("mysql-ha-manager/", "custos-ha/", "custos/")
 
+# 节点形态 → 中文标签（与 nodes.html 节点行徽标口径保持一致）
+_NODE_TYPE_LABEL = {
+    "docker": "Docker",
+    "mariadb": "MariaDB 裸机",
+    "mariadb-docker": "MariaDB 容器",
+}
+
+
+def _node_type_summary(nodes):
+    """按集群内【实际节点类型】汇总展示文案（如 "MariaDB 裸机×1 · MariaDB 容器×1"）。
+
+    混部集群（裸机 MariaDB + 容器 MariaDB，同 MariaDB 引擎族允许混部）下，
+    集群级 node_type 只是建集群时的默认值 / 加节点时的族校验基准，并非各节点真实形态。
+    组头若直接展示集群级 node_type，会让用户误以为集群内所有节点都是该形态。
+    """
+    from collections import Counter
+    cnt = Counter((n.get("node_type") or "docker") for n in nodes)
+    return " · ".join("%s×%d" % (_NODE_TYPE_LABEL.get(t, t), c) for t, c in cnt.most_common())
+
 
 @app.get("/nodes")
 def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", error: str = "",
@@ -2041,17 +2149,20 @@ def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", err
         cid = c["id"]
         if ac and cid != ac:      # 指定了集群筛选时只显示该集群
             continue
+        members = by_cid.get(cid, [])
         groups.append({
             "id": cid,
             "name": c.get("name") or f"集群{cid}",
             "node_type": c.get("node_type") or "docker",
+            "type_summary": _node_type_summary(members),
             "vip": c.get("vip") or "",
-            "nodes": by_cid.get(cid, []),
+            "nodes": members,
         })
     # 尚未归属任何集群的节点（历史数据）单独归到「未分配」
     orphans = by_cid.get(None, [])
     if orphans and not ac:
-        groups.append({"id": 0, "name": "未分配集群", "node_type": "", "vip": "", "nodes": orphans})
+        groups.append({"id": 0, "name": "未分配集群", "node_type": "",
+                       "type_summary": _node_type_summary(orphans), "vip": "", "nodes": orphans})
 
     return render("nodes.html", request, user=user, nodes=nodes, clusters=clusters,
                   groups=groups, creds=creds, cfg=cfg, active_cluster=ac, msg=msg, error=error)

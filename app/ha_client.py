@@ -32,12 +32,12 @@ from .mysql_compat import (detect_syntax, detect_flavour, flavour_from_node_type
                            start_replication_sql,
                            stop_replication_sql, reset_replica_sql, show_replica_status_sql,
                            default_auth_plugin, F_MYSQL8, F_MARIADB)
-from .config import get_manager_public_ip
+from .config import get_manager_public_ip, SEMI_SYNC
 
 
 # 可安全做「空事务跳过」的复制错误码集合（均为幂等类冲突：对象/记录已存在或已不存在，
 # 说明该事务的效果在当前节点实际上已经完成，跳过不会造成数据丢失）。
-_SKIPPABLE_SQL_ERRNOS = frozenset({1007, 1050, 1061, 1062, 1396, 1032, 1146})
+_SKIPPABLE_SQL_ERRNOS = frozenset({1007, 1050, 1061, 1062, 1396, 1032, 1146, 1133})
 
 
 def _tiny_sleep(seconds=0.3):
@@ -59,6 +59,47 @@ def _one_dict(cur):
     cols = [d[0] for d in cur.description]
     row = cur.fetchone()
     return dict(zip(cols, row)) if row else None
+
+
+def _derive_stuck_gtid(cur, syntax):
+    """从 SHOW REPLICA STATUS 的 Retrieved/Executed GTID 集合推导当前卡住的事务 GTID。
+
+    仅当存在「已接收但未执行」的事务时有效，返回 MariaDB GTID 格式 'domain-server-seq'。
+    MySQL 8.0 的 uuid:seq 格式不在本函数范围（其错误文本通常已含 GTID，由上层正则捕获）。
+    """
+    cur.execute(show_replica_status_sql(syntax))
+    row = _one_dict(cur)
+    if not row:
+        return None
+    r = row.get("Retrieved_Gtid_Set") or ""
+    e = row.get("Executed_Gtid_Set") or ""
+
+    def _parse(s):
+        d = {}
+        for part in s.split(","):
+            part = part.strip()
+            if not part or "-" not in part:
+                continue
+            dom, rest = part.split("-", 1)
+            sid, seqs = rest.split("-", 1)
+            try:
+                seq = max(int(x) for x in seqs.split(":"))
+                d[int(dom)] = (int(sid), seq)
+            except (ValueError, TypeError):
+                continue
+        return d
+
+    rd, ed = _parse(r), _parse(e)
+    cands = []
+    for dom, (sid, rseq) in rd.items():
+        eseq = ed.get(dom, (None, 0))[1]
+        if rseq > eseq:
+            cands.append((dom, sid, eseq + 1))
+    if not cands:
+        return None
+    cands.sort()
+    dom, sid, nxt = cands[0]
+    return "%d-%d-%d" % (dom, sid, nxt)
 
 
 def heal_replication(host, port, user, password, root_user="root", root_pass=""):
@@ -143,17 +184,57 @@ def heal_replication(host, port, user, password, root_user="root", root_pass="")
                     return False, str(e)
                 _tiny_sleep()
                 continue
-            # 非 GTID 自动定位，或无法解析具体 GTID：用 sql_slave_skip_counter 跳过。
-            # 兼容传统 binlog 坐标复制，避免 SET GTID_NEXT 不生效导致自愈失败、复制卡死。
+            # ---- 1133：复制重放 DCL（GRANT/REVOKE）时目标账号在从库不存在 ----
+            # MariaDB 多域 GTID 下 sql_slave_skip_counter 被禁（错误 1966），且错误文本不含事务
+            # GTID，无法走空事务注入。最稳妥：在从库补建该账号，重放即成功、复制继续，零数据丢失；
+            # 账号后续由 ensure_ha_creds 校正密码/权限。
+            if last_code == 1133:
+                uh = re.search(r"TO\s+'?([^'@\s]+)'?\s*@\s*'?'?([^'\s,)]+)", last_err) \
+                     or re.search(r"FROM\s+'?([^'@\s]+)'?\s*@\s*'?'?([^'\s,)]+)", last_err)
+                if uh:
+                    cu, ch = uh.group(1), uh.group(2)
+                    try:
+                        cur.execute(stop_replication_sql(syntax))
+                        cur.execute("CREATE USER IF NOT EXISTS '%s'@'%s'" % (_esc_sql(cu), _esc_sql(ch)))
+                        cur.execute(start_replication_sql(syntax))
+                        skipped.append("create_user:%s@%s" % (cu, ch))
+                        _tiny_sleep()
+                        continue
+                    except Exception as e:
+                        return False, f"1133 补建账号失败({cu}@{ch}): {e}"
+                # 解析不到账号则落到下方 1966 兜底（空事务跳过该事务）
             if last_code and last_code not in _SKIPPABLE_SQL_ERRNOS and not m:
                 return False, f"复制错误码 {last_code} 非幂等冲突，需人工处理：{last_err}"
+            # 非 GTID 自动定位，或无法解析具体 GTID：用 sql_slave_skip_counter 跳过。
+            # 兼容传统 binlog 坐标复制，避免 SET GTID_NEXT 不生效导致自愈失败、复制卡死。
             try:
                 cur.execute(stop_replication_sql(syntax))
                 cur.execute("SET GLOBAL sql_slave_skip_counter = 1")
                 cur.execute(start_replication_sql(syntax))
                 skipped.append("skip_counter")
             except Exception as e:
-                return False, f"跳过冲突事务失败(sql_slave_skip_counter): {e}"
+                em = str(e)
+                # MariaDB 多域 GTID：sql_slave_skip_counter 被禁（错误 1966）——改用「空事务注入」
+                # 跳过卡住的事务：从 SHOW REPLICA STATUS 的 Retrieved/Executed GTID 集合推导其 GTID。
+                if "1966" in em and auto_pos == 1:
+                    try:
+                        gx = _derive_stuck_gtid(cur, syntax)
+                    except Exception:
+                        gx = None
+                    if gx:
+                        try:
+                            cur.execute("SET GTID_NEXT='%s'" % gx)
+                            cur.execute("BEGIN")
+                            cur.execute("COMMIT")
+                            cur.execute("SET GTID_NEXT='AUTOMATIC'")
+                            cur.execute(start_replication_sql(syntax))
+                            skipped.append("gtid:%s" % gx)
+                            _tiny_sleep()
+                            continue
+                        except Exception as e2:
+                            return False, f"空事务跳过失败({gx}): {e2}"
+                    return False, f"多域GTID无法跳过(1966)且无可用GTID: {em}"
+                return False, f"跳过冲突事务失败(sql_slave_skip_counter): {em}"
             _tiny_sleep()
         return False, (f"跳过冲突事务次数过多（>200，含 {', '.join(skipped)}），"
                        f"可能存在结构性冲突，需人工处理")
@@ -819,6 +900,10 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
         connections=None, threads_running=None, qps=None,
         # 压力代理指标（宿主机资源在远程节点上拿不到，改用 MySQL 侧压力信号）
         row_lock_waits=None, slow_queries=None,
+        # 半同步复制健康指标（SEMI_SYNC=0 时变量恒为 OFF，不影响核心探活）
+        semi_master_status=None, semi_slave_status=None,
+        semi_master_clients=None, semi_no_times=None,
+        semi_no_tx=None, semi_yes_tx=None,
     )
     try:
         conn = connect_robust(host, port, user, password, root_user, root_pass, timeout=timeout)
@@ -860,6 +945,23 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
                 result["role"] = result.get("role") or "master"
                 result["slave_io"] = None
                 result["slave_sql"] = None
+        except Exception:
+            pass
+        # 半同步复制健康指标（与复制探测同级；SEMI_SYNC 关闭时变量恒为 OFF，不告警）
+        try:
+            cur.execute("SHOW GLOBAL STATUS LIKE 'Rpl_semi_sync%'")
+            ss = dict(cur.fetchall())
+            def _si(k):
+                try:
+                    return int(ss.get(k) or 0)
+                except Exception:
+                    return None
+            result["semi_master_status"] = ss.get("Rpl_semi_sync_master_status")
+            result["semi_slave_status"] = ss.get("Rpl_semi_sync_slave_status")
+            result["semi_master_clients"] = _si("Rpl_semi_sync_master_clients")
+            result["semi_no_times"] = _si("Rpl_semi_sync_master_no_times")
+            result["semi_no_tx"] = _si("Rpl_semi_sync_master_no_tx")
+            result["semi_yes_tx"] = _si("Rpl_semi_sync_master_yes_tx")
         except Exception:
             pass
         # 轻量采集实时运行指标（供观测中心趋势图使用）。
@@ -952,6 +1054,10 @@ def promote_to_master(host, port, user, password, root_user="root", root_pass=""
     try:
         cur = conn.cursor()
         syntax = detect_syntax(cur)
+        try:
+            enable_semisync(cur, detect_flavour(cur))
+        except Exception:
+            pass
         # 只读快检：不产生任何写盘 / 不进 binlog
         try:
             cur.execute("SELECT @@GLOBAL.read_only")
@@ -1025,6 +1131,63 @@ def _local_state_self_master(cur, host, port):
     return _addr_eq(rec, host, port), rec
 
 
+def enable_semisync(cur, flavour):
+    """在节点上启用半同步复制（仅当 SEMI_SYNC=1 时生效，否则直接返回，零开销）。
+
+    半同步把「主库提交」改为等待至少一个从库 ACK，从而把故障切换时的数据丢失窗口
+    从「已提交但未复制到任何从库」压缩到接近 0（仍需至少一个从库存活且在
+    rpl_semi_sync_master_timeout 内 ACK，否则退化为异步）。
+
+    实现为运行时启用（INSTALL PLUGIN + SET GLOBAL），覆盖存量与新建节点
+    （节点经 manager 的 ensure_ha_creds / make_slave_of / promote_to_master 时触发）；
+    不写 my.cnf，避免插件缺失导致节点启动失败。
+
+    幂等且容错：插件已安装 / 变量已设置 / 插件文件缺失 均忽略报错，仅告警，
+    绝不中断主流程（失败即退化为异步，不影响复制建立）。
+    MySQL 与 MariaDB 的插件名、变量名不同，按风味分派。
+    """
+    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
+        return
+    try:
+        if flavour == F_MARIADB:
+            plugins = (("semisync_master", "semisync_master"),
+                       ("semisync_slave", "semisync_slave"))
+            sets = [
+                "SET GLOBAL rpl_semi_sync_master_enabled=1",
+                "SET GLOBAL rpl_semi_sync_slave_enabled=1",
+                "SET GLOBAL rpl_semi_sync_master_timeout=10000",
+                # 无损半同步：主库先等从库 ACK 再提交（MariaDB 12.x 无 wait_for_slave_count 变量，
+                # 默认即等待至少 1 个从库 ACK，等价于 MySQL 的 wait_for_slave_count=1）
+                "SET GLOBAL rpl_semi_sync_master_wait_point=AFTER_SYNC",
+            ]
+        else:
+            plugins = (("rpl_semi_sync_master", "semisync_master"),
+                       ("rpl_semi_sync_slave", "semisync_slave"))
+            sets = [
+                "SET GLOBAL rpl_semi_sync_master_enabled=1",
+                "SET GLOBAL rpl_semi_sync_slave_enabled=1",
+                "SET GLOBAL rpl_semi_sync_master_timeout=10000",
+                "SET GLOBAL rpl_semi_sync_master_wait_for_slave_count=1",
+                "SET GLOBAL rpl_semi_sync_master_wait_point=AFTER_SYNC",
+            ]
+        for pname, soname in plugins:
+            try:
+                cur.execute("INSTALL PLUGIN %s SONAME '%s.so'" % (pname, soname))
+            except Exception as e:
+                _m = str(e).lower()
+                if "already" in _m or "1125" in _m or "1060" in _m or "1286" in _m:
+                    pass  # 已安装 / 插件文件缺失(1286) / 平台不支持(1125)：忽略
+                else:
+                    print(f"[semisync] INSTALL PLUGIN {pname} 失败(可忽略): {e}")
+        for s in sets:
+            try:
+                cur.execute(s)
+            except Exception as e:
+                print(f"[semisync] {s} 失败(可忽略): {e}")
+    except Exception as e:
+        print(f"[semisync] 启用半同步失败(可忽略): {e}")
+
+
 def make_slave_of(host, port, user, password, master_host, master_port,
                   repl_user, repl_pass, root_user="root", root_pass=""):
     """把本节点改造为 master_host 的从库（GTID 自动定位）。
@@ -1044,6 +1207,10 @@ def make_slave_of(host, port, user, password, master_host, master_port,
     try:
         cur = conn.cursor()
         flavour = detect_flavour(cur)
+        try:
+            enable_semisync(cur, flavour)
+        except Exception:
+            pass
         # ---- VIP 守卫（必须先于任何复制改动执行）----
         # ha_local.state 是 keepalived 检查脚本判定 VIP 归属的**唯一**依据。若本节点该表
         # 记录的 current_master 指向自己，说明 VIP 正绑在本机、业务正在经 VIP 写它。
@@ -1662,6 +1829,10 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             flavour = detect_flavour(cur)
         except Exception:
             flavour = F_MYSQL8
+        try:
+            enable_semisync(cur, flavour)
+        except Exception:
+            pass
         # 认证插件：MySQL >= 8.0.34 用 caching_sha2_password，消除
         # "[MY-013360] mysql_native_password is deprecated" 告警（8.4 起该插件默认不可用）。
         # MariaDB 始终用自带的 mysql_native_password（无废弃问题）。
@@ -1751,10 +1922,32 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         #  - READ_ONLY ADMIN：MariaDB 10.11+ / MySQL 8.0 需要，提升主库时关 read_only 用。
         #  - BINLOG ADMIN：MariaDB 10.5+ 需要，写 ha_local.state 前关闭会话 binlog 用。
         #    （对 MySQL 8.0 不存在该权限，GRANT 会失败但已被 except 吞掉，无副作用。）
-        for extra in ("CREATE USER", "READ_ONLY ADMIN", "BINLOG ADMIN"):
+        # 账号 DCL（CREATE USER / GRANT）绝不参与复制：节点级账号由各节点独立授予
+        # （管理器逐节点直连写入），若经 binlog 复制到从库，从库上被 GRANT 的精确 host 账号
+        # （如 ha_monitor@<manager_ip>）往往不存在，重放即报 1133
+        # 「Can't find any matching row in the user table」→ SQL 线程卡死。
+        # 故此处关会话 binlog，避免把该 GRANT 复制下去（从库由管理器直连单独授予）。
+        _binlog_off = False
+        try:
+            cur.execute("SET SESSION sql_log_bin=0")
+            _binlog_off = True
+        except Exception:
+            pass  # 缺 BINLOG ADMIN/SUPER（如 ha_monitor 首跑尚未获得）时跳过，由复制自愈兜底
+        for extra in ("CREATE USER", "READ_ONLY ADMIN", "BINLOG ADMIN", "REPLICATION MASTER ADMIN"):
+            # 同时授予 @'%' 与管理器实际连入用的 @manager_ip 账号（精确 host 优先匹配，
+            # 管理器大多以 ha_monitor@<manager_ip> 连入，缺 REPLICATION MASTER ADMIN 会导致
+            # enable_semisync 的 SET GLOBAL rpl_semi_sync_master_* 报 Access Denied）。
+            for _h in ("%", manager_ip):
+                if not _h:
+                    continue
+                try:
+                    if extra.upper() not in _granted_privs(cur, ha_user, _h):
+                        cur.execute("GRANT %s ON *.* TO '%s'@'%s'" % (extra, _esc_sql(ha_user), _h))
+                except Exception:
+                    pass
+        if _binlog_off:
             try:
-                if extra.upper() not in _granted_privs(cur, ha_user, "%"):
-                    cur.execute("GRANT %s ON *.* TO '%s'@'%%'" % (extra, _esc_sql(ha_user)))
+                cur.execute("SET SESSION sql_log_bin=1")
             except Exception:
                 pass
         # 节点本地状态库 ha_local 的读写授权（见 _ensure_local_state_grant 说明）
@@ -1801,3 +1994,4 @@ def ensure_ha_creds(host, port, root_user, root_pass,
     except Exception:
         pass
     return True, "ok (via %s)" % used
+      

@@ -62,12 +62,21 @@ def _update_host(h, st, is_master=False):
     delay = st["seconds_behind"]
     s_io = st["slave_io"]
     s_sql = st["slave_sql"]
+    # 节点半同步状态：主库看 master_status，从库看 slave_status
+    semi = st.get("semi_master_status") if is_master else st.get("semi_slave_status")
+    semi_clients = st.get("semi_master_clients")
+    semi_no_times = st.get("semi_no_times")
+    semi_no_tx = st.get("semi_no_tx")
+    semi_yes_tx = st.get("semi_yes_tx")
 
     # 与库中当前值逐字段比对，全部一致则视为「无变化」
     changed = not (
         _same(status, h.get("status")) and _same(role, h.get("role"))
         and _same(delay, h.get("repl_delay")) and _same(s_io, h.get("slave_io"))
         and _same(s_sql, h.get("slave_sql")) and _same(err, h.get("err"))
+        and _same(semi, h.get("semi_sync")) and _same(semi_clients, h.get("semi_clients"))
+        and _same(semi_no_times, h.get("semi_no_times")) and _same(semi_no_tx, h.get("semi_no_tx"))
+        and _same(semi_yes_tx, h.get("semi_yes_tx"))
     )
 
     hb_due = False
@@ -83,23 +92,27 @@ def _update_host(h, st, is_master=False):
     if hb_due:
         execute(
             """UPDATE hosts SET status=%s, role=%s, repl_delay=%s, slave_io=%s, slave_sql=%s,
-               err=%s, last_seen=NOW() WHERE cluster_id=%s AND host=%s AND port=%s""",
+               err=%s, semi_sync=%s, semi_clients=%s, semi_no_times=%s, semi_no_tx=%s,
+               semi_yes_tx=%s, last_seen=NOW() WHERE cluster_id=%s AND host=%s AND port=%s""",
             (status, role, delay, s_io, s_sql, err,
+             semi, semi_clients, semi_no_times, semi_no_tx, semi_yes_tx,
              h["cluster_id"], h["host"], int(h["port"])),
         )
     else:
         execute(
             """UPDATE hosts SET status=%s, role=%s, repl_delay=%s, slave_io=%s, slave_sql=%s,
-               err=%s WHERE cluster_id=%s AND host=%s AND port=%s""",
+               err=%s, semi_sync=%s, semi_clients=%s, semi_no_times=%s, semi_no_tx=%s,
+               semi_yes_tx=%s WHERE cluster_id=%s AND host=%s AND port=%s""",
             (status, role, delay, s_io, s_sql, err,
+             semi, semi_clients, semi_no_times, semi_no_tx, semi_yes_tx,
              h["cluster_id"], h["host"], int(h["port"])),
         )
 
 
-def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, cluster_id):
+def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, cluster_id, semi=None):
     """根据与上一次观测的差异发送告警，仅在状态跃迁时触发（避免刷屏）。"""
     prev = _PREV.get(key)
-    _PREV[key] = dict(status=status, is_master=is_master, repl_ok=repl_ok, delay=delay)
+    _PREV[key] = dict(status=status, is_master=is_master, repl_ok=repl_ok, delay=delay, semi=semi)
     if prev is None:
         return  # 首次观测只建立基线，不告警
     host = f"{key[0]}:{key[1]}"
@@ -124,6 +137,22 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
             if crossed:
                 send_alert("复制延迟过高", f"{tag}节点 {host} 复制延迟 {delay}s，已超过阈值 {REPL_LAG_ALERT_SEC}s。",
                            cluster_id=cluster_id)
+        # 4) 半同步退化（RPO 风险）：主库 master_status / 从库 slave_status 由 ON 变非 ON
+        if semi is not None and prev.get("semi") is not None and prev["semi"] == "ON" and semi != "ON":
+            if is_master:
+                send_alert("半同步退化(异步)",
+                           f"{tag}主库 {host} 已退化为异步复制（半同步 master_status=OFF）。此期间提交的事务不等待从库 ACK，"
+                           f"存在故障切换后数据丢失(RPO)风险。请检查从库连通性与 Slave_IO 线程、rpl_semi_sync_master_timeout。",
+                           cluster_id=cluster_id)
+            else:
+                send_alert("半同步降级",
+                           f"{tag}从库 {host} 未处于半同步态（slave_status=OFF）。若该从库被提升为主库，可能缺失主库已提交事务。",
+                           cluster_id=cluster_id)
+        # 5) 半同步恢复：由非 ON 回到 ON
+        if semi is not None and prev.get("semi") is not None and prev["semi"] != "ON" and semi == "ON":
+            send_alert("半同步恢复",
+                       f"{tag}节点 {host} 半同步已恢复（status=ON），数据丢失(RPO)风险解除。",
+                       cluster_id=cluster_id)
     except Exception as e:
         print(f"[monitor] 发送告警失败(可忽略): {e}")
 
@@ -284,7 +313,8 @@ def _probe_all():
         cur_key = (cur_h, int(cur_p)) if cur_h else None
         # 一并把「待比对」的当前值查出来：_update_host 需要它们做变更检测（空闲时不写库）
         hosts = query(
-            "SELECT host, port, cluster_id, status, role, repl_delay, slave_io, slave_sql, err "
+            "SELECT host, port, cluster_id, status, role, repl_delay, slave_io, slave_sql, err, "
+            "semi_sync, semi_clients, semi_no_times, semi_no_tx, semi_yes_tx "
             "FROM hosts WHERE cluster_id=%s", (cid,))
         for h in hosts:
             # 兼容历史数据：hosts.port 可能为 NULL/非法，跳过避免 int() 崩溃
@@ -320,6 +350,8 @@ def _probe_all():
             # 自愈分支（heal_replication / heal_io_gtid_gap），避免「切换后 SQL 线程停却
             # 不自愈、复制永久断流」的 bug。
             is_master = ((host, port) == cur_key) and (st.get("mode") != "slave")
+            # 节点半同步状态：主库看 master_status，从库看 slave_status
+            semi = st.get("semi_master_status") if is_master else st.get("semi_slave_status")
             _update_host({"host": host, "port": port, "cluster_id": cid}, st, is_master)
             # 连续失败计数（用于阈值触发自动切换）
             f = run_once._fails.setdefault(cid, {})
@@ -330,7 +362,7 @@ def _probe_all():
             # 复制是否正常（主库无复制通道，视为主库自身即「正常」）
             repl_ok = is_master or (st.get("slave_io") == "Yes" and st.get("slave_sql") == "Yes")
             _alert_on_transition(key, "up" if st["alive"] else "down", is_master, repl_ok,
-                                 st.get("seconds_behind"), cluster_name, cid)
+                                 st.get("seconds_behind"), cluster_name, cid, semi)
             cache_by_cid[cid][key] = (st, is_master)
     # 仅覆盖已探活集群的缓存（未配置账号的集群保留上一次结果，避免误自愈）
     for cid, cache in cache_by_cid.items():
@@ -536,7 +568,7 @@ def _auto_switch_on_lag_or_pressure(cid, cluster_name, cache):
     cycles = max(1, _int_setting("LAG_FAILOVER_CYCLES", 3))
     prs_threads = _int_setting("PRESSURE_THREADS_RUNNING", 50)
     prs_locks = _int_setting("PRESSURE_ROW_LOCK_WAITS", 50)
-    cooldown = _int_setting("FAILOVER_COOLDOWN_SEC", 600)
+    cooldown = _int_setting("FAILOVER_COOLDOWN_SEC", 120)
 
     now = time.time()
     if now - _LAST_AUTO_SWITCH.get(cid, 0.0) < cooldown:

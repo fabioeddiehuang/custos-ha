@@ -89,7 +89,7 @@
     <table class="tbl" style="margin-top:14px">
       <thead>
         <tr>
-          <th>主机</th><th>角色</th><th>状态</th><th>复制延迟</th><th>IO 线程</th><th>SQL 线程</th><th>最后心跳</th><th>操作</th>
+          <th>主机</th><th>角色</th><th>状态</th><th>复制延迟</th><th>IO 线程</th><th>SQL 线程</th><th>半同步</th><th>最后心跳</th><th>操作</th>
         </tr>
       </thead>
       <tbody>
@@ -108,6 +108,7 @@
           <td data-f="delay">{% if h.repl_delay is not none %}{{ h.repl_delay }}s{% else %}—{% endif %}</td>
           <td data-f="io"{% if h.slave_io and h.slave_io != 'Yes' %} class="repl-bad" title="{{ h.err or '' }}"{% endif %}>{{ h.slave_io or '—' }}</td>
           <td data-f="sql"{% if h.slave_sql and h.slave_sql != 'Yes' %} class="repl-bad" title="{{ h.err or '' }}"{% endif %}>{{ h.slave_sql or '—' }}</td>
+          <td data-f="semi">{{ h.semi_sync or '—' }}</td>
           <td>{{ h.last_seen or '—' }}</td>
           <td>
             {% if (h.host ~ ':' ~ h.port) != c.current_master %}
@@ -168,7 +169,7 @@
       <div class="obs-kpi" id="trendKpi"></div>
       <div class="trend-wrap">
         <svg class="trend-svg" id="trendSvg" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
-        <div class="trend-empty" id="trendEmpty" hidden>暂无数据</div>
+        <!-- 运行趋势无数据时不再显示「暂无数据」 -->
       </div>
     </div>
 
@@ -340,6 +341,30 @@
                         isMaster ? '当前主库，无复制从线程' : h.err);
           setThreadCell(tr.querySelector('[data-f="sql"]'), isMaster ? null : h.slave_sql,
                         isMaster ? '当前主库，无复制从线程' : h.err);
+          // 半同步复制健康徽标（采集自 hosts.semi_sync；ON=无损半同步，OFF=已退化为异步）
+          var sc = tr.querySelector('[data-f="semi"]');
+          if (sc) {
+            var sv = h.semi_sync;
+            if (sv === 'ON') {
+              sc.style.color = '#2ecc71';
+              if (isMaster) {
+                var tip = '无损半同步已生效：已提交事务会等待从库 ACK';
+                if (h.semi_clients != null) tip += '；半同步从库数 ' + h.semi_clients;
+                if (h.semi_yes_tx != null) tip += '；正常半同步提交 ' + h.semi_yes_tx + ' 笔';
+                if (h.semi_no_times != null) tip += '；历史退化 ' + h.semi_no_times + ' 次 / ' + h.semi_no_tx + ' 笔异步';
+                sc.title = tip;
+              } else {
+                sc.title = '从库半同步已生效：主库提交会等待本节点 ACK（无损），故障切换不丢数据';
+              }
+            } else if (sv === 'OFF') {
+              sc.style.color = '#e74c3c';
+              sc.title = isMaster ? '半同步已退化(异步)：存在故障切换数据丢失(RPO)风险' : '从库未处于半同步态：被提升后可能缺失已提交事务';
+            } else {
+              sc.style.color = '';
+              sc.title = '未采集（SEMI_SYNC 未开启或非半同步架构）';
+            }
+            sc.textContent = sv || '—';
+          }
         });
         // 各集群统计 + KPI + 最大延迟
         var byCid = {};
@@ -395,7 +420,7 @@
     var items = [
       { k:"连接", v:(d.connections!=null?d.connections:"—")+(d.max_connections!=null?" / "+d.max_connections:""), pct:d.conn_pct, c:"#38bdf8" },
       { k:"内存(缓冲池)", v:fmtGB(d.buf_size), pct:d.buf_pct, c:"#E11D74" },
-      { k:"磁盘(数据量)", v:fmtGB(d.data_bytes), pct:null, c:"#34d399" },
+      { k:"慢查询(累计)", v:(d.slow_queries!=null?d.slow_queries:"—"), pct:null, c:"#34d399" },
       { k:"负载(QPS)", v:(d.qps!=null?d.qps:"—"), pct:(d.qps!=null?Math.min(100, d.qps/10):null), c:"#fbbf24" },
     ];
     return items.map(function(it){
@@ -674,13 +699,27 @@
           return;
         }
         var okCount = rows.length - bad.length;
+        function normVal(v) {
+          if (v === null || v === undefined || v === "") return "—";
+          var s = String(v).toLowerCase();
+          if (s === "1" || s === "on" || s === "yes") return "ON (开启/1)";
+          if (s === "0" || s === "off" || s === "no") return "OFF (关闭/0)";
+          return v;
+        }
+        var VARDESC = {
+          "read_only": "只读模式", "sync_binlog": "同步binlog",
+          "innodb_flush_log_at_trx_commit": "事务提交刷盘策略",
+          "gtid_mode": "GTID 模式", "enforce_gtid_consistency": "GTID 一致性",
+          "rpl_semi_sync_master_enabled": "主库半同步", "rpl_semi_sync_slave_enabled": "从库半同步"
+        };
         body.innerHTML = bad.map(function (r) {
+          var vn = r.var_name || "";
           return '<div class="drift-item">'
             + '<div><span class="drift-node">' + esc(r.host + ":" + (r.port || "")) + '</span>'
-            + '<span class="drift-var">' + esc(r.var_name || "") + '</span></div>'
-            + '<div class="drift-line"><span class="drift-exp">期望 ' + esc(r.expected || "") + '</span>'
+            + '<span class="drift-var" title="' + esc(VARDESC[vn] || "") + '">' + esc(VARDESC[vn] || vn) + '</span></div>'
+            + '<div class="drift-line"><span class="drift-exp">期望 ' + esc(normVal(r.expected)) + '</span>'
             + '<span class="drift-arrow">→</span>'
-            + '<span class="drift-act">实际 ' + esc(r.actual || "") + '</span></div>'
+            + '<span class="drift-act">实际 ' + esc(normVal(r.actual)) + '</span></div>'
             + '</div>';
         }).join("") + '<div class="drift-foot">其余 ' + okCount + ' 项一致</div>';
       })
@@ -712,7 +751,13 @@
   function collectNow(target) {
     fetch("/api/collect", { method: "POST", cache: "no-store", credentials: "same-origin",
       headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "target=" + target })
-      .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { return null; } }); })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          var d = null; try { d = JSON.parse(t); } catch (e) { d = null; }
+          if (!r.ok) throw { status: r.status, data: d, text: t };
+          return d;
+        });
+      })
       .then(function (d) {
         if (d && d.ok) {
           alert("已提交，后台采集中，稍候自动刷新…");
@@ -721,7 +766,11 @@
           alert("采集失败: " + ((d && d.error) || "未知错误"));
         }
       })
-      .catch(function (e) { alert("采集请求异常: " + e.message); });
+      .catch(function (e) {
+        var msg = (e && e.status) ? ("HTTP " + e.status + (e.data && e.data.error ? "：" + e.data.error : ""))
+                                   : ("网络异常：" + (e && e.message ? e.message : e));
+        alert("采集请求异常: " + msg);
+      });
   }
   // 集群操作（设为主库 / 修复复制）
   function apiPostForm(url, body, cb) {

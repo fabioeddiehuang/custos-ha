@@ -1,8 +1,26 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> 当前版本：**v2.2.15**（镜像标签 `custos:v2.2.15`，keepalived 镜像 `custos-node:v2.2.15`）
+> 当前版本：**v2.2.17**（镜像标签 `custos:v2.2.16`，keepalived 镜像 `custos-node:v2.2.16`）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
 > 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
+
+---
+
+## 〇、v2.2.17 错误日志面板兼容全部部署形态（MySQL/MariaDB 裸机/docker）
+
+- **问题**：「24 小时错误日志」面板此前仅用 `LOAD_FILE(@@log_error)` 读节点错误日志文件；容器化 MariaDB/MySQL 多将日志写 stdout 或受 `secure_file_priv` 限制，导致面板恒空，复制错误(如 1133)看不到。
+- **修复**：
+  - 管理器接口改为「`mysql.error_log` 表优先（纯 SELECT，容器/裸机通用，不受 secure_file_priv 限制）→ 文件 LOAD_FILE 兜底」，返回结构化 `rows{time,level,message}` + `source`。
+  - MySQL 8.0 docker 节点 `ha-overrides.cnf` 启用 `log_error_services=...;log_sink_table`，错误日志落 `mysql.error_log` 表。
+  - MariaDB docker 节点放开 `secure_file_priv=''`，保证文件日志 `LOAD_FILE` 可读（兜底）。
+  - 前端按 `rows` 渲染时间/级别/消息，并标注来源（表/文件）。
+- **生效**：重建管理器（`./deploy.sh`）；MySQL8 docker 节点需重新生成并部署以获取表错误日志配置。
+
+## 〇、v2.2.16 裸机包只适配裸机（移除容器回退脚本）
+
+- **问题**：裸机（`mariadb`）节点生成目录曾一并交付 `Install-mariadb-docker-Node.sh`，供 glibc 过低装不上 tarball 时改跑容器。该脚本把**裸机完整 `my.cnf`**（仅剔除 `datadir`/`socket`/`pid_file`）喂给官方镜像容器，残留裸机专属参数 —— 典型如**缺失 `log_error`**（官方镜像默认写 stdout、`@@log_error` 为空，导致管理器「错误日志」面板恒为空）与 `innodb_buffer_pool_size=1G`，致使容器 MariaDB 与裸机主从不能正确适配；且部署机制分裂为「`docker run --network host` + keepalived-only compose」，与 `mariadb-docker` 的纯 compose 形成两条并存路径，必然再次漂移。
+- **另一后果**：节点库里 `node_type=mariadb` 而实际运行容器，导致 UI 徽标显示「MariaDB 裸机」、卸载脚本与数据目录指引与真实形态全部不符。
+- **修复**：裸机节点目录**不再交付**该回退脚本，脚本文件从 `app/node_assets` 移除（如需恢复可从 git 历史取回）。需要容器化时**创建节点直接选 `mariadb-docker`** —— `node_family` 本就允许两种 MariaDB 形态同集群混部，且数据目录同为 `/data/custos-ha/mariadb12`，既有回退安装可**无损迁移**到纯 compose。
 
 ---
 

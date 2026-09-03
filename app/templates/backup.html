@@ -155,7 +155,7 @@
     <div id="rtMeta" class="bk-scope" style="margin-top:10px"></div>
 
     <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
-      <button class="btn btn-danger" style="background:var(--danger);color:#fff" onclick="runRestore()">⤒ 执行恢复</button>
+      <button class="btn btn-danger" style="background:var(--danger);color:#fff" onclick="runRestore()">执行恢复</button>
       <button class="btn" onclick="previewBackup()">预览备份头</button>
     </div>
 
@@ -182,15 +182,17 @@
         <td class="mono">{{ b.file }}</td>
         <td>{{ (b.meta.time if b.meta else b.mtime) }}</td>
         <td>{% if b.meta %}{% if b.meta.scope == 'all' %}<span class="badge sky">全库</span>{% else %}<span class="badge warn">指定库</span>{% endif %}{% if not b.meta.with_data %}<span class="badge">仅结构</span>{% endif %}{% else %}<span class="badge">—</span>{% endif %}</td>
-        <td class="wrap">{{ (b.meta.databases|join(', ')) if b.meta else '—' }}</td>
+        <td class="wrap">{% if b.meta and b.meta.scope == 'all' %}<span class="badge sky">全部业务库</span>{% elif b.meta %}{{ b.meta.databases|join(', ') }}{% else %}—{% endif %}</td>
         <td class="mono">{% if b.meta %}{{ b.meta.tables }}/{{ b.meta.views }}/{{ b.meta.rows }}{% else %}—{% endif %}</td>
         <td class="mono">{{ (b.size/1024)|round(1) }} KB</td>
         <td class="mono">{% if b.meta %}{{ b.meta.host }}:{{ b.meta.port }}{% else %}—{% endif %}</td>
         <td>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;max-width:260px">
           <button class="btn btn-sm" onclick="restoreFile('{{ b.file }}')">恢复</button>
           <a class="btn btn-sm btn-ghost" href="/api/backup/download?cluster_id={{ cluster.id }}&file={{ b.file }}">下载</a>
           <button class="btn btn-sm" onclick="previewFile('{{ b.file }}')">预览</button>
           <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delBackup('{{ b.file }}')">删除</button>
+          </div>
         </td>
       </tr>
       {% else %}
@@ -316,7 +318,7 @@
     post("/api/backup/restore",{
       cluster_id:CID, host:n.host, port:n.port, file:f, databases:dbs
     },function(d){
-      btn.disabled=false; btn.textContent="⤒ 执行恢复";
+      btn.disabled=false; btn.textContent="执行恢复";
       toast(d.msg||(d.ok?"恢复完成":"恢复失败"), d.ok?"ok":"err");
       if(d.errors && d.errors.length) console.warn("恢复错误明细：", d.errors);
     });

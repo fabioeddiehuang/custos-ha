@@ -50,18 +50,21 @@ services:
       # ⚠ 管理库只供「管理器自身存储」使用，绝不作为集群节点，也不写入任何节点部署配置。
       #   业务通信仅发生在「管理器服务端后台 IP」与「各节点」之间，管理库不在其列。
       # 默认用户/密码/库名统一为 ha（使用外部库时请按你的实际情况修改）。
-      MGMT_MYSQL_HOST: "192.0.2.88"   # 管理后台库地址（仅管理器内部存储，非集群节点）
+      MGMT_MYSQL_HOST: "192.168.1.88"   # 管理后台库地址（仅管理器内部存储，非集群节点）
       MGMT_MYSQL_PORT: "3306"
-      MGMT_MYSQL_USER: "ha"
-      MGMT_MYSQL_PASS: "change_me"             # 含特殊字符请用引号包裹
-      MGMT_MYSQL_DB:   "ha"
+      MGMT_MYSQL_USER: "ha2"
+      MGMT_MYSQL_PASS: "ha2"             # 含特殊字符请用引号包裹
+      MGMT_MYSQL_DB:   "ha2"
       # 全站统一中国时间（Asia/Shanghai = UTC+8）：影响备份时间戳、运行日志、页面时间
       TZ: "Asia/Shanghai"
       WEB_PORT: 28888
       WEB_USER: admin
-      WEB_PASS: "" #留空则首次启动随机生成并打印到日志；填写则以该密码为准（可改密码，每次启动同步）
+      WEB_PASS: admin #留空则首次启动随机生成并打印到日志；填写则以该密码为准（可改密码，每次启动同步）
+      SECRET_KEY: "${SECRET_KEY}"   # 留空（不在 .env 设置）则首次启动自动生成随机密钥并持久化到 ./data/secret_key；或在 .env 设置 SECRET_KEY=<强随机值> 固定
+      SEMI_SYNC: "1"   # 半同步复制开关：置 "1" 启用（主库提交等待从库 ACK，压缩切换数据丢失窗口）；需节点插件可用
       CHECK_INTERVAL: 3
       FAIL_THRESHOLD: 2
+      FAILOVER_COOLDOWN_SEC: 120   # 两次切换最小间隔(秒)；仅约束手动切换与「延迟/压力」自动切换，不影响主库失联的紧急切换
       NODES_DIR: /app/generated_nodes
       # VIP / 网络（供「添加节点」生成的 compose 使用；网卡/VRID 有默认值，VIP 必填）
       # VIP 注意：需为节点同网段、当前空闲的 IP；系统无法自动探测，必须填写。
@@ -75,7 +78,7 @@ services:
       # 已显式设为 docker 宿主机（服务端后台）IP 192.0.2.66：管理器从该 IP 连入各节点，
       # 节点 ha_check.conf 的 MANAGER_IP、Install 的 root@'<IP>' 授权均对齐此值。
       # 若你的服务端后台 IP 不同，请改为实际值；切勿填成管理库地址 192.0.2.88。
-      MANAGER_PUBLIC_IP: "192.0.2.66"
+      MANAGER_PUBLIC_IP: "192.168.1.66"
       INTERFACE: eth0
       VRID: "51"
       # SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / ALERT_EMAIL
@@ -88,6 +91,8 @@ services:
       # 持久化「集群备份」产物：逻辑备份 SQL（gzip）落在项目根 ./backups/<集群名称>/ 下，
       # 容器重建不丢失。备份/恢复均为纯 Python 实现，容器内无需 mysqldump / mysql 客户端。
       - ./backups:/app/backups
+      # 持久化管理器自身状态（含自动生成的 SECRET_KEY），容器重建不丢失会话
+      - ./data:/app/data
       # 挂载宿主 docker.sock：使管理器能读取兄弟容器（keepalived / monitor 等）日志。
       # 无需在镜像内安装 docker CLI，直接经 Unix Socket 调 Docker HTTP API。
       - /var/run/docker.sock:/var/run/docker.sock

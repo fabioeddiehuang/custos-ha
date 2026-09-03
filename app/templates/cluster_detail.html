@@ -535,13 +535,15 @@
     }else{
       apiPost("/api/node_error_log",{cluster_id:cid,host:p[0],port:p[1],limit:100},function(d){
         if(!d.ok){body.innerHTML='<tr><td colspan="4" style="color:#fb7185;">'+(d.path?"路径: "+esc(d.path)+"<br>":"")+esc(d.error||"加载失败")+'</td></tr>';return;}
-        var lines=(d.lines||[]).slice(-50);
-        if(!lines.length){body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">错误日志为空</td></tr>';return;}
-        body.innerHTML=lines.map(function(l){
-          var level=/error|aborted|GLIBCXX/i.test(l)?"down":(/warn/i.test(l)?"warn":"sky");
-          return '<tr><td>'+esc(l.slice(0,19))+'</td><td class="mono">'+esc(cm)+'</td>'
+        var rows=(d.rows||[]);
+        if(d.source){document.getElementById("logSrc").textContent="来源：mysql.error_log（"+(d.source==="table"?"表":"文件")+"）";}
+        if(!rows.length){body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">错误日志为空'+(d.note?("："+esc(d.note)):"")+'</td></tr>';return;}
+        body.innerHTML=rows.map(function(r){
+          var lv=(r.level||"").toUpperCase();
+          var level=/ERROR|ABORTED|GLIBCXX/i.test(lv||r.message)?"down":(/WARN/i.test(lv||r.message)?"warn":"sky");
+          return '<tr><td>'+(r.time||"—")+'</td><td class="mono">'+esc(cm)+'</td>'
             +'<td><span class="badge '+level+'">'+(level==="down"?"Error":(level==="warn"?"Warn":"Info"))+'</span></td>'
-            +'<td style="white-space:normal;word-break:break-word;">'+esc(l.slice(19))+'</td></tr>';
+            +'<td style="white-space:normal;word-break:break-word;">'+esc(r.message||"")+'</td></tr>';
         }).join("");
       });
     }

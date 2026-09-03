@@ -317,6 +317,19 @@ def init_schema():
                 c.execute("ALTER TABLE nodes ADD COLUMN cluster_id INT DEFAULT NULL")
             except Exception:
                 pass
+            # hosts 增加半同步复制健康指标（monitor.get_status 采集，仪表盘展示 + 退化告警）。
+            # SEMI_SYNC=0 时变量恒为 OFF，这些列保持 NULL，不影响核心探活。
+            for _col, _def in (
+                ("semi_sync", "varchar(8) DEFAULT NULL"),
+                ("semi_clients", "int DEFAULT NULL"),
+                ("semi_no_times", "int DEFAULT NULL"),
+                ("semi_no_tx", "int DEFAULT NULL"),
+                ("semi_yes_tx", "int DEFAULT NULL"),
+            ):
+                try:
+                    c.execute(f"ALTER TABLE hosts ADD COLUMN {_col} {_def}")
+                except Exception:
+                    pass
             # alerts 增加 acked（告警中心「已读/确认」标记）
             try:
                 c.execute("ALTER TABLE alerts ADD COLUMN acked TINYINT(1) NOT NULL DEFAULT 0")

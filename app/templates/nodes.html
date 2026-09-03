@@ -6,6 +6,11 @@
   .acc-pwd .mask{font-family:var(--mono);color:#e8eefc}
   .acc-pwd .reveal{cursor:pointer;color:var(--primary);margin-left:8px;font-size:12px;background:none;border:none;padding:0}
   .acc-pwd .reveal:hover{color:var(--primary-dark)}
+  .acc{display:flex;align-items:center;gap:6px;padding:4px 0}
+  .acc-name{font-weight:600;font-family:var(--mono)}
+  .acc-role{font-size:11px;color:var(--muted);background:rgba(15,23,42,.06);padding:1px 8px;border-radius:999px;margin-left:6px}
+  html[data-theme="light"] .acc-role{background:rgba(15,23,42,.08)}
+  .acc-pwd{margin-left:auto}
   .dd-actions{display:flex;gap:10px;flex-wrap:wrap}
   /* 按集群分卡片：每个集群一张独立卡片，左侧色条区分 */
   .ng-card{border-left:3px solid var(--primary)}
@@ -87,7 +92,7 @@
   <h3>
     <span class="ng-dot"></span>{{ g.name }}
     <span class="badge sky">{{ g.nodes|length }} 节点</span>
-    {% if g.id %}<span class="badge">{{ g.node_type }}</span>{% endif %}
+    {% if g.type_summary %}<span class="badge">{{ g.type_summary }}</span>{% endif %}
     {% if g.vip %}<span class="badge ok mono">VIP {{ g.vip }}</span>{% endif %}
     <span style="flex:1"></span>
     {% if g.id %}<a class="btn btn-sm btn-ghost" href="/clusters/{{ g.id }}">集群详情</a>{% endif %}
@@ -316,7 +321,7 @@
             {n:"root",u:d.root_user,p:d.root_pass}
           ].filter(function(x){return x.u||x.p;});
           acc.innerHTML=items.length?'<div class="acc-list">'+items.map(function(x){
-            return '<div class="acc"><span class="acc-name">'+esc(x.n)+'</span><span class="acc-pwd"><span class="mask">••••••••</span>'
+            return '<div class="acc"><span class="acc-name">'+esc(x.u||x.n)+'</span><span class="acc-role">'+esc(x.n)+'</span><span class="acc-pwd"><span class="mask">••••••••</span>'
               +'<button class="reveal" onclick="toggleMask(this,\''+escAttr(x.p||"")+'\')">显示</button>'
               +'<button class="reveal" onclick="copyTxt(this,\''+escAttr(x.p||"")+'\')">复制</button></span></div>';
           }).join('')+'</div>':'<div class="obs-empty">无账号信息</div>';

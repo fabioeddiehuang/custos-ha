@@ -1,6 +1,9 @@
 import os
 import socket
 import secrets
+import hashlib
+import hmac
+import logging
 
 
 def env(name, default=None):
@@ -25,11 +28,99 @@ MGMT = dict(
 WEB_PORT = int(env("WEB_PORT", 28888))
 WEB_USER = env("WEB_USER", "admin")
 WEB_PASS = env("WEB_PASS", "admin")  # 为空则首次启动随机生成并打印
-SECRET_KEY = env("SECRET_KEY", "change-me-in-production")
+DEFAULT_SECRET_KEY = "change-me-in-production"
+# 密钥持久化目录（建议挂卷，使容器重建后仍复用同一密钥，避免会话全部失效）。
+DATA_DIR = env("DATA_DIR", "/app/data")
+SECRET_KEY_FILE = os.path.join(DATA_DIR, "secret_key")
+
+
+def _resolve_secret_key():
+    """解析 SECRET_KEY：
+
+    - 显式设置了不安全值（默认值 'change-me-in-production' 或长度<16）→ 明确拒绝，不静默覆盖。
+    - 显式设置了强密钥（.env / docker-compose 的 SECRET_KEY）→ 直接使用。
+    - 留空/未设置 → 优先复用已持久化的密钥文件（容器重建不丢失会话）；
+      否则生成随机密钥并持久化到 DATA_DIR/secret_key，并打印日志提示。
+    """
+    raw = env("SECRET_KEY", "")
+    if raw:
+        if raw == DEFAULT_SECRET_KEY or len(raw) < 16:
+            raise RuntimeError(
+                "显式设置的 SECRET_KEY 为默认值 'change-me-in-production' 或长度不足 16，"
+                "存在会话伪造风险。请改为强随机值，或删除该设置让系统自动生成。"
+            )
+        return raw
+    # 未设置：尝试复用已持久化的密钥
+    try:
+        if os.path.exists(SECRET_KEY_FILE):
+            with open(SECRET_KEY_FILE, "r") as f:
+                k = f.read().strip()
+            if k and len(k) >= 16:
+                return k
+    except Exception:
+        pass
+    # 生成并持久化
+    k = secrets.token_hex(32)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(SECRET_KEY_FILE, "w") as f:
+            f.write(k)
+        os.chmod(SECRET_KEY_FILE, 0o600)
+        import sys
+        print(
+            "[config] SECRET_KEY 未显式设置，已自动生成随机密钥并持久化到 %s（容器重建不丢失）；"
+            "如需固定，可在 .env 设置 SECRET_KEY=<强随机值>。" % SECRET_KEY_FILE,
+            file=sys.stderr,
+        )
+    except Exception as e:
+        logging.getLogger("config").warning(
+            "无法持久化 SECRET_KEY 到 %s（%s），已使用内存随机密钥，重启后会话将失效。", SECRET_KEY_FILE, e
+        )
+    return k
+
+
+SECRET_KEY = _resolve_secret_key()
+
+
+def validate_config():
+    """启动期安全校验：SECRET_KEY 必须非空且长度≥16（留空会自动生成随机密钥并持久化）。"""
+    if not SECRET_KEY or len(SECRET_KEY) < 16:
+        raise RuntimeError("SECRET_KEY 生成/配置失败（长度不足 16），启动中止。")
+
+
+def hash_pwd(p):
+    """加盐密码哈希，格式 `salt$hash`（salt 为随机十六进制）。
+
+    校验用 verify_pwd；旧格式（无 `$` 分隔）按 sha256(p+SECRET_KEY) 兼容，
+    以便 SECRET_KEY 不变时存量账号可平滑过渡。
+    """
+    salt = secrets.token_hex(16)
+    digest = hashlib.sha256((salt + SECRET_KEY + p).encode()).hexdigest()
+    return f"{salt}${digest}"
+
+
+def verify_pwd(stored, p):
+    if not stored:
+        return False
+    if "$" in stored:
+        salt, h = stored.split("$", 1)
+        digest = hashlib.sha256((salt + SECRET_KEY + p).encode()).hexdigest()
+        return hmac.compare_digest(h, digest)
+    # 兼容旧格式（无盐）：sha256(p + SECRET_KEY)
+    return hmac.compare_digest(
+        stored, hashlib.sha256((p + SECRET_KEY).encode()).hexdigest()
+    )
 
 # 检测与切换
 CHECK_INTERVAL = int(env("CHECK_INTERVAL", 2))   # 探活间隔(秒)
 FAIL_THRESHOLD = int(env("FAIL_THRESHOLD", 2))    # 连续失败次数阈值
+# 故障切换冷却（秒）：同集群两次切换最小间隔，防止频繁切换产生抖动（split-brain 风险）。
+# 注意：该冷却【不影响】主库失联的紧急自动切换（那由 CHECK_INTERVAL/FAIL_THRESHOLD 驱动），
+# 仅约束 ①手动切换 与 ②「高延迟/压力」自动切换（后者默认关闭）。故 120s 已足够安全。
+FAILOVER_COOLDOWN_SEC = int(env("FAILOVER_COOLDOWN_SEC", 120))
+# 半同步复制开关（"1" 启用）。启用后主库提交等待至少一个从库 ACK，压缩故障切换数据丢失窗口。
+# 默认关闭：避免在未确认插件可用性的存量集群上强行开启导致复制异常；需显式开启并经测试。
+SEMI_SYNC = env("SEMI_SYNC", "0")
 # 单节点探活超时（秒）：主库服务停止时会立即收到 RST（连接拒绝很快返回），
 # 仅当主机断电/网络黑洞时才走到该超时。调小可加快「主机失联」判定（配合 FAIL_THRESHOLD）。
 PROBE_TIMEOUT = int(env("PROBE_TIMEOUT", 2))

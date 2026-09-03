@@ -1,6 +1,6 @@
 """自动/手动故障切换核心逻辑（多集群：所有操作均按 cluster_id 隔离）。"""
 from .db import query, execute
-from .config import get_manager_public_ip, get_manager_docker_subnet_wildcard
+from .config import get_manager_public_ip, get_manager_docker_subnet_wildcard, FAILOVER_COOLDOWN_SEC
 from .state import get_current_master, set_current_master
 from .ha_client import (set_read_only, promote_to_master, make_slave_of,
                         set_local_master_flag, is_stale_master, get_status,
@@ -8,6 +8,7 @@ from .ha_client import (set_read_only, promote_to_master, make_slave_of,
                         parse_gtid_set, fix_node_mysql_params, ensure_ha_creds,
                         heal_anonymous_gtid_io, is_read_only)
 import time
+import threading
 from .alerts import send_alert
 from .clusters import get_cluster_creds
 
@@ -39,6 +40,28 @@ _TOPO_AT = {}
 # 值未变化时不推送；但节点重启可能丢失本地状态，故最长 PUSH_MAX_INTERVAL 强制推一次。
 PUSH_MAX_INTERVAL = 300
 _LAST_PUSH = {}
+
+# 故障切换全局互斥锁：自动（monitor 在 _RUN_ONCE_LOCK 保护区内调用 do_failover）与手动（API）
+# 切换统一串行，避免并发切换造成 split-brain / 双主。
+# ⚠ 必须用「独立」锁而非 monitor 的 _RUN_ONCE_LOCK——monitor 调用 do_failover 时已持有
+# _RUN_ONCE_LOCK，若此处复用会在同一线程重入死锁。
+_FAILOVER_LOCK = threading.Lock()
+_LAST_FAILOVER_TS = {}
+
+
+def _failover_guarded(func):
+    """串行化所有故障切换（自动/手动统一互斥），避免并发切换造成 split-brain / 双主。
+
+    必须在独立锁上串行，而非复用 monitor 的 _RUN_ONCE_LOCK（否则同一线程重入死锁）。
+    仅当切换成功时才记录时间戳，供手动 API 路径做冷却判断（避免自动路径在冷却期刷告警）。
+    """
+    def wrapper(cluster_id, *args, **kwargs):
+        with _FAILOVER_LOCK:
+            result = func(cluster_id, *args, **kwargs)
+            if result:
+                _LAST_FAILOVER_TS[cluster_id] = time.time()
+            return result
+    return wrapper
 
 
 def _warn_repoint(host, port, msg):
@@ -246,6 +269,7 @@ def reset_topo_throttle(cluster_id):
     _LAST_PUSH.pop(cluster_id, None)
 
 
+@_failover_guarded
 def do_failover(cluster_id, reason="auto"):
     """主库判定宕机后执行切换：fencing -> 提升延迟最小从库 -> 更新 current_master -> 其余节点重指向。"""
     cur_h, cur_p = get_current_master(cluster_id)
@@ -311,6 +335,7 @@ def do_failover(cluster_id, reason="auto"):
     return True
 
 
+@_failover_guarded
 def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定主库"):
     """手动将指定节点提升为主库（保留手动指定 + 自动选延迟最小两种切换方式）。"""
     target_port = int(target_port)

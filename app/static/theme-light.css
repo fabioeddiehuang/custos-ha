@@ -102,3 +102,10 @@ html[data-theme="light"] .banner.err{color:var(--danger)}
 html[data-theme="light"] .banner.warn{color:var(--warning)}
 /* 自动化说明等 info 横幅：浅底上用正文深色，避免青/绿低对比看不清 */
 html[data-theme="light"] .banner.info{color:var(--text)}
+/* 浅色主题：默认 .btn（次级按钮）原为近白底，在白卡上几乎不可见 → 改为清晰浅灰 + 实边框 */
+html[data-theme="light"] .btn { background: var(--surface-3); border: 1px solid var(--border-strong); color: var(--text); }
+html[data-theme="light"] .btn:hover { background: var(--primary-light); border-color: var(--primary); color: var(--primary-dark); }
+html[data-theme="light"] .btn:active { transform: translateY(1px); }
+/* 浅色主题：开关 OFF 态原为白透，在白底不可见 → 改为灰底 */
+html[data-theme="light"] .slider { background: rgba(15,23,42,.22); }
+html[data-theme="light"] .switch input:checked + .slider { background: var(--primary); }

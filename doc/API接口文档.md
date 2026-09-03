@@ -1,6 +1,6 @@
 # Custos HA · API 接口文档
 
-> 适用版本：**v2.2.15**（与 `app/VERSION` 保持一致）
+> 适用版本：**v2.2.17**（与 `app/VERSION` 保持一致）
 > 基址：管理端地址（默认 `http://<manager>:28888`）
 > 本文档由 `app/api.py` 实际路由导出（共 **63** 个端点），与代码强一致。
 
@@ -90,7 +90,7 @@
 | POST | `/nodes/{ip}/regen` | `ip`(路径) | 用已保存参数重新生成配置文件（覆盖），返回各文件 md5 便于核对 |
 | GET | `/api/node_creds_sql` | `cluster_id`=0, `host`='', `port`=0, `download`=0 | 查看/下载节点 `fix-node-creds.sql`（`download=1` 触发文件下载） |
 | POST | `/api/node_detail` | `cluster_id`, `host`, `port`（Form） | 节点详情：运行时变量（server_id/datadir/gtid/read_only）+ 账号清单 |
-| POST | `/api/node_error_log` | `cluster_id`, `host`, `port`, `limit`（Form） | 读取节点 MySQL 错误日志（`LOAD_FILE` 尽力而为） |
+| POST | `/api/node_error_log` | `cluster_id`, `host`, `port`, `limit`（Form） | 读取节点错误日志（优先 mysql.error_log 表，文件 LOAD_FILE 兜底；MySQL/MariaDB 裸机/docker 通用） |
 | POST | `/api/fix_node` | `cluster_id`, `host`, `port`（Form） | 一键自愈节点复制参数（`SET PERSIST` 写 `mysqld-auto.cnf`，重启仍生效） |
 | POST | `/api/precheck` | `cluster_id`, `host`, `port`（Form） | 节点/集群预检（仅告警）；不传 host/port 则整集群 |
 | POST | `/api/collect` | `target`, `cluster_id`（Form） | 手动触发采集，`target` ∈ `metrics`/`slow`/`drift`/`all`。**后台线程非阻塞**，请求立即返回 accepted |

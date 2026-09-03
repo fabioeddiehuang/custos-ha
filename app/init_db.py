@@ -2,11 +2,7 @@
 import hashlib
 import secrets
 from .db import init_schema, get_conn
-from .config import WEB_USER, WEB_PASS, SECRET_KEY
-
-
-def hash_pwd(p):
-    return hashlib.sha256((p + SECRET_KEY).encode()).hexdigest()
+from .config import WEB_USER, WEB_PASS, hash_pwd
 
 
 def main():

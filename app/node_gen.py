@@ -53,7 +53,7 @@ NODE_SCRIPTS = Path(__file__).parent / "node_assets"
 #      与 Debian 构建的 /etc/mysql/conf.d 路径不同，配置挂载易失效。
 # 另：Debian 构建的 12.3.3 不要求 UBI 的 x86-64-v3 指令集，【老 CPU 兼容性已优于 UBI】；
 # 12.3.2 作为同系列（Debian 构建、版本更保守）的备用，拉取失败或个别老 CPU 不兼容时自动回退。
-# 口径与 Install-mariadb-docker-Node.sh 保持一致（该文件同样以 12.3.3 为主、12.3.2 为备）。
+# 口径与容器化 MariaDB 部署保持一致（以 12.3.3 为主、12.3.2 为备）。
 MARIADB_DOCKER_IMAGE = "mariadb:12.3.3"
 MARIADB_DOCKER_IMAGE_FALLBACK = "mariadb:12.3.2"
 
@@ -371,6 +371,9 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
         "# 会导致管理器「错误日志」面板 LOAD_FILE 读不到、永远显示为空。落到 /var/lib/mysql\n"
         "#（已挂载宿主 /data/mariadb）既持久又对 LOAD_FILE 可读（MariaDB secure_file_priv 默认无限制）。\n"
         "log_error = /var/lib/mysql/error.log\n"
+        "# 放开 secure_file_priv，使管理器 LOAD_FILE 可读错误日志文件（容器镜像可能限制路径），"
+        "# 作为「错误日志」面板读取 mysql.error_log 表失败时的兜底；仅放开文件导入/导出，HA 账号不受影响。"
+        "secure_file_priv = ''\n"
         f"port = {port}\n"
         "bind_address = 0.0.0.0\n"
         "skip-name-resolve\n"
@@ -412,7 +415,7 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
         # 缺它时管理器写 ha_local.state（需禁 binlog）会报 1227，主库标记一直写不进去、
         # keepalived 只能拿到空状态退化判定。
         "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
-        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
+        "REPLICATION SLAVE ADMIN, REPLICATION MASTER ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
         "REPLICATION CLIENT, PROCESS, "
         "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
@@ -444,7 +447,7 @@ def render_baremetal_compose(node_name, vip_port=None):
 
     - 裸机 MariaDB：mysqld 由宿主 systemd 提供；
     - 容器化 MariaDB（node_type=mariadb-docker）已改为纯 compose（见 render_mariadb_compose），
-       本函数只服务裸机形态（keepalived-only）；裸机装不上 tarball 时仍可改跑 Install-mariadb-docker-Node.sh 回退。
+       本函数只服务裸机形态（keepalived-only）；需要容器化请创建节点时直接选 mariadb-docker（纯 compose）。
 
     keepalived 容器使用 host 网络，连接 127.0.0.1:<port> 探活本机 MariaDB。
     """
@@ -575,6 +578,10 @@ def render_docker_my_cnf():
     return (
         "[mysqld]\n"
         "bind-address = 0.0.0.0\n"
+        "# 错误日志写入 mysql.error_log 表（log_sink_table 为 MySQL 8.0 内置组件，无需装插件），"
+        "# 管理器「错误日志」面板直接 SELECT 该表，容器环境下不再依赖 LOAD_FILE / secure_file_priv。"
+        "log_error_services = log_filter_internal; log_sink_file; log_sink_table\n"
+        "log_error = /var/lib/mysql-files/error.log\n"
         "skip-name-resolve\n"
         "slow_query_log = 1\n"
         "long_query_time = 0.5\n"
@@ -754,13 +761,13 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         # BINLOG ADMIN：见 render_mariadb_init_sql 的说明，缺它 ha_local.state 写不进去。
         "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
-        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
+        "REPLICATION SLAVE ADMIN, REPLICATION MASTER ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
         "REPLICATION CLIENT, PROCESS, "
         "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
         "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "ALTER USER '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
-        "REPLICATION SLAVE ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
+        "REPLICATION SLAVE ADMIN, REPLICATION MASTER ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
         "REPLICATION CLIENT, PROCESS, "
         "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%s';\n"
         "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
@@ -1046,10 +1053,16 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/my.cnf"
             extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/Install-ha-mariadb-Node.sh"
             extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-Node.sh"
-            # Install-mariadb-docker-Node.sh 一并交付：裸机装不上（如 glibc 过低）时，
-            # 可在同一目录改跑容器方案，无需重新生成节点。
-            for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh",
-                       "Install-mariadb-docker-Node.sh"):
+            # 裸机包【只适配裸机】：不再交付 Install-mariadb-docker-Node.sh 容器回退脚本。
+            # 原因：该脚本把裸机完整 my.cnf（仅剔除 datadir/socket/pid_file）喂给官方镜像容器，
+            # 残留裸机专属参数（缺失 log_error → 官方镜像默认写 stdout，管理器「错误日志」
+            # 面板读不到恒为空；buffer pool 1G 等），且部署机制分裂为
+            # 「docker run --network host + keepalived-only compose」，与 mariadb-docker 的
+            # 纯 compose 形成两条并存路径，必然再次漂移。
+            # 需要容器化（如 glibc 过低装不上 tarball）时，创建节点直接选 mariadb-docker 即可：
+            # node_family 允许两种 MariaDB 形态同集群混部，且数据目录同为
+            # /data/custos-ha/mariadb12，既有回退安装可无损迁移到纯 compose。
+            for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh"):
                 src = NODE_SCRIPTS / sf
                 if src.exists():
                     _write(d / sf, src.read_text(), mode=0o755)
