@@ -859,10 +859,23 @@ def settings_page(request: Request, user=Depends(auth_required), msg: str = "", 
     alert_emails = _load_alert_emails()
     clusters = [{"id": c["id"], "name": c.get("name") or f"集群{c['id']}"}
                 for c in list_clusters()]
+    # 高级切换 / 监控开关与阈值（全局，默认与 monitor 守护进程一致）
+    adv = dict(
+        auto_failover=get_setting("AUTO_FAILOVER", "1") == "1",
+        auto_repair=get_setting("AUTO_REPAIR", "0") == "1",
+        lag_failover=get_setting("LAG_FAILOVER_ENABLED", "0") == "1",
+        pressure_failover=get_setting("PRESSURE_FAILOVER_ENABLED", "0") == "1",
+        lag_failover_sec=get_setting("LAG_FAILOVER_SEC", "60"),
+        lag_failover_cycles=get_setting("LAG_FAILOVER_CYCLES", "3"),
+        pressure_threads_running=get_setting("PRESSURE_THREADS_RUNNING", "50"),
+        pressure_row_lock_waits=get_setting("PRESSURE_ROW_LOCK_WAITS", "50"),
+        failover_cooldown_sec=get_setting("FAILOVER_COOLDOWN_SEC", "120"),
+    )
     return render("settings.html", request, user=user, cfg=cfg, msg=msg, error=error,
                   alert_emails=alert_emails, clusters=clusters,
                   check_interval=get_setting("CHECK_INTERVAL", "2"),
-                  manager_ip=get_setting("MANAGER_PUBLIC_IP", ""))
+                  manager_ip=get_setting("MANAGER_PUBLIC_IP", ""),
+                  adv=adv)
 
 
 @app.post("/settings")
@@ -874,6 +887,16 @@ def settings_save(
     smtp_pass: str = Form(""),
     check_interval: str = Form(""),
     manager_ip: str = Form(""),
+    # 高级切换 / 监控（全局；未传则不改动，避免覆盖）
+    auto_failover: str = Form(""),
+    auto_repair: str = Form(""),
+    lag_failover_enabled: str = Form(""),
+    pressure_failover_enabled: str = Form(""),
+    lag_failover_sec: str = Form(""),
+    lag_failover_cycles: str = Form(""),
+    pressure_threads_running: str = Form(""),
+    pressure_row_lock_waits: str = Form(""),
+    failover_cooldown_sec: str = Form(""),
     user=Depends(auth_required),
 ):
     upsert_setting("SMTP_HOST", smtp_host.strip())
@@ -893,6 +916,40 @@ def settings_save(
     # 管理器内网 IP（记录用；运行时以环境变量 MANAGER_PUBLIC_IP 为准）
     if manager_ip.strip():
         upsert_setting("MANAGER_PUBLIC_IP", manager_ip.strip())
+    # 高级切换 / 监控开关与阈值（全局）
+    uname = user.get("username") if isinstance(user, dict) else str(user)
+    _bools = {
+        "AUTO_FAILOVER": auto_failover,
+        "AUTO_REPAIR": auto_repair,
+        "LAG_FAILOVER_ENABLED": lag_failover_enabled,
+        "PRESSURE_FAILOVER_ENABLED": pressure_failover_enabled,
+    }
+    for k, v in _bools.items():
+        s = (v or "").strip()
+        if not s:
+            continue  # 未传（如未勾选也不影响）则跳过
+        val = "1" if s in ("1", "true", "on", "True") else "0"
+        upsert_setting(k, val)
+        audit.add_audit(uname, "setting_set", k, val, None)
+    _ints = {
+        "LAG_FAILOVER_SEC": lag_failover_sec,
+        "LAG_FAILOVER_CYCLES": lag_failover_cycles,
+        "PRESSURE_THREADS_RUNNING": pressure_threads_running,
+        "PRESSURE_ROW_LOCK_WAITS": pressure_row_lock_waits,
+        "FAILOVER_COOLDOWN_SEC": failover_cooldown_sec,
+    }
+    for k, v in _ints.items():
+        s = (v or "").strip()
+        if not s:
+            continue
+        try:
+            iv = int(s)
+        except ValueError:
+            continue
+        if iv < 0:
+            iv = 0
+        upsert_setting(k, str(iv))
+        audit.add_audit(uname, "setting_set", k, str(iv), None)
     return JSONResponse({"ok": True, "msg": "✓ 已保存配置"})
 
 
@@ -1393,11 +1450,13 @@ def _parse_err_line(line):
 @app.post("/api/node_error_log")
 def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(...),
                        limit: int = Form(500), user=Depends(auth_required)):
-    """读取节点错误日志（mysql.error_log 优先，文件 LOAD_FILE 兜底）。
+    """读取节点错误日志（文件 LOAD_FILE 为主，MySQL 8.0 额外支持错误日志表）。
 
-    一级：错误日志表 mysql.error_log（MySQL 8.0 / MariaDB 均支持，纯 SELECT，
-    容器/裸机通用，无需 FILE 权限，也不受 secure_file_priv 限制）。
-    二级：原始错误日志文件（LOAD_FILE @@log_error），兼容未开启表日志的节点。
+    一级（仅 MySQL 8.0）：错误日志表 mysql.error_log（log_sink_table 组件写入，
+    纯 SELECT，容器/裸机通用，无需 FILE 权限，不受 secure_file_priv 限制）。
+    二级（MySQL 8.0 / MariaDB 通用）：原始错误日志文件（LOAD_FILE @@log_error）。
+    注意：MariaDB 不支持错误日志写表（仅 general/slow 日志可写表），故 MariaDB
+    节点必须落盘到文件并放开 secure_file_priv，面板才能读到（见 node_gen 配置）。
     """
     try:
         port = int(port)
@@ -1444,6 +1503,15 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
         if not rows:
             cur.execute("SELECT @@log_error")
             path = (cur.fetchone() or ("",))[0] or ""
+            # 相对路径按数据目录解析（部分部署 @@log_error 仅返回文件名）
+            if path and not path.startswith("/"):
+                try:
+                    cur.execute("SELECT @@datadir")
+                    dd = (cur.fetchone() or ("",))[0] or ""
+                    if dd:
+                        path = (dd.rstrip("/") + "/" + path)
+                except Exception:
+                    pass
             if path:
                 try:
                     cur.execute("SELECT LOAD_FILE(%s)", (path,))

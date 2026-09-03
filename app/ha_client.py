@@ -1150,8 +1150,8 @@ def enable_semisync(cur, flavour):
         return
     try:
         if flavour == F_MARIADB:
-            plugins = (("semisync_master", "semisync_master"),
-                       ("semisync_slave", "semisync_slave"))
+            # MariaDB semisync is built-in; skip INSTALL PLUGIN (would 1126) and just SET GLOBAL.
+            plugins = ()
             sets = [
                 "SET GLOBAL rpl_semi_sync_master_enabled=1",
                 "SET GLOBAL rpl_semi_sync_slave_enabled=1",
@@ -1175,7 +1175,7 @@ def enable_semisync(cur, flavour):
                 cur.execute("INSTALL PLUGIN %s SONAME '%s.so'" % (pname, soname))
             except Exception as e:
                 _m = str(e).lower()
-                if "already" in _m or "1125" in _m or "1060" in _m or "1286" in _m:
+                if "already" in _m or "1125" in _m or "1060" in _m or "1286" in _m or "1126" in _m:
                     pass  # 已安装 / 插件文件缺失(1286) / 平台不支持(1125)：忽略
                 else:
                     print(f"[semisync] INSTALL PLUGIN {pname} 失败(可忽略): {e}")

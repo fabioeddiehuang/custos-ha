@@ -299,6 +299,11 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         "long_query_time = 0.5\n"
         "log_output = TABLE\n"
         "log_queries_not_using_indexes = 0\n"
+        # 错误日志落盘到数据目录文件，供管理器「错误日志」面板 LOAD_FILE 读取。
+        # MariaDB 不支持错误日志写表(mysql.error_log 仅 MySQL 8.0 支持)，只能走文件；
+        # secure_file_priv='' 放开 LOAD_FILE 路径限制，使面板在容器/裸机都能读到。
+        f"log_error = {data_dir}/error.log\n"
+        "secure_file_priv = ''\n"
         f"port = {port}\n"
         f"datadir = {data_dir}\n"
         f"socket = {data_dir}/mysql.sock\n"

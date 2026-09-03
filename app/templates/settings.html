@@ -14,6 +14,21 @@
   .srv-actions .btn{flex:0 0 auto;white-space:nowrap}
   .srv-actions .mini-sel{flex:0 0 auto}
   .srv-log{background:#060b16;color:#cbd5e1;padding:14px;border-radius:12px;max-height:420px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.6;white-space:pre-wrap;margin:0}
+  .adv-switch{position:relative;display:inline-block;width:40px;height:22px;flex:0 0 auto}
+  .adv-switch input{opacity:0;width:0;height:0}
+  .adv-slider{position:absolute;inset:0;background:var(--border);border-radius:22px;transition:.2s;cursor:pointer}
+  .adv-slider:before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+  .adv-switch input:checked + .adv-slider{background:var(--primary)}
+  .adv-switch input:checked + .adv-slider:before{transform:translateX(18px)}
+  .adv-row{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:11px 0;border-bottom:1px solid var(--border)}
+  .adv-row:last-child{border-bottom:none}
+  .adv-info{display:flex;flex-direction:column;gap:3px}
+  .adv-title{font-size:14px;font-weight:600}
+  .adv-desc{font-size:12px;color:var(--muted);line-height:1.5}
+  .adv-num{display:flex;align-items:center;gap:8px}
+  .adv-num input{width:90px;font-family:var(--mono)}
+  .adv-num .unit{font-size:12px;color:var(--muted)}
+  .adv-danger{color:#fb7185;font-weight:600}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -36,6 +51,85 @@
     <div class="setting-input"><input id="setInterval" value="{{ check_interval }}"> 秒</div>
   </div>
   <div style="margin-top:16px"><button class="btn btn-primary btn-sm" onclick="saveMgr()">保存设置</button></div>
+</div>
+
+<div class="card">
+  <h3>高级切换 / 监控</h3>
+  <div class="note">以下为<b>全局</b>自动运维开关与阈值（对所有集群生效）。修改即时写入 <code>monitor_settings</code> 并记入审计。危险项默认关闭，开启前请确认理解其触发条件，避免误切或抖动。</div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">自动切换（主库失联）</span>
+      <span class="adv-desc">主库探活连续失败达阈值时，自动把最优从库提为主。默认开启。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afAuto" {% if adv.auto_failover %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">自动修复</span>
+      <span class="adv-desc">高延迟从库自动摘流量并触发修复；账号/配置漂移在轮询中自动校正。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afRepair" {% if adv.auto_repair %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title"><span class="adv-danger">⚠ 延迟切换</span></span>
+      <span class="adv-desc">多数从库复制延迟持续 ≥ LAG_FAILOVER_SEC 且连续 LAG_FAILOVER_CYCLES 个周期成立时，自动把延迟最小的从库提为主。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afLag" {% if adv.lag_failover %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title"><span class="adv-danger">⚠ 压力切换</span></span>
+      <span class="adv-desc">主库压力持续超阈值（Threads_running ≥ 阈值 或 行锁等待 ≥ 阈值）且连续 3 个周期成立时，自动把压力最低的从库提为主。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afPrs" {% if adv.pressure_failover %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">延迟切换阈值</span>
+      <span class="adv-desc">LAG_FAILOVER_SEC：触发延迟切换的复制延迟秒数。</span>
+    </div>
+    <div class="adv-num"><input id="afLagSec" value="{{ adv.lag_failover_sec }}"><span class="unit">秒</span></div>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">延迟切换连续周期</span>
+      <span class="adv-desc">LAG_FAILOVER_CYCLES：需连续成立的轮询周期数（防大事务瞬时抖动）。</span>
+    </div>
+    <div class="adv-num"><input id="afLagCyc" value="{{ adv.lag_failover_cycles }}"><span class="unit">周期</span></div>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">压力-Threads_running 阈值</span>
+      <span class="adv-desc">PRESSURE_THREADS_RUNNING：主库并发线程数超此值视为高压。</span>
+    </div>
+    <div class="adv-num"><input id="afPrsThr" value="{{ adv.pressure_threads_running }}"><span class="unit">线程</span></div>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">压力-行锁等待阈值</span>
+      <span class="adv-desc">PRESSURE_ROW_LOCK_WAITS：行锁等待次数超此值视为高压。</span>
+    </div>
+    <div class="adv-num"><input id="afPrsLock" value="{{ adv.pressure_row_lock_waits }}"><span class="unit">次/周期</span></div>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">切换冷却时间</span>
+      <span class="adv-desc">FAILOVER_COOLDOWN_SEC：两次自动/手动切换的最小间隔，避免反复切换。</span>
+    </div>
+    <div class="adv-num"><input id="afCool" value="{{ adv.failover_cooldown_sec }}"><span class="unit">秒</span></div>
+  </div>
+
+  <div style="margin-top:16px"><button class="btn btn-primary btn-sm" onclick="saveAdv()">保存高级设置</button></div>
 </div>
 
 <div class="card">
@@ -76,6 +170,20 @@
       manager_ip:document.getElementById("setIp").value,
       check_interval:document.getElementById("setInterval").value
     },function(d){toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");});
+  }
+  function saveAdv(){
+    var body={
+      auto_failover:document.getElementById("afAuto").checked?"1":"0",
+      auto_repair:document.getElementById("afRepair").checked?"1":"0",
+      lag_failover_enabled:document.getElementById("afLag").checked?"1":"0",
+      pressure_failover_enabled:document.getElementById("afPrs").checked?"1":"0",
+      lag_failover_sec:document.getElementById("afLagSec").value,
+      lag_failover_cycles:document.getElementById("afLagCyc").value,
+      pressure_threads_running:document.getElementById("afPrsThr").value,
+      pressure_row_lock_waits:document.getElementById("afPrsLock").value,
+      failover_cooldown_sec:document.getElementById("afCool").value
+    };
+    apiPost("/settings",body,function(d){toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");});
   }
   var _full=false;
   function toggleFull(){
