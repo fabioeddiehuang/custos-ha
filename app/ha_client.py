@@ -1493,6 +1493,35 @@ def make_slave_of(host, port, user, password, master_host, master_port,
             if gm is not None and gm != "ON":
                 return False, (f"本节点 gtid_mode={gm}（应为 ON），无法使用 GTID 自动定位。"
                                f"请重新运行 Install-ha-mariadb-Node.sh 开启 GTID 后重入集群。")
+        # ---- GTID 分叉感知（升版重启/历史切换后从库执行集可能超前或分叉于主库）----
+        # 正常重指向：RESET SLAVE ALL + MASTER_USE_GTID=slave_pos 即可（GTID 自动定位跳过已执行事务）。
+        # 但若从库 gtid_slave_pos 不是主库 gtid_binlog_pos 的子集（如本例 100 已有 3-3-17737、
+        # 主库却发 3-3-1），slave_pos 自动定位失败并触发「out-of-order sequence」(gtid_strict_mode)，
+        # 复制卡死。此时清掉从库本地 GTID 并把 gtid_slave_pos 对齐到主库【当前】位置后重链，
+        # 跳过已一致的历史事务、从当前位点续传，且不会因重放旧事务报 1007/1062。
+        try:
+            cur.execute("SELECT @@gtid_slave_pos")
+            _slave_gt = (cur.fetchone() or [None])[0] or ""
+            _mconn = connect_robust(master_host, int(master_port), user, password, root_user, root_pass)
+            if _mconn is not None:
+                _mcur = _mconn.cursor()
+                _mcur.execute("SELECT @@gtid_binlog_pos")
+                _master_gt = (_mcur.fetchone() or [None])[0] or ""
+                _mconn.close()
+                if _slave_gt and _master_gt:
+                    cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
+                    if not (cur.fetchone() or [0])[0]:
+                        print("[gtid] %s:%s 执行集非主库子集(分叉)，RESET MASTER 并对齐主库当前 GTID 后重链" % (host, port))
+                        try:
+                            cur.execute(stop_replication_sql(flavour))
+                            cur.execute(reset_replica_sql(flavour))
+                            cur.execute("RESET MASTER")
+                            cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
+                        except Exception as e2:
+                            print("[gtid] 分叉重建失败(可忽略，继续常规重链): %s" % e2)
+        except Exception as e:
+            print("[gtid] 分叉检测跳过(可忽略): %s" % e)
+
         try:
             cur.execute(stop_replication_sql(flavour))
             cur.execute(reset_replica_sql(flavour))

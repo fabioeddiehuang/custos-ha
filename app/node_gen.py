@@ -22,7 +22,7 @@ import pymysql
 
 from .db import get_setting, query, execute
 from .mysql_compat import default_auth_plugin, is_mariadb_node
-from .config import NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
+from .config import NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, SEMI_SYNC
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
 
@@ -257,6 +257,34 @@ services:
     """.replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME)
 
 
+def _semisync_block():
+    """半同步复制配置片段（仅 SEMI_SYNC=1 时返回非空，否则空串）。
+
+    写进 my.cnf 使半同步随实例启动即生效、重启不丢——根治「升版/重启后
+    SET GLOBAL 清零导致半同步静默退化为异步」的反复问题。MariaDB 半同步插件
+    为内置，plugin_load_add 保证启动时加载，变量即可设置，不会因插件缺失
+    导致节点启动失败。
+    """
+    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
+        return ""
+    return (
+        "# ---- 半同步复制（SEMI_SYNC=1：插件内置，随启动生效，重启不丢）----\n"
+        "plugin_load_add = rpl_semi_sync_master;rpl_semi_sync_slave\n"
+        "rpl_semi_sync_master_enabled = 1\n"
+        "rpl_semi_sync_slave_enabled = 1\n"
+        "rpl_semi_sync_master_timeout = 10000\n"
+        "rpl_semi_sync_master_wait_point = AFTER_SYNC\n"
+    )
+
+
+def _inject_semisync(cnf):
+    """把半同步配置片段注入到 [mysqld] 段开头（仅 SEMI_SYNC=1 时插入）。"""
+    blk = _semisync_block()
+    if blk:
+        cnf = cnf.replace("[mysqld]\n", "[mysqld]\n" + blk, 1)
+    return cnf
+
+
 def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/mariadb", install_dir="/opt/mariadb"):
     """生成 MariaDB 裸机节点的【完整 my.cnf】（非片段，可直接用）。
 
@@ -271,7 +299,7 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
     if gtid_domain_id is None:
         # 默认域：统一使用 0（不推荐；generate_node 现已显式传入 server_id 作为非 0 域）
         gtid_domain_id = 0
-    return (
+    _cnf = (
         "# ---- Custos 生成的 MariaDB 节点配置（完整 my.cnf，Install 脚本落盘）----\n"
         "[mysqld]\n"
         f"server-id = {server_id}\n"
@@ -322,6 +350,7 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         f"socket = {data_dir}/mysql.sock\n"
         "default-character-set = utf8mb4\n"
     )
+    return _inject_semisync(_cnf)
 
 
 def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
@@ -340,7 +369,7 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
     """
     if gtid_domain_id is None:
         gtid_domain_id = server_id
-    return (
+    _cnf = (
         "# ---- Custos 生成的容器化 MariaDB 节点配置（docker-my.cnf，由 Install 脚本挂载进容器）----\n"
         "# 注意：容器内数据目录固定 /var/lib/mysql、socket 固定 /run/mariadb/mariadb.sock，\n"
         "#       故本文件【不设】datadir / socket / pid_file，请到 Install 脚本改 MARIA_DATA_DIR。\n"
@@ -386,6 +415,7 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
         "character_set_server = utf8mb4\n"
         "collation_server = utf8mb4_general_ci\n"
     )
+    return _inject_semisync(_cnf)
 
 
 def _q(s):
