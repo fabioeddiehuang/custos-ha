@@ -186,7 +186,7 @@ def _render_compose(node_name, root_pass, port, server_id, vip_port=None):
 services:
   mysql:
     image: mysql:8.0
-    container_name: {node_name}
+    container_name: custos-mysql
     restart: always
     environment:
       MYSQL_ROOT_PASSWORD: "{root_pass}"
@@ -283,6 +283,44 @@ def _inject_semisync(cnf):
     if blk:
         cnf = cnf.replace("[mysqld]\n", "[mysqld]\n" + blk, 1)
     return cnf
+
+
+def _mysql_version_tuple(v):
+    try:
+        parts = [int(x) for x in str(v).split(".")[:3] if x.strip().isdigit()]
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+    except Exception:
+        return (8, 0, 0)
+
+
+def _semisync_block_mysql(mysql_version=None):
+    """MySQL(Docker) 节点的半同步 my.cnf 片段（仅 SEMI_SYNC=1 返回非空）。
+
+    写进 ha-overrides.cnf，随容器启动即加载插件并开启半同步——根治「节点重启后
+    SET GLOBAL 清零导致半同步静默退化为异步」以及「远程 root 无 SUPER/INSERT 权限、
+    运行时 INSTALL PLUGIN 被拒」的问题（插件改为随启动加载，无需运行时安装）。
+    MySQL 8.0.26+ 插件/变量改名为 source/replica；更早 8.0 用 master/slave。
+    """
+    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
+        return ""
+    modern = _mysql_version_tuple(mysql_version) >= (8, 0, 26)
+    if modern:
+        names = "semisync_source.so;semisync_replica.so"
+        src, rep = "rpl_semi_sync_source", "rpl_semi_sync_replica"
+    else:
+        names = "semisync_master.so;semisync_slave.so"
+        src, rep = "rpl_semi_sync_master", "rpl_semi_sync_slave"
+    return (
+        "# ---- 半同步复制（SEMI_SYNC=1：随启动加载插件，重启不丢）----\n"
+        f"plugin_load_add = {names}\n"
+        f"{src}_enabled = 1\n"
+        f"{rep}_enabled = 1\n"
+        f"{src}_timeout = 10000\n"
+        f"{src}_wait_point = AFTER_SYNC\n"
+        f"{src}_wait_for_replica_count = 1\n"
+    )
 
 
 def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/mariadb", install_dir="/opt/mariadb"):
@@ -552,7 +590,7 @@ def render_mariadb_compose(node_name, root_pass, port, server_id, vip_port=None,
 services:
   mariadb:
     image: {image}
-    container_name: {node_name}
+    container_name: custos-mariadb
     restart: always
     # 以 root 启动：官方 entrypoint 会先把数据目录 chown 给 mysql，再 gosu 降权运行 mariadbd。
     # 规避 UBI 构建默认 USER=mysql(uid 999) 时宿主数据目录属主为 root 导致的 Errcode 13。
@@ -604,13 +642,14 @@ services:
 """
 
 
-def render_docker_my_cnf():
+def render_docker_my_cnf(mysql_version=None):
     """Docker 节点 MySQL 覆盖配置：开启慢日志（log_output=TABLE），供 slow_log 采集。
 
     挂载到容器 /etc/mysql/conf.d/ha-overrides.cnf。对 v2.0 已部署集群无副作用，
-    仅在该节点重新生成并部署后生效。
+    仅在该节点重新生成并部署后生效。SEMI_SYNC=1 时额外注入半同步插件加载与开启参数，
+    使半同步随容器启动即生效、重启不丢（无需运行时 INSTALL PLUGIN）。
     """
-    return (
+    cnf = (
         "[mysqld]\n"
         "bind-address = 0.0.0.0\n"
         "# 错误日志写入 mysql.error_log 表（log_sink_table 为 MySQL 8.0 内置组件，无需装插件），"
@@ -623,6 +662,10 @@ def render_docker_my_cnf():
         "log_output = TABLE\n"
         "log_queries_not_using_indexes = 0\n"
     )
+    blk = _semisync_block_mysql(mysql_version)
+    if blk:
+        cnf = cnf.replace("[mysqld]\n", "[mysqld]\n" + blk, 1)
+    return cnf
 
 
 def _auth_plugin_pref():
@@ -950,7 +993,7 @@ def regenerate_cluster_compose(cluster_id):
             content = _render_compose(
                 node_name, r.get("root_pass") or "", int(r["port"]),
                 int(r.get("server_id") or 0), vip_port)
-            _write(kd.parent / "ha-overrides.cnf", render_docker_my_cnf(), mode=0o644)
+            _write(kd.parent / "ha-overrides.cnf", render_docker_my_cnf(r.get("mysql_version")), mode=0o644)
         _write(p, content)
 
 
@@ -1106,7 +1149,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。
         _write(d / "init.sql", init_sql, mode=0o644)
         # 慢日志覆盖配置（挂载到容器 /etc/mysql/conf.d）
-        _write(d / "ha-overrides.cnf", render_docker_my_cnf(), mode=0o644)
+        _write(d / "ha-overrides.cnf", render_docker_my_cnf(mysql_version), mode=0o644)
 
     # 2) keepalived.conf
     keep_conf = _render_keepalived_conf(

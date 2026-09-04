@@ -21,9 +21,11 @@ LABEL org.opencontainers.image.description="MySQL/MariaDB 高可用管理：故�
 
 COPY . .
 
-# 统一版本真相：构建时若传入 --build-arg VERSION（由 docker-compose 的 .env 提供），
-# 以它为准并写回镜像内 app/VERSION；否则回退使用源码内的 app/VERSION。
-# 这样 镜像标签 / LABEL / 容器内 app/VERSION 三处一致，Web 也能读到版本。
+# 版本单一来源 = .env 的 VERSION=（由 docker-compose 经 build-arg 传入镜像）。
+# 镜像构建时以 build-arg VERSION 为准，写回镜像内 app/VERSION 与 /app/.version.env，
+# 使 镜像标签 / LABEL / 容器内 app/VERSION 三处一致，Web 也能读到版本。
+# 源码树不再维护 app/VERSION（避免「两处版本」不一致）；若源码内无 app/VERSION
+# （如干净克隆），则以 build-arg VERSION 为准生成。
 RUN SRC_VER=$(tr -d '[:space:]' < app/VERSION 2>/dev/null || echo ""); \
     ARG_VER=$(printf '%s' "${VERSION}" | tr -d '[:space:]'); \
     if [ -n "${SRC_VER}" ] && [ -n "${ARG_VER}" ] && [ "${SRC_VER}" != "${ARG_VER}" ]; then \

@@ -114,7 +114,7 @@
           {% if n.mysql_version %}{{ n.mysql_version }}{% endif %}
           {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-left:4px">MariaDB 裸机</span>
           {% elif n.node_type == 'mariadb-docker' %}<span class="badge sky" style="margin-left:4px">MariaDB 容器</span>
-          {% elif n.node_type == 'docker' %}<span class="badge emerald" style="margin-left:4px">Docker</span>{% endif %}
+          {% elif n.node_type == 'docker' %}<span class="badge emerald" style="margin-left:4px">MySQL</span>{% endif %}
         </td>
         <td data-f="status"><span class="badge" style="background:var(--surface-3);color:var(--muted);">检测中…</span></td>
         <td><button class="btn btn-sm" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button></td>
@@ -185,7 +185,7 @@
         </label>
         <label>节点类型
           <select name="node_type" id="nodeType" onchange="onNodeTypeChange()">
-            <option value="docker" selected>Docker（容器化 MySQL + keepalived 客户端）</option>
+            <option value="docker" selected>MySQL（容器化 MySQL + keepalived 客户端）</option>
             <option value="mariadb">MariaDB 裸机（全量安装，脱离宝塔，独立数据库）</option>
             <option value="mariadb-docker">MariaDB 容器版（官方镜像，老系统/免装环境首选）</option>
           </select>

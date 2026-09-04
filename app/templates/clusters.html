@@ -104,7 +104,7 @@
     <div class="cc-head">
       <div style="min-width:0">
         <div class="cc-name">{{ c.name }}</div>
-        <div class="cc-sub">ID {{ c.id }} · {{ c.node_type or 'docker' }}{% if c.mysql_version %} · {{ c.mysql_version }}{% endif %}</div>
+        <div class="cc-sub">ID {{ c.id }} · {{ display_node_type(c.node_type) }}{% if c.mysql_version %} · {{ c.mysql_version }}{% endif %}</div>
       </div>
       {% if c.has_issue %}<span class="badge warn">异常</span>{% else %}<span class="badge ok">正常</span>{% endif %}
     </div>
@@ -156,7 +156,7 @@
         <label>VIP 端口<input name="vip_port" type="number" min="1" max="65535" value="3307"></label>
         <label>节点类型（部署形态）
           <select name="node_type">
-            <option value="docker" selected>Docker（容器化 MySQL + keepalived）</option>
+            <option value="docker" selected>MySQL（容器化 MySQL + keepalived）</option>
             <option value="mariadb">MariaDB（裸机全量安装，脱离宝塔）</option>
             <option value="mariadb-docker">MariaDB 容器版（官方镜像，老系统/免装环境首选）</option>
           </select>

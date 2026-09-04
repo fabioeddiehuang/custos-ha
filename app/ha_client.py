@@ -1078,10 +1078,7 @@ def promote_to_master(host, port, user, password, root_user="root", root_pass=""
     try:
         cur = conn.cursor()
         syntax = detect_syntax(cur)
-        try:
-            enable_semisync(cur, detect_flavour(cur))
-        except Exception:
-            pass
+
         # 只读快检：不产生任何写盘 / 不进 binlog
         try:
             cur.execute("SELECT @@GLOBAL.read_only")
@@ -1153,76 +1150,6 @@ def _local_state_self_master(cur, host, port):
         return False, None
     rec = (row[0] if row else None)
     return _addr_eq(rec, host, port), rec
-
-
-def enable_semisync(cur, flavour):
-    """在节点上启用半同步复制（仅当 SEMI_SYNC=1 时生效，否则直接返回，零开销）。
-
-    半同步把「主库提交」改为等待至少一个从库 ACK，从而把故障切换时的数据丢失窗口
-    从「已提交但未复制到任何从库」压缩到接近 0（仍需至少一个从库存活且在
-    rpl_semi_sync_master_timeout 内 ACK，否则退化为异步）。
-
-    实现为运行时启用（INSTALL PLUGIN + SET GLOBAL），覆盖存量与新建节点
-    （节点经 manager 的 ensure_ha_creds / make_slave_of / promote_to_master 时触发）；
-    不写 my.cnf，避免插件缺失导致节点启动失败。
-
-    幂等且容错：插件已安装 / 变量已设置 / 插件文件缺失 均忽略报错，仅告警，
-    绝不中断主流程（失败即退化为异步，不影响复制建立）。
-    MySQL 与 MariaDB 的插件名、变量名不同，按风味分派。
-    """
-    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
-        return
-    try:
-        if flavour == F_MARIADB:
-            # MariaDB semisync is built-in; skip INSTALL PLUGIN (would 1126) and just SET GLOBAL.
-            plugins = ()
-            sets = [
-                "SET GLOBAL rpl_semi_sync_master_enabled=1",
-                "SET GLOBAL rpl_semi_sync_slave_enabled=1",
-                "SET GLOBAL rpl_semi_sync_master_timeout=10000",
-                # 无损半同步：主库先等从库 ACK 再提交（MariaDB 12.x 无 wait_for_slave_count 变量，
-                # 默认即等待至少 1 个从库 ACK，等价于 MySQL 的 wait_for_slave_count=1）
-                "SET GLOBAL rpl_semi_sync_master_wait_point=AFTER_SYNC",
-            ]
-        else:
-            # MySQL 8.0.26+ 起插件与变量改名为 source/replica，旧名（semisync_master.so /
-            # semisync_slave.so）已被移除 —— 旧名 INSTALL 会报 1126
-            # "Can't open shared library ... No such file or directory"，半同步因此装不上。
-            # 这里旧名新名都尝试，失败一律忽略；最终以「变量能否 SET 成功」为准。
-            plugins = (("rpl_semi_sync_master", "semisync_master"),
-                       ("rpl_semi_sync_slave", "semisync_slave"),
-                       ("rpl_semi_sync_source", "semisync_source"),
-                       ("rpl_semi_sync_replica", "semisync_replica"))
-            sets = [
-                # 旧名（<=8.0.25 及 8.0.26+ 的兼容别名）
-                "SET GLOBAL rpl_semi_sync_master_enabled=1",
-                "SET GLOBAL rpl_semi_sync_slave_enabled=1",
-                "SET GLOBAL rpl_semi_sync_master_timeout=10000",
-                "SET GLOBAL rpl_semi_sync_master_wait_for_slave_count=1",
-                "SET GLOBAL rpl_semi_sync_master_wait_point=AFTER_SYNC",
-                # 新名（8.0.26+；老版本上会失败，被下方 try 忽略，无副作用）
-                "SET GLOBAL rpl_semi_sync_source_enabled=1",
-                "SET GLOBAL rpl_semi_sync_replica_enabled=1",
-                "SET GLOBAL rpl_semi_sync_source_timeout=10000",
-                "SET GLOBAL rpl_semi_sync_source_wait_for_replica_count=1",
-                "SET GLOBAL rpl_semi_sync_source_wait_point=AFTER_SYNC",
-            ]
-        for pname, soname in plugins:
-            try:
-                cur.execute("INSTALL PLUGIN %s SONAME '%s.so'" % (pname, soname))
-            except Exception as e:
-                _m = str(e).lower()
-                if "already" in _m or "1125" in _m or "1060" in _m or "1286" in _m or "1126" in _m:
-                    pass  # 已安装 / 插件文件缺失(1286) / 平台不支持(1125)：忽略
-                else:
-                    print(f"[semisync] INSTALL PLUGIN {pname} 失败(可忽略): {e}")
-        for s in sets:
-            try:
-                cur.execute(s)
-            except Exception as e:
-                print(f"[semisync] {s} 失败(可忽略): {e}")
-    except Exception as e:
-        print(f"[semisync] 启用半同步失败(可忽略): {e}")
 
 
 def get_node_utc_time(host, port, user, password, root_user="root", root_pass=""):
@@ -1319,99 +1246,6 @@ def purge_binlog_before(host, port, user, password, dt_str, root_user="root", ro
             pass
 
 
-def ensure_semisync_on(host, port, user, password, root_user="root", root_pass=""):
-    """检测并修复半同步退化：SEMI_SYNC=1 但节点半同步开关被关闭时重新启用。
-
-    【为什么需要它】enable_semisync 只做 SET GLOBAL（刻意不写 my.cnf，避免插件
-    缺失导致节点启动失败），因此**节点重启后变量必然回到默认 OFF**；而它仅在
-    make_slave_of / ensure_ha_creds / 提升主库 这类结构性操作时被调用，稳态下
-    节点重启不会触发 → 半同步静默退化为异步，切换时会丢已提交事务。
-    更隐蔽的是：monitor 的半同步告警只在「ON → 非 ON」跃迁时发（依赖 _PREV
-    基线），若管理器与节点**同时**重启（升版就是这种场景），基线丢失，连告警都没有。
-    故在监控周期里主动检测「开关变量」并重新打开。
-
-    从库侧注意：SET GLOBAL rpl_semi_sync_slave_enabled 不会立即生效，必须重启
-    IO 线程使其与主库重新协商半同步，否则 slave_status 长期为 OFF。
-
-    返回 (ok, msg, action)：action = None(无需动作) / 'fixed'(已修复) /
-    'unsupported'(插件缺失或版本不支持，需人工)。
-    """
-    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
-        return True, "SEMI_SYNC 未开启，跳过", None
-    try:
-        conn = connect_robust(host, port, user, password, root_user, root_pass)
-    except Exception as e:
-        return False, f"连接失败: {e}", None
-    if conn is None:
-        return False, "无法连接节点(ha_monitor/root 均失败)", None
-    try:
-        cur = conn.cursor()
-        flavour = detect_flavour(cur)
-
-        def _var(names):
-            """按候选名依次读全局变量，兼容 MySQL 8.0.26+ 的 source/replica 改名。"""
-            for n in names:
-                try:
-                    cur.execute(f"SHOW GLOBAL VARIABLES LIKE '{n}'")
-                    row = cur.fetchone()
-                    if row:
-                        return n, (row[1] if len(row) > 1 else None)
-                except Exception:
-                    continue
-            return None, None
-
-        def _on(v):
-            return str(v).strip().upper() in ("ON", "1", "YES", "TRUE")
-
-        _, m_val = _var(("rpl_semi_sync_master_enabled", "rpl_semi_sync_source_enabled"))
-        _, s_val = _var(("rpl_semi_sync_slave_enabled", "rpl_semi_sync_replica_enabled"))
-        if _on(m_val) and _on(s_val):
-            return True, "半同步开关已为 ON", None
-
-        # 开关被关闭（多为节点重启所致）→ 重新启用
-        enable_semisync(cur, flavour)
-
-        # 从库侧：重启 IO 线程，与主库重新协商半同步
-        io_restarted = False
-        try:
-            cur.execute("SHOW SLAVE STATUS" if flavour == F_MARIADB else "SHOW REPLICA STATUS")
-            has_replica = bool(cur.fetchall())
-        except Exception:
-            has_replica = False
-        if has_replica:
-            for stop_sql, start_sql in (
-                    ("STOP REPLICA IO_THREAD", "START REPLICA IO_THREAD"),
-                    ("STOP SLAVE IO_THREAD", "START SLAVE IO_THREAD"),
-            ):
-                try:
-                    cur.execute(stop_sql)
-                    cur.execute(start_sql)
-                    io_restarted = True
-                    break
-                except Exception:
-                    continue
-
-        # 复查
-        _, m_val2 = _var(("rpl_semi_sync_master_enabled", "rpl_semi_sync_source_enabled"))
-        _, s_val2 = _var(("rpl_semi_sync_slave_enabled", "rpl_semi_sync_replica_enabled"))
-        still_off = []
-        if not _on(m_val2):
-            still_off.append("master/source")
-        if not _on(s_val2):
-            still_off.append("slave/replica")
-        if still_off:
-            return False, ("已尝试重新启用，但 %s 仍为 OFF（插件缺失或权限不足），需人工处理"
-                           % "、".join(still_off)), "unsupported"
-        return True, ("半同步已自动重新启用" + ("（并重启 IO 线程）" if io_restarted else "")), "fixed"
-    except Exception as e:
-        return False, f"检测/修复半同步异常: {e}", None
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
 def make_slave_of(host, port, user, password, master_host, master_port,
                   repl_user, repl_pass, root_user="root", root_pass=""):
     """把本节点改造为 master_host 的从库（GTID 自动定位）。
@@ -1431,10 +1265,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
     try:
         cur = conn.cursor()
         flavour = detect_flavour(cur)
-        try:
-            enable_semisync(cur, flavour)
-        except Exception:
-            pass
+
         # ---- VIP 守卫（必须先于任何复制改动执行）----
         # ha_local.state 是 keepalived 检查脚本判定 VIP 归属的**唯一**依据。若本节点该表
         # 记录的 current_master 指向自己，说明 VIP 正绑在本机、业务正在经 VIP 写它。
@@ -2096,10 +1927,7 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             flavour = detect_flavour(cur)
         except Exception:
             flavour = F_MYSQL8
-        try:
-            enable_semisync(cur, flavour)
-        except Exception:
-            pass
+
         # 认证插件：MySQL >= 8.0.34 用 caching_sha2_password，消除
         # "[MY-013360] mysql_native_password is deprecated" 告警（8.4 起该插件默认不可用）。
         # MariaDB 始终用自带的 mysql_native_password（无废弃问题）。

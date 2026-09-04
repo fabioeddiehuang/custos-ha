@@ -152,6 +152,19 @@ try:
     ).read_text().strip()
 except Exception:
     TEMPLATES.globals["APP_VERSION"] = ""
+
+
+def display_node_type(nt):
+    """部署形态（node_type）对外展示名：docker 形态即「容器化 MySQL」，统一显示为 MySQL。"""
+    nt = (nt or "docker").strip()
+    if nt == "docker":
+        return "MySQL"
+    if nt in ("mariadb", "mariadb-docker"):
+        return "MariaDB"
+    return nt
+
+
+TEMPLATES.globals["display_node_type"] = display_node_type
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 # 启动期安全校验：SECRET_KEY 为默认值则拒绝加载（避免会话被伪造）
 validate_config()

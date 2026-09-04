@@ -8,7 +8,7 @@ from .config import (CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENAB
                      MGMT, get_mgmt_host, SEMI_SYNC)
 from .db import query, execute, get_setting
 from .ha_client import (get_status, heal_replication, heal_io_gtid_gap,
-                        ensure_semisync_on, get_binlog_usage, purge_binlog_before,
+                        get_binlog_usage, purge_binlog_before,
                         set_read_only, get_node_utc_time)
 from .state import get_current_master
 from .failover import (do_failover, do_failover_to, ensure_topology, load_creds,
@@ -41,15 +41,6 @@ _HEAL_SKIP_LOGGED = set()
 _HEAL_MIN_BACKOFF = 30      # 连续失败后首次冷却秒数（按失败次数线性放大）
 _HEAL_MAX_BACKOFF = 300     # 冷却上限（5 分钟）
 
-# 半同步退化自愈的限频时刻：(cluster_id, host, port) -> monotonic
-_SEMI_FIX_AT = {}
-_SEMI_FIX_INTERVAL = 300    # 同一节点最多 5 分钟检测/修复一次
-_SEMI_UNSUPPORTED_LOGGED = set()   # 已告警过「半同步无法启用」的节点（避免刷屏）
-
-
-def _semi_sync_enabled():
-    """SEMI_SYNC 开关是否打开（环境变量，默认关闭）。"""
-    return str(SEMI_SYNC).strip() not in ("", "0", "false", "False", "off", "OFF", "no", "None")
 
 
 def _repl_err_is_connectivity(st):
@@ -643,40 +634,6 @@ def _act_once():
                 continue
             h_host, h_port = key[0], key[1]
             ru, rp = node_root(h_host, cid)
-            # ---- 半同步退化自愈 ----
-            # 半同步只靠 SET GLOBAL 启用（刻意不写 my.cnf），节点重启后变量必然回到 OFF；
-            # 而 enable_semisync 仅在 make_slave_of / ensure_ha_creds / 提升主库 时触发，
-            # 稳态下的节点重启不会触发 → 静默退化为异步，切换即丢已提交事务。
-            # 且 monitor 的半同步告警依赖 _PREV 基线做「ON→OFF」跃迁判定，
-            # 管理器与节点同时重启（升版场景）时基线丢失、连告警都没有。故此处主动检测。
-            if _semi_sync_enabled() and time.monotonic() >= _SEMI_FIX_AT.get(key, 0.0):
-                _semi_now = (st.get("semi_master_status") if is_master
-                             else st.get("semi_slave_status"))
-                if _semi_now is not None and str(_semi_now).upper() != "ON":
-                    _SEMI_FIX_AT[key] = time.monotonic() + _SEMI_FIX_INTERVAL
-                    try:
-                        ok_s, msg_s, act_s = ensure_semisync_on(
-                            h_host, h_port, creds["ha_user"], creds["ha_pass"], ru, rp)
-                    except Exception as e:
-                        ok_s, msg_s, act_s = False, f"{type(e).__name__}: {e}", None
-                    if act_s == "fixed":
-                        _sh_stat("semi_fixed")
-                        print(f"[monitor] 半同步自愈 {h_host}:{h_port}: {msg_s}")
-                        send_alert("半同步已自动恢复",
-                                   f"【{cluster_name}】节点 {h_host}:{h_port} 半同步退化为异步"
-                                   f"（多为节点重启后 SET GLOBAL 丢失所致），已自动重新启用：{msg_s}。"
-                                   f"若需重启后仍保持，请把半同步参数写入节点 my.cnf。",
-                                   cluster_id=cid)
-                    elif act_s == "unsupported" and key not in _SEMI_UNSUPPORTED_LOGGED:
-                        _SEMI_UNSUPPORTED_LOGGED.add(key)
-                        print(f"[monitor] 半同步无法启用 {h_host}:{h_port}: {msg_s}")
-                        send_alert("半同步无法启用",
-                                   f"【{cluster_name}】节点 {h_host}:{h_port} 半同步未生效：{msg_s}。"
-                                   f"常见原因：MySQL 8.0.26+ 插件改名（semisync_source/replica.so 缺失）"
-                                   f"或账号缺少 SUPER 权限。当前为异步复制，切换存在数据丢失(RPO)风险。",
-                                   cluster_id=cid)
-                    elif not ok_s and act_s is None:
-                        print(f"[monitor] 半同步检测 {h_host}:{h_port} 失败: {msg_s}")
             # ---- binlog 空间守卫（仅主库，每小时一次）----
             if is_master and time.monotonic() >= _BINLOG_AT.get(key, 0.0):
                 _BINLOG_AT[key] = time.monotonic() + _BINLOG_INTERVAL

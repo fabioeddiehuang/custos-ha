@@ -128,7 +128,7 @@
   <div class="cd-sum"><div class="k">当前主库</div><div class="v {% if cluster.current_master == '未选举' %}bad{% else %}ok{% endif %}">{{ cluster.current_master }}</div></div>
   <div class="cd-sum"><div class="k">节点在线</div><div class="v">{{ cluster.online }}/{{ cluster.node_count }}</div></div>
   <div class="cd-sum"><div class="k">从库数量</div><div class="v">{{ cluster.slaves|length }}</div></div>
-  <div class="cd-sum"><div class="k">部署形态</div><div class="v">{{ cluster.node_type or 'docker' }}</div></div>
+  <div class="cd-sum"><div class="k">部署形态</div><div class="v">{{ display_node_type(cluster.node_type) }}</div></div>
 </div>
 
 <div class="banner info">自动化说明：开启「自动修复」后，账号凭证密码漂移与节点配置漂移由管理器在轮询中自动校正（复用 ensure_ha_creds / 配置下发），无需登录节点手动操作。一键修复用于立即触发。</div>
