@@ -1,12 +1,41 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> 当前版本：**v2.2.17**（镜像标签 `custos:v2.2.16`，keepalived 镜像 `custos-node:v2.2.16`）
+> 当前版本：**v2.2.20**（镜像标签 `custos-server:v2.2.20`，keepalived 镜像 `custos-node:v2.2.20`）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
 > 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
 
 ---
 
-## 〇、v2.2.17 错误日志面板兼容全部部署形态（MySQL/MariaDB 裸机/docker）
+## 〇、v2.2.20 半同步复制配置文件持久化 + 部署形态展示统一
+
+- **半同步复制改为「配置文件持久化」方式**（v2.2.18/19 为运行期 `SET GLOBAL` 启用）：
+  - 节点生成时，按数据库类型注入对应半同步片段到 `my.cnf` / `ha-overrides.cnf`：
+    - MySQL 8.0：写入 `plugin_load_add='semisync_source;semisync_replica'`、`rpl_semi_sync_source_enabled=1`/`rpl_semi_sync_replica_enabled=1`（≥8.0.26 用 `source/replica` 命名，更早用 `master/slave`）。
+    - MariaDB：写入 `plugin_load_add='semisync_master;semisync_slave'`、`rpl_semi_sync_master_enabled=1`/`rpl_semi_sync_slave_enabled=1`。
+  - 随实例启动即生效、**重启不丢**，根治「升版/重启后 `SET GLOBAL` 清零导致半同步静默退化为异步」的反复问题。
+- **移除运行期半同步启用逻辑**：`ha_client.enable_semisync` / `node_gen` 的运行期注入、`monitor` 的半同步自愈定时任务与 `SEMI_FIX_*` 标记全部删除；半同步状态完全由配置文件决定。
+- **部署形态展示名统一**：`api.display_node_type` 将 `docker` 形态对外显示为「MySQL」（不再显示「Docker」），`mariadb` / `mariadb-docker` 显示为「MariaDB」；节点管理页与集群页徽标 `Docker→MySQL`。
+- **版本号与镜像改名**：
+  - 删除 `app/VERSION` 文件，版本号改由 `.env` 的 `VERSION` 字段管理。
+  - 服务端容器/镜像名统一为 **`custos-server`**（原 `custos`），Docker 节点容器固定为 `custos-mysql`（MySQL）/ `custos-mariadb`（MariaDB）。
+  - 镜像标签：`custos-server:v2.2.20`、`custos-node:v2.2.20`。
+
+## v2.2.19 GTID 分叉感知（续传优先，解 v2.2.18 误判）
+
+- **问题**：v2.2.18 的 GTID 分叉检测只看从库「已应用集」(`gtid_slave_pos`)，一旦检测到分叉就 `RESET MASTER`；对于「从库自有 binlog(`gtid_binlog_pos`) 早已领先、但已应用集落后」的节点会被误判强制重置，丢失已执行位点、破坏续传。
+- **修复**：
+  - 检测范围扩展为同时比较 `gtid_slave_pos` 与 `gtid_binlog_pos`：仅当**两者都不是主库 GTID 子集**时，才判定真正分叉并 `RESET MASTER` 解除冲突。
+  - 否则仅重置从库复制链路（`RESET SLAVE` + 重 `CHANGE MASTER`），保留已应用位点继续从主库续传，避免无谓全量重建。
+- **效果**：升版重启 / 历史切换后从库位点判断更精准，`out-of-order sequence` 类复制卡死自愈更安全。
+
+## v2.2.18 GTID 分叉感知 + 半同步复制基础
+
+- **GTID 分叉感知**：`ha_client.make_slave_of` 在重指向前新增 GTID 分叉检测与自愈，解决「升版重启 / 历史切换后从库执行集超前或分叉于主库」导致的复制卡死（`out-of-order sequence`）。检测到分叉时 `RESET MASTER` 解除冲突后重链。
+- **半同步复制（初版，运行期启用）**：新增 `SEMI_SYNC` 环境变量；`node_gen` 生成节点时向 `my.cnf` 注入半同步插件加载与 `rpl_semi_sync_*_enabled=1` 参数，并在链接后在运行期 `SET GLOBAL` 启用，主库提交等待至少 1 个从库 ACK，压缩切换数据丢失窗口。**注意**：该初版依赖运行期 `SET GLOBAL`，实例重启后会清零退化为异步，故在 v2.2.20 改为配置文件持久化（见 v2.2.20）。
+
+---
+
+## v2.2.17 错误日志面板兼容全部部署形态（MySQL/MariaDB 裸机/docker）
 
 - **问题**：「24 小时错误日志」面板此前仅用 `LOAD_FILE(@@log_error)` 读节点错误日志文件；容器化 MariaDB/MySQL 多将日志写 stdout 或受 `secure_file_priv` 限制，导致面板恒空，复制错误(如 1133)看不到。
 - **修复**：
@@ -250,3 +279,6 @@
 - **v2.1.0**：补齐 v3 高保真稿剩余模块——主库状态 gauge、实时活动 feed、系统设置（轮询间隔 / 内网 IP）、告警已自愈 / 未恢复标记、集群节点自愈 SQL 查看 / 下载。新增 `alerts`、`audit_log` 持久化与 `/api/node_resources`、`/api/activity_feed`、`/api/node_creds_sql` 等端点。
 - **v2.2.11**：节点形态扩展至三种（新增 Docker MariaDB 12.3.x，含 CPU 指令集预检回退 12.3.2 与小内存 buffer pool 自动收敛）；修复安装脚本误报「未找到客户端」(command -v 误用)、OOM 崩溃循环掩盖；修复仪表盘卡片布局偏移、告警详情溢出、节点自愈 SQL 下载 422；新增 doc/ 用户手册 / API 文档 / 数据库字段 / 业务流程图。
 - **v2.0.x**：基础 HA 管理能力（监控 / 自愈 / 切换 / VIP / 告警 / 预检 / 慢日志 / 配置漂移 / 审计）。
+- **v2.2.18**：GTID 分叉感知（make_slave_of 重指向前检测并自愈，解升版重启 / 历史切换后复制卡死）；半同步复制基础（SEMI_SYNC 运行期 SET GLOBAL 启用）。
+- **v2.2.19**：GTID 分叉感知改进（同时比对 gtid_slave_pos 与 gtid_binlog_pos，仅真分叉才 RESET MASTER，续传优先）。
+- **v2.2.20**：半同步复制改配置文件持久化（my.cnf 注入插件与 rpl_semi_sync_*_enabled=1，随启动生效、重启不丢），移除运行期 SET GLOBAL 启用逻辑；部署形态展示名统一（docker→MySQL / MariaDB）；版本号移入 .env，服务端镜像/容器改名 custos-server。

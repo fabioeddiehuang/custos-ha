@@ -1,13 +1,14 @@
 # Custos
 
-> 当前版本：**v2.2.17**
+> 当前版本：**v2.2.20**
 > 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
 
-基于 **Keepalived + MySQL 主从（GTID）** 的 MySQL 高可用方案，附带一个轻量管理器：
+基于 **Keepalived + MySQL/MariaDB 主从（GTID）** 的 MySQL 高可用方案，附带一个轻量管理器：
 - **决策器（monitor）**：探活主从、按策略自动选主、控制 VIP 漂移与脑裂保护；
 - **Web 控制台**：多集群管理、查看拓扑 / 切换历史 / 自动发现节点、一键生成节点部署文件；
 - **节点一键部署**：在 Web 上填写节点信息后，自动生成可直接 `docker compose up -d` 的节点目录。
+- **半同步复制（可选）**：服务端 `SEMI_SYNC=1` 时，节点 my.cnf 自动注入半同步插件与开启参数，主库提交等待从库 ACK，把故障切换的数据丢失窗口压缩到接近 0（随实例启动生效、重启不丢）。
 
 ---
 
@@ -18,6 +19,7 @@
 | 多集群隔离管理 | 每个集群独立 HA 监控账号 / 复制账号 / 业务账号、VIP、网卡、VRID；切换与监控按 `cluster_id` 隔离。 |
 | 自动高可用与故障切换 | 探活主从、GTID 感知选主（`pick_best_master`）、VIP 漂移、脑裂保护；主库失联约 6s 触发切换（默认 `CHECK_INTERVAL=3` / `FAIL_THRESHOLD=2`）。 |
 | 复制自愈 | 在线修复 SQL（1007/1050/1061/1062/1396/1032/1146）与 IO（13114/1236）复制错误（注入空事务跳过冲突）；支持手动 `/api/heal` 重指向 + 自愈。 |
+| 半同步复制（可选） | `SEMI_SYNC=1` 时，节点 my.cnf 注入半同步插件与开启参数（MySQL 8.0 × MariaDB 内置一致），主库提交等待从库 ACK；**随启动生效、重启不丢**（v2.2.20 起改为配置文件持久化，根治运行期 `SET GLOBAL` 清零后静默退化为异步）。GTID 分叉感知重链（v2.2.18/19）可自动解「out-of-order sequence」复制卡死。 |
 | 节点一键部署 | **三种形态**：① Docker MySQL 8.0（`Install-mysql-docker-Node.sh` + compose）；② Docker MariaDB 12.3.x（生成即**纯 compose**，目录内 `docker compose up -d` 一键起 MariaDB + keepalived）；③ 裸机 MariaDB 12.x（`Install-ha-mariadb-Node.sh` 一条命令完成安装+账号初始化+keepalived 启动，**该包只适配裸机**）。**裸机装不上 tarball（如 glibc 过低）时直接选②容器版**，可与③同集群混部。账号/GTID 统一初始化，首次安装即可部署成功。 |
 | Web 控制台 | 仪表盘（实时拓扑 / 统计 / 刷新）、集群管理（单色系卡片 + SVG 图标 + 按集群配置凭证与 VIP）、节点配置（生成 / 重新生成 / 删除）、系统配置（SMTP 多收件人告警 + 按集群路由）。 |
 | 切换历史与告警 | 记录每次切换（from→to + 原因）；支持邮件告警与异常日志一键复制排错。 |
@@ -129,12 +131,13 @@ cd custos-ha
 | `NODES_DIR` | 容器内节点生成目录 | `/app/generated_nodes` |
 | `NODES_HOST_BASE` | 节点目录在宿主机的**显示路径**（Web 展示用） | `custos-ha/generated_nodes` |
 | `VIP` / `VIP_PREFIX` / `INTERFACE` / `VRID` / `VIP_PORT` | VIP / 掩码位 / 网卡 / 虚拟路由ID / VIP 对外访问端口 | 空 / `24` / `eth0` / `51` / `3307` |
+| `SEMI_SYNC` | 半同步复制开关：置 `"1"` 启用（主库提交等待从库 ACK，压缩切换数据丢失窗口）；节点 my.cnf 自动注入插件与开启参数，随启动生效、重启不丢。MySQL 8.0（≥8.0.26 用 source/replica 命名，更早用 master/slave）与 MariaDB 均支持 | `"0"` |
 | `SMTP_*` / `ALERT_EMAIL` | 切换告警邮件（可选） | — |
 
 > 也支持通过文件注入敏感信息：`MGMT_MYSQL_PASS_FILE`、`WEB_PASS_FILE`（容器内路径）。
 
 ### 可选：自带演示用管理库
-取消 `docker-compose.yml` 中 `mgmt-mysql` 整段注释，并取消 `custos` 的 `depends_on` 注释；数据落在 `./data/mysql-data`。生产推荐使用你已有的外部管理库。
+取消 `docker-compose.yml` 中 `mgmt-mysql` 整段注释，并取消 `custos-server` 的 `depends_on` 注释；数据落在 `./data/mysql-data`。生产推荐使用你已有的外部管理库。
 
 ---
 
@@ -260,7 +263,7 @@ cd custos-ha
 - 核对节点侧 `ha_check.conf` / `init.sql` 中的 `ha_monitor`、`replication` 密码，与「集群管理」中该集群设置的完全一致；可点「同步密码到节点」重新下发。
 
 **Q6. 刷新按钮卡顿 / 仪表盘不更新**
-- 刷新按钮只做并发探活 + 后台异步收敛，约单超时返回；仪表盘每 10s 轮询。若源码改动未生效，确认已 `docker compose up -d --build custos` 重建镜像，且部署为单 worker（勿加 `--workers`）。
+- 刷新按钮只做并发探活 + 后台异步收敛，约单超时返回；仪表盘每 10s 轮询。若源码改动未生效，确认已 `docker compose up -d --build custos-server` 重建镜像，且部署为单 worker（勿加 `--workers`）。
 
 ---
 
