@@ -862,7 +862,8 @@ def settings_page(request: Request, user=Depends(auth_required), msg: str = "", 
     # 高级切换 / 监控开关与阈值（全局，默认与 monitor 守护进程一致）
     adv = dict(
         auto_failover=get_setting("AUTO_FAILOVER", "1") == "1",
-        auto_repair=get_setting("AUTO_REPAIR", "0") == "1",
+        # 默认与 monitor.py 运行时一致（get_setting("AUTO_REPAIR","1")），避免 UI 显示「关」但实际在自愈
+        auto_repair=get_setting("AUTO_REPAIR", "1") == "1",
         lag_failover=get_setting("LAG_FAILOVER_ENABLED", "0") == "1",
         pressure_failover=get_setting("PRESSURE_FAILOVER_ENABLED", "0") == "1",
         lag_failover_sec=get_setting("LAG_FAILOVER_SEC", "60"),

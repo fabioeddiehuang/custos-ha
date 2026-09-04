@@ -3,7 +3,8 @@ import concurrent.futures as _cf
 import threading
 import time
 from .config import (CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENABLED,
-                     HEARTBEAT_INTERVAL, METRICS_INTERVAL, DRIFT_INTERVAL)
+                     HEARTBEAT_INTERVAL, METRICS_INTERVAL, DRIFT_INTERVAL,
+                     MGMT, get_mgmt_host)
 from .db import query, execute, get_setting
 from .ha_client import get_status, heal_replication, heal_io_gtid_gap
 from .state import get_current_master
@@ -26,6 +27,93 @@ _PREV = {}
 
 # 每个节点心跳(last_seen)上一次落库的 monotonic 时刻，用于 HEARTBEAT_INTERVAL 限频
 _HEARTBEAT_AT = {}
+
+# ===== 自愈退避 / 守卫状态 =====
+# (cluster_id, host, port) -> 下次允许自愈的 monotonic 时刻
+_HEAL_NEXT_AT = {}
+# (cluster_id, host, port) -> 连续自愈失败次数
+_HEAL_FAILS = {}
+# 已打印过「源库不可达，跳过自愈」提示的 key（避免每周期刷屏）
+_HEAL_SKIP_LOGGED = set()
+_HEAL_MIN_BACKOFF = 30      # 连续失败后首次冷却秒数（按失败次数线性放大）
+_HEAL_MAX_BACKOFF = 300     # 冷却上限（5 分钟）
+
+
+def _repl_err_is_connectivity(st):
+    """复制错误是否属于「源库不可达」（对端宕机 / 断网 / 端口不通）。
+
+    这类错误**没有任何可自愈的东西**：源库只是连不上，跳过冲突事务或重新挂载都无效。
+    若仍每个周期对从库反复 START SLAVE / CHANGE MASTER，会白白把从库 CPU 打满——
+    线上即表现为「某节点关机后，另一节点 CPU 飙高、机器温度上升」。
+    故此处直接跳过自愈，等对端恢复后自动继续。
+
+    注意：1045 密码错误属凭证漂移，由 _cred_self_heal 负责，不在此列（不算不可达）。
+    """
+    errs = (st.get("slave_io_err") or "", st.get("slave_sql_err") or "", st.get("error") or "")
+    pats = (
+        "2003", "2002", "2013", "2059", "1129", "1130",
+        "can't connect", "cannot connect", "lost connection",
+        "error reconnecting to master", "reconnecting to master",
+        "error connecting to master", "connecting to master",
+        "connection refused", "no route to host", "network is unreachable",
+        "host is blocked", "max_connect_errors", "timed out", "timeout",
+    )
+    for e in errs:
+        low = (e or "").lower()
+        if not low:
+            continue
+        for p in pats:
+            if p in low:
+                return True
+    return False
+
+
+def _heal_ok(key):
+    """自愈成功：清除退避与失败计数，后续周期可立即再次自愈。"""
+    _HEAL_FAILS.pop(key, None)
+    _HEAL_NEXT_AT.pop(key, None)
+
+
+def _heal_fail(key):
+    """自愈失败：按连续失败次数放大冷却（30s 起步、300s 封顶）。
+
+    避免源库长时间不可用时，每个探活周期都把自愈（含 200 次跳过循环）重跑一遍。
+    """
+    n = _HEAL_FAILS.get(key, 0) + 1
+    _HEAL_FAILS[key] = n
+    _HEAL_NEXT_AT[key] = time.monotonic() + min(_HEAL_MAX_BACKOFF, _HEAL_MIN_BACKOFF * n)
+
+
+# ===== 管理库兜底防护 =====
+_MGMT_NODE_WARNED = set()
+
+
+def _is_mgmt_endpoint(host, port):
+    """该 (host, port) 是否为管理库本体（MGMT_MYSQL_HOST:PORT）。
+
+    管理库只供管理器自身存储使用，绝不参与集群（同机不同端口的节点仍允许）。
+    """
+    try:
+        mh = get_mgmt_host()
+    except Exception:
+        return False
+    if not mh or mh in ("127.0.0.1", "localhost", "auto"):
+        return False
+    try:
+        return (str(host).strip() == str(mh).strip()
+                and str(port) == str(MGMT.get("port", 3306)))
+    except Exception:
+        return False
+
+
+def _warn_mgmt_node_once(host, port):
+    """提示「节点指向管理库」，每个地址只提示一次，避免每周期刷屏。"""
+    k = (str(host), str(port))
+    if k in _MGMT_NODE_WARNED:
+        return
+    _MGMT_NODE_WARNED.add(k)
+    print(f"[monitor] 警告：节点 {host}:{port} 指向管理库（MGMT_MYSQL_HOST），已跳过探活与自愈/切换。"
+          f"管理库不参与集群，请在「节点管理」删除该节点，避免其状态恒为「在线」。")
 
 
 def _same(a, b):
@@ -323,6 +411,13 @@ def _probe_all():
             except (TypeError, ValueError):
                 print(f"[monitor] 跳过无效主机 {h['host']}（port 缺失/非法：{h['port']!r}）")
                 continue
+            # 兜底防护：管理库（MGMT_MYSQL_HOST:PORT）只供管理器自身存储，绝不能当集群节点。
+            # 「添加节点」处已有校验，但历史数据里可能残留早于该校验录入的节点。
+            # 若不跳过：探活会连到仍在监听的管理库上，使该节点永远显示「在线」；
+            # 更危险的是自愈/切换会对管理库执行 START SLAVE / CHANGE MASTER 等复制操作。
+            if _is_mgmt_endpoint(h["host"], port):
+                _warn_mgmt_node_once(h["host"], port)
+                continue
             tasks.append((cid, cluster_name, h["host"], port, creds, cur_key))
 
     if not tasks:
@@ -395,6 +490,21 @@ def _act_once():
                 continue
             h_host, h_port = key[0], key[1]
             ru, rp = node_root(h_host, cid)
+            # ---- 自愈前置守卫（仅从库）----
+            # ① 源库不可达（宕机/断网）：根本无从自愈，直接跳过，避免每周期对从库反复
+            #    START SLAVE / CHANGE MASTER 把 CPU 打满（源库不可用期间的主要放大源）。
+            # ② 退避期内：上次自愈失败后冷却时间未到，不重复尝试。
+            if not is_master:
+                if _repl_err_is_connectivity(st):
+                    if key not in _HEAL_SKIP_LOGGED:
+                        _HEAL_SKIP_LOGGED.add(key)
+                        _e = (st.get("slave_io_err") or st.get("slave_sql_err") or "IO 线程已停")
+                        print(f"[monitor] 跳过自愈 {h_host}:{h_port}：复制错误为「源库不可达」"
+                              f"（{str(_e)[:120]}），等对端恢复后自动继续")
+                    continue
+                _HEAL_SKIP_LOGGED.discard(key)
+                if time.monotonic() < _HEAL_NEXT_AT.get(key, 0.0):
+                    continue
             # 当前主库但若仍挂着复制通道（SHOW REPLICA STATUS 有输出）：这是提升为主时
             # RESET SLAVE ALL 未清干净、或被 ensure_topology 误 repoint 的残留。它会让主库
             # 仍尝试拉旧源 binlog 而报 1236（"master 却 IO 错误"的矛盾现象）。
@@ -413,6 +523,7 @@ def _act_once():
                 ok, msg = heal_replication(h_host, h_port, creds["ha_user"], creds["ha_pass"], ru, rp)
                 if ok:
                     print(f"[monitor] 自愈 {h_host}:{h_port} 成功: {msg}")
+                    _heal_ok(key)
                     try:
                         if not query("SELECT 1 FROM alerts WHERE cluster_id=%s AND host=%s AND port=%s AND status='healed' AND created_at > NOW()-INTERVAL 10 MINUTE LIMIT 1", (cid, h_host, int(h_port))):
                             execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) VALUES(%s,%s,%s,'selfheal','healed',%s,NOW())", (cid, h_host, int(h_port), msg))
@@ -420,6 +531,7 @@ def _act_once():
                         pass
                 else:
                     print(f"[monitor] 自愈 {h_host}:{h_port} 失败: {msg}")
+                    _heal_fail(key)
             # 复制 IO 线程中断，分两类处理：
             #  (A) 匿名事务 1236（"Cannot replicate anonymous transaction when AUTO_POSITION=1"）：
             #      源端 binlog 含匿名事务（节点曾被提升为主、旧 binlog 写于 gtid_mode<ON 期）。
@@ -436,6 +548,7 @@ def _act_once():
                         cur_h, cur_p, creds)
                     if ok_r:
                         print(f"[monitor] 匿名事务1236 自愈(重挂载) {h_host}:{h_port}: {msg_r}")
+                        _heal_ok(key)
                         try:
                             if not query("SELECT 1 FROM alerts WHERE cluster_id=%s AND host=%s AND port=%s AND status='healed' AND created_at > NOW()-INTERVAL 10 MINUTE LIMIT 1", (cid, h_host, int(h_port))):
                                 execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) VALUES(%s,%s,%s,'selfheal','healed',%s,NOW())", (cid, h_host, int(h_port), msg_r))
@@ -443,6 +556,7 @@ def _act_once():
                             pass
                     else:
                         print(f"[monitor] 匿名事务1236 重挂载失败 {h_host}:{h_port}: {msg_r}")
+                        _heal_fail(key)
                 else:
                     # (B) 缺 GTID 类：源端注入空事务
                     sru, srp = node_root(h_host, cid)
@@ -452,6 +566,7 @@ def _act_once():
                         sru, srp, cur_h, int(cur_p) if cur_p else None, mru, mrp)
                     if ok_g:
                         print(f"[monitor] IO 自愈 {h_host}:{h_port}: {msg_g}")
+                        _heal_ok(key)
                         try:
                             if not query("SELECT 1 FROM alerts WHERE cluster_id=%s AND host=%s AND port=%s AND status='healed' AND created_at > NOW()-INTERVAL 10 MINUTE LIMIT 1", (cid, h_host, int(h_port))):
                                 execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) VALUES(%s,%s,%s,'selfheal','healed',%s,NOW())", (cid, h_host, int(h_port), msg_g))
@@ -459,6 +574,10 @@ def _act_once():
                             pass
                     elif "more GTIDs" in msg_g or "13114" in msg_g or "1236" in msg_g:
                         print(f"[monitor] IO 自愈 {h_host}:{h_port} 失败: {msg_g}")
+                        _heal_fail(key)
+                    else:
+                        # 其他失败同样退避，避免非「不可达」类故障被每周期重跑
+                        _heal_fail(key)
         # 当前主库连续失败达到阈值 -> 自动切换
         fails = run_once._fails.setdefault(cid, {})
         for key, (st, is_master) in list(cache.items()):
