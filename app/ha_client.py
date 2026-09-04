@@ -1495,28 +1495,42 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                                f"请重新运行 Install-ha-mariadb-Node.sh 开启 GTID 后重入集群。")
         # ---- GTID 分叉感知（升版重启/历史切换后从库执行集可能超前或分叉于主库）----
         # 正常重指向：RESET SLAVE ALL + MASTER_USE_GTID=slave_pos 即可（GTID 自动定位跳过已执行事务）。
-        # 但若从库 gtid_slave_pos 不是主库 gtid_binlog_pos 的子集（如本例 100 已有 3-3-17737、
-        # 主库却发 3-3-1），slave_pos 自动定位失败并触发「out-of-order sequence」(gtid_strict_mode)，
-        # 复制卡死。此时清掉从库本地 GTID 并把 gtid_slave_pos 对齐到主库【当前】位置后重链，
-        # 跳过已一致的历史事务、从当前位点续传，且不会因重放旧事务报 1007/1062。
+        # 但若从库「自有 binlog(gtid_binlog_pos) 或 已应用集(gtid_slave_pos)」不是主库
+        # gtid_binlog_pos 的子集（如本例 100 曾为主、自有 binlog 含 3-3-17737，主库却发 3-3-1），
+        # slave_pos 自动定位失败并触发「out-of-order sequence」(gtid_strict_mode)，复制卡死。
+        # 此时 RESET MASTER 清空从库自有 binlog 解除乱序冲突；gtid_slave_pos 默认保留（让复制从
+        # 已应用位点续传、重放主库其余 domain 最终一致）。仅当 gtid_slave_pos 本身也非子集
+        # （极少见：从库应用过主库没有的事务）才把 gtid_slave_pos 对齐到主库当前位置跳过重放。
         try:
-            cur.execute("SELECT @@gtid_slave_pos")
-            _slave_gt = (cur.fetchone() or [None])[0] or ""
+            cur.execute("SELECT @@gtid_slave_pos, @@gtid_binlog_pos")
+            _sr = cur.fetchone() or [None, None]
+            _slave_gt = _sr[0] or ""
+            _own_gt = _sr[1] or ""
             _mconn = connect_robust(master_host, int(master_port), user, password, root_user, root_pass)
             if _mconn is not None:
                 _mcur = _mconn.cursor()
                 _mcur.execute("SELECT @@gtid_binlog_pos")
                 _master_gt = (_mcur.fetchone() or [None])[0] or ""
                 _mconn.close()
-                if _slave_gt and _master_gt:
-                    cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
-                    if not (cur.fetchone() or [0])[0]:
-                        print("[gtid] %s:%s 执行集非主库子集(分叉)，RESET MASTER 并对齐主库当前 GTID 后重链" % (host, port))
+                if _master_gt and (_slave_gt or _own_gt):
+                    _pos_ok = False
+                    if _slave_gt:
+                        cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
+                        _pos_ok = bool((cur.fetchone() or [0])[0])
+                    _bin_ok = False
+                    if _own_gt:
+                        cur.execute("SELECT GTID_SUBSET(%s, %s)", (_own_gt, _master_gt))
+                        _bin_ok = bool((cur.fetchone() or [0])[0])
+                    if not (_pos_ok and _bin_ok):
+                        print("[gtid] %s:%s 本地 GTID 非主库子集(分叉)，RESET MASTER 解除冲突后重链" % (host, port))
                         try:
                             cur.execute(stop_replication_sql(flavour))
                             cur.execute(reset_replica_sql(flavour))
                             cur.execute("RESET MASTER")
-                            cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
+                            if _slave_gt and not _pos_ok:
+                                # 已应用集也分叉：对齐到主库当前位置，跳过重放避免 1236
+                                cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
+                                print("[gtid] %s:%s 已应用集分叉，gtid_slave_pos 已对齐主库当前 %s" % (host, port, _master_gt))
                         except Exception as e2:
                             print("[gtid] 分叉重建失败(可忽略，继续常规重链): %s" % e2)
         except Exception as e:
