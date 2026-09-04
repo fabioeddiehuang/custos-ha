@@ -1,5 +1,5 @@
 """自动/手动故障切换核心逻辑（多集群：所有操作均按 cluster_id 隔离）。"""
-from .db import query, execute
+from .db import query, execute, get_setting
 from .config import get_manager_public_ip, get_manager_docker_subnet_wildcard, FAILOVER_COOLDOWN_SEC
 from .state import get_current_master, set_current_master
 from .ha_client import (set_read_only, promote_to_master, make_slave_of,
@@ -269,6 +269,85 @@ def reset_topo_throttle(cluster_id):
     _LAST_PUSH.pop(cluster_id, None)
 
 
+# 交叉验证用的「连不上主库」判定（与 monitor._repl_err_is_connectivity 同义；
+# 此处本地实现，避免 failover ↔ monitor 循环导入）
+_CONN_ERR_PATS = (
+    "2003", "2002", "2013", "2059", "1129", "1130",
+    "can't connect", "cannot connect", "lost connection",
+    "reconnecting to master", "connecting to master",
+    "connection refused", "no route to host", "network is unreachable", "timeout",
+)
+
+
+def _io_err_is_connectivity(err):
+    low = (err or "").lower()
+    return any(p in low for p in _CONN_ERR_PATS)
+
+
+def confirm_master_down(cluster_id, master_host, master_port, creds, node_root_fn=None):
+    """交叉验证：让集群内其它节点作证「主库确实连不上」，用于防误切与防脑裂。
+
+    为什么需要：探活是**管理器单方面**的视角。管理器↔主库网络分区、或主库
+    max_connections 打满，都会表现为「管理器连不上」，但主库其实好好的——
+    此时若直接提升从库，就会出现两个可写节点（脑裂双写）。
+
+    判定口径：
+      - 有其它节点仍与主库保持复制连接（IO 线程 Yes）→ 主库从别的视角仍存活 → **不确认**
+      - 至少一个其它节点明确报「连不上主库」→ 确认（独立证人）
+      - 一个证人都联系不上 → 不确认（宁可不切，也不赌）
+      - 集群没有其它节点 → 无从作证，放行（并在返回信息里说明）
+
+    返回 (confirmed: bool, detail: str)
+    """
+    try:
+        rows = query("SELECT host, port FROM hosts WHERE cluster_id=%s", (cluster_id,))
+    except Exception as e:
+        return False, f"读取集群节点失败，无法交叉验证：{e}"
+    others = []
+    for r in rows:
+        try:
+            h, p = r["host"], int(r["port"])
+        except (TypeError, ValueError):
+            continue
+        if h == master_host and p == int(master_port):
+            continue
+        others.append((h, p))
+    if not others:
+        return True, "集群内无其它节点可交叉验证，放行"
+
+    alive_seen, down_witness, unknown = [], [], []
+    for h, p in others:
+        ru, rp = (node_root_fn(h, cluster_id) if node_root_fn else ("root", ""))
+        try:
+            st = get_status(h, p, creds["ha_user"], creds["ha_pass"], ru, rp)
+        except Exception as e:
+            unknown.append(f"{h}:{p}(探活异常 {type(e).__name__})")
+            continue
+        if not st.get("alive"):
+            unknown.append(f"{h}:{p}(节点离线)")
+            continue
+        io = st.get("slave_io")
+        if io == "Yes":
+            alive_seen.append(f"{h}:{p}")
+        elif io in ("No", "Connecting"):
+            if _io_err_is_connectivity(st.get("slave_io_err")):
+                down_witness.append(f"{h}:{p}")
+            else:
+                unknown.append(f"{h}:{p}(IO 停但错误非连接类，无法作证)")
+        else:
+            unknown.append(f"{h}:{p}(无复制通道，无法作证)")
+
+    if alive_seen:
+        return False, ("其它节点仍与 %s:%s 保持复制连接（%s），说明主库从其它视角看仍然存活；"
+                       "判定为管理器侧网络/权限问题，已中止切换以规避脑裂"
+                       % (master_host, master_port, "、".join(alive_seen)))
+    if down_witness:
+        return True, "已由 %s 作证主库不可达" % "、".join(down_witness)
+    detail = ("无法确认主库状态：没有任何节点能作证（%s），已中止切换" % "；".join(unknown)) \
+        if unknown else "无可用证人，已中止切换"
+    return False, detail
+
+
 @_failover_guarded
 def do_failover(cluster_id, reason="auto"):
     """主库判定宕机后执行切换：fencing -> 提升延迟最小从库 -> 更新 current_master -> 其余节点重指向。"""
@@ -300,10 +379,29 @@ def do_failover(cluster_id, reason="auto"):
 
     # 1) fencing：尽量把旧主置只读，使其释放 VIP 并拒绝写入
     ru, rp = node_root(cur_h, cluster_id)
+    fenced = True
     try:
         set_read_only(cur_h, cur_p, creds["ha_user"], creds["ha_pass"], True, ru, rp)
     except Exception as e:
+        fenced = False
         print(f"[failover] 无法连接旧主做 fencing(可能已宕机): {e}")
+
+    # 1.5) 防误切 / 防脑裂：fencing 失败只说明「管理器连不上旧主」，不等于旧主已宕机
+    #      （网络分区、max_connections 打满、账号权限失效都会如此）。此时必须由集群内
+    #      其它节点作证主库确实不可达，否则**宁可不切**——两个可写节点（脑裂双写）
+    #      的代价远大于「该切没切」。
+    if not fenced and get_setting("REQUIRE_WITNESS_FOR_FAILOVER", "1") == "1":
+        ok_c, detail = confirm_master_down(cluster_id, cur_h, cur_p, creds, node_root)
+        if not ok_c:
+            send_alert("切换中止(疑似脑裂风险)",
+                       f"无法连接旧主 {cur_h}:{cur_p} 做 fencing，且交叉验证未通过：{detail}。"
+                       f"为避免出现两个可写节点（脑裂双写），本次切换已中止。请检查管理器到旧主的"
+                       f"网络、旧主 max_connections 与 ha_monitor 账号权限；确需强制切换时，"
+                       f"可临时将 REQUIRE_WITNESS_FOR_FAILOVER 设为 0。",
+                       cluster_id=cluster_id)
+            print(f"[failover] 切换中止：{detail}")
+            return False
+        print(f"[failover] 交叉验证通过：{detail}")
 
     # 2) 提升新主
     ru, rp = node_root(new_h, cluster_id)
@@ -348,12 +446,27 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
     if (cur_h, int(cur_p or 0)) == (target_host, target_port):
         return True  # 已是主库
     # 1) fencing 旧主（置只读），若已宕机则忽略
+    fenced = True
     if cur_h:
         ru, rp = node_root(cur_h, cluster_id)
         try:
             set_read_only(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], True, ru, rp)
         except Exception as e:
+            fenced = False
             print(f"[failover] 无法连接旧主做 fencing(可能已宕机): {e}")
+    # 1.5) 与自动切换同口径：fencing 失败时必须由其它节点作证旧主确实不可达，
+    #      否则中止（手动切换同样会造成脑裂双写）。
+    if cur_h and not fenced and get_setting("REQUIRE_WITNESS_FOR_FAILOVER", "1") == "1":
+        ok_c, detail = confirm_master_down(cluster_id, cur_h, int(cur_p or 0), creds, node_root)
+        if not ok_c:
+            send_alert("手动切换中止(疑似脑裂风险)",
+                       f"无法连接旧主 {cur_h}:{cur_p} 做 fencing，且交叉验证未通过：{detail}。"
+                       f"为避免脑裂双写，本次手动切换已中止。请检查管理器到旧主的网络或"
+                       f"旧主 max_connections；确需强制执行可将 REQUIRE_WITNESS_FOR_FAILOVER 设为 0。",
+                       cluster_id=cluster_id)
+            print(f"[failover] 手动切换中止：{detail}")
+            return False
+        print(f"[failover] 交叉验证通过：{detail}")
     # 2) 提升目标为新主（清 GTID 重置、置可写）
     ru, rp = node_root(target_host, cluster_id)
     ok_m, err_m = promote_to_master(target_host, target_port, creds["ha_user"], creds["ha_pass"], ru, rp)

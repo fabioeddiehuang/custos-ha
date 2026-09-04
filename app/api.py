@@ -19,7 +19,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from urllib.parse import quote
 
-from .config import (SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT, validate_config, hash_pwd, verify_pwd, FAILOVER_COOLDOWN_SEC)
+from .config import (SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_manager_public_ip_source, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT, validate_config, hash_pwd, verify_pwd, FAILOVER_COOLDOWN_SEC)
 from .db import query, execute, get_conn, get_setting, upsert_setting
 from .state import get_current_master
 from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root, _LAST_FAILOVER_TS
@@ -364,6 +364,22 @@ def api_status(user=Depends(auth_required)):
         return _json_ok(_build_status_payload())
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/selfheal/stats")
+def api_selfheal_stats(user=Depends(auth_required)):
+    """自愈动作统计（进程内计数，管理器重启清零）。
+
+    自愈做得越多，越需要能回答「它到底动过什么、成功率如何」——否则自愈本身
+    就成了黑盒，出问题时无从判断是它没做、还是做了但做错了。
+    """
+    try:
+        from .monitor import _SELFHEAL_STATS
+        stats = dict(_SELFHEAL_STATS)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    stats["total"] = sum(v for v in stats.values() if isinstance(v, int))
+    return JSONResponse({"ok": True, "stats": stats})
 
 
 @app.post("/api/refresh")
@@ -866,16 +882,33 @@ def settings_page(request: Request, user=Depends(auth_required), msg: str = "", 
         auto_repair=get_setting("AUTO_REPAIR", "1") == "1",
         lag_failover=get_setting("LAG_FAILOVER_ENABLED", "0") == "1",
         pressure_failover=get_setting("PRESSURE_FAILOVER_ENABLED", "0") == "1",
+        # 危险：允许自愈跳过 1062/1032/1146 数据冲突（会造成主从数据永久不一致）
+        skip_data_conflict=get_setting("SKIP_DATA_CONFLICT", "0") == "1",
         lag_failover_sec=get_setting("LAG_FAILOVER_SEC", "60"),
         lag_failover_cycles=get_setting("LAG_FAILOVER_CYCLES", "3"),
         pressure_threads_running=get_setting("PRESSURE_THREADS_RUNNING", "50"),
         pressure_row_lock_waits=get_setting("PRESSURE_ROW_LOCK_WAITS", "50"),
         failover_cooldown_sec=get_setting("FAILOVER_COOLDOWN_SEC", "120"),
+        # binlog 空间守卫
+        binlog_alert_mb=get_setting("BINLOG_SIZE_ALERT_MB", "20480"),
+        auto_purge_binlog=get_setting("AUTO_PURGE_BINLOG", "0") == "1",
+        binlog_keep_hours=get_setting("BINLOG_KEEP_HOURS", "24"),
+        # 切换前交叉验证（防脑裂）
+        require_witness=get_setting("REQUIRE_WITNESS_FOR_FAILOVER", "1") == "1",
     )
+    # 管理器内网 IP：页面可编辑的值 + 实际生效值与来源
+    # （环境变量优先于页面设置，故环境变量存在时页面填写不会生效 —— 必须明示，
+    #  否则运维会遇到「填不填都没差异」的困惑）
+    _eff_ip, _eff_src = get_manager_public_ip_source()
+    _src_text = {"env": "环境变量 MANAGER_PUBLIC_IP（页面填写不生效）",
+                 "db": "本页设置",
+                 "auto": "自动探测（未显式配置，建议填写）"}.get(_eff_src, _eff_src)
     return render("settings.html", request, user=user, cfg=cfg, msg=msg, error=error,
                   alert_emails=alert_emails, clusters=clusters,
                   check_interval=get_setting("CHECK_INTERVAL", "2"),
                   manager_ip=get_setting("MANAGER_PUBLIC_IP", ""),
+                  manager_ip_effective=_eff_ip, manager_ip_source=_src_text,
+                  manager_ip_readonly=(_eff_src == "env"),
                   adv=adv)
 
 
@@ -893,6 +926,11 @@ def settings_save(
     auto_repair: str = Form(""),
     lag_failover_enabled: str = Form(""),
     pressure_failover_enabled: str = Form(""),
+    skip_data_conflict: str = Form(""),
+    require_witness: str = Form(""),
+    auto_purge_binlog: str = Form(""),
+    binlog_alert_mb: str = Form(""),
+    binlog_keep_hours: str = Form(""),
     lag_failover_sec: str = Form(""),
     lag_failover_cycles: str = Form(""),
     pressure_threads_running: str = Form(""),
@@ -924,6 +962,9 @@ def settings_save(
         "AUTO_REPAIR": auto_repair,
         "LAG_FAILOVER_ENABLED": lag_failover_enabled,
         "PRESSURE_FAILOVER_ENABLED": pressure_failover_enabled,
+        "SKIP_DATA_CONFLICT": skip_data_conflict,
+        "REQUIRE_WITNESS_FOR_FAILOVER": require_witness,
+        "AUTO_PURGE_BINLOG": auto_purge_binlog,
     }
     for k, v in _bools.items():
         s = (v or "").strip()
@@ -938,6 +979,8 @@ def settings_save(
         "PRESSURE_THREADS_RUNNING": pressure_threads_running,
         "PRESSURE_ROW_LOCK_WAITS": pressure_row_lock_waits,
         "FAILOVER_COOLDOWN_SEC": failover_cooldown_sec,
+        "BINLOG_SIZE_ALERT_MB": binlog_alert_mb,
+        "BINLOG_KEEP_HOURS": binlog_keep_hours,
     }
     for k, v in _ints.items():
         s = (v or "").strip()
@@ -1335,6 +1378,19 @@ def api_backup_run(cluster_id: int = Form(...), host: str = Form(...),
         r["msg"] = (f"备份完成：{m.get('tables', 0)} 张表 / {m.get('views', 0)} 个视图 / "
                     f"{m.get('rows', 0)} 行，文件 {m.get('file', '')} "
                     f"（{round(m.get('size', 0) / 1024, 1)} KB）")
+    else:
+        # 备份失败必须留痕并告警：静默失败的备份等于没有备份，
+        # 真正需要恢复时才发现不可用就太晚了。
+        _err = r.get("error", "未知错误")
+        try:
+            send_alert("集群备份失败",
+                       f"集群 {cluster_id} 对 {host}:{port} 的备份失败：{_err}。"
+                       f"本次未生成可用备份文件，请检查节点连通性、账号权限与磁盘空间。"
+                       f"注意：无法恢复的备份等同于没有备份。",
+                       cluster_id=int(cluster_id))
+        except Exception:
+            pass
+        r["msg"] = f"备份失败：{_err}"
     return JSONResponse(r)
 
 
@@ -1407,7 +1463,11 @@ def api_setting_set(key: str = Form(...), value: str = Form(...),
                # 高延迟 / 压力自动切换（默认关闭）
                "LAG_FAILOVER_ENABLED", "LAG_FAILOVER_SEC", "LAG_FAILOVER_CYCLES",
                "PRESSURE_FAILOVER_ENABLED", "PRESSURE_THREADS_RUNNING",
-               "PRESSURE_ROW_LOCK_WAITS", "FAILOVER_COOLDOWN_SEC"}
+               "PRESSURE_ROW_LOCK_WAITS", "FAILOVER_COOLDOWN_SEC",
+               # 自愈 / 半同步 / binlog 守卫（默认保守，页面与 /api/setting_set 共用白名单）
+               "SKIP_DATA_CONFLICT", "REQUIRE_WITNESS_FOR_FAILOVER",
+               "AUTO_PURGE_BINLOG", "BINLOG_SIZE_ALERT_MB",
+               "BINLOG_KEEP_HOURS", "SEMI_SYNC"}
     if key not in allowed:
         return JSONResponse({"ok": False, "error": "不允许修改该项"})
     upsert_setting(key, value)

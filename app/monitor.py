@@ -2,11 +2,14 @@
 import concurrent.futures as _cf
 import threading
 import time
+from datetime import datetime, timedelta
 from .config import (CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENABLED,
                      HEARTBEAT_INTERVAL, METRICS_INTERVAL, DRIFT_INTERVAL,
-                     MGMT, get_mgmt_host)
+                     MGMT, get_mgmt_host, SEMI_SYNC)
 from .db import query, execute, get_setting
-from .ha_client import get_status, heal_replication, heal_io_gtid_gap
+from .ha_client import (get_status, heal_replication, heal_io_gtid_gap,
+                        ensure_semisync_on, get_binlog_usage, purge_binlog_before,
+                        set_read_only, get_node_utc_time)
 from .state import get_current_master
 from .failover import (do_failover, do_failover_to, ensure_topology, load_creds,
                       node_root, _repoint_slave, promote_to_master)
@@ -38,6 +41,16 @@ _HEAL_SKIP_LOGGED = set()
 _HEAL_MIN_BACKOFF = 30      # 连续失败后首次冷却秒数（按失败次数线性放大）
 _HEAL_MAX_BACKOFF = 300     # 冷却上限（5 分钟）
 
+# 半同步退化自愈的限频时刻：(cluster_id, host, port) -> monotonic
+_SEMI_FIX_AT = {}
+_SEMI_FIX_INTERVAL = 300    # 同一节点最多 5 分钟检测/修复一次
+_SEMI_UNSUPPORTED_LOGGED = set()   # 已告警过「半同步无法启用」的节点（避免刷屏）
+
+
+def _semi_sync_enabled():
+    """SEMI_SYNC 开关是否打开（环境变量，默认关闭）。"""
+    return str(SEMI_SYNC).strip() not in ("", "0", "false", "False", "off", "OFF", "no", "None")
+
 
 def _repl_err_is_connectivity(st):
     """复制错误是否属于「源库不可达」（对端宕机 / 断网 / 端口不通）。
@@ -68,10 +81,24 @@ def _repl_err_is_connectivity(st):
     return False
 
 
+# 自愈动作统计（进程内计数，重启清零；供 /api/selfheal/stats 观测自愈健康度）
+_SELFHEAL_STATS = {"ok": 0, "fail": 0, "skip_unreachable": 0, "data_conflict": 0,
+                   "semi_fixed": 0, "ro_fixed": 0}
+
+
+def _sh_stat(field):
+    """自愈动作计数（自愈做得越多，越需要能回答「它到底动过什么」）。"""
+    try:
+        _SELFHEAL_STATS[field] = _SELFHEAL_STATS.get(field, 0) + 1
+    except Exception:
+        pass
+
+
 def _heal_ok(key):
     """自愈成功：清除退避与失败计数，后续周期可立即再次自愈。"""
     _HEAL_FAILS.pop(key, None)
     _HEAL_NEXT_AT.pop(key, None)
+    _sh_stat("ok")
 
 
 def _heal_fail(key):
@@ -82,6 +109,132 @@ def _heal_fail(key):
     n = _HEAL_FAILS.get(key, 0) + 1
     _HEAL_FAILS[key] = n
     _HEAL_NEXT_AT[key] = time.monotonic() + min(_HEAL_MAX_BACKOFF, _HEAL_MIN_BACKOFF * n)
+    _sh_stat("fail")
+
+
+# 复制数据冲突告警的限频时刻（同一节点 1 小时最多一次，避免刷屏）
+_DATA_CONFLICT_ALERT_AT = {}
+_DATA_CONFLICT_ALERT_INTERVAL = 3600
+
+
+def _alert_data_conflict(key, host, port, cluster_name, cid, msg):
+    """复制「数据冲突」告警（限频）。
+
+    1062/1032/1146 意味着主从数据已经不一致，自动跳过会静默放大分歧；
+    默认已拒绝自愈，但必须让运维知晓——否则节点长期挂着不动，
+    直到某次切主才暴露数据丢失。
+    """
+    now = time.monotonic()
+    if now < _DATA_CONFLICT_ALERT_AT.get(key, 0.0):
+        return
+    _DATA_CONFLICT_ALERT_AT[key] = now + _DATA_CONFLICT_ALERT_INTERVAL
+    _sh_stat("data_conflict")
+    try:
+        send_alert("复制数据冲突(需人工处理)",
+                   f"【{cluster_name}】节点 {host}:{port} 复制中断于数据冲突，已拒绝自动跳过：{msg}。"
+                   f"该节点数据与主库已不一致，建议核对差异或从主库重建此节点。"
+                   f"切勿长期忽略，否则切主后会暴露数据丢失。",
+                   cluster_id=cid)
+    except Exception:
+        pass
+
+
+# binlog 空间守卫的限频时刻（主库，每小时一次）
+_BINLOG_AT = {}
+_BINLOG_INTERVAL = 3600
+
+# 各从库上一次观测到的复制延迟（用于延迟切换的「趋势判断」）
+_LAG_TREND = {}
+
+# 从库「可写」纠正/告警的限频时刻（每小时一次）
+_RO_FIX_AT = {}
+_RO_FIX_INTERVAL = 3600
+
+# 时钟漂移检测的限频时刻（每小时一次）
+_CLOCK_AT = {}
+_CLOCK_INTERVAL = 3600
+
+
+def _clock_drift_guard(cid, cluster_name, host, port, creds, ru, rp):
+    """节点与管理器的时钟漂移检测（限频由调用方控制）。
+
+    为什么要它：复制延迟 Seconds_Behind_Master 本身受时钟影响；备份文件名与
+    审计时间也依赖一致的时间基准。节点时钟大幅漂移会让「延迟」等指标失去意义，
+    甚至让延迟/压力切换的判定失真。
+
+    用 UTC_TIMESTAMP() 与管理器 datetime.utcnow() 比对，规避时区差异误报。
+    """
+    try:
+        limit = int(get_setting("CLOCK_DRIFT_ALERT_SEC", "5") or 5)
+    except (TypeError, ValueError):
+        limit = 5
+    node_t = get_node_utc_time(host, port, creds["ha_user"], creds["ha_pass"], ru, rp)
+    if node_t is None:
+        return
+    try:
+        diff = abs((datetime.utcnow() - node_t).total_seconds())
+    except Exception:
+        return
+    if diff > limit:
+        send_alert("节点时钟漂移",
+                   f"【{cluster_name}】节点 {host}:{port} 与管理器时钟相差 {diff:.0f} 秒"
+                   f"（阈值 {limit}s，节点 UTC={node_t}）。时钟漂移会使复制延迟、"
+                   f"备份时间戳与切换判定失真，请检查该主机的 NTP 同步。",
+                   cluster_id=cid)
+
+
+def _binlog_guard(cid, cluster_name, host, port, creds, ru, rp, cache):
+    """binlog 空间守卫（仅主库）：超阈值告警；全部从库追平时按保留期自动清理。
+
+    背景：远程节点没有 agent，OS 级磁盘指标不可得；而「复制中断 → binlog 只增不减
+    → 撑爆磁盘」是 MySQL 最高频的生产事故之一。这里用 SHOW BINARY LOGS 求和绕过限制。
+
+    自动清理（AUTO_PURGE_BINLOG=1 才启用，**默认关闭**）的安全前提：
+      该集群**所有**从库都在线、IO/SQL 线程均为 Yes、且复制延迟为 0。
+      任一条不满足即跳过 —— 误删从库尚未应用的 binlog 会让它永久报 1236，只能重建。
+    """
+    total, cnt, oldest = get_binlog_usage(host, port, creds["ha_user"], creds["ha_pass"], ru, rp)
+    if total is None:
+        return
+    try:
+        limit_mb = int(get_setting("BINLOG_SIZE_ALERT_MB", "20480") or 20480)
+    except (TypeError, ValueError):
+        limit_mb = 20480
+    used_mb = total / 1024.0 / 1024.0
+    if used_mb >= limit_mb:
+        send_alert("binlog 占用超阈值",
+                   f"【{cluster_name}】主库 {host}:{port} binlog 占用 {used_mb:.0f}MB"
+                   f"（{cnt} 个文件，最早 {oldest}），已超过阈值 {limit_mb}MB。"
+                   f"复制中断时 binlog 只增不减，存在撑爆磁盘风险。请检查从库复制状态，"
+                   f"或在确认全部从库已追平后开启 AUTO_PURGE_BINLOG 让其自动清理。",
+                   cluster_id=cid)
+    if get_setting("AUTO_PURGE_BINLOG", "0") != "1":
+        return
+    lagging = []
+    for (h2, p2, c2), (st2, is_m2) in (cache or {}).items():
+        if c2 != cid or is_m2:
+            continue
+        if not st2.get("alive"):
+            lagging.append(f"{h2}:{p2}(离线)")
+            continue
+        if st2.get("slave_io") != "Yes" or st2.get("slave_sql") != "Yes":
+            lagging.append(f"{h2}:{p2}(复制线程未运行)")
+            continue
+        d = st2.get("seconds_behind")
+        if d is None or d > 0:
+            lagging.append(f"{h2}:{p2}(延迟 {d}s)")
+    if lagging:
+        print(f"[monitor] 跳过 binlog 清理 {host}:{port}：从库未全部追平 -> {'; '.join(lagging)}")
+        return
+    try:
+        keep_hours = int(get_setting("BINLOG_KEEP_HOURS", "24") or 24)
+    except (TypeError, ValueError):
+        keep_hours = 24
+    if keep_hours <= 0:
+        return
+    dt = (datetime.now() - timedelta(hours=keep_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    ok_p, msg_p = purge_binlog_before(host, port, creds["ha_user"], creds["ha_pass"], dt, ru, rp)
+    print(f"[monitor] binlog {'清理成功' if ok_p else '清理失败'} {host}:{port}: {msg_p}")
 
 
 # ===== 管理库兜底防护 =====
@@ -490,12 +643,84 @@ def _act_once():
                 continue
             h_host, h_port = key[0], key[1]
             ru, rp = node_root(h_host, cid)
+            # ---- 半同步退化自愈 ----
+            # 半同步只靠 SET GLOBAL 启用（刻意不写 my.cnf），节点重启后变量必然回到 OFF；
+            # 而 enable_semisync 仅在 make_slave_of / ensure_ha_creds / 提升主库 时触发，
+            # 稳态下的节点重启不会触发 → 静默退化为异步，切换即丢已提交事务。
+            # 且 monitor 的半同步告警依赖 _PREV 基线做「ON→OFF」跃迁判定，
+            # 管理器与节点同时重启（升版场景）时基线丢失、连告警都没有。故此处主动检测。
+            if _semi_sync_enabled() and time.monotonic() >= _SEMI_FIX_AT.get(key, 0.0):
+                _semi_now = (st.get("semi_master_status") if is_master
+                             else st.get("semi_slave_status"))
+                if _semi_now is not None and str(_semi_now).upper() != "ON":
+                    _SEMI_FIX_AT[key] = time.monotonic() + _SEMI_FIX_INTERVAL
+                    try:
+                        ok_s, msg_s, act_s = ensure_semisync_on(
+                            h_host, h_port, creds["ha_user"], creds["ha_pass"], ru, rp)
+                    except Exception as e:
+                        ok_s, msg_s, act_s = False, f"{type(e).__name__}: {e}", None
+                    if act_s == "fixed":
+                        _sh_stat("semi_fixed")
+                        print(f"[monitor] 半同步自愈 {h_host}:{h_port}: {msg_s}")
+                        send_alert("半同步已自动恢复",
+                                   f"【{cluster_name}】节点 {h_host}:{h_port} 半同步退化为异步"
+                                   f"（多为节点重启后 SET GLOBAL 丢失所致），已自动重新启用：{msg_s}。"
+                                   f"若需重启后仍保持，请把半同步参数写入节点 my.cnf。",
+                                   cluster_id=cid)
+                    elif act_s == "unsupported" and key not in _SEMI_UNSUPPORTED_LOGGED:
+                        _SEMI_UNSUPPORTED_LOGGED.add(key)
+                        print(f"[monitor] 半同步无法启用 {h_host}:{h_port}: {msg_s}")
+                        send_alert("半同步无法启用",
+                                   f"【{cluster_name}】节点 {h_host}:{h_port} 半同步未生效：{msg_s}。"
+                                   f"常见原因：MySQL 8.0.26+ 插件改名（semisync_source/replica.so 缺失）"
+                                   f"或账号缺少 SUPER 权限。当前为异步复制，切换存在数据丢失(RPO)风险。",
+                                   cluster_id=cid)
+                    elif not ok_s and act_s is None:
+                        print(f"[monitor] 半同步检测 {h_host}:{h_port} 失败: {msg_s}")
+            # ---- binlog 空间守卫（仅主库，每小时一次）----
+            if is_master and time.monotonic() >= _BINLOG_AT.get(key, 0.0):
+                _BINLOG_AT[key] = time.monotonic() + _BINLOG_INTERVAL
+                try:
+                    _binlog_guard(cid, cluster_name, h_host, h_port, creds, ru, rp, cache)
+                except Exception as e:
+                    print(f"[monitor] binlog 守卫异常 {h_host}:{h_port}: {type(e).__name__}: {e}")
+            # ---- 时钟漂移检测（每小时一次）----
+            if time.monotonic() >= _CLOCK_AT.get(key, 0.0):
+                _CLOCK_AT[key] = time.monotonic() + _CLOCK_INTERVAL
+                try:
+                    _clock_drift_guard(cid, cluster_name, h_host, h_port, creds, ru, rp)
+                except Exception as e:
+                    print(f"[monitor] 时钟漂移检测异常 {h_host}:{h_port}: {type(e).__name__}: {e}")
+            # ---- 从库可写检测 ----
+            # 从库若 read_only 被突破（人工误操作 / 参数漂移 / 提升后残留可写），
+            # 业务一旦写进来就会与主库数据分叉，且这类分叉**不可逆**（复制不会自动
+            # 收敛，只会逐步报 1062/1032）。故持续校验并自动纠正 + 告警。
+            if (not is_master and st.get("mode") == "slave"
+                    and str(st.get("ro")).strip() in ("0", "0.0", "False", "false")
+                    and time.monotonic() >= _RO_FIX_AT.get(key, 0.0)):
+                _RO_FIX_AT[key] = time.monotonic() + _RO_FIX_INTERVAL
+                _ro_ok, _ro_err = False, ""
+                try:
+                    set_read_only(h_host, h_port, creds["ha_user"], creds["ha_pass"],
+                                  True, ru, rp)
+                    _ro_ok = True
+                    _sh_stat("ro_fixed")
+                except Exception as e:
+                    _ro_err = f"{type(e).__name__}: {e}"
+                    print(f"[monitor] 从库只读纠正失败 {h_host}:{h_port}: {_ro_err}")
+                send_alert("从库可写(已自动纠正)" if _ro_ok else "从库可写(纠正失败)",
+                           f"【{cluster_name}】节点 {h_host}:{h_port} 挂着复制通道但 read_only=OFF，"
+                           f"业务写入会导致主从数据分叉且不可逆。"
+                           + (f"已自动重新置为只读。" if _ro_ok
+                              else f"自动纠正失败（{_ro_err}），请立即人工处理！"),
+                           cluster_id=cid)
             # ---- 自愈前置守卫（仅从库）----
             # ① 源库不可达（宕机/断网）：根本无从自愈，直接跳过，避免每周期对从库反复
             #    START SLAVE / CHANGE MASTER 把 CPU 打满（源库不可用期间的主要放大源）。
             # ② 退避期内：上次自愈失败后冷却时间未到，不重复尝试。
             if not is_master:
                 if _repl_err_is_connectivity(st):
+                    _sh_stat("skip_unreachable")
                     if key not in _HEAL_SKIP_LOGGED:
                         _HEAL_SKIP_LOGGED.add(key)
                         _e = (st.get("slave_io_err") or st.get("slave_sql_err") or "IO 线程已停")
@@ -520,7 +745,8 @@ def _act_once():
             # 仅当 SQL 线程明确为 "No"（非 None/空，即确有复制通道且停了）才触发，
             # 避免无复制通道节点（slave_sql=None）被误判为「需自愈」刷日志。
             if not is_master and st.get("slave_sql") == "No" and get_setting("AUTO_REPAIR", "1") == "1":
-                ok, msg = heal_replication(h_host, h_port, creds["ha_user"], creds["ha_pass"], ru, rp)
+                ok, msg = heal_replication(h_host, h_port, creds["ha_user"], creds["ha_pass"], ru, rp,
+                                           allow_data_conflict=(get_setting("SKIP_DATA_CONFLICT", "0") == "1"))
                 if ok:
                     print(f"[monitor] 自愈 {h_host}:{h_port} 成功: {msg}")
                     _heal_ok(key)
@@ -532,6 +758,9 @@ def _act_once():
                 else:
                     print(f"[monitor] 自愈 {h_host}:{h_port} 失败: {msg}")
                     _heal_fail(key)
+                    # 数据冲突（主从数据已不一致）：默认已拒绝跳过，必须告警让运维介入
+                    if "数据冲突" in (msg or ""):
+                        _alert_data_conflict(key, h_host, h_port, cluster_name, cid, msg)
             # 复制 IO 线程中断，分两类处理：
             #  (A) 匿名事务 1236（"Cannot replicate anonymous transaction when AUTO_POSITION=1"）：
             #      源端 binlog 含匿名事务（节点曾被提升为主、旧 binlog 写于 gtid_mode<ON 期）。
@@ -720,8 +949,30 @@ def _auto_switch_on_lag_or_pressure(cid, cluster_name, cache):
         # 至少 2 个从库（或过半，取较大者）同时高延迟才算，避免单节点抖动
         need = max(2, (len(slaves) + 1) // 2)
         if len(lagging) >= need:
-            lag_hit = True
-            lag_detail = f"{len(lagging)}/{len(slaves)} 个从库延迟 ≥ {lag_sec}s"
+            # 趋势判断：若**所有**高延迟从库的延迟都在回落，说明是瞬时堆积
+            # （大事务 / DDL / 批量导入），此时切主毫无收益 —— 新主同样要重放该事务，
+            # 反而白白中断业务、还多一次切换风险。故只在「未回落」时才真正触发。
+            improving, not_improving = [], []
+            for k, s in slaves:
+                if k not in lagging:
+                    continue
+                d = s.get("seconds_behind")
+                prev = _LAG_TREND.get(k)
+                tag = f"{k[0]}:{k[1]}"
+                if prev is not None and d is not None and d < prev:
+                    improving.append(f"{tag}({prev}s→{d}s)")
+                else:
+                    not_improving.append(f"{tag}({d}s)")
+            if improving and not not_improving:
+                print(f"[monitor] 延迟切换跳过：从库延迟正在回落（{'；'.join(improving)}），"
+                      f"判定为瞬时堆积，切主无法加速，继续观察")
+            else:
+                lag_hit = True
+                lag_detail = f"{len(lagging)}/{len(slaves)} 个从库延迟 ≥ {lag_sec}s"
+    # 更新延迟趋势基线（供下个周期比对）
+    for k, s in slaves:
+        if s.get("seconds_behind") is not None:
+            _LAG_TREND[k] = s["seconds_behind"]
 
     # ---- 判据 B：主库自身压力过高 ----
     prs_hit, prs_detail = False, ""

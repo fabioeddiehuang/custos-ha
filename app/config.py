@@ -195,22 +195,24 @@ MANAGER_PUBLIC_IP = (env("MANAGER_PUBLIC_IP", "") or "").strip()
 SLOWLOG_ENABLED = str(env("SLOWLOG_ENABLED", "0") or "0").strip() in ("1", "true", "yes", "on")
 
 
-def get_manager_public_ip():
-    """管理器对外 IP —— 裸机节点应允许此 IP 连接、并写入节点部署配置。
+def get_manager_public_ip_source():
+    """返回 (ip, source)，source ∈ {'env','db','auto'}。
 
-    这是「服务端后台（管理器应用）」的 IP，节点只允许该 IP 连入；
-    它与「管理端后台 MySQL（MGMT_MYSQL_HOST）」无关 —— 管理库只供管理器自身
-    存储，绝不能作为集群节点、也不应出现在任何节点配置里。
-
-    优先用显式 MANAGER_PUBLIC_IP（生产强烈建议显式设置）；未设置时自动探测本机
-    主网卡 IPv4 并打印告警提示显式配置（docker 桥接网络下探测到的是容器 IP，
-    与节点看到的宿主机 IP 不同，此时必须显式设置 MANAGER_PUBLIC_IP，否则
-    root@'<IP>' / ha_monitor@'<IP>' 授权会错位，导致管理器连不上节点）。
+    【为什么需要 source】此前 get_manager_public_ip() 只看环境变量，页面「系统设置 →
+    管理器内网 IP」写入 monitor_settings 的值**从未被读取**，导致「填不填都无差异」。
+    现在明确三级优先级：环境变量（部署态事实）> 页面设置 > 自动探测，
+    并把「当前值来自哪一级」暴露给页面，避免运维以为页面改了却不生效。
     """
-    import logging
     if MANAGER_PUBLIC_IP and MANAGER_PUBLIC_IP not in ("127.0.0.1", "localhost", "auto"):
-        return MANAGER_PUBLIC_IP
-    _log = logging.getLogger("ha.config")
+        return MANAGER_PUBLIC_IP, "env"
+    # 页面设置（仅当环境变量未显式指定时生效）
+    try:
+        from .db import get_setting  # 延迟导入：db 依赖 config，避免导入期循环
+        v = (get_setting("MANAGER_PUBLIC_IP", "") or "").strip()
+        if v and v not in ("127.0.0.1", "localhost", "auto"):
+            return v, "db"
+    except Exception:
+        pass
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -219,6 +221,28 @@ def get_manager_public_ip():
         ip = "127.0.0.1"
     finally:
         s.close()
+    return ip, "auto"
+
+
+def get_manager_public_ip():
+    """管理器对外 IP —— 裸机节点应允许此 IP 连接、并写入节点部署配置。
+
+    这是「服务端后台（管理器应用）」的 IP，节点只允许该 IP 连入；
+    它与「管理端后台 MySQL（MGMT_MYSQL_HOST）」无关 —— 管理库只供管理器自身
+    存储，绝不能作为集群节点、也不应出现在任何节点配置里。
+
+    优先级：环境变量 MANAGER_PUBLIC_IP > 页面设置(monitor_settings) > 自动探测。
+    自动探测仅作兜底并打印告警（docker 桥接网络下探测到的是容器 IP，与节点看到的
+    宿主机 IP 不同，此时必须显式设置，否则 root@'<IP>' / ha_monitor@'<IP>'
+    授权会错位，导致管理器连不上节点）。
+    """
+    import logging
+    ip, source = get_manager_public_ip_source()
+    if source == "env":
+        return ip
+    if source == "db":
+        return ip
+    _log = logging.getLogger("ha.config")
     _log.warning(
         "MANAGER_PUBLIC_IP 未显式设置，已自动探测为 %s。若以 docker 部署，节点看到的连接"
         "来源是宿主机 IP，请显式设置 MANAGER_PUBLIC_IP 为管理器宿主机的对外 IP，"

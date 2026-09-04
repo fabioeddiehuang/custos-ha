@@ -40,8 +40,14 @@
     <div class="setting-info">
       <span class="setting-title">管理器内网 IP</span>
       <span class="setting-desc">用于向节点下发的管理器地址（keepalived 上报 / 校验用）</span>
+      <span class="setting-desc" style="margin-top:4px">
+        当前生效：<b>{{ manager_ip_effective }}</b>（来源：{{ manager_ip_source }}）
+        {% if manager_ip_readonly %}
+        <br><span style="color:#fb7185">已由 docker-compose 的环境变量 MANAGER_PUBLIC_IP 指定，优先级高于本页，此处填写不会生效。</span>
+        {% endif %}
+      </span>
     </div>
-    <input id="setIp" placeholder="192.0.2.66" value="{{ manager_ip }}">
+    <input id="setIp" placeholder="192.0.2.66" value="{{ manager_ip }}" {% if manager_ip_readonly %}disabled title="已由环境变量 MANAGER_PUBLIC_IP 指定，页面不可修改"{% endif %}>
   </div>
   <div class="setting-item">
     <div class="setting-info">
@@ -87,6 +93,46 @@
       <span class="adv-desc">主库压力持续超阈值（Threads_running ≥ 阈值 或 行锁等待 ≥ 阈值）且连续 3 个周期成立时，自动把压力最低的从库提为主。</span>
     </div>
     <label class="adv-switch"><input type="checkbox" id="afPrs" {% if adv.pressure_failover %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title"><span class="adv-danger">☠ 允许跳过数据冲突</span></span>
+      <span class="adv-desc">复制报 1062（重复键）/ 1032（缺行）/ 1146（表不存在）意味着<b>该节点数据与主库已经不一致</b>。开启后自愈会跳过这些事务让复制继续，但<b>分歧会被永久保留</b>，切主时才暴露数据丢失。默认关闭 → 遇到时拒绝自愈并告警，由人工核对或重建从库。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afSkipConflict" {% if adv.skip_data_conflict %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">切换前交叉验证（防脑裂）</span>
+      <span class="adv-desc">当管理器连不上旧主时，要求集群内<b>其它节点作证</b>主库确实不可达才允许切换。可规避「管理器侧网络分区 / 主库连接数打满」导致的误切与脑裂双写。关闭后恢复为「管理器单方面判定即切换」的旧行为。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afWitness" {% if adv.require_witness %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title"><span class="adv-danger">⚠ binlog 自动清理</span></span>
+      <span class="adv-desc">主库 binlog 超过告警阈值且<b>所有从库都已追平</b>（在线、IO/SQL 双 Yes、延迟 0）时，自动清理超过保留时长的 binlog。仅在全部从库追平时才执行，避免误删导致从库报 1236。默认关闭，只告警不清理。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afPurge" {% if adv.auto_purge_binlog %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">binlog 占用告警阈值</span>
+      <span class="adv-desc">主库 binlog 总占用超过此值即告警（远程节点无 OS 磁盘指标，此处用 SHOW BINARY LOGS 求和）。</span>
+    </div>
+    <div class="adv-num"><input id="afBinlogMb" value="{{ adv.binlog_alert_mb }}"><span class="unit">MB</span></div>
+  </div>
+
+  <div class="adv-row">
+    <div class="adv-info">
+      <span class="adv-title">binlog 保留时长</span>
+      <span class="adv-desc">自动清理时保留最近多少小时的 binlog（仅在「binlog 自动清理」开启且从库全部追平时生效）。</span>
+    </div>
+    <div class="adv-num"><input id="afBinlogH" value="{{ adv.binlog_keep_hours }}"><span class="unit">小时</span></div>
   </div>
 
   <div class="adv-row">
@@ -177,11 +223,16 @@
       auto_repair:document.getElementById("afRepair").checked?"1":"0",
       lag_failover_enabled:document.getElementById("afLag").checked?"1":"0",
       pressure_failover_enabled:document.getElementById("afPrs").checked?"1":"0",
+      skip_data_conflict:document.getElementById("afSkipConflict").checked?"1":"0",
       lag_failover_sec:document.getElementById("afLagSec").value,
       lag_failover_cycles:document.getElementById("afLagCyc").value,
       pressure_threads_running:document.getElementById("afPrsThr").value,
       pressure_row_lock_waits:document.getElementById("afPrsLock").value,
-      failover_cooldown_sec:document.getElementById("afCool").value
+      failover_cooldown_sec:document.getElementById("afCool").value,
+      require_witness:document.getElementById("afWitness").checked?"1":"0",
+      auto_purge_binlog:document.getElementById("afPurge").checked?"1":"0",
+      binlog_alert_mb:document.getElementById("afBinlogMb").value,
+      binlog_keep_hours:document.getElementById("afBinlogH").value
     };
     apiPost("/settings",body,function(d){toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");});
   }

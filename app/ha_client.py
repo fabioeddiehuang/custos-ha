@@ -35,9 +35,20 @@ from .mysql_compat import (detect_syntax, detect_flavour, flavour_from_node_type
 from .config import get_manager_public_ip, SEMI_SYNC
 
 
-# 可安全做「空事务跳过」的复制错误码集合（均为幂等类冲突：对象/记录已存在或已不存在，
-# 说明该事务的效果在当前节点实际上已经完成，跳过不会造成数据丢失）。
-_SKIPPABLE_SQL_ERRNOS = frozenset({1007, 1050, 1061, 1062, 1396, 1032, 1146, 1133})
+# 复制错误码分类 —— 两类语义完全不同，绝不可混为一谈：
+#
+#  ① 幂等类（1007/1050/1061/1396/1133）：库/表/索引/账号「已存在或不存在」，属 DDL/DCL
+#     重放冲突（典型场景：旧主重入、切换后新主重放同名 DDL）。该事务的效果在本节点
+#     实际上已经达成，跳过**不丢数据**，自动跳过是安全的。
+#
+#  ② 数据冲突类（1062/1032/1146）：行内容不同 / 行缺失 / 表缺失，属 DML 层面主从
+#     数据**已经不一致**。此时「跳过」= 静默接受分歧：主库那条变更永远不会应用到本节点，
+#     从库与主库永久不一致，且只留一条 healed 日志，半年后切主才发现数据对不上、
+#     已无法追溯。故【默认禁止自动跳过】，应人工核对或从主库重建从库。
+_IDEMPOTENT_SQL_ERRNOS = frozenset({1007, 1050, 1061, 1396, 1133})
+_DATA_CONFLICT_SQL_ERRNOS = frozenset({1062, 1032, 1146})
+# 兼容旧引用（全集）；是否真的可跳过由 heal_replication 的 allow_data_conflict 决定
+_SKIPPABLE_SQL_ERRNOS = _IDEMPOTENT_SQL_ERRNOS | _DATA_CONFLICT_SQL_ERRNOS
 
 
 def _tiny_sleep(seconds=0.3):
@@ -102,8 +113,14 @@ def _derive_stuck_gtid(cur, syntax):
     return "%d-%d-%d" % (dom, sid, nxt)
 
 
-def heal_replication(host, port, user, password, root_user="root", root_pass=""):
+def heal_replication(host, port, user, password, root_user="root", root_pass="",
+                     allow_data_conflict=False):
     """自愈复制：当 Slave_SQL_Running=No 且错误为幂等冲突时，注入空事务跳过该 GTID。
+
+    allow_data_conflict：是否允许跳过「数据冲突类」错误（1062/1032/1146）。
+    默认 False —— 这类错误意味着主从数据已经不一致，跳过会静默放大分歧，
+    应人工核对或重建从库。仅在运维明确接受风险时由 SKIP_DATA_CONFLICT 开启。
+
 
     典型场景：旧主重入 / 切换后，某节点物理数据已包含某事务（如 CREATE DATABASE）
     但其 GTID 执行集合未记录该事务，新主重放时触发 1007 等「已存在」错误导致
@@ -203,6 +220,13 @@ def heal_replication(host, port, user, password, root_user="root", root_pass="")
                     except Exception as e:
                         return False, f"1133 补建账号失败({cu}@{ch}): {e}"
                 # 解析不到账号则落到下方 1966 兜底（空事务跳过该事务）
+            # 数据冲突（1062/1032/1146）：跳过等于静默接受主从数据永久不一致，
+            # 默认拒绝自动自愈；仅在运维显式开启 SKIP_DATA_CONFLICT 时才放行。
+            if last_code in _DATA_CONFLICT_SQL_ERRNOS and not allow_data_conflict:
+                return False, (
+                    f"数据冲突(errno {last_code})：跳过会使本节点与主库数据永久不一致，"
+                    f"已拒绝自动跳过，需人工核对或从主库重建本节点。{last_err}"
+                    f"（若确认可接受风险，请在「系统设置 → 高级切换/监控」开启「允许跳过数据冲突」）")
             if last_code and last_code not in _SKIPPABLE_SQL_ERRNOS and not m:
                 return False, f"复制错误码 {last_code} 非幂等冲突，需人工处理：{last_err}"
             # 非 GTID 自动定位，或无法解析具体 GTID：用 sql_slave_skip_counter 跳过。
@@ -1161,14 +1185,27 @@ def enable_semisync(cur, flavour):
                 "SET GLOBAL rpl_semi_sync_master_wait_point=AFTER_SYNC",
             ]
         else:
+            # MySQL 8.0.26+ 起插件与变量改名为 source/replica，旧名（semisync_master.so /
+            # semisync_slave.so）已被移除 —— 旧名 INSTALL 会报 1126
+            # "Can't open shared library ... No such file or directory"，半同步因此装不上。
+            # 这里旧名新名都尝试，失败一律忽略；最终以「变量能否 SET 成功」为准。
             plugins = (("rpl_semi_sync_master", "semisync_master"),
-                       ("rpl_semi_sync_slave", "semisync_slave"))
+                       ("rpl_semi_sync_slave", "semisync_slave"),
+                       ("rpl_semi_sync_source", "semisync_source"),
+                       ("rpl_semi_sync_replica", "semisync_replica"))
             sets = [
+                # 旧名（<=8.0.25 及 8.0.26+ 的兼容别名）
                 "SET GLOBAL rpl_semi_sync_master_enabled=1",
                 "SET GLOBAL rpl_semi_sync_slave_enabled=1",
                 "SET GLOBAL rpl_semi_sync_master_timeout=10000",
                 "SET GLOBAL rpl_semi_sync_master_wait_for_slave_count=1",
                 "SET GLOBAL rpl_semi_sync_master_wait_point=AFTER_SYNC",
+                # 新名（8.0.26+；老版本上会失败，被下方 try 忽略，无副作用）
+                "SET GLOBAL rpl_semi_sync_source_enabled=1",
+                "SET GLOBAL rpl_semi_sync_replica_enabled=1",
+                "SET GLOBAL rpl_semi_sync_source_timeout=10000",
+                "SET GLOBAL rpl_semi_sync_source_wait_for_replica_count=1",
+                "SET GLOBAL rpl_semi_sync_source_wait_point=AFTER_SYNC",
             ]
         for pname, soname in plugins:
             try:
@@ -1186,6 +1223,193 @@ def enable_semisync(cur, flavour):
                 print(f"[semisync] {s} 失败(可忽略): {e}")
     except Exception as e:
         print(f"[semisync] 启用半同步失败(可忽略): {e}")
+
+
+def get_node_utc_time(host, port, user, password, root_user="root", root_pass=""):
+    """读取节点 UTC 时间（SELECT UTC_TIMESTAMP()），用于时钟漂移检测。
+
+    用 UTC 而非 NOW()：节点与管理器的系统时区可能不同，直接比较本地时间会因
+    时区差异产生 8 小时级别的误报；UTC 可完全消除该歧义。
+
+    返回 datetime 或 None。
+    """
+    try:
+        conn = connect_robust(host, port, user, password, root_user, root_pass)
+    except Exception:
+        return None
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT UTC_TIMESTAMP()")
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def get_binlog_usage(host, port, user, password, root_user="root", root_pass=""):
+    """读取 binlog 占用总量（无需 SSH / OS 权限，纯 MySQL 侧可得）。
+
+    为什么重要：远程节点没有 agent，OS 级磁盘指标不可得（api.py 注释明确说明），
+    而「binlog 堆积撑爆磁盘」是 MySQL 最高频的生产事故之一——复制一断，binlog
+    只增不减。这里用 SHOW BINARY LOGS 求和即可拿到占用量。
+
+    返回 (total_bytes, file_count, oldest_file)；失败返回 (None, None, None)。
+    """
+    try:
+        conn = connect_robust(host, port, user, password, root_user, root_pass)
+    except Exception:
+        return None, None, None
+    if conn is None:
+        return None, None, None
+    try:
+        cur = conn.cursor()
+        cur.execute("SHOW BINARY LOGS")
+        rows = cur.fetchall()
+        if not rows:
+            return 0, 0, None
+        total = 0
+        oldest = None
+        for r in rows:
+            try:
+                total += int(r[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if oldest is None:
+                oldest = r[0]
+        return total, len(rows), oldest
+    except Exception:
+        return None, None, None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def purge_binlog_before(host, port, user, password, dt_str, root_user="root", root_pass=""):
+    """PURGE BINARY LOGS BEFORE <dt_str>。
+
+    ⚠ 危险操作：调用方必须已确认**所有从库都已追平**（否则从库需要的 binlog 被删，
+    复制会永久报 1236，只能重建从库）。故仅在 monitor 的 binlog 守卫里、
+    且 AUTO_PURGE_BINLOG=1 且全部从库无延迟时才会被调用。
+    """
+    try:
+        conn = connect_robust(host, port, user, password, root_user, root_pass)
+    except Exception as e:
+        return False, f"连接失败: {e}"
+    if conn is None:
+        return False, "无法连接节点(ha_monitor/root 均失败)"
+    try:
+        cur = conn.cursor()
+        cur.execute("PURGE BINARY LOGS BEFORE '%s'" % str(dt_str).replace("'", ""))
+        return True, f"已清理 {dt_str} 之前的 binlog"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def ensure_semisync_on(host, port, user, password, root_user="root", root_pass=""):
+    """检测并修复半同步退化：SEMI_SYNC=1 但节点半同步开关被关闭时重新启用。
+
+    【为什么需要它】enable_semisync 只做 SET GLOBAL（刻意不写 my.cnf，避免插件
+    缺失导致节点启动失败），因此**节点重启后变量必然回到默认 OFF**；而它仅在
+    make_slave_of / ensure_ha_creds / 提升主库 这类结构性操作时被调用，稳态下
+    节点重启不会触发 → 半同步静默退化为异步，切换时会丢已提交事务。
+    更隐蔽的是：monitor 的半同步告警只在「ON → 非 ON」跃迁时发（依赖 _PREV
+    基线），若管理器与节点**同时**重启（升版就是这种场景），基线丢失，连告警都没有。
+    故在监控周期里主动检测「开关变量」并重新打开。
+
+    从库侧注意：SET GLOBAL rpl_semi_sync_slave_enabled 不会立即生效，必须重启
+    IO 线程使其与主库重新协商半同步，否则 slave_status 长期为 OFF。
+
+    返回 (ok, msg, action)：action = None(无需动作) / 'fixed'(已修复) /
+    'unsupported'(插件缺失或版本不支持，需人工)。
+    """
+    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
+        return True, "SEMI_SYNC 未开启，跳过", None
+    try:
+        conn = connect_robust(host, port, user, password, root_user, root_pass)
+    except Exception as e:
+        return False, f"连接失败: {e}", None
+    if conn is None:
+        return False, "无法连接节点(ha_monitor/root 均失败)", None
+    try:
+        cur = conn.cursor()
+        flavour = detect_flavour(cur)
+
+        def _var(names):
+            """按候选名依次读全局变量，兼容 MySQL 8.0.26+ 的 source/replica 改名。"""
+            for n in names:
+                try:
+                    cur.execute(f"SHOW GLOBAL VARIABLES LIKE '{n}'")
+                    row = cur.fetchone()
+                    if row:
+                        return n, (row[1] if len(row) > 1 else None)
+                except Exception:
+                    continue
+            return None, None
+
+        def _on(v):
+            return str(v).strip().upper() in ("ON", "1", "YES", "TRUE")
+
+        _, m_val = _var(("rpl_semi_sync_master_enabled", "rpl_semi_sync_source_enabled"))
+        _, s_val = _var(("rpl_semi_sync_slave_enabled", "rpl_semi_sync_replica_enabled"))
+        if _on(m_val) and _on(s_val):
+            return True, "半同步开关已为 ON", None
+
+        # 开关被关闭（多为节点重启所致）→ 重新启用
+        enable_semisync(cur, flavour)
+
+        # 从库侧：重启 IO 线程，与主库重新协商半同步
+        io_restarted = False
+        try:
+            cur.execute("SHOW SLAVE STATUS" if flavour == F_MARIADB else "SHOW REPLICA STATUS")
+            has_replica = bool(cur.fetchall())
+        except Exception:
+            has_replica = False
+        if has_replica:
+            for stop_sql, start_sql in (
+                    ("STOP REPLICA IO_THREAD", "START REPLICA IO_THREAD"),
+                    ("STOP SLAVE IO_THREAD", "START SLAVE IO_THREAD"),
+            ):
+                try:
+                    cur.execute(stop_sql)
+                    cur.execute(start_sql)
+                    io_restarted = True
+                    break
+                except Exception:
+                    continue
+
+        # 复查
+        _, m_val2 = _var(("rpl_semi_sync_master_enabled", "rpl_semi_sync_source_enabled"))
+        _, s_val2 = _var(("rpl_semi_sync_slave_enabled", "rpl_semi_sync_replica_enabled"))
+        still_off = []
+        if not _on(m_val2):
+            still_off.append("master/source")
+        if not _on(s_val2):
+            still_off.append("slave/replica")
+        if still_off:
+            return False, ("已尝试重新启用，但 %s 仍为 OFF（插件缺失或权限不足），需人工处理"
+                           % "、".join(still_off)), "unsupported"
+        return True, ("半同步已自动重新启用" + ("（并重启 IO 线程）" if io_restarted else "")), "fixed"
+    except Exception as e:
+        return False, f"检测/修复半同步异常: {e}", None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def make_slave_of(host, port, user, password, master_host, master_port,
