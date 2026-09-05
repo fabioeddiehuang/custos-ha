@@ -1,0 +1,19 @@
+[Unit]
+Description=Custos 节点 OS 指标采集 agent（供管理器拉取真实 CPU/内存/磁盘）
+After=network.target
+
+[Service]
+Type=simple
+# 把下面路径改为你存放 node_agent.py 的位置；建议在每台 MySQL 节点宿主机上各部署一份。
+WorkingDirectory=/opt/custos-ha/scripts
+ExecStart=/usr/bin/python3 /opt/custos-ha/scripts/node_agent.py --port 29100 --bind 0.0.0.0
+# 可选：开启令牌校验（与管理器 NODE_AGENT_TOKEN 一致）
+#Environment=NODE_AGENT_TOKEN=your-shared-secret
+# 可选：额外汇报的挂载点
+#Environment=NODE_AGENT_DISKS=/data,/backup
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

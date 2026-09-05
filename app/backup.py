@@ -29,6 +29,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import time
 import re
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -413,6 +414,35 @@ def list_backups(cid):
     return out
 
 
+def purge_old_backups(cid, days):
+    """按保留天数清理过期备份（连带删除配套 .meta.json）。
+
+    days<=0 表示不清理。以文件 mtime 判定（与备份时间戳同为本地时间）。
+    返回 {"deleted": [文件名...], "kept": 保留份数}。
+    """
+    try:
+        days = int(days or 0)
+    except (TypeError, ValueError):
+        days = 0
+    if days <= 0:
+        return {"deleted": [], "kept": 0}
+    cutoff = time.time() - days * 86400
+    deleted, kept = [], 0
+    for p in _dir(cid).glob("*.sql.gz"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                meta_p = p.with_suffix("").with_suffix(".meta.json")
+                if meta_p.exists():
+                    meta_p.unlink()
+                p.unlink()
+                deleted.append(p.name)
+            else:
+                kept += 1
+        except Exception:
+            kept += 1
+    return {"deleted": deleted, "kept": kept}
+
+
 def get_backup_path(cid, filename: str) -> Path:
     """只允许本集群目录下的文件名，杜绝 ../ 穿越。"""
     name = os.path.basename(filename)
@@ -508,11 +538,16 @@ def split_statements(text: str):
 # --------------------------------------------------------------------------
 # 恢复
 # --------------------------------------------------------------------------
-def restore_backup(cid, host, port, filename, databases=None):
+def restore_backup(cid, host, port, filename, databases=None, no_binlog=False):
     """把备份恢复到指定节点。
 
     databases 为空则恢复备份内的全部库；否则只恢复其中的指定库
     （按备份内的 CREATE DATABASE / USE 段落过滤）。
+
+    no_binlog=True 时在本会话执行 SET sql_log_bin=0：
+      重建从库必须关掉，否则恢复产生的海量 DML 会写入从库 binlog、生成新的
+      GTID 集合，与主库历史 GTID 冲突，重链时被判「分叉」进而触发 RESET MASTER。
+      该变量是 session 级（不能 SET GLOBAL），故只能在本函数建连后设置。
     """
     path = get_backup_path(cid, filename)
     try:
@@ -555,6 +590,12 @@ def restore_backup(cid, host, port, filename, databases=None):
     ok_n, err_n, errors = 0, 0, []
     try:
         with conn.cursor() as cur:
+            if no_binlog:
+                try:
+                    cur.execute("SET sql_log_bin = 0")
+                except Exception as e:
+                    return {"ok": False,
+                            "error": f"无法关闭会话 binlog（需 SUPER 权限）：{e}"}
             for s in stmts:
                 try:
                     cur.execute(s)

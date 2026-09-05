@@ -5,7 +5,7 @@
 """
 import pymysql
 from pymysql.cursors import DictCursor
-from .config import MGMT
+from .config import MGMT, ROLE_ADMIN, ROLE_VIEWER
 
 
 def _create():
@@ -70,6 +70,7 @@ SCHEMA_SQL = [
         id INT AUTO_INCREMENT PRIMARY KEY,
         username VARCHAR(64) UNIQUE,
         password_hash VARCHAR(128),
+        role VARCHAR(16) NOT NULL DEFAULT 'admin',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB
     """,
@@ -335,6 +336,11 @@ def init_schema():
                 c.execute("ALTER TABLE alerts ADD COLUMN acked TINYINT(1) NOT NULL DEFAULT 0")
             except Exception:
                 pass
+            # users 增加 role（角色分级：admin 管理员 / viewer 只读）
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'admin'")
+            except Exception:
+                pass
             # current_master 改为按集群（cluster_id 主键），兼容旧版单列(id=1)结构。
             # 仅当 current_master 仍是旧结构（含 id 列、无 cluster_id 列）时迁移一次，
             # 避免每次重启都把当前主数据清空。
@@ -430,6 +436,56 @@ def execute(sql, args=None):
         return lastrowid
     finally:
         conn.close()
+
+
+def get_user_role(username, default=None):
+    """读取用户角色。
+
+    异常/迁移未完成时**回退管理员**而非只读：宁可暂时放宽，也不能把既有管理员
+    锁死在系统外（role 列缺失时若回退 viewer，所有人将无法做任何操作）。
+    """
+    try:
+        rows = query("SELECT role FROM users WHERE username=%s", (username,))
+        r = rows[0].get("role") if rows else None
+        return (str(r).strip().lower() if r else (default or ROLE_ADMIN))
+    except Exception:
+        return default or ROLE_ADMIN
+
+
+def list_users():
+    try:
+        return query("SELECT id, username, role, created_at FROM users ORDER BY id")
+    except Exception:
+        return query("SELECT id, username, created_at FROM users ORDER BY id")
+
+
+def get_user(username):
+    rows = query("SELECT id, username, role FROM users WHERE username=%s", (username,))
+    return rows[0] if rows else None
+
+
+def create_user(username, password_hash, role=ROLE_ADMIN):
+    execute("INSERT INTO users (username, password_hash, role) VALUES (%s,%s,%s)",
+            (username, password_hash, role or ROLE_ADMIN))
+
+
+def set_user_role(username, role):
+    execute("UPDATE users SET role=%s WHERE username=%s",
+            (ROLE_VIEWER if role == ROLE_VIEWER else ROLE_ADMIN, username))
+
+
+def delete_user(username):
+    execute("DELETE FROM users WHERE username=%s", (username,))
+
+
+def count_admins():
+    """剩余管理员数量（用于阻止删光/降级最后一个管理员）。"""
+    try:
+        rows = query("SELECT COUNT(*) AS n FROM users WHERE role=%s", (ROLE_ADMIN,))
+        return int(rows[0].get("n") or 0)
+    except Exception:
+        # role 列不存在时无法统计，按「有很多管理员」处理以免误拦截
+        return 999
 
 
 def upsert_setting(key, value):

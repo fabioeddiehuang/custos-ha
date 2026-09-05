@@ -174,3 +174,170 @@ def get_latest_drift(cluster_id):
         return rows, drift
     except Exception:
         return [], 0
+
+
+def remediate_latest(cluster_id):
+    """对最近一次巡检的 DRIFT 项尝试在线修复（同时兼容 MySQL 与 MariaDB）。
+
+    持久化差异（必须区分，否则 MariaDB 上会语法报错）：
+      - MySQL 8.0+：SET PERSIST 写入 mysqld-auto.cnf，重启仍生效。
+      - MariaDB：无 SET PERSIST 语法，改用 SET GLOBAL（仅运行时生效，重启需改 my.cnf 持久化）。
+    故按节点 flavour 选择 PERSIST / GLOBAL 关键字。
+
+    可在线修复：
+      - read_only：按角色设 0(master)/1(slave)（两款均支持）
+      - gtid_mode：仅 MySQL（MariaDB 无该变量）；三阶段 + FLUSH BINARY LOGS
+      - gtid_domain_id：仅 MariaDB（MySQL 无该变量）；设回基准节点值
+
+    不能在线修复（标 manual）：server_id 冲突 / log_bin=OFF / binlog_format /
+      version / connectivity。
+
+    返回 {"ok":bool,"fixed":[...],"manual":[...],"errors":[...],"msg":str}
+    """
+    rows, _ = get_latest_drift(cluster_id)
+    drifts = [r for r in rows if r["status"] == "DRIFT"]
+    if not drifts:
+        return {"ok": True, "fixed": [], "manual": [], "errors": [], "msg": "无漂移项，无需修复"}
+
+    from .clusters import get_cluster_creds
+    nodes = query(
+        "SELECT n.ip, n.port, n.root_user, n.root_pass, h.role "
+        "FROM nodes n LEFT JOIN hosts h ON h.host=n.ip AND h.cluster_id=n.cluster_id "
+        "WHERE n.cluster_id=%s", (cluster_id,))
+    creds = get_cluster_creds(cluster_id) or {}
+    ha_user = creds.get("ha_user") or "ha_monitor"
+    ha_pass = creds.get("ha_pass") or ""
+
+    # 重新 gather 快照，确定基准节点（base）、各节点角色与 flavour
+    snaps = []
+    for n in nodes:
+        s = _fetch_all(n["ip"], int(n["port"]), ha_user, ha_pass,
+                       n.get("root_user") or "root", n.get("root_pass") or "")
+        if s:
+            s["_ip"] = n["ip"]; s["_port"] = int(n["port"])
+            s["_role"] = (n.get("role") or "unknown").lower()
+            s["_root_user"] = n.get("root_user") or "root"
+            s["_root_pass"] = n.get("root_pass") or ""
+            s["_is_maria"] = bool(s.get("is_mariadb"))
+            snaps.append(s)
+    if not snaps:
+        return {"ok": False, "fixed": [], "manual": [], "errors": ["所有节点均不可达，无法修复"],
+                "msg": "无法连接任何节点"}
+    base = snaps[0]
+    base_gtid_domain = base.get("gtid_domain_id")
+
+    fixed, manual, errors = [], [], []
+    by_node = {}
+    for d in drifts:
+        by_node.setdefault((d["host"], int(d["port"])), []).append(d)
+
+    for (ip, port), items in by_node.items():
+        snap = next((s for s in snaps if s["_ip"] == ip and s["_port"] == port), None)
+        if not snap:
+            for d in items:
+                manual.append({"host": ip, "port": port, "var": d["var_name"],
+                               "reason": "节点不可达，无法在线修复"})
+            continue
+        role = snap["_role"]
+        is_maria = snap["_is_maria"]
+        # MySQL 用 SET PERSIST；MariaDB 不支持该语法，改用 SET GLOBAL（重启需 my.cnf 持久化）
+        kw = "PERSIST" if not is_maria else "GLOBAL"
+        note = "" if not is_maria else "（MariaDB 仅运行时生效，重启需 my.cnf 持久化）"
+        # 修复是写操作（SET PERSIST / SET GLOBAL），需要 SYSTEM_VARIABLES_ADMIN /
+        # PERSIST_RO_VARIABLES_ADMIN 等权限；ha_monitor 为只读监控账号，通常没有
+        # （执行 SET read_only 会报 1227）。故**优先用 root**，ha_monitor 仅作最后回退。
+        # 注意：connect_robust 内部也优先 ha_monitor，只在「连不上」时才回退 root，
+        # 权限不足不会触发其 root 回退 —— 所以这里必须显式先试 root，否则会拿 ha_monitor
+        # 连接去执行写语句导致全部修复失败。
+        conn = None
+        if snap.get("_root_pass"):
+            try:
+                from .ha_client import connect
+                conn = connect(ip, port, snap["_root_user"], snap["_root_pass"], timeout=5)
+            except Exception:
+                conn = None
+        if conn is None and ha_pass:
+            try:
+                from .ha_client import connect
+                conn = connect(ip, port, ha_user, ha_pass, timeout=5)
+            except Exception:
+                conn = None
+        if conn is None:
+            conn = connect_robust(ip, port, ha_user, ha_pass,
+                                  snap["_root_user"], snap["_root_pass"])
+        if conn is None:
+            for d in items:
+                errors.append({"host": ip, "port": port, "var": d["var_name"],
+                               "reason": "无法连接（ha_monitor 与 root 均失败）"})
+            continue
+        cur = conn.cursor()
+        try:
+            for d in items:
+                vn = d["var_name"]
+                try:
+                    if vn == "read_only":
+                        target = "0" if role in ("master", "primary") else "1"
+                        cur.execute(f"SET {kw} read_only={target}")
+                        fixed.append({"host": ip, "port": port, "var": vn,
+                                      "action": f"SET {kw} read_only={target}（按角色 {role}）{note}"})
+                    elif vn == "gtid_mode":
+                        # 仅 MySQL 存在该变量；MariaDB 不产出此项漂移
+                        cur.execute(f"SET {kw} enforce_gtid_consistency=ON")
+                        ok_g = True
+                        for stp in ("OFF_PERMISSIVE", "ON_PERMISSIVE", "ON"):
+                            try:
+                                cur.execute(f"SET {kw} gtid_mode={stp}")
+                            except Exception as e:
+                                ok_g = False
+                                errors.append({"host": ip, "port": port, "var": vn,
+                                               "reason": f"gtid_mode={stp} 失败: {e}"})
+                                break
+                        if ok_g:
+                            try:
+                                cur.execute("FLUSH BINARY LOGS")
+                            except Exception:
+                                pass
+                            fixed.append({"host": ip, "port": port, "var": vn,
+                                          "action": f"SET {kw} gtid_mode=ON（三阶段+FLUSH BINARY LOGS）{note}"})
+                    elif vn == "gtid_domain_id":
+                        # 仅 MariaDB 存在；MySQL 不产出此项漂移
+                        if base_gtid_domain and str(base_gtid_domain) not in ("0", "NONE", ""):
+                            cur.execute(f"SET {kw} gtid_domain_id={int(base_gtid_domain)}")
+                            fixed.append({"host": ip, "port": port, "var": vn,
+                                          "action": f"SET {kw} gtid_domain_id={int(base_gtid_domain)}（按基准）{note}"})
+                        else:
+                            manual.append({"host": ip, "port": port, "var": vn,
+                                           "reason": "基准节点 gtid_domain_id 为 0，无参考值，需人工"})
+                    elif vn == "server_id":
+                        manual.append({"host": ip, "port": port, "var": vn,
+                                       "reason": "server_id 冲突需在复制拓扑谨慎分配唯一值，未自动修改；请人工重设后重启"})
+                    elif vn == "log_bin":
+                        manual.append({"host": ip, "port": port, "var": vn,
+                                       "reason": "log_bin 不能在线开启，需到节点改 my.cnf 并重启（MySQL/MariaDB）"})
+                    elif vn == "binlog_format":
+                        manual.append({"host": ip, "port": port, "var": vn,
+                                       "reason": "binlog_format 需改 my.cnf 并重启后生效，无法在线持久化（MySQL 为只读变量；MariaDB 亦无 PERSIST）"})
+                    elif vn == "version":
+                        manual.append({"host": ip, "port": port, "var": vn,
+                                       "reason": "版本不一致需升级节点，无法在线修复"})
+                    elif vn == "connectivity":
+                        manual.append({"host": ip, "port": port, "var": vn,
+                                       "reason": "节点不可达，请检查网络/MySQL 状态"})
+                    else:
+                        manual.append({"host": ip, "port": port, "var": vn,
+                                       "reason": "未知漂移项，未自动处理"})
+                except Exception as e:
+                    errors.append({"host": ip, "port": port, "var": vn,
+                                   "reason": f"修复失败: {type(e).__name__}: {e}"})
+            conn.commit()
+        except Exception as e:
+            errors.append({"host": ip, "port": port, "var": "*",
+                           "reason": f"节点修复异常: {type(e).__name__}: {e}"})
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    return {"ok": True, "fixed": fixed, "manual": manual, "errors": errors,
+            "msg": f"修复完成：{len(fixed)} 项已在线修复，{len(manual)} 项需人工，{len(errors)} 项失败"}

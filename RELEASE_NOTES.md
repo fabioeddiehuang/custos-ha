@@ -270,7 +270,7 @@
 1. **主库状态 gauge 的指标来源**：远程节点无 SSH / agent，无法获取 OS 级 CPU / 内存 / 磁盘使用率。故 dashboard 的「主库状态」采用 MySQL 可观测指标近似——连接数%（`Threads_connected` / `max_connections`）、InnoDB 缓冲池使用%（`Innodb_buffer_pool_bytes_data` / `size`）、数据量（`information_schema` 字节数）、QPS（`Queries` / `Uptime`）。磁盘项为数据库数据量绝对值，非操作系统磁盘占用率。
 2. **告警「已自愈」语义**：自愈（手动 / 监控自动）成功后写入 `alerts` 状态表，对该节点（`cluster_id+host+port`）的实时聚合告警叠加「已自愈」标记；自愈失败则保持「未恢复」。监控自动自愈的去重窗口为 10 分钟。
 3. **账号策略**：当前账号 host 仍含 `%`（历史实现）。去 `%` 改造（节点网段% + docker 网关 172.28% + 127.0.0.1）为结构性重构，风险评估见项目 F 清单，暂缓至统一安全整改阶段。
-4. **部署**：仅用 `docker compose`；改 `./app` 后须 `docker compose up -d --build custos` 重建。
+4. **部署**：仅用 `docker compose`；改 `./app` 后须 `docker compose up -d --build custos-server` 重建（v2.2.20 起服务端容器/镜像名为 `custos-server`，原 `custos`）。
 
 ---
 

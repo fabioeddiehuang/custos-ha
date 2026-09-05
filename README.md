@@ -20,6 +20,10 @@
 | 自动高可用与故障切换 | 探活主从、GTID 感知选主（`pick_best_master`）、VIP 漂移、脑裂保护；主库失联约 6s 触发切换（默认 `CHECK_INTERVAL=3` / `FAIL_THRESHOLD=2`）。 |
 | 复制自愈 | 在线修复 SQL（1007/1050/1061/1062/1396/1032/1146）与 IO（13114/1236）复制错误（注入空事务跳过冲突）；支持手动 `/api/heal` 重指向 + 自愈。 |
 | 半同步复制（可选） | `SEMI_SYNC=1` 时，节点 my.cnf 注入半同步插件与开启参数（MySQL 8.0 × MariaDB 内置一致），主库提交等待从库 ACK；**随启动生效、重启不丢**（v2.2.20 起改为配置文件持久化，根治运行期 `SET GLOBAL` 清零后静默退化为异步）。GTID 分叉感知重链（v2.2.18/19）可自动解「out-of-order sequence」复制卡死。 |
+| 从库在线重建 | 复制出现**真实数据冲突**（1062/1032 且自愈无法修复）时，一键「主库 dump → 从库 restore → GTID 重链」，替代停机手工重建。异步任务 + 实时进度；恢复期间关闭会话 binlog，避免污染从库 GTID；禁止对当前主库执行。 |
+| 主从一致性校验 | 主动比对主从数据（表行数 / `CHECKSUM TABLE` 两档，纯只读），在分歧酿成故障前暴露，而不必等复制报错。 |
+| 定时备份与保留 | 可配置周期备份（默认关闭）+ 保留期自动清理；优先备份从库，避免拖累主库。 |
+| 用户与角色 | 管理员 / 只读两级。只读账号的**任何写操作在服务端统一拦截**（集中校验而非逐接口标注，避免遗漏）。 |
 | 节点一键部署 | **三种形态**：① Docker MySQL 8.0（`Install-mysql-docker-Node.sh` + compose）；② Docker MariaDB 12.3.x（生成即**纯 compose**，目录内 `docker compose up -d` 一键起 MariaDB + keepalived）；③ 裸机 MariaDB 12.x（`Install-ha-mariadb-Node.sh` 一条命令完成安装+账号初始化+keepalived 启动，**该包只适配裸机**）。**裸机装不上 tarball（如 glibc 过低）时直接选②容器版**，可与③同集群混部。账号/GTID 统一初始化，首次安装即可部署成功。 |
 | Web 控制台 | 仪表盘（实时拓扑 / 统计 / 刷新）、集群管理（单色系卡片 + SVG 图标 + 按集群配置凭证与 VIP）、节点配置（生成 / 重新生成 / 删除）、系统配置（SMTP 多收件人告警 + 按集群路由）。 |
 | 切换历史与告警 | 记录每次切换（from→to + 原因）；支持邮件告警与异常日志一键复制排错。 |
@@ -110,7 +114,7 @@ custos-ha/
 
 ```bash
 cd custos-ha
-./deploy.sh                     # 等价于 docker compose up -d --build（自动同步 app/VERSION 到 .env）
+./deploy.sh                     # 等价于 docker compose up -d --build（读取 .env 的 VERSION 后构建）
 ```
 
 启动后访问：`http://<管理端IP>:28888`（默认账号 `admin` / `admin`，生产请改 `WEB_PASS`）。
@@ -132,6 +136,33 @@ cd custos-ha
 | `NODES_HOST_BASE` | 节点目录在宿主机的**显示路径**（Web 展示用） | `custos-ha/generated_nodes` |
 | `VIP` / `VIP_PREFIX` / `INTERFACE` / `VRID` / `VIP_PORT` | VIP / 掩码位 / 网卡 / 虚拟路由ID / VIP 对外访问端口 | 空 / `24` / `eth0` / `51` / `3307` |
 | `SEMI_SYNC` | 半同步复制开关：置 `"1"` 启用（主库提交等待从库 ACK，压缩切换数据丢失窗口）；节点 my.cnf 自动注入插件与开启参数，随启动生效、重启不丢。MySQL 8.0（≥8.0.26 用 source/replica 命名，更早用 master/slave）与 MariaDB 均支持 | `"0"` |
+
+> **运行时配置项**（settings 表，Web「系统设置」可改，改后无需重启）：
+> - 备份调度：`BACKUP_SCHEDULE_ENABLED`（`0` 默认关闭）/ `BACKUP_INTERVAL_HOURS`（`24`）/ `BACKUP_RETENTION_DAYS`（`7`，`0`=不清理）/ `BACKUP_TARGET`（`slave`，优先从库，无可用从库时回退主库）/ `BACKUP_WITH_DATA`（`1`）
+> - 半同步开关也可由 settings 的 `SEMI_SYNC` 覆盖环境变量（预检会据此校验节点是否真的启用）
+> - 既有：`CHECK_INTERVAL` / `FAIL_THRESHOLD` / `REPL_LAG_ALERT_SEC` / `BINLOG_SIZE_ALERT_MB` / `AUTO_PURGE_BINLOG` / `FAILOVER_COOLDOWN_SEC`
+> - 账号收敛（**默认 `additive` 已开启**）：`ACCOUNT_HOST_MODE`，见下节
+
+### 账号 host 收敛（默认 `additive` 已开启）
+
+节点账号默认建为 `@'%'`（任意来源可连）。`ACCOUNT_HOST_MODE` 用于按内网段收敛，**现在默认 `additive`：自动追加网段账号、同时保留 `@'%'` 兜底，既收敛暴露面又不破坏现有连接**：
+
+| 取值 | 行为 | 适用阶段 |
+|---|---|---|
+| `legacy` | 仅 `@'%'` | 回退到未收敛状态（改回即可） |
+| `additive`（默认） | 追加 `@'192.168.1.%'`，**保留 `@'%'` 兜底** | 灰度第一步（安全，可随时改回） |
+| `additive` | 追加 `@'192.168.1.%'`，**保留 `@'%'` 兜底** | 灰度第一步（安全，可随时改回） |
+| `segment` | 仅 `@'192.168.1.%'`；**不自动 DROP `@'%'`** | 灰度终态（仍可改回回滚） |
+
+网段由 `MANAGER_PUBLIC_IP` 推导 C 段（`192.168.1.100` → `192.168.1.%`）；**推导失败一律回退 `@'%'`**，绝不猜测网段——猜错会让管理器连不上所有节点，远比保留 `%` 危险。
+
+推荐灰度（利用 MySQL **host 精确度优先匹配**，网段账号比 `@'%'` 更具体、自动优先生效）：
+
+1. 设 `ACCOUNT_HOST_MODE=additive`，重启管理器 → 只**新增**网段账号，`%` 原样保留；
+2. 在节点上执行 `SELECT USER(), CURRENT_USER();` —— 若 `CURRENT_USER()` 显示网段账号，说明已生效（`USER()` 是连接用的，`CURRENT_USER()` 才是实际匹配到的）；
+3. 观察无误后改 `segment`；确认长期稳定，再人工 `DROP USER 'xxx'@'%'`（本模式不会自动删）。
+
+> ⚠️ `MANAGER_PUBLIC_IP` 请**显式配置**，不要依赖自动探测：管理器跑在 docker 桥接网络时，探测到的是容器 IP 而非节点看到的宿主机 IP，会导致授权错位、管理器连不上节点（详见 `app/config.py` 中 `get_manager_public_ip` 的说明）。
 | `SMTP_*` / `ALERT_EMAIL` | 切换告警邮件（可选） | — |
 
 > 也支持通过文件注入敏感信息：`MGMT_MYSQL_PASS_FILE`、`WEB_PASS_FILE`（容器内路径）。
@@ -239,6 +270,84 @@ cd custos-ha
 3. 模拟主节点故障（停掉主节点 MySQL 或 keepalived），观察 VIP 漂移到对端、对端升主；
 4. 故障恢复后，原主以从库身份重新加入（GTID 自动补齐）；
 5. Web「切换历史」「集群管理」可查看过程；如配置了邮件会收到告警。
+
+### 8.1 管理器看门狗（自愈拉起 + 告警通道）
+
+管理器（Custos-Server）本身是无状态的 Web 服务，但它一挂，自动故障切换能力就丢失了
+（VIP/keepalived 跑在节点上、不依赖管理器，所以业务不直接中断）。`scripts/watchdog_manager.sh`
+从**外部**每分钟探活一次，连续失败达到阈值后自动拉起容器，把「无人知晓的不可用」消除。
+
+**部署（建议放在另一台机器上，避免管理器宿主机宕机时脚本一起消失）：**
+
+```cron
+# 每分钟探测；--apply 才真正拉起（否则只报告）
+* * * * * cd /opt/custos-ha && ./scripts/watchdog_manager.sh --apply >> logs/watchdog.log 2>&1
+```
+
+**告警通道（第二层）：达到阈值拉起容器、或恢复时，推送告警。**
+**默认通道是邮件**（最稳、不依赖外网 IM 服务）；如需 IM 群消息，再叠加 webhook。
+通过环境变量配置，无需改脚本：
+
+| 变量 | 说明 | 默认 |
+|------|------|------|
+| `CUSTOS_URL` | 探测地址（健康检查 `/login` 无需登录） | `http://127.0.0.1:28888` |
+| `CUSTOS_CONTAINER` | 容器名 | `custos-server` |
+| `CUSTOS_COMPOSE_DIR` | 设置后优先用 `docker compose up -d` 拉起 | 空（用 `docker restart`） |
+| `CUSTOS_FAIL_N` | 连续失败次数阈值 | `3` |
+| `CUSTOS_TIMEOUT` | 单次探测超时（秒） | `5` |
+| `CUSTOS_ALERT_MAILTO` | **默认通道**：收件人，用系统 `mail` 命令发送（需系统有 `mail`） | 空（不发） |
+| `CUSTOS_ALERT_WEBHOOK` | 可选叠加：告警 webhook URL（钉钉/企微/飞书/通用） | 空（不发） |
+| `CUSTOS_ALERT_WEBHOOK_TYPE` | `generic`(默认) \| `dingtalk` \| `wecom` \| `feishu` | `generic` |
+| `CUSTOS_ALERT_EVENTS` | 触发事件：`action,recover,all`（逗号分隔） | `action,recover` |
+
+示例（默认邮件告警，叠加钉钉群机器人）：
+
+```bash
+# 默认通道：邮件（建议优先配置）
+export CUSTOS_ALERT_MAILTO="dba@example.com"
+# 可选叠加：钉钉群机器人
+export CUSTOS_ALERT_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=xxxx"
+export CUSTOS_ALERT_WEBHOOK_TYPE="dingtalk"
+./scripts/watchdog_manager.sh --apply
+```
+
+> 说明：第一层（自动拉起）始终生效；第二层（告警）默认走邮件，仅在配置了
+> `CUSTOS_ALERT_MAILTO` 或 `CUSTOS_ALERT_WEBHOOK` 时投递。告警发送失败不影响看门狗主逻辑。
+
+### 8.2 节点 OS 指标采集 agent
+
+管理器是 agentless 架构（不 SSH / 不装 agent 到节点），原本 dashboard「主库状态」只能用
+MySQL 内部指标近似。**若想看到真实 CPU / 内存 / 磁盘占用**，在每台 MySQL 节点**宿主机**上
+跑一个轻量 agent，管理器定时拉取其 `/stats` 接口即可。该能力完全可选：agent 不可达时
+dashboard 仅不显示 OS 指标，不影响 HA 主逻辑。
+
+**agent 特性**：纯标准库、无第三方依赖（节点缺网也能跑，有 `psutil` 则更准）；只暴露只读采集；
+可选令牌校验；同机 2s 缓存避免抖动。
+
+**部署（每台节点宿主机）**：
+
+```bash
+# 1) 把脚本放到节点（如 /opt/custos-ha/scripts/node_agent.py）
+# 2) 用 systemd 托管（附 scripts/node-agent.service）：
+cp scripts/node-agent.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now node-agent
+
+# 或临时前台跑：
+python3 node_agent.py --port 29100 --bind 0.0.0.0
+# 开启令牌（与管理器 NODE_AGENT_TOKEN 一致）：NODE_AGENT_TOKEN=xxxx python3 node_agent.py
+```
+
+**管理器侧配置**（环境变量，无需改脚本）：
+
+| 变量 | 说明 | 默认 |
+|------|------|------|
+| `NODE_AGENT_PORT` | agent 监听端口（节点与管理器需网络可达） | `29100` |
+| `NODE_AGENT_TOKEN` | 可选，与 agent 端一致则校验 Bearer/查询参数 | 空（不校验） |
+| `NODE_AGENT_TIMEOUT` | 单次拉取超时（秒） | `3.0` |
+| `NODE_AGENT_CACHE_TTL` | 拉取结果缓存秒数（避免频繁打节点） | `15` |
+
+部署后，dashboard 每个集群卡片的「节点 OS 资源」面板会展示各节点 CPU / 内存 / 磁盘(`/`) / 负载。
+端点：`GET /api/os_metrics?cluster_id=`。
 
 ---
 

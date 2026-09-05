@@ -22,19 +22,16 @@ import pymysql
 
 from .db import get_setting, query, execute
 from .mysql_compat import default_auth_plugin, is_mariadb_node
-from .config import NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, SEMI_SYNC
+from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, SEMI_SYNC
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
 
 logger = logging.getLogger("node_gen")
 
-# 与 Web 后台 VERSION 文件、管理器镜像 tag 保持一致的版本号（用于构建节点 keepalived 镜像 tag）。
-def _pkg_version():
-    try:
-        return (Path(__file__).parent / "VERSION").read_text().strip() or "v2.0.1"
-    except Exception:
-        return "v2.0.1"
-PKG_VERSION = _pkg_version()
+# 节点 keepalived 镜像 tag 所用版本号，与管理器镜像 tag 保持一致。
+# 唯一来源为 .env 的 VERSION=（经 config.APP_VERSION 读取）；
+# 仅当取不到时兜底 v2.0.1，避免 tag 变成空值。
+PKG_VERSION = APP_VERSION or "v2.0.1"
 
 # VIP 非法（如集群尚未设置 VIP）时，keepalived.conf 刷新会被跳过并告警。
 # 该告警每周期都打会刷屏，这里按 ip 做冷却（默认 5 分钟最多提示一次）。

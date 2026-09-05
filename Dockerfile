@@ -21,21 +21,15 @@ LABEL org.opencontainers.image.description="MySQL/MariaDB 高可用管理：故�
 
 COPY . .
 
-# 版本单一来源 = .env 的 VERSION=（由 docker-compose 经 build-arg 传入镜像）。
-# 镜像构建时以 build-arg VERSION 为准，写回镜像内 app/VERSION 与 /app/.version.env，
-# 使 镜像标签 / LABEL / 容器内 app/VERSION 三处一致，Web 也能读到版本。
-# 源码树不再维护 app/VERSION（避免「两处版本」不一致）；若源码内无 app/VERSION
-# （如干净克隆），则以 build-arg VERSION 为准生成。
-RUN SRC_VER=$(tr -d '[:space:]' < app/VERSION 2>/dev/null || echo ""); \
-    ARG_VER=$(printf '%s' "${VERSION}" | tr -d '[:space:]'); \
-    if [ -n "${SRC_VER}" ] && [ -n "${ARG_VER}" ] && [ "${SRC_VER}" != "${ARG_VER}" ]; then \
-      echo "ERROR: 版本不一致 —— app/VERSION=${SRC_VER}，构建参数 VERSION=${ARG_VER}" >&2; \
-      echo "       请改用 ./deploy.sh（或 make build），它会自动同步 .env 后再构建。" >&2; \
+# 版本单一来源 = .env 的 VERSION=（由 docker-compose 经 build-arg 传入、再由 environment 注入容器）。
+# 源码树不再维护 app/VERSION（v2.2.20 起废弃）；应用只读环境变量 VERSION（config.APP_VERSION）。
+# 此处仅把实际版本写入镜像内元数据文件，供排障时 docker exec 查阅。
+RUN ARG_VER=$(printf '%s' "${VERSION}" | tr -d '[:space:]'); \
+    if [ -z "${ARG_VER}" ]; then \
+      echo "ERROR: 未提供构建参数 VERSION —— 请改用 ./deploy.sh（或 make build），它从 .env 读取后构建。" >&2; \
       exit 1; \
     fi; \
-    VER="${SRC_VER:-${ARG_VER}}"; \
-    printf '%s' "${VER}" > app/VERSION && \
-    echo "VERSION=${VER}" > /app/.version.env
+    echo "VERSION=${ARG_VER}" > /app/.version.env
 
 RUN chmod +x docker-entrypoint.sh
 

@@ -16,6 +16,18 @@
   .drift-exp{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
   .drift-arrow{color:#8b9ac0;margin:0 4px}
   .drift-foot{font-size:11.5px;color:#8b9ac0;padding-top:2px}
+  /* 节点 OS 资源（来自节点 agent） */
+  .dh-os-status{margin-top:14px}
+  .os-tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+  .os-tbl th{text-align:left;color:#8b9ac0;font-weight:600;padding:2px 6px 5px;border-bottom:1px solid rgba(255,255,255,.06)}
+  .os-tbl td{padding:6px 6px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle}
+  .os-bar{display:inline-block;width:60px;height:7px;border-radius:4px;background:rgba(255,255,255,.08);overflow:hidden;vertical-align:middle;margin-right:6px}
+  .os-bar span{display:block;height:100%}
+  .bar-ok{background:var(--success)}.bar-warn{background:#f59e0b}.bar-danger{background:var(--danger)}
+  .os-val{font-family:var(--mono);font-size:11.5px;color:var(--text)}
+  .os-sub{display:block;font-size:10.5px;color:#8b9ac0;margin-left:66px;margin-top:1px}
+  .os-load{font-size:11.5px;color:#8b9ac0;font-family:var(--mono);white-space:nowrap}
+  .os-off{color:#8b9ac0;font-size:11.5px}
   /* 活动中心：实时活动 + 切换记录 合并卡片 */
   .act-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
   .act-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}
@@ -129,6 +141,10 @@
       <div class="dh-ms-h">主库状态 · <span class="mono">{{ c.current_master }}</span></div>
       <div id="mres-{{ c.cluster_id }}"></div>
     </div>
+    <div class="dh-os-status">
+      <div class="dh-ms-h">节点 OS 资源 <span class="muted" style="font-weight:400">（来自节点 agent）</span></div>
+      <div id="osmetrics-{{ c.cluster_id }}"><div class="obs-empty">加载中…</div></div>
+    </div>
     <div class="banner" id="banner-{{ c.cluster_id }}" style="display:none"></div>
   </div>
 {% endfor %}
@@ -189,6 +205,7 @@
         <span class="obs-dot obs-dot--plum"></span>
         <span class="obs-card-name">配置一致性巡检</span>
         <div class="obs-sum" id="driftSum"></div>
+        <button class="obs-fix-btn" id="driftFixBtn" style="display:none" onclick="remediateDrift()">一键修复</button>
       </div>
       <div class="obs-body obs-scroll" id="driftBody"><div class="obs-empty">加载中…</div></div>
     </div>
@@ -395,6 +412,10 @@
         Object.keys(cms).forEach(function (cid) {
           if (cms[cid]) loadMasterResources(cid, cms[cid]);
         });
+        // 节点 OS 资源（来自 agent，可选；不可达时静默不显示）
+        (data.clusters || []).forEach(function (cl) {
+          loadOsMetrics(cl.cluster_id);
+        });
         if (dot) dot.classList.remove("busy");
         if (spin) spin.style.display = "none";
         if (txt) txt.textContent = "实时监控中";
@@ -442,6 +463,44 @@
         box.innerHTML = renderGauges(d);
       })
       .catch(function () { box.innerHTML = '<div class="obs-empty">主库状态加载失败</div>'; });
+  }
+  // 节点 OS 资源（来自节点 agent /stats；agentless 架构下真实 CPU/内存/磁盘）
+  function osBar(pct, danger) {
+    pct = (pct == null ? 0 : pct);
+    var cls = pct >= 90 ? "bar-danger" : (pct >= 75 ? "bar-warn" : "bar-ok");
+    if (danger) cls = "bar-danger";
+    return '<div class="os-bar"><span class="' + cls + '" style="width:' + Math.min(100, pct) + '%"></span></div>' +
+           '<span class="os-val">' + pct + '%</span>';
+  }
+  function renderOsMetrics(list) {
+    if (!list || !list.length) return '<div class="obs-empty">无节点</div>';
+    var rows = list.map(function (n) {
+      if (!n.ok || !n.data) {
+        return '<tr><td class="mono">' + (n.ip || "-") + '</td>' +
+               '<td colspan="4" class="os-off">agent 未部署/不可达</td></tr>';
+      }
+      var d = n.data, host = d.host || {}, mem = d.mem || {}, disks = d.disks || [];
+      var root = disks[0] || {};
+      var cells = '<td class="mono">' + (n.ip || "-") + '</td>' +
+        '<td>' + osBar(d.cpu_percent) + '</td>' +
+        '<td>' + osBar(mem.percent) + '<span class="os-sub">' + (mem.used_mb || 0) + ' / ' + (mem.total_mb || 0) + ' MB</span></td>' +
+        '<td>' + (root.percent != null ? osBar(root.percent) + '<span class="os-sub">' + (root.used_gb != null ? root.used_gb + ' / ' + root.total_gb + ' GB' : '') + '</span>' : '—') + '</td>' +
+        '<td class="os-load">load ' + (host.load1 != null ? host.load1 : "-") + (host.cpus ? ' / ' + host.cpus + '核' : '') + '</td>';
+      return '<tr>' + cells + '</tr>';
+    }).join("");
+    return '<table class="os-tbl"><thead><tr><th>节点</th><th>CPU</th><th>内存</th><th>磁盘 /</th><th>负载</th></tr></thead>' +
+           '<tbody>' + rows + '</tbody></table>';
+  }
+  function loadOsMetrics(cid) {
+    var box = document.getElementById("osmetrics-" + cid);
+    if (!box) return;
+    fetch("/api/os_metrics?cluster_id=" + cid, {cache: "no-store", credentials: "same-origin"})
+      .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { return null; } }); })
+      .then(function (d) {
+        if (!d || !d.ok) { box.innerHTML = '<div class="obs-empty" style="color:#fb7185;">OS 指标加载失败</div>'; return; }
+        box.innerHTML = renderOsMetrics(d.nodes);
+      })
+      .catch(function () { box.innerHTML = '<div class="obs-empty">OS 指标加载失败</div>'; });
   }
   // 实时活动（mockup dh-ev 样式）
   function loadActivity() {
@@ -693,6 +752,8 @@
         if (sum) sum.innerHTML = drift > 0
           ? '<span class="bad">'+drift + ' 项漂移</span>'
           : '<span class="ok">全部一致</span>';
+        var fb = document.getElementById("driftFixBtn");
+        if (fb) fb.style.display = drift > 0 ? "" : "none";
         var bad = rows.filter(function (r) { return r.status === "DRIFT"; });
         if (!bad.length) {
           body.innerHTML = '<div class="drift-ok-box"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>全部配置一致</div>';
@@ -727,6 +788,26 @@
         var body = document.getElementById("driftBody");
         if (body) body.innerHTML = '<div class="obs-empty" style="color:#fb7185;">' + esc(e.message) + '</div>';
       });
+  }
+  function remediateDrift() {
+    var sel = document.getElementById("obsCluster");
+    if (!sel) return;
+    var cid = sel.value;
+    var btn = document.getElementById("driftFixBtn");
+    if (btn) { btn.disabled = true; btn.textContent = "修复中…"; }
+    fetch("/api/config_drift/remediate?cluster_id=" + cid, { method: "POST", cache: "no-store", credentials: "same-origin" })
+      .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { return null; } }); })
+      .then(function (d) {
+        if (btn) { btn.disabled = false; btn.textContent = "一键修复"; }
+        if (!d) { alert("修复失败：返回解析错误"); return; }
+        var msg = d.msg || (d.ok ? "修复完成" : "修复失败");
+        if (d.fixed && d.fixed.length) msg += "\n已修复：" + d.fixed.map(function (f) { return f.host + ":" + f.port + " " + f.var; }).join("；");
+        if (d.manual && d.manual.length) msg += "\n需人工：" + d.manual.map(function (m) { return m.host + ":" + m.port + " " + m.var + "（" + m.reason + "）"; }).join("；");
+        if (d.errors && d.errors.length) msg += "\n失败：" + d.errors.map(function (m) { return m.host + ":" + m.port + " " + m.var + "：" + m.reason; }).join("；");
+        alert(msg);
+        loadDrift();
+      })
+      .catch(function (e) { if (btn) { btn.disabled = false; btn.textContent = "一键修复"; } alert("修复请求异常：" + e.message); });
   }
   function refreshObs() { loadTrend(); loadSlow(); loadDrift(); }
   function precheckCluster(btn) {

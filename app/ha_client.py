@@ -32,7 +32,7 @@ from .mysql_compat import (detect_syntax, detect_flavour, flavour_from_node_type
                            start_replication_sql,
                            stop_replication_sql, reset_replica_sql, show_replica_status_sql,
                            default_auth_plugin, F_MYSQL8, F_MARIADB)
-from .config import get_manager_public_ip, SEMI_SYNC
+from .config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, SEMI_SYNC
 
 
 # 复制错误码分类 —— 两类语义完全不同，绝不可混为一谈：
@@ -1883,6 +1883,26 @@ def _ensure_local_state_grant(cur, ha_user):
         return False
 
 
+def _account_hosts(manager_ip=None):
+    """按 ACCOUNT_HOST_MODE 返回要为 ha_monitor / replication / app 创建的 host 列表。
+
+    legacy（默认）: ['%']            仅 @'%'，与历史行为完全一致
+    additive      : ['%', '<段>.%']  追加网段账号，**保留 @'%' 兜底**（灰度第一步，最安全）
+    segment       : ['<段>.%']       仅网段（灰度终态；不自动 DROP @'%'，可随时改回回滚）
+
+    网段推导失败（manager_ip 为空 / 非 IPv4）时一律回退 ['%']：
+    宁可维持现状，也绝不赌网段 —— 猜错会让管理器连不上所有节点，
+    这比保留 % 危险得多（参考 config.get_manager_public_ip 关于 docker 桥接
+    探测错位的说明）。
+    """
+    if ACCOUNT_HOST_MODE not in ("additive", "segment"):
+        return ["%"]
+    seg = segment_of(manager_ip or "")
+    if not seg:
+        return ["%"]
+    return ["%", seg] if ACCOUNT_HOST_MODE == "additive" else [seg]
+
+
 def ensure_ha_creds(host, port, root_user, root_pass,
                     ha_user, ha_pass, repl_user, repl_pass,
                     app_user="", app_pass="", manager_ip="", manager_subnet=None):
@@ -1981,9 +2001,14 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             accts.append((app_user, app_pass, app_grant))
         # 幂等：账号/密码/权限无变化则不写任何语句（见 _ensure_account），
         # 彻底消除「主库每周期 ALTER/GRANT -> binlog -> 副本重放再写盘」的空闲写盘。
+        # 账号 host 策略（开关 ACCOUNT_HOST_MODE，默认 legacy 仅 @'%'，行为完全不变）。
+        # 开启后 MySQL 会按 host 精确度优先匹配：网段账号比 @'%' 更具体、优先生效。
+        _acct_hosts = _account_hosts(manager_ip)
         for u, p, grant_sql in accts:
-            _ensure_account(cur, u, "%", p, idn, grant_sql,
-                            conn_host=host, conn_port=port, plugin=auth_plugin)
+            for _h in _acct_hosts:
+                _g = grant_sql if _h == "%" else grant_sql.replace("@'%'", "@'%s'" % _h)
+                _ensure_account(cur, u, _h, p, idn, _g,
+                                conn_host=host, conn_port=port, plugin=auth_plugin)
         # 关键：把 root@'<管理器IP>' 与 root@'%' 密码校正为管理器库存 root_pass。
         #  - manager_ip 的 root 用于管理器自愈回退；
         #  - 127.0.0.1 的 root 供 keepalived 的 check_mysql_master.sh 本机 TCP 探活使用

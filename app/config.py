@@ -10,6 +10,62 @@ def env(name, default=None):
     return os.environ.get(name, default)
 
 
+def _resolve_app_version():
+    """版本号唯一来源：.env 的 VERSION=。
+
+    优先级：环境变量 VERSION（docker compose 已从 .env 注入）→ 仓库根 .env 文件 → 空串。
+    注意：v2.2.20 起 app/VERSION 文件已删除废弃，**任何代码都不要再读该文件**，
+    否则会静默回退到错误版本（曾导致节点 keepalived 镜像 tag 取到 v2.0.1）。
+    """
+    raw = (env("VERSION") or "").strip()
+    if raw:
+        return raw
+    try:
+        env_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
+        )
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("VERSION="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+APP_VERSION = _resolve_app_version()
+
+# 节点账号 host 策略（安全开关）
+#   legacy   : 仅创建 @'%'
+#   additive : 追加 @'<网段>.%'，同时**保留** @'%' 兜底（灰度第一步，最安全）
+#   segment  : 仅 @'<网段>.%'（灰度终态）。注意：本模式只停止维护 @'%'，
+#              **不会自动 DROP**，故随时可改回 additive 回滚，确认无误后再人工清理。
+# 默认 additive：开启账号 host 收敛（保留 @'%' 兜底，绝不破坏现有连接），
+# 消除「任意来源可连 ha_monitor/replication」的暴露面。改回 legacy 可关闭。
+ACCOUNT_HOST_MODE = (env("ACCOUNT_HOST_MODE", "additive") or "additive").strip().lower()
+
+
+def segment_of(ip):
+    """由 IPv4 推导 C 段通配：192.168.1.100 -> 192.168.1.%。
+
+    非 IPv4 或无法推导时返回 None —— 调用方必须回退 @'%'，绝不能猜测网段：
+    猜错会让管理器连不上所有节点，比保留 % 危险得多。
+    """
+    try:
+        parts = str(ip or "").strip().split(".")
+        if len(parts) != 4 or not all(x.isdigit() for x in parts):
+            return None
+        return ".".join(parts[:3]) + ".%"
+    except Exception:
+        return None
+
+
+# 用户角色：admin=管理员（全部权限）；viewer=只读（任何写操作一律拒绝）
+ROLE_ADMIN = "admin"
+ROLE_VIEWER = "viewer"
+
+
 def rand_secret(n=16):
     """生成 URL 安全的随机密钥（用于自动生成账号密码）。"""
     return secrets.token_urlsafe(n)
@@ -136,6 +192,15 @@ HEARTBEAT_INTERVAL = int(env("HEARTBEAT_INTERVAL", 30))
 # 这两个采集会向管理库 INSERT 历史行；空闲时值与上次完全一致则不写（见各模块内的变更检测）。
 METRICS_INTERVAL = int(env("METRICS_INTERVAL", 60))
 DRIFT_INTERVAL = int(env("DRIFT_INTERVAL", 300))
+
+# 节点 OS 指标采集 agent（填补 agentless 架构下「无 OS 级指标」的缺口）。
+# 在每个 MySQL 节点宿主机上运行 `scripts/node_agent.py`（轻量 HTTP 服务，stdlib-only），
+# 管理器定时拉取其 /stats 接口拿到真实 CPU/内存/磁盘占用，补进 dashboard。
+# 该能力完全可选：agent 不可达时管理器静默降级（dashboard 仅不显示 OS 指标，不影响 HA 主逻辑）。
+NODE_AGENT_PORT = int(env("NODE_AGENT_PORT", 29100))        # 节点 agent 监听端口
+NODE_AGENT_TOKEN = (env("NODE_AGENT_TOKEN", "") or "").strip()  # 可选：Bearer/查询参数校验
+NODE_AGENT_TIMEOUT = float(env("NODE_AGENT_TIMEOUT", 3.0))  # 单次拉取超时（秒）
+NODE_AGENT_CACHE_TTL = int(env("NODE_AGENT_CACHE_TTL", 15))  # 拉取结果缓存秒数（避免频繁打节点）
 
 # 节点生成目录（一键启动 compose 落地目录；建议挂卷持久化）
 NODES_DIR = env("NODES_DIR", "/app/generated_nodes")

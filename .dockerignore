@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 .git/
 .gitignore
+.env   # 含 SECRET_KEY 等敏感值，禁止打进镜像；运行时由 compose 注入环境变量
 data/
 generated_nodes/
 *.md

@@ -12,3 +12,18 @@ backups/
 
 # 本地 compose 配置备份（含真实地址，切勿入库）
 docker-compose.yml.bak.*
+
+# 本地环境变量（含 SECRET_KEY / 管理库口令，**切勿入库**）
+.env
+# 运行时数据（含会话密钥文件 data/secret_key）
+data/
+# 节点部署单元（内含明文密码）
+generated_nodes/
+
+# 本地真实部署配置（含真实内网 IP / 管理库口令 / Web 口令，切勿入库）。
+# 仓库只保留脱敏模板 docker-compose-example.yml；新环境首次部署：
+#   cp docker-compose-example.yml docker-compose.yml 再按需修改。
+docker-compose.yml
+
+# 运行时日志（看门狗/agent 输出，非敏感但无需入库）
+logs/

@@ -101,6 +101,9 @@
       <div class="menu-label">一键修复</div>
       <a onclick="doRepair('heal_io')">修复复制延迟<span class="d">高延迟</span></a>
       <a onclick="doRepair('heal_sql')">修复复制中断<span class="d">IO/SQL 报错</span></a>
+      <div class="menu-label">一致性校验</div>
+      <a onclick="checkConsistency('rows')">行数比对<span class="d">轻量</span></a>
+      <a onclick="checkConsistency('checksum')">校验和比对<span class="d">精确·较慢</span></a>
       <a onclick="doRepair('sync')">同步账号凭证<span class="d">支持自动</span></a>
       <a onclick="doRepair('push')">重新下发配置<span class="d">支持自动</span></a>
     </div>
@@ -149,7 +152,7 @@
         <td>{% if r.status == 'up' %}<span class="badge up">在线</span>{% else %}<span class="badge down">离线</span>{% endif %}</td>
         <td>{% if r.role == '主库' %}<span class="badge ok">正常</span>{% elif r.status != 'up' %}<span class="badge down">未启动</span>{% elif r.bad %}<span class="badge warn">异常</span>{% else %}<span class="badge ok">正常</span>{% endif %}</td>
         <td class="mono">{% if r.role == '主库' %}—{% else %}{{ r.seconds_behind if r.seconds_behind is not none else '—' }}s{% endif %}</td>
-        <td><button class="btn btn-sm" onclick="openNodeDetail({{ cluster.id }}, '{{ r.host }}', {{ r.port }}, '{{ 'master' if r.role=='主库' else 'slave' }}')">详情</button></td>
+        <td><button class="btn btn-sm" onclick="openNodeDetail({{ cluster.id }}, '{{ r.host }}', {{ r.port }}, '{{ 'master' if r.role=='主库' else 'slave' }}')">详情</button>{% if r.role != '主库' %}<button class="btn btn-sm" style="margin-left:6px;border-color:#f0a02055;color:#f0a020;" onclick="rebuildNode({{ cluster.id }}, '{{ r.host }}', {{ r.port }})" title="复制数据冲突（1062/1032）无法自愈时：从主库重做本从库数据。重建期间该从库不可用，耗时随数据量增长">重建</button>{% endif %}</td>
       </tr>
       {% else %}
       <tr><td colspan="6" style="color:#8b9ac0;text-align:center;padding:24px;">该集群暂无节点。请前往「节点管理」添加节点。</td></tr>
@@ -785,5 +788,105 @@
 
   rebuildMenus();
   if(document.getElementById("logCluster") && document.getElementById("logCluster").value) loadCurrentLog();
+  // ---- 从库在线重建（异步任务 + 进度条）----
+  // 用于复制出现真实数据冲突、自愈无法修复时，替代「停机手工重建」。
+  function rebuildNode(cid, host, port){
+    if(!confirm('确定要从主库重建从库 '+host+':'+port+' 吗？\n\n'
+      + '• 会用主库当前数据覆盖本从库\n'
+      + '• 重建期间该从库不可用\n'
+      + '• 耗时随数据量增长，请勿重复点击\n\n'
+      + '适用于复制报 1062/1032 且一键修复无效的场景。')) return;
+    var fd=new FormData();
+    fd.append('cluster_id', cid); fd.append('host', host); fd.append('port', port);
+    fetch('/api/node/rebuild',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(r){return r.json();})
+      .then(function(j){
+        if(!j.ok){ alert('启动失败：'+(j.error||'未知错误')); return; }
+        pollRebuild(j.task);
+      })
+      .catch(function(e){ alert('请求失败：'+e); });
+  }
+
+  function pollRebuild(task){
+    var box=document.getElementById('rebuildBar');
+    if(!box){
+      box=document.createElement('div'); box.id='rebuildBar';
+      box.style.cssText='position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:9999;'
+        +'min-width:360px;padding:14px 18px;border-radius:10px;background:#0e1830;color:#e6edf7;'
+        +'border:1px solid #22d3ee55;box-shadow:0 8px 30px rgba(0,0,0,.45);font-size:13px;';
+      document.body.appendChild(box);
+    }
+    var timer=setInterval(function(){
+      fetch('/api/node/rebuild_status?task='+encodeURIComponent(task),{credentials:'same-origin'})
+        .then(function(r){return r.json();})
+        .then(function(t){
+          var pct=(t.pct==null?0:t.pct);
+          var bar='<div style="height:6px;border-radius:3px;background:#ffffff14;overflow:hidden;">'
+            +'<div style="height:100%;width:'+pct+'%;background:linear-gradient(90deg,#22d3ee,#0ABAB5);transition:width .3s;"></div></div>';
+          if(t.status==='done'||t.status==='failed'){
+            clearInterval(timer);
+            var ok=(t.status==='done');
+            box.style.borderColor=ok?'#22d3ee88':'#ff6b6b88';
+            box.innerHTML='<div style="font-weight:600;">'+(ok?'✓ 重建完成':'✗ 重建失败')+'</div>'
+              +'<div style="margin-top:6px;color:#9fb0d0;word-break:break-all;">'+(t.msg||'')+'</div>'
+              +'<div style="margin-top:10px;text-align:right;"><button class="btn btn-sm" '
+              +'onclick="var b=document.getElementById(\'rebuildBar\');if(b)b.remove();location.reload();">关闭并刷新</button></div>';
+          } else {
+            box.innerHTML='<div style="margin-bottom:8px;font-weight:600;">从库重建中… '+pct+'%</div>'
+              +bar+'<div style="margin-top:8px;color:#9fb0d0;">'+(t.msg||'')+'</div>';
+          }
+        })
+        .catch(function(e){ clearInterval(timer); box.innerHTML='进度查询失败：'+e; });
+    },2000);
+  }
+
+  // ---- 主从数据一致性校验（只读）----
+  function checkConsistency(mode){
+    var cid = {{ cluster.id }};
+    var box = document.getElementById('csBox');
+    if(!box){
+      box=document.createElement('div'); box.id='csBox';
+      box.style.cssText='position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:10000;'
+        +'max-width:min(860px,92vw);max-height:76vh;overflow:auto;padding:18px 20px;border-radius:12px;'
+        +'background:#0e1830;color:#e6edf7;border:1px solid #22d3ee55;box-shadow:0 16px 50px rgba(0,0,0,.55);font-size:13px;';
+      document.body.appendChild(box);
+    }
+    box.innerHTML='<div style="font-weight:600;">正在校验（'+(mode==='checksum'?'校验和':'行数')+'）… 大集群可能需要数十秒</div>';
+    var fd=new FormData();
+    fd.append('cluster_id', cid); fd.append('mode', mode);
+    fetch('/api/consistency/check',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(r){return r.json();})
+      .then(function(j){
+        if(!j.ok){ box.innerHTML='<div style="color:#ff6b6b;">校验失败：'+(j.error||'未知')+'</div>'+csCloseBtn(); return; }
+        var h='<div style="font-weight:600;margin-bottom:6px;">一致性校验结果</div>'
+          +'<div style="color:#9fb0d0;margin-bottom:10px;">模式：'+(j.mode==='checksum'?'校验和（精确）':'行数（轻量）')
+          +'　主库：'+j.master+'　已比对表：'+j.checked+'　从库：'+(j.slaves||[]).join('、')+'</div>';
+        var d=j.diffs||[];
+        if(!d.length){
+          h+='<div style="padding:14px;border-radius:8px;background:#22d3ee14;border:1px solid #22d3ee33;">✓ 未发现差异</div>';
+        } else {
+          h+='<div style="padding:10px 12px;border-radius:8px;background:#ff6b6b14;border:1px solid #ff6b6b44;margin-bottom:10px;">'
+            +'⚠ 发现 '+d.length+' 处差异</div>'
+            +'<table class="tbl" style="width:100%;font-size:12px;"><thead><tr>'
+            +'<th>从库</th><th>表</th><th>主库值</th><th>从库值</th><th>说明</th></tr></thead><tbody>';
+          for(var i=0;i<d.length && i<200;i++){
+            var x=d[i];
+            h+='<tr><td class="mono">'+x.host+':'+x.port+'</td><td class="mono">'+x.table+'</td>'
+              +'<td class="mono">'+x.master+'</td><td class="mono">'+x.slave+'</td>'
+              +'<td>'+(x.note||'')+'</td></tr>';
+          }
+          h+='</tbody></table>';
+          if(d.length>200) h+='<div style="color:#9fb0d0;margin-top:8px;">（仅显示前 200 条）</div>';
+        }
+        h+=csCloseBtn();
+        box.innerHTML=h;
+      })
+      .catch(function(e){ box.innerHTML='请求失败：'+e+csCloseBtn(); });
+  }
+  function csCloseBtn(){
+    return '<div style="margin-top:14px;text-align:right;"><button class="btn btn-sm" '
+      +'onclick="var b=document.getElementById(\'csBox\');if(b)b.remove();">关闭</button></div>';
+  }
+
 </script>
 {% endblock %}

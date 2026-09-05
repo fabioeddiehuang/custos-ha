@@ -19,8 +19,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 from urllib.parse import quote
 
-from .config import (SECRET_KEY, WEB_USER, rand_secret, get_manager_public_ip, get_manager_public_ip_source, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT, validate_config, hash_pwd, verify_pwd, FAILOVER_COOLDOWN_SEC)
-from .db import query, execute, get_conn, get_setting, upsert_setting
+from .config import (APP_VERSION, SECRET_KEY, WEB_USER, ROLE_ADMIN, ROLE_VIEWER, rand_secret, get_manager_public_ip, get_manager_public_ip_source, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT, validate_config, hash_pwd, verify_pwd, FAILOVER_COOLDOWN_SEC)
+from .db import (query, execute, get_conn, get_setting, upsert_setting,
+                 get_user_role, list_users, get_user, create_user, set_user_role,
+                 delete_user, count_admins)
 from .state import get_current_master
 from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root, _LAST_FAILOVER_TS
 from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
@@ -33,7 +35,8 @@ from .ha_client import (connect, heal_replication, heal_io_gtid_gap, heal_io_aut
                        fix_node_mysql_params, reset_replication_creds_on_master,
                        restart_slave_io, connect_robust)
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
-from . import precheck, audit, metrics, slow_log, config_drift, docker_helper, backup
+from . import precheck, audit, metrics, slow_log, config_drift, docker_helper, backup, os_metrics
+from . import rebuild, consistency
 from .mysql_compat import detect_flavour, flavour_from_node_type, F_MARIADB
 
 # ---------------------------------------------------------------------------
@@ -146,12 +149,7 @@ TEMPLATES = Environment(
     loader=FileSystemLoader(str(Path(__file__).parent / "templates")),
     autoescape=select_autoescape(["html"]),
 )
-try:
-    TEMPLATES.globals["APP_VERSION"] = (
-        Path(__file__).resolve().parent / "VERSION"
-    ).read_text().strip()
-except Exception:
-    TEMPLATES.globals["APP_VERSION"] = ""
+TEMPLATES.globals["APP_VERSION"] = APP_VERSION
 
 
 def display_node_type(nt):
@@ -179,6 +177,12 @@ start_in_background()
 
 
 def auth_required(request: Request):
+    """校验登录态并返回用户名。
+
+    写操作（非 GET/HEAD/OPTIONS）额外做角色校验：只读账号 role=viewer 一律 403。
+    刻意在这一处统一拦截 —— 若逐个接口加装饰器，漏一个就等于「只读账号可写」，
+    而本项目有上百个写接口，逐个标注不可能审计周全。
+    """
     token = request.cookies.get(COOKIE)
     if not token:
         raise HTTPException(status_code=307, headers={"Location": "/login"})
@@ -186,6 +190,9 @@ def auth_required(request: Request):
         user = serializer.loads(token, max_age=86400 * 7)
     except BadSignature:
         raise HTTPException(status_code=307, headers={"Location": "/login"})
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if get_user_role(user) == ROLE_VIEWER:
+            raise HTTPException(status_code=403, detail="只读账号无操作权限")
     return user
 
 
@@ -362,11 +369,8 @@ def dashboard(request: Request, user=Depends(auth_required)):
         err = str(e)
     else:
         err = None
-    # 读取版本号（若有）
-    try:
-        version = (Path(__file__).parent / "VERSION").read_text().strip()
-    except Exception:
-        version = ""
+    # 版本号唯一来源：.env 的 VERSION=（经 config.APP_VERSION 读取）
+    version = APP_VERSION
     return render("dashboard.html", request, user=user, clusters=dash,
                   history=history, error=err, version=version)
 
@@ -587,6 +591,32 @@ def api_config_drift(cluster_id: int = 0, user=Depends(auth_required)):
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
+@app.post("/api/config_drift/remediate")
+def api_config_drift_remediate(cluster_id: int = 0, user=Depends(auth_required)):
+    """一键修复最近一次巡检的 DRIFT 项（在线 SET PERSIST，仅可在线修复项；其余标 manual）。"""
+    try:
+        res = config_drift.remediate_latest(int(cluster_id))
+        # 修复改变了在线节点状态，重跑一次巡检刷新 config_drift 表，
+        # 让前端「重新加载」后能看到真实结果（已修复项会变为 OK，未达标项仍 DRIFT）。
+        try:
+            config_drift.check_cluster(int(cluster_id))
+        except Exception:
+            pass  # 巡检刷新失败不影响已下发的修复结果
+        return _json_ok(res)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/os_metrics")
+def api_os_metrics(cluster_id: int = 0, user=Depends(auth_required)):
+    """拉取指定集群各节点的 OS 指标（来自节点 agent /stats）。agent 不可达时 ok=False。"""
+    try:
+        nodes = os_metrics.get_cluster_os_metrics(int(cluster_id))
+        return _json_ok({"cluster_id": cluster_id, "nodes": nodes})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
 @app.get("/api/audit")
 def api_audit(limit: int = 200, cluster_id: int = 0, user=Depends(auth_required)):
     """操作审计日志列表。"""
@@ -643,6 +673,57 @@ def api_collect(target: str = Form("all"), cluster_id: int = Form(0), user=Depen
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     return _json_ok({"ok": True, "accepted": True, "msg": "采集任务已提交，正在后台执行…"})
+
+
+@app.post("/api/consistency/check")
+def api_consistency_check(cluster_id: int = Form(...), mode: str = Form("rows"),
+                          user=Depends(auth_required)):
+    """主从数据一致性校验（纯只读）。
+
+    mode=rows     比对各业务表行数（轻量，可定期跑）
+    mode=checksum CHECKSUM TABLE 逐表比对（较重，能发现行数相同但内容不同）
+    """
+    try:
+        res = consistency.check_consistency(cluster_id, mode)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok(res)
+
+
+
+@app.get("/api/consistency/check")
+def api_consistency_check_get(cluster_id: int = 0, mode: str = "rows",
+                              user=Depends(auth_required)):
+    """GET 形式的一致性校验（便于前端/脚本直接调用）。"""
+    try:
+        res = consistency.check_consistency(cluster_id, mode)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok(res)
+
+
+@app.post("/api/node/rebuild")
+def api_node_rebuild(cluster_id: int = Form(...), host: str = Form(...),
+                     port: int = Form(...), user=Depends(auth_required)):
+    """从库在线重建（异步）：主库 dump → 从库 restore（关 binlog）→ GTID 重链。
+
+    用于复制出现真实数据冲突（1062/1032 且自愈无法修复）时，替代「停机手工重建」。
+    严禁对当前主库执行 —— 那等于用主库数据覆盖主库本身。
+    """
+    try:
+        cur_m = get_current_master(cluster_id) or {}
+        if cur_m.get("host") == host and int(cur_m.get("port") or 0) == int(port):
+            return _json_ok({"ok": False, "error": "不能重建当前主库（会抹掉整个集群数据）"})
+        task = rebuild.start_rebuild(cluster_id, host, port, actor=str(user))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok({"ok": True, "task": task})
+
+
+@app.get("/api/node/rebuild_status")
+def api_rebuild_status(task: str = "", user=Depends(auth_required)):
+    """查询重建任务进度（status/pct/msg）。"""
+    return _json_ok(rebuild.get_task(task))
 
 
 @app.post("/api/heal")
@@ -1870,6 +1951,66 @@ def api_active_alerts(user=Depends(auth_required)):
     # 严重(error)优先，其次按集群号
     alerts.sort(key=lambda a: (0 if a["level"] == "error" else 1, a["cluster_id"]))
     return JSONResponse({"ok": True, "alerts": alerts})
+
+
+@app.get("/api/users")
+def api_users(user=Depends(auth_required)):
+    """用户列表（含角色）。"""
+    return _json_ok(list_users())
+
+
+@app.post("/api/users/add")
+def api_user_add(username: str = Form(...), password: str = Form(...),
+                 role: str = Form(ROLE_ADMIN), user=Depends(auth_required)):
+    """新增用户。role=viewer 为只读账号（任何写操作会被 auth_required 拦截）。"""
+    username = (username or "").strip()
+    if not username or not password:
+        return _json_ok({"ok": False, "error": "用户名和密码均不能为空"})
+    role = ROLE_VIEWER if (role or "").strip().lower() == ROLE_VIEWER else ROLE_ADMIN
+    if get_user(username):
+        return _json_ok({"ok": False, "error": f"用户 {username} 已存在"})
+    try:
+        create_user(username, hash_pwd(password), role)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"新增失败：{e}"})
+    return _json_ok({"msg": f"已新增用户 {username}（{'只读' if role == ROLE_VIEWER else '管理员'}）"})
+
+
+@app.post("/api/users/role")
+def api_user_role(username: str = Form(...), role: str = Form(...),
+                  user=Depends(auth_required)):
+    """修改用户角色。禁止把最后一个管理员降级为只读。"""
+    username = (username or "").strip()
+    role = ROLE_VIEWER if (role or "").strip().lower() == ROLE_VIEWER else ROLE_ADMIN
+    u = get_user(username)
+    if not u:
+        return _json_ok({"ok": False, "error": f"用户 {username} 不存在"})
+    if role == ROLE_VIEWER and (u.get("role") or ROLE_ADMIN) == ROLE_ADMIN \
+            and count_admins() <= 1:
+        return _json_ok({"ok": False, "error": "至少需保留一个管理员，无法将该账号降级为只读"})
+    try:
+        set_user_role(username, role)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"修改失败：{e}"})
+    return _json_ok({"msg": f"{username} 已设为{'只读' if role == ROLE_VIEWER else '管理员'}"})
+
+
+@app.post("/api/users/delete")
+def api_user_delete(username: str = Form(...), user=Depends(auth_required)):
+    """删除用户。禁止删除自己、禁止删光最后一个管理员。"""
+    username = (username or "").strip()
+    if username == user:
+        return _json_ok({"ok": False, "error": "不能删除当前登录账号"})
+    u = get_user(username)
+    if not u:
+        return _json_ok({"ok": False, "error": f"用户 {username} 不存在"})
+    if (u.get("role") or ROLE_ADMIN) == ROLE_ADMIN and count_admins() <= 1:
+        return _json_ok({"ok": False, "error": "至少需保留一个管理员"})
+    try:
+        delete_user(username)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"删除失败：{e}"})
+    return _json_ok({"msg": f"已删除用户 {username}"})
 
 
 @app.post("/api/alert_rules")

@@ -55,6 +55,9 @@ services:
     # depends_on:
     #   - mgmt-mysql
     environment:
+      # 版本号：由 .env 的 VERSION= 注入。应用内 config.APP_VERSION 直接读该环境变量，
+      # 故镜像内无需 .env 文件（.dockerignore 已排除 .env，避免 SECRET_KEY 等敏感值入镜像）。
+      VERSION: ${VERSION}
       # ===== 管理库连接（指向你的独立 / 外部管理 MySQL）=====
       # 重要：必须填外部库真实可达 IP，不要写 auto 或 127.0.0.1。
       #   - auto 会探测本机 IP，而本机通常没跑 MySQL，会导致「添加节点」时

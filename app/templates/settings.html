@@ -195,6 +195,30 @@
   <pre class="srv-log" id="srvLog">日志加载中…</pre>
   <button class="btn btn-sm btn-ghost" id="fullClose" style="display:none;margin-top:10px;" onclick="toggleFull()">退出全屏</button>
 </div>
+<div class="card">
+  <h3>用户与角色</h3>
+  <div class="adv-desc" style="margin-bottom:12px;">
+    <b>管理员</b>：可读写全部功能（切换、修复、重建、改配置）。
+    <b>只读</b>：仅能查看，任何写操作都会被服务端拒绝（统一拦截，逐个接口不会遗漏）。
+  </div>
+  <table class="tbl" style="width:100%;margin-bottom:14px;">
+    <thead><tr><th>用户名</th><th>角色</th><th>创建时间</th><th style="width:190px;">操作</th></tr></thead>
+    <tbody id="userRows">
+      <tr><td colspan="4" style="color:var(--muted);text-align:center;padding:16px;">加载中…</td></tr>
+    </tbody>
+  </table>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <input id="nuUser" placeholder="用户名" style="max-width:170px;">
+    <input id="nuPass" type="password" placeholder="密码" style="max-width:170px;">
+    <select id="nuRole" class="mini-sel">
+      <option value="admin">管理员</option>
+      <option value="viewer">只读</option>
+    </select>
+    <button class="btn" onclick="addUser()">新增用户</button>
+  </div>
+  <div id="userMsg" style="margin-top:10px;font-size:13px;color:var(--muted);"></div>
+</div>
+
 
 <script>
   function toast(msg,kind){
@@ -329,6 +353,89 @@
 
   loadSrvUnits();
   loadSrvLog();
+  loadUsers();
   setInterval(pollSrvLog, 4000);
+  // ---- 用户与角色管理 ----
+  function userMsg(t, bad){
+    var el=document.getElementById('userMsg');
+    if(el){ el.textContent=t||''; el.style.color = bad ? '#ff6b6b' : 'var(--muted)'; }
+  }
+  function escHtml(x){
+    return String(x==null?'':x).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function loadUsers(){
+    fetch('/api/users',{credentials:'same-origin'})
+      .then(function(r){return r.json();})
+      .then(function(rows){
+        var tb=document.getElementById('userRows'); if(!tb) return;
+        rows = rows || [];
+        if(!rows.length){
+          tb.innerHTML='<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:16px;">暂无用户</td></tr>';
+          return;
+        }
+        var h='';
+        rows.forEach(function(u){
+          var role=(u.role||'admin');
+          h+='<tr>'
+            +'<td class="mono">'+escHtml(u.username)+'</td>'
+            +'<td>'+(role==='viewer'
+                ? '<span class="badge warn">只读</span>'
+                : '<span class="badge ok">管理员</span>')+'</td>'
+            +'<td class="mono">'+escHtml(u.created_at||'')+'</td>'
+            +'<td><select class="mini-sel" data-user="'+escHtml(u.username)+'" onchange="chgRole(this)">'
+              +'<option value="admin"'+(role==='admin'?' selected':'')+'>管理员</option>'
+              +'<option value="viewer"'+(role==='viewer'?' selected':'')+'>只读</option>'
+            +'</select> '
+            +'<button class="btn btn-sm" data-user="'+escHtml(u.username)+'" onclick="delUser(this)">删除</button>'
+            +'</td></tr>';
+        });
+        tb.innerHTML=h;
+      })
+      .catch(function(e){ userMsg('用户列表加载失败：'+e, true); });
+  }
+  function addUser(){
+    var u=document.getElementById('nuUser').value.trim();
+    var p=document.getElementById('nuPass').value;
+    var r=document.getElementById('nuRole').value;
+    if(!u||!p){ userMsg('用户名和密码均不能为空', true); return; }
+    var fd=new FormData();
+    fd.append('username',u); fd.append('password',p); fd.append('role',r);
+    fetch('/api/users/add',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(x){return x.json();})
+      .then(function(j){
+        if(!j.ok){ userMsg(j.error||'新增失败', true); return; }
+        document.getElementById('nuUser').value='';
+        document.getElementById('nuPass').value='';
+        userMsg(j.msg||'已新增'); loadUsers();
+      })
+      .catch(function(e){ userMsg('请求失败：'+e, true); });
+  }
+  function chgRole(sel){
+    var u=sel.getAttribute('data-user'), v=sel.value;
+    var fd=new FormData();
+    fd.append('username',u); fd.append('role',v);
+    fetch('/api/users/role',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(x){return x.json();})
+      .then(function(j){
+        if(!j.ok){ userMsg(j.error||'修改失败', true); loadUsers(); return; }
+        userMsg(j.msg||'已更新'); loadUsers();
+      })
+      .catch(function(e){ userMsg('请求失败：'+e, true); loadUsers(); });
+  }
+  function delUser(btn){
+    var u=btn.getAttribute('data-user');
+    if(!confirm('确定删除用户 '+u+' 吗？')) return;
+    var fd=new FormData(); fd.append('username',u);
+    fetch('/api/users/delete',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(x){return x.json();})
+      .then(function(j){
+        if(!j.ok){ userMsg(j.error||'删除失败', true); return; }
+        userMsg(j.msg||'已删除'); loadUsers();
+      })
+      .catch(function(e){ userMsg('请求失败：'+e, true); });
+  }
+
+
 </script>
 {% endblock %}

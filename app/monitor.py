@@ -16,7 +16,7 @@ from .failover import (do_failover, do_failover_to, ensure_topology, load_creds,
 from .alerts import send_alert
 from .clusters import list_clusters
 from . import node_gen
-from . import metrics, slow_log, config_drift
+from . import backup, metrics, slow_log, config_drift
 
 # 复制延迟告警阈值（秒）。超过即发邮件告警，避免重复刷屏只在「跨阈值的那一刻」触发。
 REPL_LAG_ALERT_SEC = 30
@@ -1007,7 +1007,7 @@ def run_forever():
 # 周期计数：慢日志仍按周期倍数（默认关闭，影响可忽略）
 _COLLECT_CYCLE = {"metrics": 0, "slow": 0, "drift": 0}
 # 采集时间戳（monotonic，秒）：指标/漂移改为**按秒限频**，不随 CHECK_INTERVAL 变化而漂移
-_COLLECT_AT = {"metrics": 0.0, "slow": 0.0, "drift": 0.0}
+_COLLECT_AT = {"metrics": 0.0, "slow": 0.0, "drift": 0.0, "backup": 0.0}
 _SLOW_EVERY = 20        # 慢日志仍按周期倍数（约默认 60s 一次）
 
 
@@ -1062,6 +1062,83 @@ def _maybe_collect():
         except Exception as e:
             print(f"[monitor] 配置漂移巡检异常: {e}", flush=True)
             import traceback; traceback.print_exc()
+    try:
+        _maybe_scheduled_backup()
+    except Exception as e:
+        print(f"[monitor] 定时备份异常: {e}", flush=True)
+        import traceback; traceback.print_exc()
+
+
+def _pick_backup_nodes(cid, mode="slave"):
+    """挑选备份目标节点的优先顺序。
+
+    mode=slave（默认）优先从库，避免备份 IO 拖累主库业务；无可用从库时回退主库。
+    刻意不依赖 hosts.status 字符串取值，逐个尝试直到备份真正成功。
+    """
+    rows = query("SELECT host, port, is_current_master FROM hosts WHERE cluster_id=%s", (cid,))
+    masters, slaves = [], []
+    for r in rows or []:
+        try:
+            item = (r["host"], int(r["port"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        (masters if int(r.get("is_current_master") or 0) == 1 else slaves).append(item)
+    return (slaves + masters) if mode != "master" else (masters + slaves)
+
+
+def _maybe_scheduled_backup():
+    """定时备份（默认关闭）：按 settings 周期对所有集群备份，并按保留期清理旧备份。
+
+    配置项（settings 表，可在 Web「系统设置」调整）：
+      BACKUP_SCHEDULE_ENABLED  1/0          是否启用（默认 0，保持既有行为不变）
+      BACKUP_INTERVAL_HOURS    小时          备份间隔（默认 24）
+      BACKUP_RETENTION_DAYS    天            保留天数（默认 7，0=不清理）
+      BACKUP_TARGET            slave/master  备份目标（默认 slave）
+      BACKUP_WITH_DATA         1/0           是否含数据（默认 1）
+    """
+    if get_setting("BACKUP_SCHEDULE_ENABLED", "0") != "1":
+        return
+    try:
+        hours = float(get_setting("BACKUP_INTERVAL_HOURS", "24") or 24)
+    except (TypeError, ValueError):
+        hours = 24.0
+    if hours <= 0:
+        return
+    if not _collect_due("backup", int(hours * 3600)):
+        return
+    mode = (get_setting("BACKUP_TARGET", "slave") or "slave").lower()
+    with_data = get_setting("BACKUP_WITH_DATA", "1") != "0"
+    try:
+        retention = int(get_setting("BACKUP_RETENTION_DAYS", "7") or 7)
+    except (TypeError, ValueError):
+        retention = 7
+    for cl in list_clusters():
+        cid = cl.get("id")
+        name = cl.get("name") or cid
+        done, last_err = False, ""
+        for host, port in _pick_backup_nodes(cid, mode):
+            try:
+                res = backup.run_backup(cid, host, port, with_data=with_data, scope="all")
+                if res.get("ok"):
+                    print(f"[monitor] 定时备份完成：集群 {name} <- {host}:{port}", flush=True)
+                    done = True
+                    break
+                last_err = str(res.get("error") or "未知错误")
+            except Exception as e:
+                last_err = str(e)
+        if not done:
+            send_alert("定时备份失败",
+                       f"【{name}】定时备份未成功：{last_err or '无可用节点'}。"
+                       f"请检查集群节点可达性与备份目录权限（./backups）。",
+                       cluster_id=cid)
+        # 无论本次是否成功都清理，避免磁盘被历史备份占满
+        try:
+            purged = backup.purge_old_backups(cid, retention)
+            if purged.get("deleted"):
+                print(f"[monitor] 集群 {name}：已清理过期备份 {len(purged['deleted'])} 份",
+                      flush=True)
+        except Exception as e:
+            print(f"[monitor] 备份清理异常: {e}", flush=True)
 
 
 def start_in_background():
