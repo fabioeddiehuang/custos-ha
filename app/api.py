@@ -8,7 +8,7 @@ import re
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -612,7 +612,7 @@ def api_os_metrics(cluster_id: int = 0, user=Depends(auth_required)):
     """拉取指定集群各节点的 OS 指标（来自节点 agent /stats）。agent 不可达时 ok=False。"""
     try:
         nodes = os_metrics.get_cluster_os_metrics(int(cluster_id))
-        return _json_ok({"cluster_id": cluster_id, "nodes": nodes})
+        return _json_ok({"ok": True, "cluster_id": cluster_id, "nodes": nodes})
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
@@ -711,8 +711,8 @@ def api_node_rebuild(cluster_id: int = Form(...), host: str = Form(...),
     严禁对当前主库执行 —— 那等于用主库数据覆盖主库本身。
     """
     try:
-        cur_m = get_current_master(cluster_id) or {}
-        if cur_m.get("host") == host and int(cur_m.get("port") or 0) == int(port):
+        cur_h, cur_p = get_current_master(cluster_id)
+        if cur_h == host and int(cur_p or 0) == int(port):
             return _json_ok({"ok": False, "error": "不能重建当前主库（会抹掉整个集群数据）"})
         task = rebuild.start_rebuild(cluster_id, host, port, actor=str(user))
     except Exception as e:
@@ -1506,13 +1506,40 @@ def api_backup_restore(cluster_id: int = Form(...), host: str = Form(...),
     r = backup.restore_backup(int(cluster_id), host.strip(), int(port),
                               file, databases=dbs or None)
     try:
-        audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
-                        "restore_backup", f"{host}:{port}",
+        uname = user.get("username") if isinstance(user, dict) else str(user)
+        backup.record_restore(int(cluster_id), {
+            "time": backup.now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+            "cluster_id": int(cluster_id),
+            "cluster_name": backup._cluster_dir_name(cluster_id),
+            "target": f"{host}:{port}",
+            "file": file,
+            "scope": "custom" if dbs else "all",
+            "databases": dbs,
+            "ok": bool(r.get("ok")),
+            "total": r.get("total", 0),
+            "ok_statements": r.get("ok_statements", 0),
+            "failed": r.get("failed", 0),
+            "operator": uname,
+            "msg": r.get("msg", ""),
+        })
+    except Exception:
+        pass
+    try:
+        audit.add_audit(uname, "restore_backup", f"{host}:{port}",
                         f"file={file} dbs={','.join(dbs) or 'ALL'}",
                         cluster_id=int(cluster_id))
     except Exception:
         pass
     return JSONResponse(r)
+
+
+@app.get("/api/restore/history")
+def api_restore_history(cluster_id: int = 0, user=Depends(auth_required)):
+    """读取该集群的恢复记录（倒序，最新在前）。"""
+    try:
+        return JSONResponse({"ok": True, "records": backup.list_restores(int(cluster_id))})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e), "records": []})
 
 
 @app.post("/api/backup/delete")
@@ -1585,6 +1612,35 @@ _READONLY_RE = re.compile(r"^\s*(SELECT|SHOW|EXPLAIN|DESCRIBE|DESC|WITH|USE|HELP
 
 _ERR_TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2})?)')
 _ERR_LV_RE = re.compile(r'\[([A-Za-z]+)\]')
+_CN_TZ = timezone(timedelta(hours=8))        # Asia/Shanghai（中国无夏令时，固定 +08:00）
+
+
+def _err_ts_to_cn(t):
+    """把错误日志行里的时间戳换算到 Asia/Shanghai。
+
+    MySQL 默认 log_timestamps=UTC，错误日志按 UTC 落盘；面板若原样展示，
+    时间会比全站统一的 Asia/Shanghai 早 8 小时。仅对"无时区标记的朴素时间"做换算。
+    """
+    if not t:
+        return t
+    try:
+        s0 = str(t).strip()
+        dt = None
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(s0, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            return t
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(_CN_TZ)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+    except Exception:
+        return t
+
+
 def _parse_err_line(line):
     """解析节点原始错误日志行，尽量抽出 (time, level, message)。"""
     t = ""
@@ -1656,6 +1712,15 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
         # 二级：原始错误日志文件（LOAD_FILE），兼容未开启表日志的节点
         path = ""
         if not rows:
+            # 错误日志时间戳的落盘时区：MySQL 默认 log_timestamps=UTC，
+            # 直接展示会比 Asia/Shanghai 早 8 小时，需按实际值换算。
+            _log_ts_utc = False
+            try:
+                cur.execute("SELECT @@log_timestamps")
+                _lt = (cur.fetchone() or ("",))[0] or ""
+                _log_ts_utc = str(_lt).strip().upper().startswith("UTC")
+            except Exception:
+                pass
             cur.execute("SELECT @@log_error")
             path = (cur.fetchone() or ("",))[0] or ""
             # 相对路径按数据目录解析（部分部署 @@log_error 仅返回文件名）
@@ -1678,7 +1743,8 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
                         lines = lines[-int(limit):]
                         for ln in reversed(lines):
                             t, lv, msg = _parse_err_line(ln)
-                            rows.append({"time": t, "level": lv, "message": msg})
+                            rows.append({"time": _err_ts_to_cn(t) if _log_ts_utc else t,
+                                         "level": lv, "message": msg})
                         source = "file"
                 except Exception as e2:
                     return JSONResponse({"ok": False, "path": path,
@@ -2266,6 +2332,7 @@ def cluster_update(
     user=Depends(auth_required),
 ):
     from .config import rand_secret
+    from .clusters import get_cluster_creds
     fields = {}
     if name.strip():
         fields["name"] = name.strip()
@@ -2310,6 +2377,7 @@ def cluster_update(
             return RedirectResponse(
                 f"/clusters/{cid}?error={quote('vip端口必须是 1-65535 之间的整数')}",
                 status_code=303)
+    old_creds = get_cluster_creds(cid)
     try:
         update_cluster(cid, **fields)
     except Exception as e:
@@ -2321,7 +2389,11 @@ def cluster_update(
     if any(k in fields for k in ("ha_pass", "repl_pass", "app_pass",
                                  "ha_user", "repl_user", "app_user")):
         try:
-            synced = sync_node_creds(cid)
+            synced = sync_node_creds(cid,
+                                     old_ha_user=old_creds.get("ha_user"),
+                                     old_repl_user=old_creds.get("repl_user"),
+                                     old_repl_pass=old_creds.get("repl_pass"),
+                                     old_app_user=old_creds.get("app_user"))
         except Exception:
             synced = 0
     msg = "已保存集群配置"

@@ -1,0 +1,35 @@
+# Custos 节点 OS 指标采集 agent —— 容器方式（部署在每台 MySQL 节点宿主机上）
+#
+# 关键：agent 必须读到【宿主机】真实指标，而非容器自身限额。
+#   - pid: host        → 共享宿主机 PID namespace，/proc 读到宿主机 CPU/内存/负载
+#   - /:/host:ro       → 只读挂载宿主机根文件系统，agent 用 --root /host 统计真实磁盘占用
+#   - network_mode: host → 直接用宿主机网络，管理器经 <节点IP>:28889 访问
+#
+# 用法（在节点宿主机上，与本文件同目录放一份 node_agent.py）：
+#   docker compose -f node-agent.compose.yml up -d
+# 或并入现有节点 compose：把下方 custos-node-agent 整个 service 粘进你的 MySQL compose 即可。
+#
+# 端口 28889 需对管理器 IP 开放（防火墙/安全组放行）。
+
+services:
+  custos-node-agent:
+    image: python:3-slim
+    container_name: custos-node-agent
+    command:
+      - python3
+      - /app/node_agent.py
+      - --port
+      - "28889"
+      - --bind
+      - 0.0.0.0
+      - --root
+      - /host
+    # 可选：与管理器 NODE_AGENT_TOKEN 保持一致即开启令牌校验
+    # environment:
+    #   - NODE_AGENT_TOKEN=your-shared-secret
+    pid: host
+    network_mode: host
+    volumes:
+      - /:/host:ro                       # 宿主机根（只读）→ 真实磁盘占用
+      - ./node_agent.py:/app/node_agent.py:ro
+    restart: always

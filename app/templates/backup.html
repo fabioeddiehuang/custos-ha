@@ -203,6 +203,34 @@
   <div class="note">表/视图/行 为备份时的统计；时间取自备份元信息。</div>
 </div>
 
+<!-- ============ 备份恢复日志 ============ -->
+<div class="card">
+  <h3>备份/恢复日志<span style="flex:1"></span>
+    <span class="badge sky">{{ blog|length }} 条</span>
+    <button class="btn btn-sm btn-ghost" onclick="loadLog()">⟳ 刷新</button>
+  </h3>
+  <div id="bkLog" class="bk-preview" style="max-height:40vh">{% if blog %}{% for l in blog %}{{ l }}
+{% endfor %}{% else %}（暂无日志）{% endif %}</div>
+  <div class="bk-note">每行格式：<code class="mono">[时间] [类型] 集群=名称(id) 节点=host:port ... 成功=N 失败=M</code>。备份按「库」统计成功/失败，恢复按「SQL 语句」统计成功/失败。</div>
+</div>
+
+<!-- ============ 恢复记录 ============ -->
+<div class="card">
+  <h3>恢复记录<span style="flex:1"></span>
+    <span class="badge sky" id="rsCount">…</span>
+    <button class="btn btn-sm btn-ghost" onclick="loadRestores()">⟳ 刷新</button>
+  </h3>
+  <table class="tbl bk-table">
+    <thead>
+      <tr><th>时间</th><th>目标节点</th><th>备份文件</th><th>范围</th><th>结果</th><th>操作者</th></tr>
+    </thead>
+    <tbody id="rsBody">
+      <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">加载中…</td></tr>
+    </tbody>
+  </table>
+  <div class="note">恢复记录按操作时间倒序，仅展示本集群的恢复历史（落盘保存，最多保留 200 条）。</div>
+</div>
+
 <!-- 预览 modal -->
 <div class="overlay" id="pvOverlay" onclick="if(event.target===this)closePreview()">
   <div class="modal" style="max-width:820px">
@@ -348,7 +376,54 @@
   }
   function closePreview(){document.getElementById("pvOverlay").classList.remove("show");}
 
+  function loadLog(){
+    fetch("/api/backup/log?cluster_id="+CID).then(function(r){return r.json();}).then(function(d){
+      var el=document.getElementById("bkLog");
+      if(d.ok && d.log && d.log.length){ el.textContent=d.log.join("\n"); }
+      else { el.textContent="（暂无日志）"; }
+    }).catch(function(e){ el.textContent="加载失败："+e; });
+  }
+
   onScopeChange();
   onFileChange();
+  loadRestores();
+
+  // ---------- 恢复记录 ----------
+  function loadRestores(){
+    var box=document.getElementById("rsBody");
+    var cnt=document.getElementById("rsCount");
+    box.innerHTML='<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">加载中…</td></tr>';
+    fetch("/api/restore/history?cluster_id="+CID)
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(d.ok && d.records && d.records.length){
+          cnt.textContent=d.records.length+" 条";
+          box.innerHTML=d.records.map(function(x){
+            var scope = (x.scope==="all") ? "全库" : "指定库";
+            var dbs = (x.databases && x.databases.length) ? x.databases.join(", ") : "全部";
+            var ok = !!x.ok;
+            var resTxt = ok ? ("成功 "+ (x.ok_statements||0) +" 条")
+                            : ("失败 "+ (x.failed||0) +" 条");
+            var resBadge = ok ? '<span class="badge sky">成功</span>'
+                              : '<span class="badge warn">失败</span>';
+            return '<tr>'
+              +'<td class="mono">'+esc(x.time)+'</td>'
+              +'<td class="mono">'+esc(x.target)+'</td>'
+              +'<td class="mono wrap">'+esc(x.file)+'</td>'
+              +'<td>'+esc(scope)+' <span class="bk-scope">'+esc(dbs)+'</span></td>'
+              +'<td>'+resBadge+' '+esc(resTxt)+'</td>'
+              +'<td>'+esc(x.operator||"—")+'</td>'
+              +'</tr>';
+          }).join("");
+        } else {
+          cnt.textContent="0 条";
+          box.innerHTML='<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">暂无恢复记录。在上方「恢复备份」执行一次即可。</td></tr>';
+        }
+      })
+      .catch(function(e){
+        cnt.textContent="—";
+        box.innerHTML='<tr><td colspan="6" style="color:var(--danger);text-align:center;padding:24px;">加载失败：'+esc(e)+'</td></tr>';
+      });
+  }
 </script>
 {% endblock %}

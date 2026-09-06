@@ -317,31 +317,53 @@ export CUSTOS_ALERT_WEBHOOK_TYPE="dingtalk"
 ### 8.2 节点 OS 指标采集 agent
 
 管理器是 agentless 架构（不 SSH / 不装 agent 到节点），原本 dashboard「主库状态」只能用
-MySQL 内部指标近似。**若想看到真实 CPU / 内存 / 磁盘占用**，在每台 MySQL 节点**宿主机**上
-跑一个轻量 agent，管理器定时拉取其 `/stats` 接口即可。该能力完全可选：agent 不可达时
-dashboard 仅不显示 OS 指标，不影响 HA 主逻辑。
+MySQL 内部指标近似。**若想看到真实 CPU / 内存 / 磁盘占用**，在每台 MySQL 节点上跑一个轻量
+agent，管理器定时拉取其 `/stats` 接口即可。该能力完全可选：agent 不可达时 dashboard 仅不显示
+OS 指标，不影响 HA 主逻辑。
 
 **agent 特性**：纯标准库、无第三方依赖（节点缺网也能跑，有 `psutil` 则更准）；只暴露只读采集；
-可选令牌校验；同机 2s 缓存避免抖动。
+可选令牌校验；同机 2s 缓存避免抖动。统一监听端口 **28889**。
 
-**部署（每台节点宿主机）**：
+#### 主路径：随节点 compose 自动部署（推荐）
 
+通过 Custos「添加节点」生成的部署单元（`generated_nodes/<ip>/docker-compose.yaml`）**已内置**
+`custos-node-agent` 服务，与 MySQL/keepalived **一同 `docker compose up -d` 安装**，无需单独部署。
+三种节点形态（MySQL 容器 / MariaDB 容器 / 裸机 MariaDB——后者 compose 只跑 keepalived 客户端、
+mysqld 在宿主机）都适用，**裸机版与 docker 版统一为容器化 sidecar**。
+
+agent 用 `pid: host` 共享宿主机 PID namespace 读 `/proc`、`/:/host:ro` 只读挂载 + `--root /host`
+统计宿主机真实磁盘、`network_mode: host` 让管理器经 `<节点IP>:28889` 直连；生成单元时已把
+`node_agent.py` 拷贝进目录并挂载进容器。
+
+> 仅需：节点宿主机放行管理器 IP 对 **28889** 的访问（防火墙/安全组），dashboard 即自动出现
+> 「节点 OS 资源」面板。重刷/重建节点单元时 agent 服务与脚本会一并重新生成。
+
+#### 备选：独立/手动部署（非 Custos 纳管节点）
+
+**A. 裸机 systemd**（想脱离容器跑）：
 ```bash
-# 1) 把脚本放到节点（如 /opt/custos-ha/scripts/node_agent.py）
-# 2) 用 systemd 托管（附 scripts/node-agent.service）：
 cp scripts/node-agent.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now node-agent
-
-# 或临时前台跑：
-python3 node_agent.py --port 29100 --bind 0.0.0.0
-# 开启令牌（与管理器 NODE_AGENT_TOKEN 一致）：NODE_AGENT_TOKEN=xxxx python3 node_agent.py
+# 或前台：python3 node_agent.py --port 28889 --bind 0.0.0.0
+# 开启令牌（与管理器 NODE_AGENT_TOKEN 一致）：NODE_AGENT_TOKEN=xxxx python3 node_agent.py --port 28889
 ```
+**B. 独立容器**：`scripts/node-agent.compose.yml`（已含 `pid: host` + `/:/host:ro` + `--root /host`）：
+```bash
+docker compose -f node-agent.compose.yml up -d   # 与 node_agent.py 同目录
+```
+
+#### 生产建议
+- **防火墙**：节点只放行**管理器 IP** 的 `28889`（如 `iptables -I INPUT -p tcp --dport 28889 -s <管理器IP> -j ACCEPT`），
+  不要对全网暴露；跨网段/公网场景**务必开启 `NODE_AGENT_TOKEN` 令牌校验**。
+- **精度**：装 `psutil`（`pip install psutil`）指标更准；不装则自动回退 `/proc` 解析，功能不受影响。
+- **日志/自愈**：容器方式 `docker logs custos-node-agent`；均设 `restart: always` 自愈。
+- **多网卡**：确认管理器经 `nodes` 表登记的 `ip:28889` 可达（与 MySQL 端口互通的网络一致）。
 
 **管理器侧配置**（环境变量，无需改脚本）：
 
 | 变量 | 说明 | 默认 |
 |------|------|------|
-| `NODE_AGENT_PORT` | agent 监听端口（节点与管理器需网络可达） | `29100` |
+| `NODE_AGENT_PORT` | agent 监听端口（节点与管理器需网络可达） | `28889` |
 | `NODE_AGENT_TOKEN` | 可选，与 agent 端一致则校验 Bearer/查询参数 | 空（不校验） |
 | `NODE_AGENT_TIMEOUT` | 单次拉取超时（秒） | `3.0` |
 | `NODE_AGENT_CACHE_TTL` | 拉取结果缓存秒数（避免频繁打节点） | `15` |

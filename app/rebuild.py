@@ -133,8 +133,8 @@ def _run(task_id, cluster_id, host, port):
         if int(rows[0].get("is_current_master") or 0) == 1:
             return False, "重建目标不能是当前主库（会抹掉整个集群的数据）"
 
-        m = get_current_master(cluster_id) or {}
-        m_host, m_port = m.get("host"), int(m.get("port") or 3306)
+        m_host, m_port = get_current_master(cluster_id)
+        m_port = int(m_port or 3306)
         if not m_host or (m_host == host and m_port == int(port)):
             return False, "集群当前主库未知或与目标相同，无法重建"
 

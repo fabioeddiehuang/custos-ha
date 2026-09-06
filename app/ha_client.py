@@ -980,12 +980,16 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
                     return int(ss.get(k) or 0)
                 except Exception:
                     return None
-            result["semi_master_status"] = ss.get("Rpl_semi_sync_master_status")
-            result["semi_slave_status"] = ss.get("Rpl_semi_sync_slave_status")
-            result["semi_master_clients"] = _si("Rpl_semi_sync_master_clients")
-            result["semi_no_times"] = _si("Rpl_semi_sync_master_no_times")
-            result["semi_no_tx"] = _si("Rpl_semi_sync_master_no_tx")
-            result["semi_yes_tx"] = _si("Rpl_semi_sync_master_yes_tx")
+            # MySQL 8.0.26+ 将半同步状态变量重命名（master→source, slave→replica），
+            # 故同时兼容新旧两套命名，确保 MySQL 8.0 与 MariaDB 都能正确采集半同步健康度。
+            def _semi_key(old, new):
+                return old if old in ss else new
+            result["semi_master_status"] = ss.get(_semi_key("Rpl_semi_sync_master_status", "Rpl_semi_sync_source_status"))
+            result["semi_slave_status"] = ss.get(_semi_key("Rpl_semi_sync_slave_status", "Rpl_semi_sync_replica_status"))
+            result["semi_master_clients"] = _si(_semi_key("Rpl_semi_sync_master_clients", "Rpl_semi_sync_source_clients"))
+            result["semi_no_times"] = _si(_semi_key("Rpl_semi_sync_master_no_times", "Rpl_semi_sync_source_no_times"))
+            result["semi_no_tx"] = _si(_semi_key("Rpl_semi_sync_master_no_tx", "Rpl_semi_sync_source_no_tx"))
+            result["semi_yes_tx"] = _si(_semi_key("Rpl_semi_sync_master_yes_tx", "Rpl_semi_sync_source_yes_tx"))
         except Exception:
             pass
         # 轻量采集实时运行指标（供观测中心趋势图使用）。
@@ -1903,9 +1907,94 @@ def _account_hosts(manager_ip=None):
     return ["%", seg] if ACCOUNT_HOST_MODE == "additive" else [seg]
 
 
+def ensure_semisync_runtime(host, port, ha_user, ha_pass, root_user=None,
+                            root_pass=None, timeout=5):
+    """按【节点】开启半同步（运行期 SET GLOBAL）——补齐**副本**侧开关。
+
+    为什么必须单独做这件事（根因）：
+        ensure_ha_creds 只在主库执行。账号/权限会经复制同步到副本，
+        但 **SET GLOBAL 不会复制**，所以副本的 rpl_semi_sync_*_enabled 永远停在 OFF；
+        主库等不到任何半同步副本 -> 主库 source_status 与副本 replica_status 恒为 OFF，
+        表现为「半同步明明配了却一直 OFF」。
+    本函数对**每个节点**单独执行（含副本）。MySQL 要求修改
+    rpl_semi_sync_replica_enabled 后重启复制 IO 线程才会以半同步方式重连，
+    故副本上检测到开关刚被打开时会自动重启 IO 线程。
+
+    幂等：开关已 ON 时直接返回，不产生任何写操作/不复制。
+    返回 (changed: bool, msg: str)
+    """
+    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
+        return False, "SEMI_SYNC 未开启，跳过"
+    conn = None
+    last_err = None
+    for cu, cp in ((ha_user, ha_pass), (root_user, root_pass)):
+        if not cu:
+            continue
+        try:
+            conn = connect(host, port, cu, cp, timeout=timeout)
+            break
+        except Exception as e:
+            last_err = e
+    if conn is None:
+        return False, "不可达: %s" % last_err
+    try:
+        cur = conn.cursor()
+        try:
+            flavour = detect_flavour(cur)
+        except Exception:
+            return False, "无法判定数据库类型"
+        if flavour != F_MYSQL8:
+            # MariaDB 半同步由 node_gen 注入的 my.cnf 决定，不走运行期 SET GLOBAL
+            return False, "非 MySQL8(%s)，跳过" % flavour
+        cur.execute("SHOW GLOBAL VARIABLES LIKE 'rpl_semi_sync%_enabled'")
+        vals = dict(cur.fetchall())
+
+        def _v(new, old):
+            return vals.get(new, vals.get(old))
+
+        def _on(x):
+            return str(x or "").strip().upper() in ("ON", "1")
+
+        if _on(_v("rpl_semi_sync_source_enabled", "rpl_semi_sync_master_enabled")) \
+                and _on(_v("rpl_semi_sync_replica_enabled", "rpl_semi_sync_slave_enabled")):
+            return False, "already-on"
+        for var in ("rpl_semi_sync_source_enabled", "rpl_semi_sync_replica_enabled"):
+            try:
+                cur.execute("SET GLOBAL %s=1" % var)
+            except Exception:
+                pass
+        # 副本：改完开关需重启 IO 线程才会真正以半同步方式重连主库
+        restarted = False
+        try:
+            cur.execute("SHOW REPLICA STATUS")
+            row = cur.fetchone()
+            cols = [d[0] for d in cur.description]
+            if row:
+                d = dict(zip(cols, row))
+                if d.get("Replica_IO_Running") == "Yes" or d.get("Slave_IO_Running") == "Yes":
+                    cur.execute("STOP REPLICA")
+                    cur.execute("START REPLICA")
+                    restarted = True
+        except Exception:
+            pass
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        return True, "已开启半同步" + ("并重启复制 IO 线程" if restarted else "")
+    except Exception as e:
+        return False, "异常: %s" % e
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def ensure_ha_creds(host, port, root_user, root_pass,
                     ha_user, ha_pass, repl_user, repl_pass,
-                    app_user="", app_pass="", manager_ip="", manager_subnet=None):
+                    app_user="", app_pass="", manager_ip="", manager_subnet=None,
+                    old_ha_user="", old_repl_user="", old_app_user=""):
     """
     将节点上的 ha_monitor / replication / app / root@'<管理器IP>' 账号**完整自愈**为当前设定值。
 
@@ -1989,6 +2078,10 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         else:
             idn = "IDENTIFIED WITH " + auth_plugin + " BY %s"
             idn_root = "IDENTIFIED WITH " + auth_plugin + " BY %s"
+            # replication 账号强制 mysql_native_password：MySQL 8.0 下非 SSL 复制 IO 线程
+            # 对 caching_sha2_password 的握手与客户端 JDBC/驱动不同，常报 Access Denied，
+            # 改为 native 后非 SSL 复制即可稳定连通（与节点 init 配方一致）。
+            idn_repl = "IDENTIFIED WITH mysql_native_password BY %s"
             ha_grant = ("GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
                         "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* "
                         f"TO '{_esc_sql(ha_user)}'@'%'")
@@ -2007,8 +2100,10 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         for u, p, grant_sql in accts:
             for _h in _acct_hosts:
                 _g = grant_sql if _h == "%" else grant_sql.replace("@'%'", "@'%s'" % _h)
-                _ensure_account(cur, u, _h, p, idn, _g,
-                                conn_host=host, conn_port=port, plugin=auth_plugin)
+                _acct_idn = idn_repl if u == repl_user else idn
+                _acct_plugin = "mysql_native_password" if u == repl_user else auth_plugin
+                _ensure_account(cur, u, _h, p, _acct_idn, _g,
+                                conn_host=host, conn_port=port, plugin=_acct_plugin)
         # 关键：把 root@'<管理器IP>' 与 root@'%' 密码校正为管理器库存 root_pass。
         #  - manager_ip 的 root 用于管理器自愈回退；
         #  - 127.0.0.1 的 root 供 keepalived 的 check_mysql_master.sh 本机 TCP 探活使用
@@ -2065,6 +2160,26 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                         cur.execute("GRANT %s ON *.* TO '%s'@'%s'" % (extra, _esc_sql(ha_user), _h))
                 except Exception:
                     pass
+        # 账号改名：删除节点上残留的旧账号（旧账号可能以多个 host 存在）。
+        # 必须在 sql_log_bin=0 作用域内执行，避免 DROP USER 经复制下放到从库。
+        def _drop_old(cur, old_user, new_user):
+            if not old_user or old_user == new_user:
+                return
+            try:
+                cur.execute("SELECT DISTINCT Host FROM mysql.user WHERE User=%s", (old_user,))
+                _hs = [r[0] for r in cur.fetchall()]
+            except Exception:
+                return
+            for _h in _hs:
+                try:
+                    cur.execute("DROP USER IF EXISTS `%s`@`%s`" % (
+                        old_user.replace("`", "``"), _h.replace("`", "``")))
+                except Exception as _e:
+                    print("[drop-old] 删除旧账号 %s@%s 失败: %s" % (old_user, _h, _e))
+        _drop_old(cur, old_ha_user, ha_user)
+        _drop_old(cur, old_repl_user, repl_user)
+        _drop_old(cur, old_app_user, app_user)
+
         if _binlog_off:
             try:
                 cur.execute("SET SESSION sql_log_bin=1")
@@ -2072,6 +2187,17 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                 pass
         # 节点本地状态库 ha_local 的读写授权（见 _ensure_local_state_grant 说明）
         local_state_ok[0] = _ensure_local_state_grant(cur, ha_user)
+
+        # 半同步：rpl_semi_sync_*_enabled 不能写进静态 my.cnf——mysqld --initialize
+        # 期间插件未加载，会报 unknown variable 并中止初始化（容器崩溃循环）。
+        # 故改在运行时 SET GLOBAL 开启，随管理器自愈周期持久化（节点重启后自动重开）。
+        if flavour == F_MYSQL8 and str(SEMI_SYNC).strip() in ("1", "true", "True", "on", "ON"):
+            try:
+                cur.execute("SET GLOBAL rpl_semi_sync_source_enabled=1")
+                cur.execute("SET GLOBAL rpl_semi_sync_replica_enabled=1")
+            except Exception as _se:
+                import logging as _lg
+                _lg.getLogger(__name__).warning("运行时开启半同步失败: %s", _se)
 
     cur = conn.cursor()
     used = used_for_connect

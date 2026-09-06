@@ -12,8 +12,8 @@
 #   - 完全可选：管理器侧 agent 不可达时静默降级，不影响 HA 主逻辑。
 #
 # 用法：
-#   python3 node_agent.py                       # 默认 0.0.0.0:29100
-#   python3 node_agent.py --port 29100 --bind 0.0.0.0
+#   python3 node_agent.py                       # 默认 0.0.0.0:28889
+#   python3 node_agent.py --port 28889 --bind 0.0.0.0
 #   NODE_AGENT_TOKEN=xxxx python3 node_agent.py # 开启令牌校验（Bearer 或 ?token=）
 #   python3 node_agent.py --disks /,/data       # 额外汇报这些挂载点的磁盘占用
 #
@@ -37,8 +37,11 @@ except Exception:
 # 指标采集（带缓存，避免每次请求都读 /proc 造成抖动）
 # ---------------------------------------------------------------------------
 class Collector:
-    def __init__(self, extra_disks=None):
+    def __init__(self, extra_disks=None, root="/"):
         self.extra_disks = [d.strip() for d in (extra_disks or []) if d.strip()]
+        # root 为「要统计磁盘占用的根挂载点」。裸机默认 "/"；
+        # 容器内部署时把宿主机 / 挂载到 /host 并传 --root /host，才能拿到宿主机真实磁盘占用。
+        self.root = root or "/"
         self._lock = threading.Lock()
         self._cpu_prev = None          # (idle, total) 上次 /proc/stat 采样
         self._cache = {"ts": 0, "data": None}
@@ -118,7 +121,7 @@ class Collector:
         }
 
     def disks(self):
-        paths = ["/"] + self.extra_disks
+        paths = [self.root] + self.extra_disks
         out = []
         seen = set()
         for p in paths:
@@ -228,13 +231,15 @@ def make_handler(collector, token):
 def main():
     ap = argparse.ArgumentParser(description="Custos 节点 OS 指标采集 agent")
     ap.add_argument("--bind", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=int(os.environ.get("NODE_AGENT_PORT", 29100)))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("NODE_AGENT_PORT", 28889)))
     ap.add_argument("--token", default=os.environ.get("NODE_AGENT_TOKEN", ""))
     ap.add_argument("--disks", default=os.environ.get("NODE_AGENT_DISKS", ""),
                     help="逗号分隔的额外挂载点，如 /data,/backup")
+    ap.add_argument("--root", default="/",
+                    help="要统计磁盘占用的根挂载点。裸机默认 /；容器部署时配合 -v /:/host:ro 传 --root /host")
     args = ap.parse_args()
 
-    collector = Collector(extra_disks=args.disks.split(",") if args.disks else [])
+    collector = Collector(extra_disks=args.disks.split(",") if args.disks else [], root=args.root)
     handler = make_handler(collector, args.token.strip())
     srv = ThreadingHTTPServer((args.bind, args.port), handler)
     print(f"[node_agent] listening on {args.bind}:{args.port}"

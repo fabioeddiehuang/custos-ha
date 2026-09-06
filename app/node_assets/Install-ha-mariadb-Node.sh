@@ -212,6 +212,27 @@ fi
 chown -R mysql:mysql "$DATA_DIR"
 [[ -d "$DATA_DIR/mysql" ]] || log "数据目录初始化完成"
 
+# ---------- 3.5) 统一日志目录 + logrotate ----------
+# 与 MySQL docker / MariaDB docker 两形态保持一致：日志统一落在
+# /data/custos-ha/logs/<数据目录基名>/，排错时按固定路径找，不再逐个形态猜。
+# （my.cnf 的 log_error 指向此处，故必须先建目录并给 mysql 属主，否则 mysqld 起不来。）
+LOG_DIR="/data/custos-ha/logs/$(basename "$DATA_DIR")"
+log "初始化统一日志目录：$LOG_DIR"
+mkdir -p "$LOG_DIR"
+chown -R mysql:mysql "$LOG_DIR"
+chmod 0755 "$LOG_DIR"
+
+# logrotate：给 error.log 加大小上限（节点崩溃循环时几分钟就能刷爆磁盘）
+if [[ -f "$SCRIPT_DIR/custos-ha-logrotate.conf" ]]; then
+  if command -v logrotate >/dev/null 2>&1; then
+    install -m 0644 "$SCRIPT_DIR/custos-ha-logrotate.conf" /etc/logrotate.d/custos-ha
+    log "已安装 logrotate：/etc/logrotate.d/custos-ha"
+  else
+    warn "未检测到 logrotate，跳过安装；请手动执行："
+    warn "  cp $SCRIPT_DIR/custos-ha-logrotate.conf /etc/logrotate.d/custos-ha"
+  fi
+fi
+
 # ---------- 4) 落盘 my.cnf（服务端生成，确保配置一致性） ----------
 CNF_SRC="$SCRIPT_DIR/my.cnf"
 if [[ ! -f "$CNF_SRC" ]]; then
@@ -451,10 +472,10 @@ setup_vip_port_forward
 # ---------- 9) 启动 keepalived 客户端（compose） ----------
 if [[ -f "$SCRIPT_DIR/docker-compose.yaml" || -f "$SCRIPT_DIR/docker-compose.yml" ]]; then
   if command -v docker >/dev/null 2>&1; then
-    log "启动 keepalived 客户端容器..."
-    ( cd "$SCRIPT_DIR" && docker compose up -d ) || warn "keepalived 启动失败，请手动 docker compose up -d"
+    log "启动 keepalived 客户端与节点 agent 容器..."
+    ( cd "$SCRIPT_DIR" && docker compose up -d keepalived custos-node-agent ) || warn "keepalived/agent 启动失败，请手动 docker compose up -d keepalived custos-node-agent"
   else
-    warn "未安装 docker，跳过 keepalived（请安装 docker 后手动 cd $SCRIPT_DIR && docker compose up -d）"
+    warn "未安装 docker，跳过 keepalived/agent（请安装 docker 后手动 cd $SCRIPT_DIR && docker compose up -d keepalived custos-node-agent）"
   fi
 fi
 

@@ -10,15 +10,34 @@
 
 - **半同步复制改为「配置文件持久化」方式**（v2.2.18/19 为运行期 `SET GLOBAL` 启用）：
   - 节点生成时，按数据库类型注入对应半同步片段到 `my.cnf` / `ha-overrides.cnf`：
-    - MySQL 8.0：写入 `plugin_load_add='semisync_source;semisync_replica'`、`rpl_semi_sync_source_enabled=1`/`rpl_semi_sync_replica_enabled=1`（≥8.0.26 用 `source/replica` 命名，更早用 `master/slave`）。
+    - MySQL 8.0：写入 `plugin_load_add = semisync_source.so;semisync_replica.so`（≥8.0.26 用 `source/replica` 命名，更早用 `master/slave`；MySQL 不会自动补 `.so`，必须写全）。**注意**：`rpl_semi_sync_*_enabled` 现**不写进静态配置**（会导致 `mysqld --initialize` 中止、容器崩溃循环），改由管理器运行期开启，详见下方「v2.2.20 修订」。
     - MariaDB：写入 `plugin_load_add='semisync_master;semisync_slave'`、`rpl_semi_sync_master_enabled=1`/`rpl_semi_sync_slave_enabled=1`。
   - 随实例启动即生效、**重启不丢**，根治「升版/重启后 `SET GLOBAL` 清零导致半同步静默退化为异步」的反复问题。
-- **移除运行期半同步启用逻辑**：`ha_client.enable_semisync` / `node_gen` 的运行期注入、`monitor` 的半同步自愈定时任务与 `SEMI_FIX_*` 标记全部删除；半同步状态完全由配置文件决定。
+- **移除运行期半同步启用逻辑**：`ha_client.enable_semisync` / `node_gen` 的运行期注入、`monitor` 的半同步自愈定时任务与 `SEMI_FIX_*` 标记全部删除；半同步状态完全由配置文件决定。（**注**：因 `rpl_semi_sync_*_enabled` 写进静态配置会导致 `mysqld --initialize` 中止、容器崩溃循环，该条款已调整 —— 改为「配置文件只注入 `plugin_load_add` + 管理器 `ensure_ha_creds` 运行期 `SET GLOBAL` 开启」，详见下方「v2.2.20 修订」。）
 - **部署形态展示名统一**：`api.display_node_type` 将 `docker` 形态对外显示为「MySQL」（不再显示「Docker」），`mariadb` / `mariadb-docker` 显示为「MariaDB」；节点管理页与集群页徽标 `Docker→MySQL`。
 - **版本号与镜像改名**：
   - 删除 `app/VERSION` 文件，版本号改由 `.env` 的 `VERSION` 字段管理。
   - 服务端容器/镜像名统一为 **`custos-server`**（原 `custos`），Docker 节点容器固定为 `custos-mysql`（MySQL）/ `custos-mariadb`（MariaDB）。
   - 镜像标签：`custos-server:v2.2.20`、`custos-node:v2.2.20`。
+
+### v2.2.20 修订：半同步落地方案修正 / 复制账号认证 / OS 指标修复
+
+> 本节记录 v2.2.20 发布后的就地修正（版本号未变，仍为 `v2.2.20`）。
+
+- **半同步：修正原「配置文件持久化」方案（根治「节点起不来」）**
+  - **问题**：把 `rpl_semi_sync_*_enabled=1` 写进静态 `my.cnf` / `ha-overrides.cnf` 后，`mysqld --initialize`（首次初始化）期间半同步插件尚未加载 → 报 `unknown variable` 并**中止初始化**，配合 `restart: always` 造成容器**崩溃循环**，表现为「节点起不来、也连不上」。
+  - **现方案**：
+    - `node_gen._semisync_block_mysql()` **只注入 `plugin_load_add`**（MySQL 8.0.26+ 必须写带 `.so` 的 soname：`semisync_source.so;semisync_replica.so`），保证插件随启动加载。
+    - `rpl_semi_sync_*_enabled` **不再写入静态配置**，改由管理器 `ensure_ha_creds` 在自愈周期运行期 `SET GLOBAL` 开启（受 `SEMI_SYNC` 开关门控）。
+  - **运维判读须知**：
+    - 须区分 `enabled`（变量＝开关）与 `status`（状态＝运行时）。
+    - 副本开启半同步后**需重启复制 IO 线程**（`STOP REPLICA; START REPLICA;`）才会以半同步方式重连。
+    - 主库在副本未开启期间等待 ACK 超时会**降级为异步**（`Rpl_semi_sync_source_no_tx` 增长、`source_status=OFF`），属 MySQL 正常降级；**集群空闲无写入时不会自动恢复**，下一次写事务即自动恢复（`yes_tx` 增长、status 转 ON）。
+- **MySQL 8.0 复制账号改为 `mysql_native_password`**：`ensure_ha_creds` 的 MySQL 分支新增 `idn_repl`，仅 `replication` 账号强制 `mysql_native_password`（`ha_monitor` / `app` / `root` 仍按 `auth_plugin`）。修复非 SSL 复制 IO 线程因 `caching_sha2_password` 握手失败导致的复制中断，并避免旧管理器每自愈周期把 `replication` 改回 `caching_sha2` 造成反复断链。**生效需重建管理器**。
+- **节点 OS 指标面板修复**（原恒显示「加载中…」或「加载失败」）：
+  - `/api/status` 返回的 `clusters` 仅有 `id` / `name`，前端却取 `cl.cluster_id` → `undefined` → `getElementById("osmetrics-undefined")` 为 `null` → 静默 return，占位文案永不刷新。改为 `cl.cluster_id || cl.id`。
+  - `/api/os_metrics` 响应补 `ok: True`（`_json_ok` 不会自动补 `ok`），否则前端 `if (!d.ok)` 会显示「OS 指标加载失败」。
+- **新增节点 agent 容器部署模板** `scripts/node-agent.compose.yml`：`custos-node-agent` 独立 compose（host 网络、端口 `28889`、`pid: host`、`/:/host:ro` 配 `--root /host` 读宿主机真实指标），便于在**已部署但缺少 agent** 的节点上单独拉起 OS 指标采集；也可把该 service 并入现有节点 compose。
 
 ## v2.2.19 GTID 分叉感知（续传优先，解 v2.2.18 误判）
 

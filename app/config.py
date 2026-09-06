@@ -197,7 +197,7 @@ DRIFT_INTERVAL = int(env("DRIFT_INTERVAL", 300))
 # 在每个 MySQL 节点宿主机上运行 `scripts/node_agent.py`（轻量 HTTP 服务，stdlib-only），
 # 管理器定时拉取其 /stats 接口拿到真实 CPU/内存/磁盘占用，补进 dashboard。
 # 该能力完全可选：agent 不可达时管理器静默降级（dashboard 仅不显示 OS 指标，不影响 HA 主逻辑）。
-NODE_AGENT_PORT = int(env("NODE_AGENT_PORT", 29100))        # 节点 agent 监听端口
+NODE_AGENT_PORT = int(env("NODE_AGENT_PORT", 28889))        # 节点 agent 监听端口
 NODE_AGENT_TOKEN = (env("NODE_AGENT_TOKEN", "") or "").strip()  # 可选：Bearer/查询参数校验
 NODE_AGENT_TIMEOUT = float(env("NODE_AGENT_TIMEOUT", 3.0))  # 单次拉取超时（秒）
 NODE_AGENT_CACHE_TTL = int(env("NODE_AGENT_CACHE_TTL", 15))  # 拉取结果缓存秒数（避免频繁打节点）

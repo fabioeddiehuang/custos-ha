@@ -144,11 +144,19 @@ def check_node(ip, port, user, password, role=None):
                                     "请在节点 my.cnf 设置对应 *_enabled=1 并重启实例。")})
                 elif str(role or "").lower() == "master":
                     # 参数已启用还不够：主库必须真的有半同步从库连上，否则仍等同异步
+                    # MySQL 8.0.26+ 重命名：master_status→source_status、master_clients→source_clients
                     st = _gstatus(conn, "Rpl_semi_sync_master_status")
+                    if st is None:
+                        st = _gstatus(conn, "Rpl_semi_sync_source_status")
                     try:
                         clients = int(_gstatus(conn, "Rpl_semi_sync_master_clients") or 0)
                     except (TypeError, ValueError):
                         clients = 0
+                    if clients == 0:
+                        try:
+                            clients = int(_gstatus(conn, "Rpl_semi_sync_source_clients") or 0)
+                        except (TypeError, ValueError):
+                            clients = 0
                     if str(st).upper() == "OFF" or clients <= 0:
                         findings.append({"level": "WARN", "var": "rpl_semi_sync",
                             "message": (f"主库半同步参数已启用，但运行时 master_status={st}、"

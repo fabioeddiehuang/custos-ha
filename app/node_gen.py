@@ -59,10 +59,51 @@ MARIADB_DOCKER_DATA_DIR = "/data/custos-ha/mariadb12"
 MYSQL_DOCKER_DATA_DIR = "/data/custos-ha/mysql8"
 MARIADB_DOCKER_CONTAINER = "mariadb-ha-node"
 
+# ---- 统一日志目录（三形态一致）----
+# MySQL docker / MariaDB 裸机 / MariaDB docker 的日志统一收敛到宿主
+#   /data/custos-ha/logs/<数据目录基名>/  例：logs/mysql8、logs/mariadb12、logs/mariadb
+# 容器内统一挂到 LOG_DIR_CT。背景：MySQL 旧配置把 error.log 写在 /var/lib/mysql-files，
+# 该路径**未挂载到宿主**，容器一销毁/重建日志就没了，是排错时最难查的一类问题。
+LOG_ROOT_HOST = "/data/custos-ha/logs"
+LOG_DIR_CT = "/var/log/custos-ha"
+
+
+def _log_dir_host(data_dir):
+    """由数据目录推导宿主日志目录：/data/custos-ha/mysql8 -> /data/custos-ha/logs/mysql8。
+
+    按「数据目录基名」分目录，天然区分同机混部的不同形态（mysql8 / mariadb12 / mariadb）。
+    """
+    base = os.path.basename((data_dir or "").rstrip("/")) or "default"
+    return "%s/%s" % (LOG_ROOT_HOST, base)
+
 # 节点侧 keepalived 客户端镜像名。项目由 mysql-ha-manager 更名为 Custos 后，
 # 镜像名也必须同步（否则新拉起的节点仍去找已废弃的 mysql-ha-keepalived:<版本>）。
 KEEPALIVED_IMAGE_NAME = "custos-node"
 
+# Node OS metrics collector agent (custos-node-agent) sidecar, deployed with the node compose.
+# Reads real host metrics: pid: host shares host PID ns for /proc; read-only mount / -> /host
+# with --root /host for real disk stats; network_mode: host lets manager reach <nodeIP>:28889.
+# node_agent.py is copied into the node unit dir (./node_agent.py) by generate_node/regenerate.
+AGENT_SERVICE = r"""
+  custos-node-agent:
+    image: python:3-slim
+    container_name: custos-node-agent
+    command:
+      - python3
+      - /app/node_agent.py
+      - --port
+      - '28889'
+      - --bind
+      - 0.0.0.0
+      - --root
+      - /host
+    restart: always
+    pid: host
+    network_mode: host
+    volumes:
+      - /:/host:ro
+      - ./node_agent.py:/app/node_agent.py:ro
+"""
 
 def _valid_vip(vip):
     """校验 VIP 是否为合法 IPv4。
@@ -172,11 +213,11 @@ def _render_compose(node_name, root_pass, port, server_id, vip_port=None):
     # 注意：YAML 无花括号，可用 f-string。root_pass 含特殊字符时建议改用 .env，此处直接内联。
     if vip_port is None:
         vip_port = VIP_PORT
-    # 端口映射：节点自身端口 + VIP 端口都映射到容器 3306，
+    # 端口映射：节点自身端口 + VIP 端口都映射到容器内同一端口（{port}，与 my.cnf 的 port= 一致），
     # 使「业务连 VIP:VIP_PORT」在任意主库节点上均可达（VIP 浮动到哪台，哪台就提供该端口）。
-    port_lines = f'      - "{port}:3306"\n'
+    port_lines = f'      - "{port}:{port}"\n'
     if str(vip_port) != str(port):
-        port_lines += f'      - "{vip_port}:3306"\n'
+        port_lines += f'      - "{vip_port}:{port}"\n'
     return f"""# 自动生成：MySQL 8.0 + keepalived 合一节点部署
 # 前置：目标主机需支持 --network host 与 NET_ADMIN/NET_RAW（Linux）；首次启动会创建 ha_monitor。
 # 运行： cd 本目录 && docker compose up -d
@@ -224,11 +265,41 @@ services:
       # 慢日志覆盖配置（slow_query_log=1 + log_output=TABLE），供 slow_log 采集 mysql.slow_log。
       # 必须挂载，否则节点慢查询不入库，/api/slow_log 永远空（节点默认 slow_query_log=OFF）。
       - ./ha-overrides.cnf:/etc/mysql/conf.d/ha-overrides.cnf:ro
+      # 统一日志目录：error.log 等全部落到这里（宿主 logs/<基名> -> 容器 /var/log/custos-ha）。
+      # 旧值 /var/lib/mysql-files 未挂到宿主，容器一销毁日志就没了，是排错时最难查的一类问题。
+      # 首次部署前需先在宿主建目录并 chown 给容器内 mysql(uid 999)：见同目录 prepare-logs.sh
+      - {_log_dir_host(MYSQL_DOCKER_DATA_DIR)}:/var/log/custos-ha:z
+    logging:
+      # 容器 stdout 上限：防崩溃循环时 docker 日志刷爆磁盘（与 error.log 的 logrotate 互补）
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    depends_on:
+      init-logs:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p{root_pass}"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # 一次性初始化：把【数据目录】与【统一日志目录】的属主改为容器内 mysql(uid 999)。
+  # 宿主挂载目录默认由 root 创建（0755 root:root），mysqld 以 mysql 运行写不了 error.log，
+  # 表现为 Could not open file '/var/log/custos-ha/error.log' ... Permission denied → 启动即退出。
+  # 复用节点已有的 mysql 镜像（无需联网）；service_completed_successfully 保证先于 mysqld 完成。
+  init-logs:
+    image: mysql:8.0
+    container_name: custos-init-logs
+    user: "0:0"
+    entrypoint:
+      - sh
+      - -c
+      - "chown -R 999:999 /var/lib/mysql /var/log/custos-ha && echo logs-dir-ready"
+    volumes:
+      - {MYSQL_DOCKER_DATA_DIR}:/var/lib/mysql:z
+      - {_log_dir_host(MYSQL_DOCKER_DATA_DIR)}:/var/log/custos-ha:z
+    restart: "no"
 
   keepalived:
     # 模板化镜像：优先使用已编译并导入的镜像 custos-node:<VERSION>（无需联网编译）。
@@ -251,7 +322,7 @@ services:
       - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro
       - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro
       - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro
-    """.replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME)
+    """.replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME) + AGENT_SERVICE
 
 
 def _semisync_block():
@@ -283,13 +354,25 @@ def _inject_semisync(cnf):
 
 
 def _mysql_version_tuple(v):
+    """解析 MySQL 版本；项目 MySQL 集群仅支持 8.0.46，解析不出时按 8.0.46 处理。
+
+    注意（踩过的坑）：v=None 时 str(None)=="None" 解析出空列表、补零后得到 (0,0,0)，
+    **不会抛异常**，所以不能只靠 except 兜底——必须显式判断空列表。
+    旧逻辑因此把「版本留空」判成远古版本，生成 8.0.46 上不存在的半同步旧命名。
+    """
     try:
         parts = [int(x) for x in str(v).split(".")[:3] if x.strip().isdigit()]
+        if not parts:
+            return (8, 0, 46)
         while len(parts) < 3:
             parts.append(0)
         return tuple(parts[:3])
     except Exception:
-        return (8, 0, 0)
+        # 版本未知/解析失败时一律按 8.0.26+ 处理（官方 mysql:8.0 镜像现为 8.0.4x）。
+        # MySQL 8.0.26 起半同步插件与变量由 master/slave 改名为 source/replica，
+        # 旧 soname（semisync_master.so）在 8.0.26+ 已随改名被移除，写进 my.cnf 会导致
+        # mysqld 启动即失败、容器 restart:always 崩溃循环（集群起不来）。未知版本走新命名。
+        return (8, 0, 26)
 
 
 def _semisync_block_mysql(mysql_version=None):
@@ -302,21 +385,17 @@ def _semisync_block_mysql(mysql_version=None):
     """
     if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
         return ""
-    modern = _mysql_version_tuple(mysql_version) >= (8, 0, 26)
-    if modern:
-        names = "semisync_source.so;semisync_replica.so"
-        src, rep = "rpl_semi_sync_source", "rpl_semi_sync_replica"
-    else:
-        names = "semisync_master.so;semisync_slave.so"
-        src, rep = "rpl_semi_sync_master", "rpl_semi_sync_slave"
+    # 项目 MySQL 集群锁定 8.0.46（属 8.0.26+ 命名体系），固定使用 source/replica，
+    # 不再按版本分支生成 master/slave 旧命名：8.0.46 上 rpl_semi_sync_master_* 等
+    # 旧变量名已废弃/不存在，写进 my.cnf 会让 mysqld 启动即失败、容器崩溃循环。
+    names = "semisync_source.so;semisync_replica.so"
+    src, rep = "rpl_semi_sync_source", "rpl_semi_sync_replica"
     return (
         "# ---- 半同步复制（SEMI_SYNC=1：随启动加载插件，重启不丢）----\n"
         f"plugin_load_add = {names}\n"
-        f"{src}_enabled = 1\n"
-        f"{rep}_enabled = 1\n"
-        f"{src}_timeout = 10000\n"
-        f"{src}_wait_point = AFTER_SYNC\n"
-        f"{src}_wait_for_replica_count = 1\n"
+        "# rpl_semi_sync_*_enabled 不写进静态 my.cnf：mysqld --initialize 期间插件未加载，"
+        "# 写它们会报 unknown variable 并中止初始化（容器崩溃循环）。"
+        "# 开关由管理器运行时 SET GLOBAL 开启（ensure_ha_creds），随自愈周期持久化。"
     )
 
 
@@ -362,10 +441,11 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         "long_query_time = 0.5\n"
         "log_output = TABLE\n"
         "log_queries_not_using_indexes = 0\n"
-        # 错误日志落盘到数据目录文件，供管理器「错误日志」面板 LOAD_FILE 读取。
+        # 错误日志落盘到统一日志目录（/data/custos-ha/logs/<基名>），而非数据目录：
+        # 与 MySQL docker / MariaDB docker 两形态保持一致，排错时按同一路径找；
         # MariaDB 不支持错误日志写表(mysql.error_log 仅 MySQL 8.0 支持)，只能走文件；
         # secure_file_priv='' 放开 LOAD_FILE 路径限制，使面板在容器/裸机都能读到。
-        f"log_error = {data_dir}/error.log\n"
+        f"log_error = {_log_dir_host(data_dir)}/error.log\n"
         "secure_file_priv = ''\n"
         f"port = {port}\n"
         f"datadir = {data_dir}\n"
@@ -436,10 +516,10 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
         "long_query_time = 0.5\n"
         "log_output = TABLE\n"
         "log_queries_not_using_indexes = 0\n"
-        "# 错误日志落盘到数据卷内文件：官方镜像默认写 stdout（@@log_error 为空），\n"
-        "# 会导致管理器「错误日志」面板 LOAD_FILE 读不到、永远显示为空。落到 /var/lib/mysql\n"
-        "#（已挂载宿主 /data/mariadb）既持久又对 LOAD_FILE 可读（MariaDB secure_file_priv 默认无限制）。\n"
-        "log_error = /var/lib/mysql/error.log\n"
+        "# 错误日志落盘到统一日志目录（容器内 /var/log/custos-ha，由 compose 挂载到宿主\n"
+        "# /data/custos-ha/logs/<基名>）：官方镜像默认写 stdout（@@log_error 为空），会导致\n"
+        "# 管理器「错误日志」面板 LOAD_FILE 读不到、永远显示为空；统一目录既持久又跨形态一致。\n"
+        f"log_error = {LOG_DIR_CT}/error.log\n"
         "# 放开 secure_file_priv，使管理器 LOAD_FILE 可读错误日志文件（容器镜像可能限制路径），"
         "# 作为「错误日志」面板读取 mysql.error_log 表失败时的兜底；仅放开文件导入/导出，HA 账号不受影响。"
         "secure_file_priv = ''\n"
@@ -546,7 +626,7 @@ def render_baremetal_compose(node_name, vip_port=None):
         "      - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro\n"
         "      - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro\n"
     ).replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME) \
-     .replace("{PKG_VERSION}", PKG_VERSION)
+     .replace("{PKG_VERSION}", PKG_VERSION) + AGENT_SERVICE
 
 
 def render_mariadb_compose(node_name, root_pass, port, server_id, vip_port=None,
@@ -611,6 +691,14 @@ services:
       # 初始化 SQL：仅在数据目录为空的首次启动执行；已初始化节点改由 fix-node-creds.sql
       # 或管理器 ensure_ha_creds 自愈校正账号（不会重复执行导致报错）。
       - ./init_mariadb.sql:/docker-entrypoint-initdb.d/init_mariadb.sql:ro,z
+      # 统一日志目录：error.log 等全部落到这里（宿主 logs/<基名> -> 容器 /var/log/custos-ha）
+      - {_log_dir_host(data_dir)}:/var/log/custos-ha:z
+    logging:
+      # 容器 stdout 上限：防崩溃循环时 docker 日志刷爆磁盘（与 error.log 的 logrotate 互补）
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     healthcheck:
       # 用镜像自带 healthcheck.sh：正确处理账密，规避密码含特殊字符时的解析问题
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
@@ -618,6 +706,23 @@ services:
       timeout: 5s
       retries: 12
       start_period: 60s
+    depends_on:
+      init-logs:
+        condition: service_completed_successfully
+
+  # 一次性初始化：把统一日志目录的属主改为容器内 mysql(uid 999)——同 MySQL 形态的原因，
+  # 宿主挂载目录默认 root:root，mysqld 写不了 error.log 会直接启动失败。
+  init-logs:
+    image: {image}
+    container_name: custos-init-logs
+    user: "0:0"
+    entrypoint:
+      - sh
+      - -c
+      - "chown -R 999:999 /var/log/custos-ha && chmod 0755 /var/log/custos-ha && echo logs-dir-ready"
+    volumes:
+      - {_log_dir_host(data_dir)}:/var/log/custos-ha:z
+    restart: "no"
 
   keepalived:
     image: {KEEPALIVED_IMAGE_NAME}:{PKG_VERSION}
@@ -636,10 +741,10 @@ services:
       - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro
       - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro
       - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro
-"""
+""" + AGENT_SERVICE
 
 
-def render_docker_my_cnf(mysql_version=None):
+def render_docker_my_cnf(mysql_version=None, port=3306):
     """Docker 节点 MySQL 覆盖配置：开启慢日志（log_output=TABLE），供 slow_log 采集。
 
     挂载到容器 /etc/mysql/conf.d/ha-overrides.cnf。对 v2.0 已部署集群无副作用，
@@ -649,10 +754,17 @@ def render_docker_my_cnf(mysql_version=None):
     cnf = (
         "[mysqld]\n"
         "bind-address = 0.0.0.0\n"
-        "# 错误日志写入 mysql.error_log 表（log_sink_table 为 MySQL 8.0 内置组件，无需装插件），"
-        "# 管理器「错误日志」面板直接 SELECT 该表，容器环境下不再依赖 LOAD_FILE / secure_file_priv。"
-        "log_error_services = log_filter_internal; log_sink_file; log_sink_table\n"
-        "log_error = /var/lib/mysql-files/error.log\n"
+        f"port = {port}\n"
+        "# 错误日志写入 mysql.error_log 表（log_sink_table 为 MySQL 8.0 内置组件，无需装插件），\n"
+        "# 管理器「错误日志」面板直接 SELECT 该表，容器环境下不再依赖 LOAD_FILE / secure_file_priv。\n"
+        "log_error_services = log_filter_internal; log_sink_internal\n"
+        # 统一日志目录：容器内固定 /var/log/custos-ha（compose 挂到宿主
+        # /data/custos-ha/logs/<基名>）。旧值 /var/lib/mysql-files 未挂载到宿主，
+        # 容器销毁即丢日志，是排错时最难查的一类问题。
+        f"log_error = {LOG_DIR_CT}/error.log\n"
+        # 放开 secure_file_priv：使管理器「错误日志」面板能用 LOAD_FILE(@@log_error)
+        # 读到上述新路径（MySQL 容器默认仅允许 /var/lib/mysql-files）。
+        "secure_file_priv = ''\n"
         "skip-name-resolve\n"
         "slow_query_log = 1\n"
         "long_query_time = 0.5\n"
@@ -663,6 +775,59 @@ def render_docker_my_cnf(mysql_version=None):
     if blk:
         cnf = cnf.replace("[mysqld]\n", "[mysqld]\n" + blk, 1)
     return cnf
+
+
+def render_logrotate_conf():
+    """生成 logrotate 配置（三形态共用）：统一日志目录下的 *.log 按「天数 + 大小上限」轮转。
+
+    为什么用 copytruncate 而不是默认的 rename+新建：mysqld 会长期持有 error.log 的句柄，
+    默认「改名 + 新建」会让 mysqld 继续往**已改名**的旧文件写，表现为轮转后日志不再更新。
+    copytruncate 复制后截断原文件，句柄/属主/权限不变，也不会写丢、无需重启 mysqld。
+    """
+    return f"""# Custos 节点日志轮转（自动生成，三形态共用）
+# 覆盖：{LOG_ROOT_HOST}/*/ 下所有 .log（mysql8 / mariadb12 / mariadb 各一个目录）
+#
+# 安装（节点宿主机执行）：
+#     cp custos-ha-logrotate.conf /etc/logrotate.d/custos-ha
+#     （裸机形态由 Install 脚本自动安装；容器形态请在宿主机手动执行上面这条）
+# 校验：logrotate -d /etc/logrotate.d/custos-ha
+{LOG_ROOT_HOST}/*/*.log {{
+    daily
+    rotate 7
+    # 大小上限：超过 100M 立即轮转（不等 daily）——节点崩溃循环时几分钟就能刷爆磁盘
+    maxsize 100M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}}
+"""
+
+
+def render_prepare_logs(node_type, log_dir):
+    """生成日志目录初始化脚本：首次部署前建目录并修正属主。
+
+    必须执行：compose 挂载的宿主目录由 root 自动创建(0755 root:root)，容器内 mysqld 以
+    mysql(uid 999) 运行，无权写 error.log —— 表现为 mysqld 起不来或日志恒为空。
+    """
+    if node_type == "mariadb":
+        chown_line = 'if id -u mysql >/dev/null 2>&1; then chown -R mysql:mysql "$LOG_DIR"; fi'
+        who = "mysql（系统用户，不存在则跳过 chown）"
+    else:
+        chown_line = 'chown -R 999:999 "$LOG_DIR"'
+        who = "uid/gid 999（容器内 mysql 用户）"
+    return f"""#!/bin/sh
+# 自动生成：初始化统一日志目录（首次部署 / 重建节点前执行一次即可）
+# 统一根目录：{LOG_ROOT_HOST}   属主：{who}
+set -eu
+LOG_DIR="{log_dir}"
+mkdir -p "$LOG_DIR"
+{chown_line}
+chmod 0755 "$LOG_DIR"
+echo "OK: $LOG_DIR ready -> $(stat -c '%U:%G %a' "$LOG_DIR" 2>/dev/null || echo unknown)"
+"""
 
 
 def _auth_plugin_pref():
@@ -990,8 +1155,12 @@ def regenerate_cluster_compose(cluster_id):
             content = _render_compose(
                 node_name, r.get("root_pass") or "", int(r["port"]),
                 int(r.get("server_id") or 0), vip_port)
-            _write(kd.parent / "ha-overrides.cnf", render_docker_my_cnf(r.get("mysql_version")), mode=0o644)
+            _write(kd.parent / "ha-overrides.cnf", render_docker_my_cnf(r.get("mysql_version"), int(r.get("port") or 3306)), mode=0o644)
         _write(p, content)
+        # sync node agent script (OS metrics sidecar deployed with node compose)
+        agent_src = Path(__file__).resolve().parent.parent / "scripts" / "node_agent.py"
+        if agent_src.exists():
+            _write(kd.parent / "node_agent.py", agent_src.read_text(), mode=0o644)
 
 
 def _clean_generated_dir(d: Path):
@@ -1146,7 +1315,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。
         _write(d / "init.sql", init_sql, mode=0o644)
         # 慢日志覆盖配置（挂载到容器 /etc/mysql/conf.d）
-        _write(d / "ha-overrides.cnf", render_docker_my_cnf(mysql_version), mode=0o644)
+        _write(d / "ha-overrides.cnf", render_docker_my_cnf(mysql_version, port), mode=0o644)
 
     # 2) keepalived.conf
     keep_conf = _render_keepalived_conf(
@@ -1188,6 +1357,12 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             mode = 0o755 if f.endswith(".sh") else 0o644
             _write(kd / f, src.read_text(), mode=mode)
 
+    # 4.5) copy node agent script (OS metrics sidecar deployed with node compose).
+    #      The rendered compose includes custos-node-agent service mounting ./node_agent.py.
+    agent_src = Path(__file__).resolve().parent.parent / "scripts" / "node_agent.py"
+    if agent_src.exists():
+        _write(d / "node_agent.py", agent_src.read_text(), mode=0o644)
+
     # 5) docker-compose.yaml
     #    MariaDB 裸机（mariadb）：compose 只跑 keepalived 客户端（mysqld 由宿主 systemd 起）；
     #    MariaDB 容器化（mariadb-docker）：纯 compose（mariadb + keepalived 合一）；
@@ -1199,6 +1374,16 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     else:
         compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
     _write(d / "docker-compose.yaml", compose)
+
+    # 5.5) 统一日志目录：logrotate 配置 + 目录初始化脚本（三形态一致）
+    #      排错时按固定路径 /data/custos-ha/logs/<基名>/ 找日志，不再逐个形态猜。
+    _data_dir_for_log = {
+        "mariadb": "/data/mariadb",              # 裸机默认（与 render_mariadb_my_cnf 默认值一致）
+        "mariadb-docker": MARIADB_DOCKER_DATA_DIR,
+    }.get(node_type, MYSQL_DOCKER_DATA_DIR)
+    _write(d / "custos-ha-logrotate.conf", render_logrotate_conf(), mode=0o644)
+    _write(d / "prepare-logs.sh",
+           render_prepare_logs(node_type, _log_dir_host(_data_dir_for_log)), mode=0o755)
 
     # 6) 登记到 nodes 表 + hosts 表（供监控自动接入）
     #    compose_path 记录「宿主机路径」（便于 Web 展示与到目标主机执行），
@@ -1232,13 +1417,13 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # 7) 新增节点后刷新同集群所有节点的对等列表
     _refresh_all_keepalived_conf(cluster_id)
 
-    # MariaDB 裸机节点：宿主机已原生运行 MariaDB，只需拉起 keepalived 容器
-    # （否则会再起一个 MySQL 容器抢占 3306）。
+    # MariaDB 裸机节点：宿主机已原生运行 MariaDB，只需拉起 keepalived + 节点 agent 容器
+    # （compose 不含数据库服务，故不会另起一个 MySQL 容器抢占 3306；agent 即 custos-node-agent）。
     # 容器化 MariaDB 节点（mariadb-docker）：纯 compose 部署，入口即 docker compose up -d
     # （mariadb + keepalived 合一，无需安装脚本）。
     # MySQL docker 节点：MySQL 与 keepalived 都在容器里，整套一起拉起。
     if node_type == "mariadb":
-        run_cmd = f"cd {host_compose} && docker compose up -d keepalived"
+        run_cmd = f"cd {host_compose} && docker compose up -d keepalived custos-node-agent"
     else:
         run_cmd = f"cd {host_compose} && docker compose up -d"
 
@@ -1285,7 +1470,7 @@ def _node_is_read_only(ip, port, root_user, root_pass, ha_user, ha_pass):
     return False
 
 
-def sync_node_creds(cluster_id=None):
+def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_repl_pass=None, old_app_user=None):
     """把指定集群（或全局）的 HA/复制/业务账号密码同步到其在线节点。
 
     触发时机：「集群管理」保存且该集群 HA/复制/业务密码发生变化时。
@@ -1349,6 +1534,9 @@ def sync_node_creds(cluster_id=None):
                     app_user, app_pass,
                     manager_ip=manager_public_ip,
                     manager_subnet=manager_subnet,
+                    old_ha_user=old_ha_user,
+                    old_repl_user=old_repl_user,
+                    old_app_user=old_app_user,
                 )
             if not ok:
                 # root 与 ha_monitor 均不可达（节点离线），跳过（恢复后重新生成部署文件）
@@ -1401,6 +1589,33 @@ def sync_node_creds(cluster_id=None):
                     manager_subnet, auth_plugin=_auth_plugin_for(mysql_version, node_type))
             _write(_safe_node_path(ip) / "fix-node-creds.sql", fix_sql, mode=0o644)
             synced += 1
+
+    # 复制账号改名/改密后，从库仍用旧 repl_user 连主库；主库 DROP 旧账号前必须先把
+    # 从库重指向新 repl_user/repl_pass，否则主库删除旧账号后复制断（Access Denied）。
+    if (old_repl_user and old_repl_user != repl_user) or \
+       (old_repl_pass is not None and old_repl_pass != repl_pass):
+        try:
+            _cm = query("SELECT host, port FROM current_master WHERE cluster_id=%s", (cluster_id,))
+        except Exception:
+            _cm = []
+        if _cm:
+            _mh, _mp = _cm[0]["host"], int(_cm[0]["port"])
+            _ns = query("SELECT ip, port, root_user, root_pass FROM nodes WHERE cluster_id=%s", (cluster_id,))
+            for _n in _ns:
+                if "%s:%s" % (_n["ip"], int(_n["port"])) == "%s:%s" % (_mh, _mp):
+                    continue  # 主库自身不重指向
+                try:
+                    from .ha_client import make_slave_of
+                    make_slave_of(
+                        _n["ip"], int(_n["port"]),
+                        _n.get("root_user") or "root", _n.get("root_pass") or "",
+                        _mh, _mp, repl_user, repl_pass,
+                        _n.get("root_user") or "root", _n.get("root_pass") or "")
+                except Exception as _e:
+                    logger.warning("副本 %s:%s 重指向新复制账号失败: %s", _n["ip"], _n["port"], _e)
+        else:
+            logger.warning("集群 %s 无 current_master，跳过从库重指向", cluster_id)
+
     return synced
 
 

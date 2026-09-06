@@ -7,7 +7,7 @@ from .config import (CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENAB
                      HEARTBEAT_INTERVAL, METRICS_INTERVAL, DRIFT_INTERVAL,
                      MGMT, get_mgmt_host, SEMI_SYNC)
 from .db import query, execute, get_setting
-from .ha_client import (get_status, heal_replication, heal_io_gtid_gap,
+from .ha_client import (get_status, ensure_semisync_runtime, heal_replication, heal_io_gtid_gap,
                         get_binlog_usage, purge_binlog_before,
                         set_read_only, get_node_utc_time)
 from .state import get_current_master
@@ -514,6 +514,13 @@ def trigger_act_once_async():
         _ACT_THREAD = t
 
 
+# 半同步按节点自愈的限频（秒）。探活间隔默认 2s，没必要每次都查。
+# 副本的 rpl_semi_sync_*_enabled 不会被复制同步，必须逐节点单独开（见
+# ha_client.ensure_semisync_runtime 说明），故放在探活循环里覆盖全部节点。
+_SEMI_LAST = {}
+_SEMI_INTERVAL = 60
+
+
 def _probe_all():
     """仅探活 + 写回 hosts 状态（up/down/复制线程/延迟/错误），并缓存结果。
 
@@ -602,6 +609,22 @@ def _probe_all():
             repl_ok = is_master or (st.get("slave_io") == "Yes" and st.get("slave_sql") == "Yes")
             _alert_on_transition(key, "up" if st["alive"] else "down", is_master, repl_ok,
                                  st.get("seconds_behind"), cluster_name, cid, semi)
+            # 半同步按节点自愈：SET GLOBAL 不复制，副本开关必须单独开，
+            # 否则主库永远等不到半同步副本、两边 status 恒为 OFF。
+            try:
+                if st.get("alive") and repl_ok:
+                    _sk = (host, port)
+                    _now = time.time()
+                    if _now - _SEMI_LAST.get(_sk, 0) >= _SEMI_INTERVAL:
+                        _SEMI_LAST[_sk] = _now
+                        _ru, _rp = node_root(host, cid)
+                        _ch, _msg = ensure_semisync_runtime(
+                            host, port, creds["ha_user"], creds["ha_pass"], _ru, _rp)
+                        if _ch:
+                            print(f"[monitor] 半同步自愈 {host}:{port}：{_msg}")
+                            _sh_stat("ok")
+            except Exception as _ee:
+                print(f"[monitor] 半同步自愈异常 {host}:{port}: {_ee}")
             cache_by_cid[cid][key] = (st, is_master)
     # 仅覆盖已探活集群的缓存（未配置账号的集群保留上一次结果，避免误自愈）
     for cid, cache in cache_by_cid.items():

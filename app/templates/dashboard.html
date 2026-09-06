@@ -414,7 +414,7 @@
         });
         // 节点 OS 资源（来自 agent，可选；不可达时静默不显示）
         (data.clusters || []).forEach(function (cl) {
-          loadOsMetrics(cl.cluster_id);
+          loadOsMetrics(cl.cluster_id || cl.id);
         });
         if (dot) dot.classList.remove("busy");
         if (spin) spin.style.display = "none";

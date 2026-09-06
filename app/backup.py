@@ -48,6 +48,36 @@ SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys", "ndbin
 # 避免单条语句超过 max_allowed_packet 导致恢复失败。
 _INSERT_MAX_BYTES = 900 * 1024
 
+# 备份/恢复操作日志（落盘，便于审计与追溯成功/失败条数）
+BACKUP_LOG = BACKUP_ROOT / "backup_restore.log"
+
+
+def _log_event(msg: str):
+    """追加一条带中国时间戳的备份/恢复操作日志。失败静默不影响主流程。"""
+    try:
+        BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+        ts = now_cn().strftime("%Y-%m-%d %H:%M:%S")
+        with open(BACKUP_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+
+def read_backup_log(cid=None, limit: int = 200):
+    """读取备份/恢复日志（倒序，最新在前）。cid 给定时仅返回该集群行。"""
+    try:
+        if not BACKUP_LOG.exists():
+            return []
+        lines = BACKUP_LOG.read_text(encoding="utf-8").splitlines()
+        if cid is not None:
+            key = f"id={int(cid)}" if str(cid).isdigit() else f"集群={cid}"
+            lines = [l for l in lines if key in l]
+        out = [l for l in lines if l.strip()]
+        out.reverse()
+        return out[:limit]
+    except Exception:
+        return []
+
 
 # --------------------------------------------------------------------------
 # 基础设施
@@ -404,6 +434,15 @@ def list_backups(cid):
                 meta = json.loads(meta_p.read_text(encoding="utf-8"))
             except Exception:
                 meta = None
+        # 备份目录按集群【名】划分：删掉旧集群又用同名重建时，旧备份会残留在同一目录。
+        # 按 meta 里的 cluster_id 过滤，只列出真正属于当前集群的备份，
+        # 避免列出上一代同名集群的备份（误恢复会把旧数据写进新集群）。
+        if isinstance(meta, dict) and meta.get("cluster_id"):
+            try:
+                if int(meta.get("cluster_id")) != int(cid):
+                    continue
+            except (TypeError, ValueError):
+                pass
         st = p.stat()
         out.append({
             "file": p.name,
@@ -624,3 +663,49 @@ def read_backup_head(cid, filename, limit: int = 4000) -> str:
     path = get_backup_path(cid, filename)
     with gzip.open(path, "rt", encoding="utf-8") as f:
         return f.read(limit)
+
+
+# --------------------------------------------------------------------------
+# 恢复记录（落盘为 JSON 列表，供备份页「恢复记录」展示与审计）
+# --------------------------------------------------------------------------
+_RESTORE_HISTORY = "restore_history.json"
+_RESTORE_HISTORY_LIMIT = 200
+
+
+def record_restore(cid, record: dict) -> None:
+    """追加一条恢复记录到 <集群目录>/restore_history.json。
+
+    倒序保存（最新在前），最多保留 `_RESTORE_HISTORY_LIMIT` 条；任何异常都
+    静默吞掉，绝不影响恢复主流程。
+    """
+    try:
+        d = _dir(cid)
+        p = d / _RESTORE_HISTORY
+        arr = []
+        if p.exists():
+            try:
+                arr = json.loads(p.read_text(encoding="utf-8")) or []
+            except Exception:
+                arr = []
+        if not isinstance(arr, list):
+            arr = []
+        arr.insert(0, record)
+        if len(arr) > _RESTORE_HISTORY_LIMIT:
+            arr = arr[:_RESTORE_HISTORY_LIMIT]
+        p.write_text(json.dumps(arr, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def list_restores(cid, limit: int = 100) -> list:
+    """读取恢复记录（倒序，最新在前）。"""
+    try:
+        p = _dir(cid) / _RESTORE_HISTORY
+        if not p.exists():
+            return []
+        arr = json.loads(p.read_text(encoding="utf-8")) or []
+        if not isinstance(arr, list):
+            return []
+        return arr[:limit]
+    except Exception:
+        return []

@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 # 把下面路径改为你存放 node_agent.py 的位置；建议在每台 MySQL 节点宿主机上各部署一份。
 WorkingDirectory=/opt/custos-ha/scripts
-ExecStart=/usr/bin/python3 /opt/custos-ha/scripts/node_agent.py --port 29100 --bind 0.0.0.0
+ExecStart=/usr/bin/python3 /opt/custos-ha/scripts/node_agent.py --port 28889 --bind 0.0.0.0
 # 可选：开启令牌校验（与管理器 NODE_AGENT_TOKEN 一致）
 #Environment=NODE_AGENT_TOKEN=your-shared-secret
 # 可选：额外汇报的挂载点

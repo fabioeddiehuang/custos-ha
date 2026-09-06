@@ -80,8 +80,8 @@ def check_consistency(cid, mode="rows"):
     diffs 每项：{"host","port","table","master","slave","kind":"rows"|"checksum"}
     """
     mode = "checksum" if str(mode).lower() == "checksum" else "rows"
-    m = get_current_master(cid) or {}
-    m_host, m_port = m.get("host"), int(m.get("port") or 3306)
+    m_host, m_port = get_current_master(cid)
+    m_port = int(m_port or 3306)
     if not m_host:
         return {"ok": False, "error": "集群当前主库未知"}
 
