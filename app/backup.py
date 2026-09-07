@@ -709,3 +709,49 @@ def list_restores(cid, limit: int = 100) -> list:
         return arr[:limit]
     except Exception:
         return []
+
+
+# --------------------------------------------------------------------------
+# 备份记录（落盘为 JSON 列表，供备份页「备份记录」展示与审计）
+# --------------------------------------------------------------------------
+_BACKUP_HISTORY = "backup_history.json"
+_HISTORY_LIMIT = 200
+
+
+def record_backup(cid, record: dict) -> None:
+    """追加一条备份记录到 <集群目录>/backup_history.json。
+
+    倒序保存（最新在前），最多保留 `_HISTORY_LIMIT` 条；任何异常都静默吞掉，
+    绝不影响备份主流程。
+    """
+    try:
+        d = _dir(cid)
+        p = d / _BACKUP_HISTORY
+        arr = []
+        if p.exists():
+            try:
+                arr = json.loads(p.read_text(encoding="utf-8")) or []
+            except Exception:
+                arr = []
+        if not isinstance(arr, list):
+            arr = []
+        arr.insert(0, record)
+        if len(arr) > _HISTORY_LIMIT:
+            arr = arr[:_HISTORY_LIMIT]
+        p.write_text(json.dumps(arr, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def list_backup_records(cid, limit: int = 100) -> list:
+    """读取备份记录（倒序，最新在前）。"""
+    try:
+        p = _dir(cid) / _BACKUP_HISTORY
+        if not p.exists():
+            return []
+        arr = json.loads(p.read_text(encoding="utf-8")) or []
+        if not isinstance(arr, list):
+            return []
+        return arr[:limit]
+    except Exception:
+        return []

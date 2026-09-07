@@ -1485,6 +1485,30 @@ def api_backup_run(cluster_id: int = Form(...), host: str = Form(...),
         except Exception:
             pass
         r["msg"] = f"备份失败：{_err}"
+    # 落盘备份记录（无论成功失败都记，便于审计与「备份记录」列表展示）
+    try:
+        uname = user.get("username") if isinstance(user, dict) else str(user)
+        m = r.get("meta") or {}
+        dbs_req = dbs if scope == "custom" else (m.get("databases") or [])
+        backup.record_backup(int(cluster_id), {
+            "time": backup.now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+            "cluster_id": int(cluster_id),
+            "cluster_name": backup._cluster_dir_name(cluster_id),
+            "source": f"{host.strip()}:{port}",
+            "file": m.get("file", "") if r.get("ok") else "",
+            "scope": scope,
+            "databases": dbs_req,
+            "with_data": bool(with_data),
+            "ok": bool(r.get("ok")),
+            "db_total": len(dbs_req) if dbs_req else (m.get("tables") or 0),
+            "tables": m.get("tables", 0),
+            "views": m.get("views", 0),
+            "rows": m.get("rows", 0),
+            "operator": uname,
+            "error": r.get("error", "") if not r.get("ok") else "",
+        })
+    except Exception:
+        pass
     return JSONResponse(r)
 
 
@@ -1495,6 +1519,15 @@ def api_backup_list(cluster_id: int = 0, user=Depends(auth_required)):
         return JSONResponse({"ok": True, "backups": backup.list_backups(int(cluster_id))})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e), "backups": []})
+
+
+@app.get("/api/backup/history")
+def api_backup_history(cluster_id: int = 0, user=Depends(auth_required)):
+    """读取该集群的备份记录（倒序，最新在前）。"""
+    try:
+        return JSONResponse({"ok": True, "records": backup.list_backup_records(int(cluster_id))})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e), "records": []})
 
 
 @app.post("/api/backup/restore")

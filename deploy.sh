@@ -23,8 +23,13 @@ cd "$(dirname "$0")"
 ENV_FILE=".env"
 
 if [ ! -f "$ENV_FILE" ]; then
-  echo "错误：找不到 $ENV_FILE，请先创建并写入 VERSION=vX.Y.Z" >&2
-  exit 1
+  if [ -f "env.example" ]; then
+    cp env.example .env
+    echo "提示：未找到 $ENV_FILE，已根据 env.example 自动生成 .env（请按需修改后再用于生产部署）。" >&2
+  else
+    echo "错误：找不到 $ENV_FILE，也没有 env.example 模板，请先创建并写入 VERSION=vX.Y.Z" >&2
+    exit 1
+  fi
 fi
 
 # 唯一版本来源：.env 的 VERSION=（去空白，含 Windows 换行符 \r）
