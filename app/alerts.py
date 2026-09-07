@@ -7,6 +7,8 @@
 - 若没有任何邮箱，则回退到旧的 ALERT_EMAIL 配置（兼容单邮箱历史用法）。
 """
 import smtplib
+import time
+import threading
 from email.mime.text import MIMEText
 from .config import env
 from .db import get_setting, query
@@ -19,6 +21,31 @@ def _cfg():
         user=get_setting("SMTP_USER") or env("SMTP_USER"),
         passwd=get_setting("SMTP_PASS") or env("SMTP_PASS"),
     )
+
+
+# ---------------------------------------------------------------------------
+# 同类告警发送节流（避免监控每个周期重复刷邮件）
+# - 同一 (主题, 集群) 在 ALERT_COOLDOWN_SEC 内只真正发送一封；
+# - 冷却期内同类的后续告警被抑制，并在冷却结束后的下一封邮件中以
+#   「已抑制 N 次」汇总（ALERT_MERGE=1 时），既不刷屏又保留次数信息。
+# - 复用 settings 中已有的 ALERT_COOLDOWN_SEC / ALERT_MERGE 配置（前端可改）。
+# ---------------------------------------------------------------------------
+_alert_lock = threading.Lock()
+_last_sent = {}      # key -> 上次真正发送的时间戳
+_suppressed = {}     # key -> 冷却期内被抑制的次数
+
+
+def _alert_cooldown_sec():
+    try:
+        v = int(get_setting("ALERT_COOLDOWN_SEC", "300") or 0)
+    except Exception:
+        v = 300
+    return v if v > 0 else 0
+
+
+def _alert_merge_enabled():
+    v = (get_setting("ALERT_MERGE", "1") or "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def resolve_recipients(cluster_id=None):
@@ -56,7 +83,7 @@ def resolve_recipients(cluster_id=None):
 last_error = ""
 
 
-def send_alert(subject, body, cluster_id=None, recipients=None):
+def send_alert(subject, body, cluster_id=None, recipients=None, force=False):
     global last_error
     last_error = ""
     c = _cfg()
@@ -66,6 +93,27 @@ def send_alert(subject, body, cluster_id=None, recipients=None):
         last_error = "未配置 SMTP 服务器或告警接收邮箱"
         print(f"[alert:skip] {subject} | {body}")
         return False
+
+    # ---- 同类告警节流：同一 (主题, 集群) 在冷却期内只发一封 ----
+    if not force:
+        cooldown = _alert_cooldown_sec()
+        if cooldown > 0:
+            key = f"{subject.strip()}||{cluster_id if cluster_id is not None else '_global'}"
+            now = time.time()
+            with _alert_lock:
+                last = _last_sent.get(key, 0.0)
+                if now - last < cooldown:
+                    _suppressed[key] = _suppressed.get(key, 0) + 1
+                    print(f"[alert:throttled] 同类冷却中，抑制重复发送：{subject} (cluster={cluster_id})")
+                    return False
+                # 冷却已过，允许发送；记下来并在发送成功后落盘时间戳
+                n_suppressed = _suppressed.get(key, 0)
+                _suppressed[key] = 0
+                _last_sent[key] = now
+            if n_suppressed > 0 and _alert_merge_enabled():
+                mins = max(1, cooldown // 60)
+                body = body + f"\n\n[注] 本类告警在过去的 {mins} 分钟内已被同类冷却抑制 {n_suppressed} 次。"
+
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = f"[MySQL-HA] {subject}"

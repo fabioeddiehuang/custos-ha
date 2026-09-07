@@ -1203,7 +1203,7 @@ def test_email(user=Depends(auth_required)):
             return JSONResponse({"ok": False,
                                   "msg": "✗ 尚未添加任何接收邮箱，请先在「提醒邮箱」中新建"},
                                  status_code=200)
-        ok = send_alert("邮件告警测试", "测试邮件，告警通道正常！", recipients=emails)
+        ok = send_alert("邮件告警测试", "测试邮件，告警通道正常！", recipients=emails, force=True)
         if ok:
             return JSONResponse({"ok": True, "msg": "✓ 发送成功：测试邮件已发出，请检查收件箱"})
         detail = last_error or "SMTP 配置不正确或收件地址无效"
