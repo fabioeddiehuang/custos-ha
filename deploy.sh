@@ -42,6 +42,17 @@ fi
 export VERSION
 echo "==> 版本 $VERSION（来源 $ENV_FILE）"
 
+# 构建前校验：Dockerfile 必须在构建上下文（项目根）内，否则给出明确指引，
+# 避免 docker compose 抛出晦涩的
+# 「failed to read dockerfile: open Dockerfile: no such file or directory」。
+if [ ! -f "Dockerfile" ]; then
+  echo "错误：构建上下文中找不到 Dockerfile（当前目录：$(pwd)）。" >&2
+  echo "请确认已从仓库完整检出（git pull 或重新 git clone），根目录需包含 " >&2
+  echo "  Dockerfile / docker-entrypoint.sh / requirements.txt / app/。" >&2
+  echo "若 .dockerignore 被本地改动过，请恢复为仓库版本（构建必需文件已用 ! 规则强制保留）。" >&2
+  exit 1
+fi
+
 # 无参数时默认「构建并后台启动」
 if [ "$#" -eq 0 ]; then
   set -- up -d --build

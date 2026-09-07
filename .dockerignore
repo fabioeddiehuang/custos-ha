@@ -8,3 +8,11 @@ data/
 generated_nodes/
 *.md
 .codebuddy/
+
+# 构建必需文件：始终保留，防止上方任何排除规则（或本地 .dockerignore 误改）把
+# 它们排除出构建上下文，否则 docker compose build 会报
+# 「failed to read dockerfile: open Dockerfile: no such file or directory」。
+!Dockerfile
+!docker-entrypoint.sh
+!requirements.txt
+!app
