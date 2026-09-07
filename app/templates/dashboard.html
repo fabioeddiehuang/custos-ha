@@ -161,7 +161,7 @@
       <select id="obsCluster" class="mini-sel" title="选择集群">
         {% for c in clusters %}<option value="{{ c.cluster_id }}">{{ c.name }}</option>{% endfor %}
       </select>
-      <button class="btn btn-sm" onclick="collectNow('all')">采集</button>
+      <button class="btn btn-sm" onclick="collectNow('all', this)">采集</button>
       <button class="btn btn-sm btn-ghost" onclick="refreshObs()">刷新</button>
     </div>
   </div>
@@ -829,7 +829,9 @@
       })
       .catch(function (e) { btn.disabled = false; btn.textContent = old; alert("预检异常: " + e.message); });
   }
-  function collectNow(target) {
+  function collectNow(target, btn) {
+    var old = btn ? btn.textContent : "采集";
+    if (btn) { btn.disabled = true; btn.textContent = "采集中…"; }
     fetch("/api/collect", { method: "POST", cache: "no-store", credentials: "same-origin",
       headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "target=" + target })
       .then(function (r) {
@@ -840,18 +842,45 @@
         });
       })
       .then(function (d) {
-        if (d && d.ok) {
-          alert("已提交，后台采集中，稍候自动刷新…");
-          setTimeout(refreshObs, 3000);
-        } else {
-          alert("采集失败: " + ((d && d.error) || "未知错误"));
+        if (!d || !d.ok) {
+          if (btn) { btn.disabled = false; btn.textContent = old; }
+          alert("采集提交失败: " + ((d && d.error) || "未知错误"));
+          return;
         }
+        // 轮询后台采集状态，给出真实成败（之前盲目显示「已提交」会掩盖真实报错）
+        var tries = 0;
+        var timer = setInterval(function () {
+          tries++;
+          fetch("/api/collect/state", { cache: "no-store", credentials: "same-origin" })
+            .then(function (r) { return r.json(); })
+            .then(function (st) {
+              if (st && st.active) {
+                if (tries > 40) { clearInterval(timer); finish("采集超时，请稍后刷新查看", true); }
+                return;
+              }
+              if (st && st.error) { clearInterval(timer); finish("采集出错：" + st.error, true); }
+              else { clearInterval(timer); finish("采集完成" + (st && st.last && st.last.length ? "：" + st.last.join("、") : ""), false); }
+            })
+            .catch(function () { if (tries > 40) { clearInterval(timer); finish("状态查询失败", true); } });
+        }, 1000);
       })
       .catch(function (e) {
+        if (btn) { btn.disabled = false; btn.textContent = old; }
         var msg = (e && e.status) ? ("HTTP " + e.status + (e.data && e.data.error ? "：" + e.data.error : ""))
                                    : ("网络异常：" + (e && e.message ? e.message : e));
         alert("采集请求异常: " + msg);
       });
+    function finish(msg, isErr) {
+      if (btn) { btn.disabled = false; btn.textContent = old; }
+      if (isErr) { alert(msg); return; }
+      var tip = document.createElement("div");
+      tip.textContent = msg;
+      tip.style.cssText = "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:99999;"
+        + "background:#0e1830;color:#9be8c0;border:1px solid #22d3ee55;padding:8px 14px;border-radius:8px;font-size:13px;";
+      document.body.appendChild(tip);
+      setTimeout(function () { tip.remove(); }, 2600);
+      refreshObs();
+    }
   }
   // 集群操作（设为主库 / 修复复制）
   function apiPostForm(url, body, cb) {

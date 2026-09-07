@@ -675,6 +675,15 @@ def api_collect(target: str = Form("all"), cluster_id: int = Form(0), user=Depen
     return _json_ok({"ok": True, "accepted": True, "msg": "采集任务已提交，正在后台执行…"})
 
 
+@app.get("/api/collect/state")
+def api_collect_state(user=Depends(auth_required)):
+    """查询后台采集任务状态（供前端轮询，给出真实成败而非盲目「已提交」）。"""
+    return _json_ok({"ok": True,
+                     "active": bool(_collect_state.get("active")),
+                     "error": _collect_state.get("error"),
+                     "last": _collect_state.get("last")})
+
+
 @app.post("/api/consistency/check")
 def api_consistency_check(cluster_id: int = Form(...), mode: str = Form("rows"),
                           user=Depends(auth_required)):

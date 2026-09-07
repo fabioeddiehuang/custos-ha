@@ -21,7 +21,15 @@ from .state import get_current_master
 from .clusters import get_cluster_creds
 from .ha_client import connect_robust
 
-SYSTEM_DBS = ("mysql", "information_schema", "performance_schema", "sys")
+# 比较时排除的库：
+# - 4 个标准系统库（永不参与业务一致性比较）
+# - ha_local：节点本地状态库。切换主库时把 current_master 写入【各节点本机】
+#   ha_local.state，且以 SET sql_log_bin=0 写入（不参与复制），从库侧还加了
+#   REPLICATE_IGNORE_DB=ha_local；因此主从的 ha_local 本就不一致——纳入比对会
+#   恒定产生伪差异（典型表现：主库比从库多 1 行）。属设计使然，必须排除。
+# - custos：管理器自身元数据库，若落在集群节点上同样不具业务一致性意义，排除。
+SYSTEM_DBS = ("mysql", "information_schema", "performance_schema", "sys",
+              "ha_local", "custos")
 
 # 保护阈值：超过则跳过该表的 checksum（行数比对不受此限，代价极低）
 MAX_TABLES = 300

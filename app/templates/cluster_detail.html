@@ -843,50 +843,74 @@
   // ---- 主从数据一致性校验（只读）----
   function checkConsistency(mode){
     var cid = {{ cluster.id }};
+    // 模态框：背景遮罩 + 居中卡片 + 顶栏（标题 / 全屏 / 关闭），关闭按钮始终可见，
+    // 支持点击遮罩、按 ESC 关闭，解决「无法关闭 / 没有按钮」问题。
+    var ov = document.getElementById('csOverlay');
+    if(!ov){
+      ov = document.createElement('div');
+      ov.id = 'csOverlay';
+      ov.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(3,8,20,.62);'
+        + 'display:none;align-items:center;justify-content:center;padding:24px;';
+      ov.onclick = function(e){ if(e.target === ov) closeCs(); };
+      document.body.appendChild(ov);
+    }
     var box = document.getElementById('csBox');
     if(!box){
-      box=document.createElement('div'); box.id='csBox';
-      box.style.cssText='position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:10000;'
-        +'max-width:min(860px,92vw);max-height:76vh;overflow:auto;padding:18px 20px;border-radius:12px;'
-        +'background:#0e1830;color:#e6edf7;border:1px solid #22d3ee55;box-shadow:0 16px 50px rgba(0,0,0,.55);font-size:13px;';
-      document.body.appendChild(box);
+      box = document.createElement('div');
+      box.id = 'csBox';
+      box.style.cssText = 'position:relative;width:min(860px,92vw);max-height:82vh;display:flex;'
+        + 'flex-direction:column;background:#0e1830;color:#e6edf7;border:1px solid #22d3ee55;'
+        + 'border-radius:12px;box-shadow:0 16px 50px rgba(0,0,0,.55);font-size:13px;overflow:hidden;';
+      ov.appendChild(box);
     }
-    box.innerHTML='<div style="font-weight:600;">正在校验（'+(mode==='checksum'?'校验和':'行数')+'）… 大集群可能需要数十秒</div>';
-    var fd=new FormData();
+    box.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid #ffffff14;">'
+      + '<strong style="flex:1;">一致性校验结果</strong>'
+      + '<button class="btn btn-sm btn-ghost" onclick="csToggleFull()">⤢ 全屏</button>'
+      + '<button class="btn btn-sm" onclick="closeCs()">关闭 ✕</button></div>'
+      + '<div id="csBody" style="padding:16px 18px;overflow:auto;">正在校验（'
+      + (mode==='checksum'?'校验和':'行数') + '）… 大集群可能需要数十秒</div>';
+    ov.style.display = 'flex';
+
+    var fd = new FormData();
     fd.append('cluster_id', cid); fd.append('mode', mode);
     fetch('/api/consistency/check',{method:'POST',body:fd,credentials:'same-origin'})
       .then(function(r){return r.json();})
       .then(function(j){
-        if(!j.ok){ box.innerHTML='<div style="color:#ff6b6b;">校验失败：'+(j.error||'未知')+'</div>'+csCloseBtn(); return; }
-        var h='<div style="font-weight:600;margin-bottom:6px;">一致性校验结果</div>'
-          +'<div style="color:#9fb0d0;margin-bottom:10px;">模式：'+(j.mode==='checksum'?'校验和（精确）':'行数（轻量）')
-          +'　主库：'+j.master+'　已比对表：'+j.checked+'　从库：'+(j.slaves||[]).join('、')+'</div>';
-        var d=j.diffs||[];
+        var b = document.getElementById('csBody'); if(!b) return;
+        if(!j.ok){ b.innerHTML = '<div style="color:#ff6b6b;">校验失败：'+(j.error||'未知')+'</div>'; return; }
+        var h = '<div style="color:#9fb0d0;margin-bottom:10px;">模式：'+(j.mode==='checksum'?'校验和（精确）':'行数（轻量）')
+          + '　主库：'+j.master+'　已比对表：'+j.checked+'　从库：'+(j.slaves||[]).join('、')+'</div>';
+        var d = j.diffs||[];
         if(!d.length){
-          h+='<div style="padding:14px;border-radius:8px;background:#22d3ee14;border:1px solid #22d3ee33;">✓ 未发现差异</div>';
+          h += '<div style="padding:14px;border-radius:8px;background:#22d3ee14;border:1px solid #22d3ee33;">✓ 未发现差异</div>';
         } else {
-          h+='<div style="padding:10px 12px;border-radius:8px;background:#ff6b6b14;border:1px solid #ff6b6b44;margin-bottom:10px;">'
-            +'⚠ 发现 '+d.length+' 处差异</div>'
-            +'<table class="tbl" style="width:100%;font-size:12px;"><thead><tr>'
-            +'<th>从库</th><th>表</th><th>主库值</th><th>从库值</th><th>说明</th></tr></thead><tbody>';
+          h += '<div style="padding:10px 12px;border-radius:8px;background:#ff6b6b14;border:1px solid #ff6b6b44;margin-bottom:10px;">'
+            + '⚠ 发现 '+d.length+' 处差异</div>'
+            + '<table class="tbl" style="width:100%;font-size:12px;"><thead><tr>'
+            + '<th>从库</th><th>表</th><th>主库值</th><th>从库值</th><th>说明</th></tr></thead><tbody>';
           for(var i=0;i<d.length && i<200;i++){
             var x=d[i];
-            h+='<tr><td class="mono">'+x.host+':'+x.port+'</td><td class="mono">'+x.table+'</td>'
-              +'<td class="mono">'+x.master+'</td><td class="mono">'+x.slave+'</td>'
-              +'<td>'+(x.note||'')+'</td></tr>';
+            h += '<tr><td class="mono">'+x.host+':'+x.port+'</td><td class="mono">'+x.table+'</td>'
+              + '<td class="mono">'+x.master+'</td><td class="mono">'+x.slave+'</td>'
+              + '<td>'+(x.note||'')+'</td></tr>';
           }
-          h+='</tbody></table>';
-          if(d.length>200) h+='<div style="color:#9fb0d0;margin-top:8px;">（仅显示前 200 条）</div>';
+          h += '</tbody></table>';
+          if(d.length>200) h += '<div style="color:#9fb0d0;margin-top:8px;">（仅显示前 200 条）</div>';
         }
-        h+=csCloseBtn();
-        box.innerHTML=h;
+        b.innerHTML = h;
       })
-      .catch(function(e){ box.innerHTML='请求失败：'+e+csCloseBtn(); });
+      .catch(function(e){ var b=document.getElementById('csBody'); if(b) b.innerHTML='请求失败：'+e; });
   }
-  function csCloseBtn(){
-    return '<div style="margin-top:14px;text-align:right;"><button class="btn btn-sm" '
-      +'onclick="var b=document.getElementById(\'csBox\');if(b)b.remove();">关闭</button></div>';
+  function closeCs(){ var ov=document.getElementById('csOverlay'); if(ov) ov.style.display='none'; }
+  function csToggleFull(){
+    var b=document.getElementById('csBox'); if(!b) return;
+    if(b.style.width==='96vw'){ b.style.width='min(860px,92vw)'; b.style.maxHeight='82vh'; }
+    else { b.style.width='96vw'; b.style.maxHeight='94vh'; }
   }
+  document.addEventListener('keydown', function(e){
+    if(e.key==='Escape'){ var ov=document.getElementById('csOverlay'); if(ov && ov.style.display==='flex') closeCs(); }
+  });
 
 </script>
 {% endblock %}
