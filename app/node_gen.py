@@ -671,7 +671,16 @@ services:
     restart: always
     # 以 root 启动：官方 entrypoint 会先把数据目录 chown 给 mysql，再 gosu 降权运行 mariadbd。
     # 规避 UBI 构建默认 USER=mysql(uid 999) 时宿主数据目录属主为 root 导致的 Errcode 13。
+    # 入口前先修一次统一日志目录属主（宿主挂载目录默认 root:root，mariadbd 写不了 error.log），
+    # 把原本独立的 init-logs 一次性容器职责合并进来，避免 restart:no + depends_on
+    # service_completed_successfully 在 docker compose down/up 重建时卡住、导致节点起不来。
     user: "0:0"
+    entrypoint:
+      - sh
+      - -c
+      - "chown -R 999:999 /var/log/custos-ha 2>/dev/null || chmod -R 777 /var/log/custos-ha 2>/dev/null; exec $@"
+      - wrap
+      - /usr/local/bin/docker-entrypoint.sh
     environment:
       MARIADB_ROOT_PASSWORD: "{root_pass}"
       # 全站统一中国时间：节点 NOW()/日志时间均为北京时间(UTC+8)
@@ -706,23 +715,10 @@ services:
       timeout: 5s
       retries: 12
       start_period: 60s
-    depends_on:
-      init-logs:
-        condition: service_completed_successfully
 
-  # 一次性初始化：把统一日志目录的属主改为容器内 mysql(uid 999)——同 MySQL 形态的原因，
-  # 宿主挂载目录默认 root:root，mysqld 写不了 error.log 会直接启动失败。
-  init-logs:
-    image: {image}
-    container_name: custos-init-logs
-    user: "0:0"
-    entrypoint:
-      - sh
-      - -c
-      - "chown -R 999:999 /var/log/custos-ha && chmod 0755 /var/log/custos-ha && echo logs-dir-ready"
-    volumes:
-      - {_log_dir_host(data_dir)}:/var/log/custos-ha:z
-    restart: "no"
+  # （日志目录属主修正已合并进上面的 mariadb 服务入口；取消独立 init-logs 容器，
+  #  避免 docker compose down/up 重建时 restart:no + depends_on 卡住节点。）
+
 
   keepalived:
     image: {KEEPALIVED_IMAGE_NAME}:{PKG_VERSION}
@@ -827,6 +823,27 @@ mkdir -p "$LOG_DIR"
 {chown_line}
 chmod 0755 "$LOG_DIR"
 echo "OK: $LOG_DIR ready -> $(stat -c '%U:%G %a' "$LOG_DIR" 2>/dev/null || echo unknown)"
+"""
+
+def render_update_node():
+    """节点更新/重装脚本（纯 compose，保留数据与日志目录）。
+
+    等价于 `docker compose down && docker compose up -d`：停掉并移除现有容器，
+    再按当前目录最新的部署文件重新拉起。管理器随后在数分钟内自动自愈
+    （账号 / 复制 / 半同步），无需手动干预。
+    """
+    return r"""#!/bin/sh
+# 自动生成：节点更新 / 重装（纯 compose，数据保留）
+# 用法： cd <节点目录> && sh update-node.sh
+# 行为：停止并移除现有容器（保留数据卷 / 绑定目录）→ 重新拉起 →
+#       管理器在数分钟内自动自愈（账号 / 复制 / 半同步），无需手动干预。
+set -e
+cd "$(dirname "$0")"
+echo "[update-node] 停止并移除现有容器（保留数据与日志目录）..."
+docker compose down
+echo "[update-node] 重新拉起节点..."
+docker compose up -d
+echo "[update-node] 完成。节点将在数十秒内启动，管理器自动自愈复制与半同步。"
 """
 
 
@@ -1384,6 +1401,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     _write(d / "custos-ha-logrotate.conf", render_logrotate_conf(), mode=0o644)
     _write(d / "prepare-logs.sh",
            render_prepare_logs(node_type, _log_dir_host(_data_dir_for_log)), mode=0o755)
+    _write(d / "update-node.sh", render_update_node(), mode=0o755)
 
     # 6) 登记到 nodes 表 + hosts 表（供监控自动接入）
     #    compose_path 记录「宿主机路径」（便于 Web 展示与到目标主机执行），
