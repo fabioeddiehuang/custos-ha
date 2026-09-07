@@ -29,7 +29,7 @@ from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
                        sync_node_creds, render_fix_node_creds_sql,
                        render_fix_node_creds_sql_mariadb)
 from .clusters import list_clusters, validate_node_version, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
-from .alerts import send_alert, last_error
+from .alerts import send_alert, last_error, smtp_view
 from .ha_client import (connect, heal_replication, heal_io_gtid_gap, heal_io_auth,
                        get_status, make_slave_of,
                        fix_node_mysql_params, reset_replication_creds_on_master,
@@ -970,11 +970,9 @@ def _load_alert_emails():
 @app.get("/settings")
 def settings_page(request: Request, user=Depends(auth_required), msg: str = "", error: str = ""):
     """服务端配置：SMTP 与多邮箱告警。各集群的管理/复制账号与密码请在「集群管理」中设置。"""
-    cfg = dict(
-        smtp_host=get_setting("SMTP_HOST") or "",
-        smtp_port=get_setting("SMTP_PORT") or "",
-        smtp_user=get_setting("SMTP_USER") or "",
-    )
+    # 用 smtp_view()：与发信口径(_cfg)一致，DB 优先 + 环境变量回退。
+    # 原写法只读 DB，导致「用环境变量配 SMTP」时邮件能发、页面却显示未配置。
+    cfg = smtp_view()
     alert_emails = _load_alert_emails()
     clusters = [{"id": c["id"], "name": c.get("name") or f"集群{c['id']}"}
                 for c in list_clusters()]
@@ -1022,6 +1020,7 @@ def settings_save(
     smtp_port: str = Form(""),
     smtp_user: str = Form(""),
     smtp_pass: str = Form(""),
+    smtp_from: str = Form(""),
     check_interval: str = Form(""),
     manager_ip: str = Form(""),
     # 高级切换 / 监控（全局；未传则不改动，避免覆盖）
@@ -1041,11 +1040,22 @@ def settings_save(
     failover_cooldown_sec: str = Form(""),
     user=Depends(auth_required),
 ):
-    upsert_setting("SMTP_HOST", smtp_host.strip())
-    upsert_setting("SMTP_PORT", smtp_port.strip())
-    upsert_setting("SMTP_USER", smtp_user.strip())
+    # SMTP：【仅当表单实际提交且非空】才写入。
+    # 原因：/settings 是多个表单（SMTP / 管理器IP与轮询 / 高级切换）共用的提交端点，
+    # 而 saveMgr()/saveAdv() 只提交各自字段，smtp_* 取 Form("") 默认空串。此前无条件
+    # upsert 会把已保存的 SMTP 配置【静默清空】——生产上表现为「明明配过，却显示未配置」。
+    # 与 SMTP_PASS 既有的「留空保持原密码」语义保持一致。
+    if smtp_host.strip():
+        upsert_setting("SMTP_HOST", smtp_host.strip())
+    if smtp_port.strip():
+        upsert_setting("SMTP_PORT", smtp_port.strip())
+    if smtp_user.strip():
+        upsert_setting("SMTP_USER", smtp_user.strip())
     if smtp_pass.strip():
         upsert_setting("SMTP_PASS", smtp_pass.strip())
+    # 发件人地址（可选）：留空则发信时回退到 SMTP_USER
+    if smtp_from.strip():
+        upsert_setting("SMTP_FROM", smtp_from.strip())
     # 监控轮询间隔（秒）：动态生效，monitor 循环每次读取
     ci = (check_interval or "").strip()
     if ci:
@@ -1996,11 +2006,9 @@ def api_term_complete(cluster_id: int = Form(...), host: str = Form(...), port: 
 @app.get("/alerts")
 def alerts_page(request: Request, user=Depends(auth_required), msg: str = "", error: str = ""):
     """告警设置：SMTP 状态、告警规则、收件人、当前告警集中管理。"""
-    cfg = dict(
-        smtp_host=get_setting("SMTP_HOST") or "",
-        smtp_port=get_setting("SMTP_PORT") or "",
-        smtp_user=get_setting("SMTP_USER") or "",
-    )
+    # 用 smtp_view()：与发信口径(_cfg)一致，DB 优先 + 环境变量回退。
+    # 原写法只读 DB，导致「用环境变量配 SMTP」时邮件能发、页面却显示未配置。
+    cfg = smtp_view()
     alert_emails = _load_alert_emails()
     clusters = [{"id": c["id"], "name": c.get("name") or f"集群{c['id']}"} for c in list_clusters()]
     rules = {

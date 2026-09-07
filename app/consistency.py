@@ -42,14 +42,19 @@ def _connect(host, port, user, pwd):
 
 def _fetch_tables(conn, max_rows=None):
     """列出业务表 [(schema, table, rows)]，按行数升序（小表先比对，快出结果）。"""
+    # 占位符数量必须随 SYSTEM_DBS【动态生成】：此前硬编码 4 个 %s，而 SYSTEM_DBS
+    # 后来扩展到 6 项（新增 ha_local / custos），参数个数与占位符个数不符 ->
+    # pymysql 抛 "not all arguments converted during string formatting"，
+    # 一致性校验直接失败。动态生成后，今后增删 SYSTEM_DBS 都不会再犯。
+    ph = ", ".join(["%s"] * len(SYSTEM_DBS))
     sql = ("SELECT table_schema, table_name, COALESCE(table_rows, 0) AS n "
            "FROM information_schema.tables "
-           "WHERE table_type='BASE TABLE' AND table_schema NOT IN (%s,%s,%s,%s)")
+           f"WHERE table_type='BASE TABLE' AND table_schema NOT IN ({ph})")
     if max_rows is not None:
         sql += " AND COALESCE(table_rows,0) <= %s"
-        args = SYSTEM_DBS + (int(max_rows),)
+        args = tuple(SYSTEM_DBS) + (int(max_rows),)
     else:
-        args = SYSTEM_DBS
+        args = tuple(SYSTEM_DBS)
     sql += " ORDER BY n"
     with conn.cursor() as cur:
         cur.execute(sql, args)

@@ -52,7 +52,7 @@
     <div class="smtp-grid">
       <label class="smtp-field"><span>SMTP 主机</span><input id="smtpHost" placeholder="smtp.example.com" value="{{ cfg.smtp_host }}"></label>
       <label class="smtp-field"><span>SMTP 端口</span><input id="smtpPort" placeholder="465 / 587" value="{{ cfg.smtp_port }}"></label>
-      <label class="smtp-field"><span>发件人地址</span><input id="smtpFrom" placeholder="noreply@example.com" value="{{ cfg.smtp_user }}"></label>
+      <label class="smtp-field"><span>发件人地址</span><input id="smtpFrom" placeholder="留空则与 SMTP 用户名相同" value="{{ cfg.smtp_from }}"></label>
       <label class="smtp-field"><span>SMTP 用户名</span><input id="smtpUser" value="{{ cfg.smtp_user }}"></label>
       <label class="smtp-field"><span>SMTP 密码</span><input id="smtpPass" type="password" placeholder="留空保持原密码"></label>
       <label class="smtp-field"><span>启用 TLS</span><label class="switch"><input type="checkbox" id="smtpTls"><span class="slider"></span></label></label>
@@ -200,14 +200,27 @@
 
   // ---- SMTP ----
   function toggleSmtpForm(){var f=document.getElementById("smtpForm");f.style.display=(f.style.display==="none")?"block":"none";}
+  // 保存后立即刷新徽章：此前只弹 toast，既不刷新页面也不更新 #smtpResult，
+  // 刚配好 SMTP 徽章却仍显示「未配置 SMTP」，很容易被误判成"没保存上"。
+  function setSmtpBadge(host){
+    var el=document.getElementById("smtpResult"); if(!el) return;
+    var ok=!!(host&&String(host).trim());
+    el.textContent=ok?"✓ 已配置 SMTP":"未配置 SMTP";
+    el.className="badge "+(ok?"ok":"down");
+  }
   function saveSmtp(){
+    var host=document.getElementById("smtpHost").value;
     apiPost("/settings",{
-      smtp_host:document.getElementById("smtpHost").value,
+      smtp_host:host,
       smtp_port:document.getElementById("smtpPort").value,
       smtp_user:document.getElementById("smtpUser").value,
+      smtp_from:document.getElementById("smtpFrom").value,
       smtp_pass:document.getElementById("smtpPass").value,
       smtp_tls:document.getElementById("smtpTls").checked?"1":"0"
-    },function(d){toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");});
+    },function(d){
+      toast(d.msg||(d.ok?"已保存":"保存失败"),d.ok?"ok":"err");
+      if(d&&d.ok)setSmtpBadge(host);
+    });
   }
   function testSmtp(){
     apiPost("/settings/test_email",{

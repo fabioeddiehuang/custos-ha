@@ -20,6 +20,25 @@ def _cfg():
         port=int(get_setting("SMTP_PORT") or env("SMTP_PORT") or 25),
         user=get_setting("SMTP_USER") or env("SMTP_USER"),
         passwd=get_setting("SMTP_PASS") or env("SMTP_PASS"),
+        # 独立发件人地址（可选）：部分中继（如 API-Key 登录的 SendGrid/阿里云邮件推送）
+        # 登录名与发件人并不相同，必须能单独指定；留空则回退到 SMTP_USER。
+        frm=get_setting("SMTP_FROM") or env("SMTP_FROM"),
+    )
+
+
+def smtp_view():
+    """供页面展示的「生效 SMTP 配置」：口径必须与 _cfg() 一致（DB 优先、env 回退）。
+
+    此前 /settings 与 /alerts 两个页面直接用 get_setting(...) 组装 cfg，**没有 env 回退**，
+    而真正发信的 _cfg() 是 `get_setting(...) or env(...)`。于是在【用环境变量配置 SMTP】
+    的部署上会出现：邮件其实能正常发出，但页面徽章恒显示「未配置 SMTP」——即
+    「展示口径」与「运行口径」不一致导致的假告警。统一走本函数即可消除该歧义。
+    """
+    return dict(
+        smtp_host=(get_setting("SMTP_HOST") or env("SMTP_HOST") or "").strip(),
+        smtp_port=str(get_setting("SMTP_PORT") or env("SMTP_PORT") or "").strip(),
+        smtp_user=(get_setting("SMTP_USER") or env("SMTP_USER") or "").strip(),
+        smtp_from=(get_setting("SMTP_FROM") or env("SMTP_FROM") or "").strip(),
     )
 
 
@@ -117,7 +136,7 @@ def send_alert(subject, body, cluster_id=None, recipients=None, force=False):
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = f"[MySQL-HA] {subject}"
-        msg["From"] = c["user"] or c["host"]
+        msg["From"] = c["frm"] or c["user"] or c["host"]
         msg["To"] = ", ".join(recipients)
         port = int(c["port"] or 25)
         if port == 465:
