@@ -675,12 +675,17 @@ services:
     # 把原本独立的 init-logs 一次性容器职责合并进来，避免 restart:no + depends_on
     # service_completed_successfully 在 docker compose down/up 重建时卡住、导致节点起不来。
     user: "0:0"
+    # 关键：Docker Compose v2 在用【列表】覆盖 entrypoint 时不会把镜像默认 CMD(mariadbd)
+    # 追加进来，若这里只写官方入口而不带 mariadbd，最终 exec 拿到空参数 -> 入口 _main
+    # 落到末尾 `exec "$@"`(空) -> 立即退出码 0、零日志、容器 Restarting 卡死。
+    # 故把 mariadbd 显式写进 entrypoint 数组，确保 $@ 始终含 mariadbd（不再依赖被丢弃的 CMD）。
     entrypoint:
       - sh
       - -c
       - "chown -R 999:999 /var/log/custos-ha 2>/dev/null || chmod -R 777 /var/log/custos-ha 2>/dev/null; exec $@"
       - wrap
       - /usr/local/bin/docker-entrypoint.sh
+      - mariadbd
     environment:
       MARIADB_ROOT_PASSWORD: "{root_pass}"
       # 全站统一中国时间：节点 NOW()/日志时间均为北京时间(UTC+8)
