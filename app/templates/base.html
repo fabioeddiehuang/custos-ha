@@ -97,7 +97,10 @@
            未指定时由下面的脚本按当前菜单自动填充。 -->
       <h1 id="pageTitle">{% block page_title %}{% endblock %}</h1>
       <div class="user">
-        <span>admin@internal</span>
+        <!-- 显示真实登录用户名：此前写死 admin@internal，任何人登录都显示同一个名字。
+             user 由各视图 render(..., user=user) 传入，登录态即用户名字符串
+             （登录时 serializer.dumps(username)）；此处兼容 dict 形态，取不到显示「未登录」。 -->
+        <span>{% if user is mapping %}{{ user.get('username') or '未登录' }}{% else %}{{ user or '未登录' }}{% endif %}</span>
         <!-- 主题切换入口 -->
         <div class="theme-wrap">
           <button class="theme-btn" id="themeBtn" onclick="toggleThemeMenu(event)" title="主题切换" aria-haspopup="true">

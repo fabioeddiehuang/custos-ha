@@ -29,6 +29,10 @@
   .adv-num input{width:90px;font-family:var(--mono)}
   .adv-num .unit{font-size:12px;color:var(--muted)}
   .adv-danger{color:#fb7185;font-weight:600}
+  /* 层级排版：子项缩进 + 左侧引导线，直观表达「谁依赖谁」 */
+  .adv-sub{margin-left:20px;padding-left:14px;border-left:2px solid var(--border)}
+  .adv-sub2{margin-left:40px;padding-left:14px;border-left:2px solid var(--border)}
+  .adv-dep{font-size:11.5px;color:#fbbf24;line-height:1.5;margin-top:2px}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -66,9 +70,59 @@
   <div class="adv-row">
     <div class="adv-info">
       <span class="adv-title">自动切换（主库失联）</span>
-      <span class="adv-desc">主库探活连续失败达阈值时，自动把最优从库提为主。默认开启。</span>
+      <span class="adv-desc">主库探活连续失败达阈值时，自动把最优从库提为主。默认开启。<b>（它同时是下方「延迟切换 / 压力切换」的总开关：关闭时那两项一律不生效。）</b></span>
     </div>
     <label class="adv-switch"><input type="checkbox" id="afAuto" {% if adv.auto_failover %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row adv-sub">
+    <div class="adv-info">
+      <span class="adv-title"><span class="adv-danger">⚠ 延迟切换</span></span>
+      <span class="adv-desc">多数从库复制延迟持续 ≥ 阈值秒数、且连续达指定周期数时，自动把延迟最小的从库提为主。</span>
+      <span class="adv-dep">↳ 受上方「自动切换」总开关约束：自动切换关闭时本项静默不生效。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afLag" {% if adv.lag_failover %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row adv-sub2">
+    <div class="adv-info">
+      <span class="adv-title">延迟切换阈值</span>
+      <span class="adv-desc">LAG_FAILOVER_SEC：触发延迟切换的复制延迟秒数。</span>
+    </div>
+    <div class="adv-num"><input id="afLagSec" value="{{ adv.lag_failover_sec }}"><span class="unit">秒</span></div>
+  </div>
+
+  <div class="adv-row adv-sub2">
+    <div class="adv-info">
+      <span class="adv-title">延迟切换连续周期</span>
+      <span class="adv-desc">LAG_FAILOVER_CYCLES：需连续成立的轮询周期数（防大事务瞬时抖动）。</span>
+    </div>
+    <div class="adv-num"><input id="afLagCyc" value="{{ adv.lag_failover_cycles }}"><span class="unit">周期</span></div>
+  </div>
+
+  <div class="adv-row adv-sub">
+    <div class="adv-info">
+      <span class="adv-title"><span class="adv-danger">⚠ 压力切换</span></span>
+      <span class="adv-desc">主库压力持续超阈值（Threads_running ≥ 阈值 或 行锁等待 ≥ 阈值）且连续 3 个周期成立时，自动把压力最低的从库提为主。</span>
+      <span class="adv-dep">↳ 受上方「自动切换」总开关约束：自动切换关闭时本项静默不生效。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afPrs" {% if adv.pressure_failover %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row adv-sub2">
+    <div class="adv-info">
+      <span class="adv-title">压力-Threads_running 阈值</span>
+      <span class="adv-desc">PRESSURE_THREADS_RUNNING：主库并发线程数超此值视为高压。</span>
+    </div>
+    <div class="adv-num"><input id="afPrsThr" value="{{ adv.pressure_threads_running }}"><span class="unit">线程</span></div>
+  </div>
+
+  <div class="adv-row adv-sub2">
+    <div class="adv-info">
+      <span class="adv-title">压力-行锁等待阈值</span>
+      <span class="adv-desc">PRESSURE_ROW_LOCK_WAITS：行锁等待次数超此值视为高压。</span>
+    </div>
+    <div class="adv-num"><input id="afPrsLock" value="{{ adv.pressure_row_lock_waits }}"><span class="unit">次/周期</span></div>
   </div>
 
   <div class="adv-row">
@@ -77,22 +131,6 @@
       <span class="adv-desc">高延迟从库自动摘流量并触发修复；账号/配置漂移在轮询中自动校正。</span>
     </div>
     <label class="adv-switch"><input type="checkbox" id="afRepair" {% if adv.auto_repair %}checked{% endif %}><span class="adv-slider"></span></label>
-  </div>
-
-  <div class="adv-row">
-    <div class="adv-info">
-      <span class="adv-title"><span class="adv-danger">⚠ 延迟切换</span></span>
-      <span class="adv-desc">多数从库复制延迟持续 ≥ LAG_FAILOVER_SEC 且连续 LAG_FAILOVER_CYCLES 个周期成立时，自动把延迟最小的从库提为主。</span>
-    </div>
-    <label class="adv-switch"><input type="checkbox" id="afLag" {% if adv.lag_failover %}checked{% endif %}><span class="adv-slider"></span></label>
-  </div>
-
-  <div class="adv-row">
-    <div class="adv-info">
-      <span class="adv-title"><span class="adv-danger">⚠ 压力切换</span></span>
-      <span class="adv-desc">主库压力持续超阈值（Threads_running ≥ 阈值 或 行锁等待 ≥ 阈值）且连续 3 个周期成立时，自动把压力最低的从库提为主。</span>
-    </div>
-    <label class="adv-switch"><input type="checkbox" id="afPrs" {% if adv.pressure_failover %}checked{% endif %}><span class="adv-slider"></span></label>
   </div>
 
   <div class="adv-row">
@@ -113,58 +151,27 @@
 
   <div class="adv-row">
     <div class="adv-info">
-      <span class="adv-title"><span class="adv-danger">⚠ binlog 自动清理</span></span>
-      <span class="adv-desc">主库 binlog 超过告警阈值且<b>所有从库都已追平</b>（在线、IO/SQL 双 Yes、延迟 0）时，自动清理超过保留时长的 binlog。仅在全部从库追平时才执行，避免误删导致从库报 1236。默认关闭，只告警不清理。</span>
-    </div>
-    <label class="adv-switch"><input type="checkbox" id="afPurge" {% if adv.auto_purge_binlog %}checked{% endif %}><span class="adv-slider"></span></label>
-  </div>
-
-  <div class="adv-row">
-    <div class="adv-info">
       <span class="adv-title">binlog 占用告警阈值</span>
-      <span class="adv-desc">主库 binlog 总占用超过此值即告警（远程节点无 OS 磁盘指标，此处用 SHOW BINARY LOGS 求和）。</span>
+      <span class="adv-desc">主库 binlog 总占用超过此值即<b>告警</b>（远程节点无 OS 磁盘指标，此处用 SHOW BINARY LOGS 求和）。<b>仅告警，与下方自动清理互不影响。</b></span>
     </div>
     <div class="adv-num"><input id="afBinlogMb" value="{{ adv.binlog_alert_mb }}"><span class="unit">MB</span></div>
   </div>
 
   <div class="adv-row">
     <div class="adv-info">
+      <span class="adv-title"><span class="adv-danger">⚠ binlog 自动清理</span></span>
+      <span class="adv-desc">开启后，<b>每个监控轮询周期</b>都会检查一次：仅当<b>所有从库都已追平</b>（在线、IO/SQL 双 Yes、延迟 0）时，才清理超过下方保留时长的 binlog。默认关闭（只告警不清理）。</span>
+    </div>
+    <label class="adv-switch"><input type="checkbox" id="afPurge" {% if adv.auto_purge_binlog %}checked{% endif %}><span class="adv-slider"></span></label>
+  </div>
+
+  <div class="adv-row adv-sub">
+    <div class="adv-info">
       <span class="adv-title">binlog 保留时长</span>
-      <span class="adv-desc">自动清理时保留最近多少小时的 binlog（仅在「binlog 自动清理」开启且从库全部追平时生效）。</span>
+      <span class="adv-desc">自动清理时保留最近多少小时的 binlog（早于该时间的会被 PURGE）。</span>
+      <span class="adv-dep">↳ 仅在上方「binlog 自动清理」开启、且所有从库已追平时才生效；关闭清理时本项无效。</span>
     </div>
     <div class="adv-num"><input id="afBinlogH" value="{{ adv.binlog_keep_hours }}"><span class="unit">小时</span></div>
-  </div>
-
-  <div class="adv-row">
-    <div class="adv-info">
-      <span class="adv-title">延迟切换阈值</span>
-      <span class="adv-desc">LAG_FAILOVER_SEC：触发延迟切换的复制延迟秒数。</span>
-    </div>
-    <div class="adv-num"><input id="afLagSec" value="{{ adv.lag_failover_sec }}"><span class="unit">秒</span></div>
-  </div>
-
-  <div class="adv-row">
-    <div class="adv-info">
-      <span class="adv-title">延迟切换连续周期</span>
-      <span class="adv-desc">LAG_FAILOVER_CYCLES：需连续成立的轮询周期数（防大事务瞬时抖动）。</span>
-    </div>
-    <div class="adv-num"><input id="afLagCyc" value="{{ adv.lag_failover_cycles }}"><span class="unit">周期</span></div>
-  </div>
-
-  <div class="adv-row">
-    <div class="adv-info">
-      <span class="adv-title">压力-Threads_running 阈值</span>
-      <span class="adv-desc">PRESSURE_THREADS_RUNNING：主库并发线程数超此值视为高压。</span>
-    </div>
-    <div class="adv-num"><input id="afPrsThr" value="{{ adv.pressure_threads_running }}"><span class="unit">线程</span></div>
-  </div>
-
-  <div class="adv-row">
-    <div class="adv-info">
-      <span class="adv-title">压力-行锁等待阈值</span>
-      <span class="adv-desc">PRESSURE_ROW_LOCK_WAITS：行锁等待次数超此值视为高压。</span>
-    </div>
-    <div class="adv-num"><input id="afPrsLock" value="{{ adv.pressure_row_lock_waits }}"><span class="unit">次/周期</span></div>
   </div>
 
   <div class="adv-row">
