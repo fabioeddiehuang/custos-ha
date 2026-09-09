@@ -1,0 +1,253 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# custosctl —— Custos 管理器统一命令行入口（deploy.sh 的 superset）
+#
+# 安装：sudo ./scripts/install-custosctl.sh   → 写入 /usr/bin/custosctl
+#                                               + /etc/custos/custosctl.env
+# 卸载：sudo custosctl uninstall [--purge]    → 同时删除 /usr/bin/custosctl
+#
+# 项目目录（docker compose 上下文）按以下顺序确定：
+#   1) 环境变量 CUSTOS_HOME
+#   2) /etc/custos/custosctl.env 中的 CUSTOS_HOME（安装时写入）
+#   3) 常见安装路径探测（/opt/Custos-HA 等）
+#   4) 当前目录（若含 docker-compose.yml）
+#
+# 版本号唯一来源：.env 的 VERSION=。
+# 未识别的子命令原样透传给 docker compose（保持与 deploy.sh 兼容）。
+# ---------------------------------------------------------------------------
+set -eu
+
+PROG=$(basename "$0")
+SVC=custos-server
+CONF=${CUSTOS_CONF:-/etc/custos/custosctl.env}
+
+# ---- 1. 定位项目目录 ----
+[ -r "$CONF" ] && . "$CONF" || true
+if [ -z "${CUSTOS_HOME:-}" ]; then
+  for d in /opt/Custos-HA /opt/custos /srv/Custos-HA "$HOME/Custos-HA"; do
+    if [ -f "$d/docker-compose.yml" ]; then CUSTOS_HOME=$d; break; fi
+  done
+fi
+if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
+  if [ -f "./docker-compose.yml" ]; then
+    CUSTOS_HOME=$(pwd)
+  else
+    echo "错误：找不到 Custos 项目目录（需含 docker-compose.yml）。" >&2
+    echo "请在 $CONF 中设置 CUSTOS_HOME=<项目目录>，或 cd 到项目目录后执行。" >&2
+    exit 1
+  fi
+fi
+cd "$CUSTOS_HOME"
+
+# ---- 2. 环境校验（沿用 deploy.sh 的中文提示）----
+ENV_FILE=".env"
+if [ ! -f "$ENV_FILE" ]; then
+  if [ -f "env.example" ]; then
+    cp env.example .env
+    echo "提示：未找到 .env，已由 env.example 生成，请按需修改后再部署。" >&2
+  else
+    echo "错误：找不到 $ENV_FILE，也没有 env.example 模板。" >&2
+    exit 1
+  fi
+fi
+VERSION=$(grep -E '^VERSION=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \t\r\n')
+if [ -z "$VERSION" ]; then
+  echo "错误：$ENV_FILE 中未找到 VERSION=，请先设置版本号。" >&2
+  exit 1
+fi
+export VERSION
+
+if [ ! -f "Dockerfile" ]; then
+  echo "错误：项目目录中找不到 Dockerfile（$CUSTOS_HOME）。" >&2
+  echo "请确认已完整检出（Dockerfile / docker-entrypoint.sh / requirements.txt / app/）。" >&2
+  exit 1
+fi
+
+COMPOSE="docker compose"
+
+# Web 端口：优先 .env，其次 docker-compose.yml，最后默认 28888
+web_port() {
+  p=$(grep -E '^ *WEB_PORT=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \t\r\n"'"'"'')
+  [ -n "$p" ] || p=$(grep -oE 'WEB_PORT: *"?[0-9]+' docker-compose.yml 2>/dev/null | head -1 | grep -oE '[0-9]+')
+  echo "${p:-28888}"
+}
+
+usage() {
+  cat <<EOF
+用法: $PROG <命令> [参数]
+
+部署 / 生命周期
+  deploy|up [-d] [--build]   构建并后台启动（默认命令；--build 强制重建镜像）
+  rebuild                    重建管理器镜像并重启（= deploy --build，最常用）
+  start                      启动已存在的容器（不重建、不删容器）
+  stop                       停止容器（保留容器与数据）
+  restart                    重启容器（不重建镜像）
+  down [--volumes]           停止并移除容器（--volumes 连匿名卷一起删）
+
+查看 / 排障
+  status                     版本 + 容器状态 + 启动时间 + Web 端口探活
+  ps                         容器列表（等价 docker compose ps）
+  tail [-n N] [--no-follow]  跟踪管理器日志（默认 -n 200 并跟随）
+  logs                       tail 的别名
+  shell                      进入管理器容器
+  version                    显示当前版本（读 .env）
+
+节点运维
+  rebuild-node --host IP --port 3306 --cluster ID
+                             触发从库在线重建（走管理器 API，等同界面「重建」）
+
+安装 / 卸载
+  install                    安装自身到 /usr/bin/custosctl（需 root）
+  uninstall [--purge]        卸载管理器：停并移除容器、删除 /usr/bin/custosctl
+                             --purge 额外删除本项目镜像与匿名卷
+                             默认【不删除】backups/ data/ generated_nodes，也【不动被管节点】
+
+其他
+  help                       显示本帮助
+  <任意 docker compose 子命令>  原样透传（如 $PROG config、$PROG images）
+
+示例
+  sudo $PROG rebuild                 # 改完 app/ 代码后必须执行
+  $PROG status
+  $PROG tail -n 500
+  $PROG rebuild-node --host 192.0.2.13 --port 3306 --cluster 1
+EOF
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift || true
+
+case "$cmd" in
+  ""|help|-h|--help)
+    usage
+    ;;
+
+  version|--version|-v)
+    echo "$VERSION"
+    ;;
+
+  deploy|up)
+    mode="up -d"
+    for a in "$@"; do
+      case "$a" in
+        --build|-b) mode="up -d --build" ;;
+      esac
+    done
+    echo "==> 版本 $VERSION（来源 $ENV_FILE）"
+    exec $COMPOSE $mode $SVC
+    ;;
+
+  # 「重建」在本项目里是高频词，统一指【重建管理器镜像并重启】；
+  # 从库数据重建请用 rebuild-node，避免歧义。
+  rebuild)
+    echo "==> 重建管理器镜像 版本 $VERSION"
+    exec $COMPOSE up -d --build $SVC
+    ;;
+
+  start)
+    exec $COMPOSE start $SVC
+    ;;
+
+  stop)
+    exec $COMPOSE stop $SVC
+    ;;
+
+  restart)
+    exec $COMPOSE restart $SVC
+    ;;
+
+  down)
+    exec $COMPOSE down "$@"
+    ;;
+
+  ps)
+    exec $COMPOSE ps
+    ;;
+
+  tail|logs)
+    n=200
+    follow=1
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -n|--lines)   n=${2:-200}; shift 2 || true ;;
+        --no-follow)  follow=0; shift ;;
+        *)            break ;;
+      esac
+    done
+    if [ "$follow" = "1" ]; then
+      exec $COMPOSE logs -f --tail="$n" $SVC
+    else
+      exec $COMPOSE logs --tail="$n" $SVC
+    fi
+    ;;
+
+  shell)
+    exec $COMPOSE exec $SVC sh
+    ;;
+
+  status)
+    echo "版本      : $VERSION"
+    echo "项目目录  : $CUSTOS_HOME"
+    echo "服务      : $SVC"
+    st=$(docker inspect -f '{{.State.Status}}' $SVC 2>/dev/null || echo "未运行/不存在")
+    up=$(docker inspect -f '{{.State.StartedAt}}' $SVC 2>/dev/null || echo "-")
+    echo "容器状态  : $st"
+    echo "启动时间  : $up （UTC，+8 为北京时间）"
+    $COMPOSE ps || true
+    p=$(web_port)
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$p/login" 2>/dev/null || echo "-")
+    echo "管理端    : http://127.0.0.1:$p  （HTTP $code）"
+    ;;
+
+  rebuild-node)
+    n_host=""
+    n_port=3306
+    n_cid=""
+    n_url="http://127.0.0.1:$(web_port)"
+    n_user=$(grep -E '^ *WEB_USER=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \t\r\n"'"'"'')
+    n_pass=$(grep -E '^ *WEB_PASS=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \t\r\n"'"'"'')
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --host)    n_host=$2; shift 2 ;;
+        --port)    n_port=$2; shift 2 ;;
+        --cluster) n_cid=$2;  shift 2 ;;
+        --url)     n_url=$2;  shift 2 ;;
+        --user)    n_user=$2; shift 2 ;;
+        --pass)    n_pass=$2; shift 2 ;;
+        *) echo "未知参数：$1（rebuild-node 支持 --host --port --cluster --url --user --pass）" >&2; exit 1 ;;
+      esac
+    done
+    if [ -z "$n_host" ] || [ -z "$n_cid" ]; then
+      echo "用法：$PROG rebuild-node --host <节点IP> --cluster <集群ID> [--port 3306]" >&2
+      exit 1
+    fi
+    command -v curl >/dev/null 2>&1 || { echo "错误：需要 curl 才能调用管理器 API。" >&2; exit 1; }
+    ck=$(mktemp)
+    # 登录拿会话 cookie
+    curl -sS -c "$ck" -o /dev/null -X POST \
+      -d "username=$n_user" -d "password=$n_pass" "$n_url/login" || {
+        echo "登录管理器失败（检查 .env 的 WEB_USER/WEB_PASS 或 --url）" >&2; rm -f "$ck"; exit 1; }
+    res=$(curl -sS -b "$ck" -X POST \
+      -d "cluster_id=$n_cid" -d "host=$n_host" -d "port=$n_port" \
+      "$n_url/api/node/rebuild") || res=""
+    rm -f "$ck"
+    echo "$res"
+    case "$res" in
+      *'"ok":true'*|*'"ok": true'*) echo "已提交重建任务（$n_host:$n_port）；进度见界面右下角或 $PROG tail" ;;
+      *) echo "提交失败：请检查集群/节点是否正确、该节点是否为非主库节点。" >&2; exit 1 ;;
+    esac
+    ;;
+
+  install)
+    exec sh "$CUSTOS_HOME/scripts/install-custosctl.sh" "$@"
+    ;;
+
+  uninstall)
+    exec sh "$CUSTOS_HOME/scripts/uninstall.sh" "$@"
+    ;;
+
+  *)
+    # 未识别：原样透传给 docker compose（兼容 deploy.sh 的用法）
+    exec $COMPOSE "$cmd" "$@"
+    ;;
+esac
