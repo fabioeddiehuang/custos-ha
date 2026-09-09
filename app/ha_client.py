@@ -1452,12 +1452,14 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                         f"compat:{e2})")
         # 双保险：ha_local 是节点本地状态表，不参与复制（写时已 SET sql_log_bin=0）。
         # 再从库侧加复制过滤，确保即便有遗漏也不会因 ha_local 事件 1062 卡死复制。
-        # 注意：MySQL 8.0 语法为 `REPLICATE_IGNORE_DB = (db)`，MariaDB 12.x 为
-        # `REPLICATE_IGNORE_DB=(db)`（无空格），必须走 mysql_compat 分支函数，不可硬编码。
-        try:
-            cur.execute(change_replication_filter_sql(["ha_local"], flavour=flavour))
-        except Exception as e_flt:
-            print(f"[repl] 设置 REPLICATE_IGNORE_DB=ha_local 失败(可忽略): {e_flt}")
+        # 仅 MySQL 支持 CHANGE REPLICATION FILTER；MariaDB 无此语句（返回 None），
+        # 直接跳过——否则每次重链都刷一条 1064 语法错误日志。
+        _flt_sql = change_replication_filter_sql(["ha_local"], flavour=flavour)
+        if _flt_sql:
+            try:
+                cur.execute(_flt_sql)
+            except Exception as e_flt:
+                print(f"[repl] 设置 REPLICATE_IGNORE_DB=ha_local 失败(可忽略): {e_flt}")
         cur.execute(start_replication_sql(flavour))
         # 从库设为只读，避免双写脑裂：仅当前主库可写。
         try:

@@ -269,16 +269,22 @@ def show_replicas_sql(flavour):
 
 
 def change_replication_filter_sql(ignore_dbs, channel=None, flavour=None):
-    """REPLICATE_IGNORE_DB 新旧语法通用。
+    """动态复制过滤 REPLICATE_IGNORE_DB。**仅 MySQL 支持**，MariaDB 返回 None。
 
-    关键差异：
-      - MariaDB 12.x：语法为 ``REPLICATE_IGNORE_DB=(db)``（**无空格**，有空格报 1064）。
-      - MySQL 8.0：语法为 ``REPLICATE_IGNORE_DB = (db)``（**有空格**，与官方文档一致）。
-    故必须按 flavour 区分等号两侧空格，否则另一系会报语法错。
+    【重要更正】此前注释称「MariaDB 12.x 为无空格写法」是**错的**：MariaDB **根本
+    没有** `CHANGE REPLICATION FILTER` 语句（动态复制过滤是 MySQL 独有；MariaDB 的
+    `replicate_ignore_db` 只能写在配置文件里、不可运行期设置）。结果 MariaDB 节点上
+    每次 `make_slave_of` 都恒报 1064：
+        You have an error in your SQL syntax ... near 'REPLICATION FILTER REPLICATE_IGNORE_DB=(ha_local)'
+    虽被 except 兜住不影响主流程，但日志刷屏且过滤器其实从未生效。
+
+    MariaDB 侧无需该兜底：`ha_local` 的写入已用 `SET SESSION sql_log_bin=0`
+    （见 `set_local_master_flag`），本就不会进 binlog、不会被复制。
     """
-    sep = "=" if flavour == F_MARIADB else " = "
+    if flavour == F_MARIADB:
+        return None
     dbs = ",".join(f"({d})" for d in (ignore_dbs or []))
-    return f"CHANGE REPLICATION FILTER REPLICATE_IGNORE_DB{sep}{dbs}{_ch(channel)}"
+    return f"CHANGE REPLICATION FILTER REPLICATE_IGNORE_DB = {dbs}{_ch(channel)}"
 
 
 def parse_gtid_set(gtid_text, flavour=None):

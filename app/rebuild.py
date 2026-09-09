@@ -111,6 +111,81 @@ def _repl_state(ip, port, user, pwd):
             pass
 
 
+def _gtid_state(ip, port, user, pwd):
+    """读取节点 GTID 位点：MariaDB 取 gtid_binlog_pos，MySQL 8 取 gtid_executed。
+
+    返回 (flavour, gtid)，flavour ∈ {"mariadb", "mysql", ""}（空串=读取失败）。
+    """
+    conn = connect_robust(ip, port, user, pwd)
+    if not conn:
+        return "", ""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT VERSION()")
+            ver = str((cur.fetchone() or ("",))[0] or "").lower()
+            if "mariadb" in ver:
+                cur.execute("SELECT @@gtid_binlog_pos")
+                return "mariadb", str((cur.fetchone() or ("",))[0] or "")
+            cur.execute("SELECT @@gtid_executed")
+            return "mysql", str((cur.fetchone() or ("",))[0] or "")
+    except Exception as e:
+        print(f"[rebuild] 读取 {ip}:{port} GTID 位点失败(可忽略): {e}")
+        return "", ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _align_gtid_after_restore(slave_host, slave_port, sru, srp,
+                              master_host, master_port, mru, mrp):
+    """重建后把从库 GTID 位点对齐到「主库导出结束时」的位置。返回说明文本。
+
+    必要性（本次修复的根因）：
+      逻辑重建 = 主库 dump + 从库 restore（且 SET sql_log_bin=0），**不会写入从库
+      GTID 状态**。重建完的从库 gtid_slave_pos / gtid_executed 为空，以 GTID 自动
+      定位（MASTER_USE_GTID=slave_pos / MASTER_AUTO_POSITION=1）连主库时，从库相当
+      于从「时间起点」请求，而主库早期 binlog 多半已清理 → 永久报
+        1236 'Could not find GTID state requested by slave in any binlog files.
+             Probably the slave state is too old and required binlog files have been purged.'
+      表现为「重建任务显示成功，但复制还是断的，仪表盘一直显示『需重建』」。
+    处理：数据既已从主库全量恢复，就把位点设为主库导出结束时的位置，从该点续传。
+    注意：dump 期间提交的事务可能未全部进入 dump（逻辑备份无一致性快照），这部分会
+    被跳过；故重建完成后建议跑一次「一致性校验」确认。
+    """
+    flavour, m_gtid = _gtid_state(master_host, master_port, mru or "root", mrp or "")
+    if not m_gtid:
+        return "无法读取主库 GTID 位点，跳过位点对齐（若复制仍报 1236 需人工处理）"
+    conn = connect_robust(slave_host, slave_port, sru, srp)
+    if not conn:
+        return "无法连接从库，跳过位点对齐"
+    try:
+        with conn.cursor() as cur:
+            if flavour == "mariadb":
+                cur.execute("SELECT @@gtid_slave_pos")
+                s_gtid = str((cur.fetchone() or ("",))[0] or "")
+                if s_gtid:
+                    cur.execute("SELECT GTID_SUBSET(%s, %s)", (s_gtid, m_gtid))
+                    if (cur.fetchone() or (0,))[0]:
+                        return f"从库位点已是主库子集，无需对齐（{s_gtid}）"
+                cur.execute("SET GLOBAL gtid_slave_pos=%s", (m_gtid,))
+                return f"已对齐 gtid_slave_pos → 主库导出结束位点 {m_gtid}"
+            cur.execute("SELECT @@gtid_executed")
+            s_gtid = str((cur.fetchone() or ("",))[0] or "")
+            if s_gtid:
+                return f"从库已有 GTID 执行集，跳过对齐（{s_gtid}）"
+            cur.execute("SET GLOBAL gtid_purged=%s", (m_gtid,))
+            return f"已对齐 gtid_purged → 主库导出结束位点 {m_gtid}"
+    except Exception as e:
+        return f"GTID 位点对齐失败(可忽略)：{e}"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _node_root(cluster_id, host):
     rows = query("SELECT root_user, root_pass FROM nodes WHERE cluster_id=%s AND ip=%s",
                  (cluster_id, host))
@@ -158,6 +233,12 @@ def _run(task_id, cluster_id, host, port):
             err0 = (r2.get("errors") or [""])[0]
             return False, f"数据恢复失败：{r2.get('msg') or r2.get('error')} {err0}"
 
+        step(80, "对齐 GTID 复制位点…")
+        mru, mrp = _node_root(cluster_id, m_host)
+        gt_msg = _align_gtid_after_restore(host, port, root_user, root_pass,
+                                           m_host, m_port, mru, mrp)
+        print(f"[rebuild] {host}:{port} {gt_msg}")
+
         step(85, "重新建立复制链路…")
         ok, msg = make_slave_of(host, port, root_user, root_pass,
                                 m_host, m_port,
@@ -170,7 +251,8 @@ def _run(task_id, cluster_id, host, port):
         io, sq, d = _repl_state(host, port, root_user, root_pass)
         step(100, "重建完成")
         return True, (f"已从主库 {m_host}:{m_port} 重建 {host}:{port}；"
-                      f"复制线程 IO={io} SQL={sq} 延迟={d}")
+                      f"复制线程 IO={io} SQL={sq} 延迟={d}；{gt_msg}。"
+                      f"（逻辑备份无一致性快照，导出窗口内提交的事务可能未包含，建议重建后执行一次一致性校验）")
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
