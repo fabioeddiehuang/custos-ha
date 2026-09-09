@@ -114,7 +114,7 @@ custos-ha/
 
 ```bash
 cd custos-ha
-./deploy.sh                     # 等价于 docker compose up -d --build（读取 .env 的 VERSION 后构建）
+./scripts/deploy.sh                     # 等价于 docker compose up -d --build（读取 .env 的 VERSION 后构建）
 ```
 
 启动后访问：`http://<管理端IP>:28888`（默认账号 `admin` / `admin`，生产请改 `WEB_PASS`）。

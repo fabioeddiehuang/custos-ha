@@ -26,7 +26,7 @@ COPY . .
 # 此处仅把实际版本写入镜像内元数据文件，供排障时 docker exec 查阅。
 RUN ARG_VER=$(printf '%s' "${VERSION}" | tr -d '[:space:]'); \
     if [ -z "${ARG_VER}" ]; then \
-      echo "ERROR: 未提供构建参数 VERSION —— 请改用 ./deploy.sh（或 make build），它从 .env 读取后构建。" >&2; \
+      echo "ERROR: 未提供构建参数 VERSION —— 请改用 ./scripts/deploy.sh（或 make build），它从 .env 读取后构建。" >&2; \
       exit 1; \
     fi; \
     echo "VERSION=${ARG_VER}" > /app/.version.env

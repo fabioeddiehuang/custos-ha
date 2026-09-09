@@ -40,12 +40,12 @@ services:
   custos-server:
     # 容器名固定为 custos-server（服务端镜像/容器统一命名）；镜像标签用语义化版本号。
     # 版本单一来源 = .env 的 VERSION=（升版只改这一处），本文件【不写死版本号】。
-    # 构建/部署统一用 ./deploy.sh（或 make build）：它读 .env 的 VERSION 调用
+    # 构建/部署统一用 ./scripts/deploy.sh（或 make build）：它读 .env 的 VERSION 调用
     # docker compose，保证镜像标签与页面显示版本始终一致。
-    #   ./deploy.sh               # 等价于 docker compose up -d --build
-    #   ./deploy.sh logs -f       # 其余参数原样透传给 docker compose
+    #   ./scripts/deploy.sh               # 等价于 docker compose up -d --build
+    #   ./scripts/deploy.sh logs -f       # 其余参数原样透传给 docker compose
     container_name: custos-server
-    image: custos-server:${VERSION:?请先执行./deploy.sh}
+    image: custos-server:${VERSION:?请先执行./scripts/deploy.sh}
     build:
       context: .
       args:

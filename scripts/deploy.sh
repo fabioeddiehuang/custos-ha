@@ -3,14 +3,14 @@
 # Custos —— 一键构建 / 部署
 #
 # 版本单一来源：.env 的 VERSION=（升版只改这一处，不要再维护 app/VERSION）。
-#   docker-compose.yml 不写死版本号，构建/部署统一用 ./deploy.sh 调用
+#   docker-compose.yml 不写死版本号，构建/部署统一用 ./scripts/deploy.sh 调用
 #   docker compose（它自动加载 .env 取得 VERSION）。
 #
 # 用法：
-#   ./deploy.sh                 等价于 docker compose up -d --build
-#   ./deploy.sh logs -f         参数原样透传给 docker compose
-#   ./deploy.sh down            同上
-#   ./deploy.sh ps              同上
+#   ./scripts/deploy.sh                 等价于 docker compose up -d --build
+#   ./scripts/deploy.sh logs -f         参数原样透传给 docker compose
+#   ./scripts/deploy.sh down            同上
+#   ./scripts/deploy.sh ps              同上
 #
 # 说明：
 #   直接执行 docker compose 也可以，但 .env 里的 VERSION 必须已设置；
@@ -18,7 +18,7 @@
 # ---------------------------------------------------------------------------
 set -eu
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 ENV_FILE=".env"
 

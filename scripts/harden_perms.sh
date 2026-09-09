@@ -12,7 +12,7 @@
 # ⚠ 两个实测踩过的坑，动手前务必看：
 #
 # 1) .env **不要**设成 600！它是 root:root 时，运行 docker compose 的普通用户
-#    会直接报 `open .env: permission denied`，deploy.sh / compose 全部失效
+#    会直接报 `open .env: permission denied`，scripts/deploy.sh / compose 全部失效
 #    （2026-09-05 实测）。正确做法是 640 + 属组给到运维所在的组：
 #      sudo chown root:docker .env && sudo chmod 640 .env
 #    这样 other 仍无权限（比默认的 664 更安全），同时 compose 可用。

@@ -1,6 +1,6 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# custosctl —— Custos 管理器统一命令行入口（deploy.sh 的 superset）
+# custosctl —— Custos 管理器统一命令行入口（scripts/deploy.sh 的 superset）
 #
 # 安装：sudo ./scripts/install-custosctl.sh   → 写入 /usr/bin/custosctl
 #                                               + /etc/custos/custosctl.env
@@ -13,7 +13,7 @@
 #   4) 当前目录（若含 docker-compose.yml）
 #
 # 版本号唯一来源：.env 的 VERSION=。
-# 未识别的子命令原样透传给 docker compose（保持与 deploy.sh 兼容）。
+# 未识别的子命令原样透传给 docker compose（保持与 scripts/deploy.sh 兼容）。
 # ---------------------------------------------------------------------------
 set -eu
 
@@ -80,7 +80,7 @@ if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
 fi
 cd "$CUSTOS_HOME"
 
-# ---- 2. 环境校验（沿用 deploy.sh 的中文提示）----
+# ---- 2. 环境校验（沿用 scripts/deploy.sh 的中文提示）----
 ENV_FILE=".env"
 if [ ! -f "$ENV_FILE" ]; then
   if [ -f "env.example" ]; then
@@ -301,7 +301,7 @@ case "$cmd" in
     ;;
 
   *)
-    # 未识别：原样透传给 docker compose（兼容 deploy.sh 的用法）
+    # 未识别：原样透传给 docker compose（兼容 scripts/deploy.sh 的用法）
     exec $COMPOSE "$cmd" "$@"
     ;;
 esac

@@ -2,9 +2,9 @@
 # ---------------------------------------------------------------------------
 # Custos 服务端【交互式一键安装】
 #
-#   sudo sh setup.sh         交互式（推荐）
-#   sudo sh setup.sh -y      非交互：全部用默认值 + 随机口令（脚本化部署）
-#   sh setup.sh -C <目录>    指定项目目录（默认：脚本所在目录，即项目根目录）
+#   sudo sh install.sh         交互式（推荐）
+#   sudo sh install.sh -y      非交互：全部用默认值 + 随机口令（脚本化部署）
+#   sh install.sh -C <目录>    指定项目目录（默认：脚本所在目录，即项目根目录）
 #
 # 做了什么
 #   1) 检查 docker / docker compose
@@ -99,7 +99,7 @@ DEF_VIP_PREFIX=$(cur_val VIP_PREFIX);    [ -n "$DEF_VIP_PREFIX" ] || DEF_VIP_PRE
 DEF_VRID=$(cur_val VRID);                [ -n "$DEF_VRID" ] || DEF_VRID=51
 DEF_WEB_PORT=$(cur_val WEB_PORT);        [ -n "$DEF_WEB_PORT" ] || DEF_WEB_PORT=28888
 DEF_WEB_USER=$(cur_val WEB_USER);        [ -n "$DEF_WEB_USER" ] || DEF_WEB_USER=admin
-DEF_VIP=$(grep -E '^[[:space:]]*#?[[:space:]]*VIP:' "$COMPOSE_FILE" 2>/dev/null | head -1 \
+DEF_VIP=$(grep -E '^[[:space:]]*VIP:' "$COMPOSE_FILE" 2>/dev/null | head -1 \
   | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//' || true)
 [ -n "$DEF_VIP" ] || DEF_VIP=""
 
@@ -114,7 +114,7 @@ ask "管理库密码" "${DEF_MGMT_PASS:-}"; MGMT_PASS=$REPLY
 ask "管理库库名" "$DEF_MGMT_DB"; MGMT_DB=$REPLY
 ask "管理器对外 IP（节点看到的来源 IP）" "$DEF_MGR_IP"; MGR_IP=$REPLY
 ask "节点网卡名 INTERFACE" "$DEF_IFACE"; IFACE=$REPLY
-ask "集群 VIP（必填，同网段空闲 IP）" "${DEF_VIP:-192.0.2.10}"; VIP=$REPLY
+ask "集群 VIP（可选，同网段空闲 IP；留空则稍后后台配置）" "${DEF_VIP:-}"; VIP=$REPLY
 ask "VIP 掩码位" "$DEF_VIP_PREFIX"; VIP_PREFIX=$REPLY
 ask "VRID（同网段多集群需不同）" "$DEF_VRID"; VRID=$REPLY
 ask "Web 端口" "$DEF_WEB_PORT"; WEB_PORT=$REPLY
@@ -165,19 +165,23 @@ set_yaml VRID "$VRID"
 set_yaml WEB_PORT "$WEB_PORT"
 set_yaml WEB_USER "$WEB_USER"
 set_yaml WEB_PASS "$WEB_PASS"
-# VIP 在模板里是注释行（# VIP: 192.0.2.10），需要取消注释并写值
-if grep -Eq '^[[:space:]]*#[[:space:]]*VIP:' "$COMPOSE_FILE"; then
-  sed -i -E "s|^[[:space:]]*#[[:space:]]*(VIP:).*|      \1 \"$VIP\"|" "$COMPOSE_FILE"
-  info "已启用并写入 VIP: $VIP"
-elif grep -Eq '^[[:space:]]*VIP:' "$COMPOSE_FILE"; then
-  set_yaml VIP "$VIP"
+# VIP 可选：留空则不在 compose 写入，稍后可在后台「服务端配置」填写
+if [ -n "$VIP" ]; then
+  if grep -Eq '^[[:space:]]*#[[:space:]]*VIP:' "$COMPOSE_FILE"; then
+    sed -i -E "s|^[[:space:]]*#[[:space:]]*(VIP:).*|      \1 \"$VIP\"|" "$COMPOSE_FILE"
+    info "已启用并写入 VIP: $VIP"
+  elif grep -Eq '^[[:space:]]*VIP:' "$COMPOSE_FILE"; then
+    set_yaml VIP "$VIP"
+  else
+    warn "compose 中未找到 VIP 键，请在 Web「服务端配置」中补填 VIP"
+  fi
 else
-  warn "compose 中未找到 VIP 键，请在 Web「服务端配置」中补填 VIP"
+  info "VIP 留空，未写入 compose；可稍后在后台「服务端配置」中填写"
 fi
 
 umask 077
 cat > .env <<EOF
-# Custos 运行配置（由 setup.sh 生成；含敏感值，请勿入库）
+# Custos 运行配置（由 install.sh 生成；含敏感值，请勿入库）
 VERSION=$CUR_VER
 COMPOSE_PROJECT_NAME=custos
 SECRET_KEY=$SECRET_KEY
@@ -214,7 +218,7 @@ fi
 
 # ---------------------------------------------------------------------------
 say "6/6 构建并启动管理器"
-sh deploy.sh up -d --build || { echo "启动失败，请执行：custosctl tail 查看日志" >&2; exit 1; }
+sh scripts/deploy.sh up -d --build || { echo "启动失败，请执行：custosctl tail 查看日志" >&2; exit 1; }
 
 sleep 5
 printf '\n'

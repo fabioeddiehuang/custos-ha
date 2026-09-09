@@ -29,16 +29,16 @@ version:
 	@echo $(VERSION)
 
 build:
-	@./deploy.sh up -d --build
+	@./scripts/deploy.sh up -d --build
 
 rebuild:
-	@./deploy.sh up -d --build
+	@./scripts/deploy.sh up -d --build
 
 up:
-	@./deploy.sh up -d
+	@./scripts/deploy.sh up -d
 
 start:
-	@./deploy.sh up -d
+	@./scripts/deploy.sh up -d
 
 stop:
 	@docker compose down
@@ -47,7 +47,7 @@ down:
 	@docker compose down
 
 restart:
-	@docker compose down && ./deploy.sh up -d
+	@docker compose down && ./scripts/deploy.sh up -d
 
 logs:
 	@docker compose logs -f --tail=200 custos-server
