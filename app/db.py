@@ -210,16 +210,6 @@ def init_schema():
         with conn.cursor() as c:
             for st in SCHEMA_SQL:
                 c.execute(st)
-            # v2.3.1 密钥镜像表：把 data/cred.key 的副本存入管理库。
-            # 价值：①「只备份管理库」即可完整恢复（无需另行保管 key 文件）；
-            # ② 文件被误删时启动自动从库恢复，小白零操作即可复原。
-            try:
-                c.execute("""CREATE TABLE IF NOT EXISTS secrets (
-                    k VARCHAR(64) PRIMARY KEY,
-                    v MEDIUMTEXT NOT NULL
-                )""")
-            except Exception:
-                pass
             # 兼容旧版 schema：将 port 为 NULL 的历史行补默认，并确保 NOT NULL
             try:
                 c.execute("UPDATE hosts SET port=3306 WHERE port IS NULL")
@@ -474,18 +464,12 @@ def init_schema():
         conn.commit()
     finally:
         conn.close()
-    # v2.3.1：密钥自愈 + 镜像。
-    # 顺序很关键：先确保密钥就绪（文件缺失则从库恢复，都没有则生成），再把它
-    # 镜像回库；只有密钥确定后，下面的明文加密迁移才能用正确的密钥加密。
+    # v2.3.1：密钥已由 crypto 从 SECRET_KEY 派生（或旧 cred.key / CRED_KEY 覆盖），
+    # 无需镜像进库、无需单独备份。此处仅确保在明文加密迁移前密钥已就绪。
     try:
-        if not _crypto.key_file_exists():
-            _restored = _get_secret("cred_key")
-            if _restored:
-                _crypto.write_key_file(_restored)
-                print("[init_db] data/cred.key 缺失，已从管理库自动恢复密钥", flush=True)
-        _set_secret("cred_key", _crypto.bootstrap())
+        _crypto.bootstrap()
     except Exception as _ke:
-        print(f"[init_db] 密钥自愈/镜像失败(可忽略，下轮重试): {_ke}")
+        print(f"[init_db] 凭证密钥初始化失败(可忽略，下轮重试): {_ke}")
     # v2.3.1：表结构与默认值就绪后，把存量明文凭证加密（幂等，失败下一轮重试）
     try:
         migrate_encrypt_credentials()
@@ -566,29 +550,6 @@ def migrate_encrypt_credentials():
     if changed:
         print(f"[init_db] 凭证加密迁移：已加密 {changed} 条存量记录", flush=True)
     return changed
-
-
-def _get_secret(k):
-    """读管理库密钥镜像（secrets 表）。失败返回 None。"""
-    try:
-        rows = query("SELECT v FROM secrets WHERE k=%s", (k,))
-        return rows[0].get("v") if rows else None
-    except Exception:
-        return None
-
-
-def _set_secret(k, v):
-    """把密钥镜像写入管理库（幂等 upsert）。失败仅告警，不阻断启动。"""
-    try:
-        execute(
-            "INSERT INTO secrets(k, v) VALUES(%s, %s) "
-            "ON DUPLICATE KEY UPDATE v=%s",
-            (k, v, v),
-        )
-        return True
-    except Exception as e:
-        print(f"[init_db] 密钥镜像入库失败(可忽略): {e}")
-        return False
 
 
 def execute(sql, args=None):

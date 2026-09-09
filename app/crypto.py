@@ -14,7 +14,9 @@ v2.5 单元分发还会把这些凭证写进节点部署文件下发到目标机
    node_gen.generate_node），在这 3 处显式加密即可，无遗漏风险。
 3. **自动迁移**：启动时扫描存量明文并加密，无需人工干预；已加密的不会二次加密。
 4. **密钥缺失/错误明确报错**：绝不静默降级为明文。
-   - 密钥来源优先级：`CRED_KEY` 环境变量 → `data/cred.key` 文件 → 自动生成并持久化；
+   - 密钥来源优先级：`CRED_KEY` 环境变量（高级/外部 KMS）→ `data/cred.key` 文件（仅旧 v2.3.1 兼容）→ **从 `SECRET_KEY` 派生（默认）**；
+   - 默认路径下密钥**不单独存储**：它随 `SECRET_KEY`（`.env` 固定值，或 config 自动生成并持久化到 `data/secret_key`）天然备份，
+     小白「备份项目目录 / data/」即完整恢复，无需理解 key 文件、也不需镜像进库；
    - 解密失败（密钥错误）时**保留密文 + 记录告警**，绝不返回半个明文或空串，
      也不把密文当明文用（会在日志与健康检查里显式暴露）。
 
@@ -23,6 +25,7 @@ v2.5 单元分发还会把这些凭证写进节点部署文件下发到目标机
 """
 import os
 import base64
+import hashlib
 import logging
 import threading
 
@@ -49,16 +52,37 @@ def _key_path():
     return os.path.join(_data_dir(), _KEY_FILE_NAME)
 
 
-def _load_or_create_key():
-    """取得密钥（bytes）。优先级：环境变量 → 密钥文件 → 自动生成并落盘。
+def _derive_from_secret(secret):
+    """从 SECRET_KEY 单向派生凭证密钥（HKDF 风格的固定信息派生）。
 
-    密钥文件权限 600；若所在目录不可写（如本机开发以普通用户跑），
-    仍会在内存生成一枚**临时**密钥并明确告警——此时密文在重启后不可解，
-    故生产部署必须保证 data/ 可写（容器默认已满足）。
+    设计出发点（v2.3.1 收尾，替代“单独 key 文件 / 镜像进库”）：
+    密钥**不单独存储**，从而既消除「小白误删 key 文件→集群失联」的运维陷阱，
+    也避免把密钥写进管理库（否则库/dump 泄露即等于白加密）。
+
+    SECRET_KEY 是部署必有之物：
+      - setup.sh 安装会在 .env 固定 SECRET_KEY → 派生密钥随 .env 一同备份；
+      - 未显式设置时 config 会自动生成并持久化到 data/secret_key（已挂载、随 data/ 备份）。
+    因此「备份项目目录 / data/」即可完整恢复凭证，无需任何额外动作，对小白零负担。
+    """
+    dig = hashlib.sha256(
+        b"custos-credential-key-v1\x00" + secret.encode("utf-8")
+    ).digest()
+    return base64.urlsafe_b64encode(dig)   # 32 字节 → 合法 Fernet 密钥
+
+
+def _load_or_create_key():
+    """取得密钥（bytes）。优先级：
+
+    1. ``CRED_KEY`` 环境变量 —— 显式指定（高级用户 / 接外部 KMS、HSM）。
+    2. ``data/cred.key`` 文件 —— 仅旧 v2.3.1 部署遗留兼容；**不再自动新建**。
+    3. 从 ``SECRET_KEY`` 派生（默认）—— 无需任何额外文件或备份，最省心。
+
+    第 3 项依赖 config.SECRET_KEY 一定就绪（config 保证非空且 ≥16，否则启动已中止），
+    故正常路径下密钥必然可确定，不存在「生成出会变密钥」的隐患。
     """
     raw = (os.environ.get(_KEY_ENV) or "").strip()
     if raw:
-        return raw.encode("utf-8"), "env"
+        return raw.encode("utf-8"), "env(CRED_KEY)"
 
     path = _key_path()
     try:
@@ -66,24 +90,16 @@ def _load_or_create_key():
             with open(path, "r", encoding="utf-8") as f:
                 k = f.read().strip()
             if k:
-                return k.encode("utf-8"), "file"
+                return k.encode("utf-8"), "file(cred.key,旧部署兼容)"
     except Exception as e:
-        _log.warning("[crypto] 读取密钥文件失败(%s)，将尝试重新生成: %s", path, e)
+        _log.warning("[crypto] 读取密钥文件失败(%s)，改由 SECRET_KEY 派生: %s", path, e)
 
-    key = Fernet.generate_key()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(key.decode("utf-8"))
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
-        return key, "file(new)"
-    except Exception as e:
-        _log.error("[crypto] 无法持久化密钥到 %s（%s）：本次使用内存临时密钥，"
-                   "重启后历史密文将不可解密，请立即修复 data/ 目录权限。", path, e)
-        return key, "memory"
+    from .config import SECRET_KEY as _sk
+    if not _sk or len(_sk) < 16:
+        raise RuntimeError(
+            "SECRET_KEY 未就绪（长度不足 16），无法派生凭证密钥，启动中止。"
+        )
+    return _derive_from_secret(_sk), "derived(SECRET_KEY)"
 
 
 def _get():
@@ -145,7 +161,8 @@ def decrypt(value):
         return _get().decrypt(token).decode("utf-8")
     except (InvalidToken, ValueError, TypeError) as e:
         _last_error = "解密失败（密钥不匹配或密文损坏）：%s" % e
-        _log.error("[crypto] %s —— 请确认 data/cred.key（或 CRED_KEY）是否为加密时使用的密钥",
+        _log.error("[crypto] %s —— 请确认 SECRET_KEY（或 CRED_KEY）是否与加密时一致；"
+                   "凭证密钥由 SECRET_KEY 派生，SECRET_KEY 变动需重新录入节点/集群凭证。",
                    _last_error)
         return ""
     except Exception as e:
@@ -162,49 +179,17 @@ def last_error():
 def status():
     """给设置页用的状态摘要。"""
     src = "env" if (os.environ.get(_KEY_ENV) or "").strip() else (
-        "file" if os.path.exists(_key_path()) else "未初始化")
+        "file" if os.path.exists(_key_path()) else "derived(SECRET_KEY)")
     return {"enabled": True, "key_source": src, "last_error": _last_error,
-            "mirrored_to_db": True}
-
-
-def key_file_exists():
-    """data/cred.key 是否存在（误删自愈前的判定用）。"""
-    return os.path.exists(_key_path())
-
-
-def write_key_file(value):
-    """把 base64 密钥串写回 data/cred.key（文件被误删后从管理库恢复用）。
-
-    会先做合法性校验（非法密钥直接抛错，绝不写出坏文件），并重置内存缓存，
-    使下次加解密改用新文件里的密钥。
-    """
-    raw = (value or "").strip()
-    if not raw:
-        raise ValueError("密钥为空")
-    key = raw.encode("utf-8")
-    Fernet(key)  # 非法则抛 InvalidToken/ValueError
-    os.makedirs(os.path.dirname(_key_path()), exist_ok=True)
-    with open(_key_path(), "w", encoding="utf-8") as f:
-        f.write(raw)
-    try:
-        os.chmod(_key_path(), 0o600)
-    except Exception:
-        pass
-    global _fernet, _last_error
-    _fernet = None
-    _last_error = ""
-
-
-def active_key_b64():
-    """返回当前生效的 base64 密钥串（用于镜像进管理库，单备份即可完整恢复）。"""
-    _get()
-    return _fernet[0].decode("utf-8")
+            "mirrored_to_db": False}
 
 
 def bootstrap():
-    """启动时确保密钥已就绪（文件 → 库 → 生成）并返回其 base64 串。
+    """启动时确保密钥已就绪（CRED_KEY / 旧 cred.key / SECRET_KEY 派生）并返回其 base64 串。
 
-    由 db.init_schema 调用：先尝试用文件/库恢复，缺失则生成，最终把当前密钥
-    镜像回管理库。这样小白即使删了 data/cred.key，重启管理器即自动复原。
+    由 db.init_schema 在明文加密迁移前调用，保证迁移使用正确的密钥。
+    密钥本身无需镜像进库、无需单独备份——它随 SECRET_KEY（.env 或 data/secret_key）
+    天然备份，小白只需常规备份项目目录 / data/ 即可完整恢复。
     """
-    return active_key_b64()
+    _get()
+    return _fernet[0].decode("utf-8")
