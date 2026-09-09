@@ -32,7 +32,7 @@ from .mysql_compat import (detect_syntax, detect_flavour, flavour_from_node_type
                            start_replication_sql,
                            stop_replication_sql, reset_replica_sql, show_replica_status_sql,
                            default_auth_plugin, F_MYSQL8, F_MARIADB)
-from .config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, SEMI_SYNC
+from .config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, is_semi_sync_enabled
 
 
 # 复制错误码分类 —— 两类语义完全不同，绝不可混为一谈：
@@ -1969,7 +1969,7 @@ def ensure_semisync_runtime(host, port, ha_user, ha_pass, root_user=None,
     幂等：开关已 ON 时直接返回，不产生任何写操作/不复制。
     返回 (changed: bool, msg: str)
     """
-    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
+    if not is_semi_sync_enabled():
         return False, "SEMI_SYNC 未开启，跳过"
     conn = None
     last_err = None
@@ -2237,7 +2237,7 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         # 半同步：rpl_semi_sync_*_enabled 不能写进静态 my.cnf——mysqld --initialize
         # 期间插件未加载，会报 unknown variable 并中止初始化（容器崩溃循环）。
         # 故改在运行时 SET GLOBAL 开启，随管理器自愈周期持久化（节点重启后自动重开）。
-        if flavour == F_MYSQL8 and str(SEMI_SYNC).strip() in ("1", "true", "True", "on", "ON"):
+        if flavour == F_MYSQL8 and is_semi_sync_enabled():
             try:
                 cur.execute("SET GLOBAL rpl_semi_sync_source_enabled=1")
                 cur.execute("SET GLOBAL rpl_semi_sync_replica_enabled=1")

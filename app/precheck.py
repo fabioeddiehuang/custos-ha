@@ -11,9 +11,9 @@
 
 返回结构化 findings 列表，前端展示为 OK / WARN / ERR。
 """
-from .db import get_setting, query
+from .db import query
 from .ha_client import connect_robust
-from .config import SEMI_SYNC
+from .config import is_semi_sync_enabled
 
 
 def _var(conn, name):
@@ -27,14 +27,8 @@ def _var(conn, name):
 
 
 def _semi_expected():
-    """服务端期望的半同步开关：settings 表优先，回退环境变量（默认关闭）。"""
-    try:
-        raw = get_setting("SEMI_SYNC", None)
-        if raw is None or str(raw).strip() == "":
-            raw = SEMI_SYNC
-        return str(raw).strip() == "1"
-    except Exception:
-        return str(SEMI_SYNC or "0").strip() == "1"
+    """服务端期望的半同步开关：统一走 config.is_semi_sync_enabled（DB 优先、env 兜底）。"""
+    return is_semi_sync_enabled()
 
 
 def _gstatus(conn, name):

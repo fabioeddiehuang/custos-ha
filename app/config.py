@@ -177,6 +177,26 @@ FAILOVER_COOLDOWN_SEC = int(env("FAILOVER_COOLDOWN_SEC", 120))
 # 半同步复制开关（"1" 启用）。启用后主库提交等待至少一个从库 ACK，压缩故障切换数据丢失窗口。
 # 默认关闭：避免在未确认插件可用性的存量集群上强行开启导致复制异常；需显式开启并经测试。
 SEMI_SYNC = env("SEMI_SYNC", "0")
+
+
+def is_semi_sync_enabled():
+    """半同步复制开关的【运行时权威值】。
+
+    修复双源不一致：此前 node_gen / ha_client 直接读启动即固定的 env 常量
+    SEMI_SYNC，而 Web「系统设置」把 SEMI_SYNC 写入的是 settings 表（DB）。
+    二者分源导致：页面/ precheck 读 DB 显示已开启，实际注入 my.cnf /
+    运行期 SET GLOBAL 却按 env=0 执行——半同步怎么都开不起来。
+
+    统一以 settings 表为权威源，DB 无记录时回退到启动 env 常量。
+    """
+    try:
+        from .db import get_setting
+        raw = get_setting("SEMI_SYNC")
+    except Exception:
+        raw = None
+    if raw is None or str(raw).strip() == "":
+        raw = SEMI_SYNC
+    return str(raw).strip() in ("1", "true", "True", "ON", "on")
 # 单节点探活超时（秒）：主库服务停止时会立即收到 RST（连接拒绝很快返回），
 # 仅当主机断电/网络黑洞时才走到该超时。调小可加快「主机失联」判定（配合 FAIL_THRESHOLD）。
 PROBE_TIMEOUT = int(env("PROBE_TIMEOUT", 2))

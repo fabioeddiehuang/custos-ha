@@ -22,7 +22,7 @@ import pymysql
 
 from .db import get_setting, query, execute
 from .mysql_compat import default_auth_plugin, is_mariadb_node
-from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, SEMI_SYNC
+from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, is_semi_sync_enabled
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
 
@@ -337,7 +337,7 @@ def _semisync_block():
     为内置，plugin_load_add 保证启动时加载，变量即可设置，不会因插件缺失
     导致节点启动失败。
     """
-    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
+    if not is_semi_sync_enabled():
         return ""
     return (
         "# ---- 半同步复制（SEMI_SYNC=1：插件内置，随启动生效，重启不丢）----\n"
@@ -387,7 +387,7 @@ def _semisync_block_mysql(mysql_version=None):
     运行时 INSTALL PLUGIN 被拒」的问题（插件改为随启动加载，无需运行时安装）。
     MySQL 8.0.26+ 插件/变量改名为 source/replica；更早 8.0 用 master/slave。
     """
-    if str(SEMI_SYNC).strip() not in ("1", "true", "True", "on", "ON"):
+    if not is_semi_sync_enabled():
         return ""
     # 项目 MySQL 集群锁定 8.0.46（属 8.0.26+ 命名体系），固定使用 source/replica，
     # 不再按版本分支生成 master/slave 旧命名：8.0.46 上 rpl_semi_sync_master_* 等
