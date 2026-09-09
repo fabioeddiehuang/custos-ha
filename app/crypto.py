@@ -163,4 +163,48 @@ def status():
     """给设置页用的状态摘要。"""
     src = "env" if (os.environ.get(_KEY_ENV) or "").strip() else (
         "file" if os.path.exists(_key_path()) else "未初始化")
-    return {"enabled": True, "key_source": src, "last_error": _last_error}
+    return {"enabled": True, "key_source": src, "last_error": _last_error,
+            "mirrored_to_db": True}
+
+
+def key_file_exists():
+    """data/cred.key 是否存在（误删自愈前的判定用）。"""
+    return os.path.exists(_key_path())
+
+
+def write_key_file(value):
+    """把 base64 密钥串写回 data/cred.key（文件被误删后从管理库恢复用）。
+
+    会先做合法性校验（非法密钥直接抛错，绝不写出坏文件），并重置内存缓存，
+    使下次加解密改用新文件里的密钥。
+    """
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("密钥为空")
+    key = raw.encode("utf-8")
+    Fernet(key)  # 非法则抛 InvalidToken/ValueError
+    os.makedirs(os.path.dirname(_key_path()), exist_ok=True)
+    with open(_key_path(), "w", encoding="utf-8") as f:
+        f.write(raw)
+    try:
+        os.chmod(_key_path(), 0o600)
+    except Exception:
+        pass
+    global _fernet, _last_error
+    _fernet = None
+    _last_error = ""
+
+
+def active_key_b64():
+    """返回当前生效的 base64 密钥串（用于镜像进管理库，单备份即可完整恢复）。"""
+    _get()
+    return _fernet[0].decode("utf-8")
+
+
+def bootstrap():
+    """启动时确保密钥已就绪（文件 → 库 → 生成）并返回其 base64 串。
+
+    由 db.init_schema 调用：先尝试用文件/库恢复，缺失则生成，最终把当前密钥
+    镜像回管理库。这样小白即使删了 data/cred.key，重启管理器即自动复原。
+    """
+    return active_key_b64()
