@@ -20,22 +20,63 @@ set -eu
 PROG=$(basename "$0")
 SVC=custos-server
 CONF=${CUSTOS_CONF:-/etc/custos/custosctl.env}
+HOME_SRC=""
+
+# ---- 0. 全局选项：-C/--dir <项目目录> 显式指定（优先级最高）----
+if [ $# -gt 0 ]; then
+  case "$1" in
+    -C|--dir)
+      if [ $# -lt 2 ]; then echo "错误：$1 需要跟上项目目录。" >&2; exit 1; fi
+      CUSTOS_HOME=$2; HOME_SRC="命令行 -C"; shift 2 ;;
+  esac
+fi
 
 # ---- 1. 定位项目目录 ----
+# 每个人安装路径都不同，故不猜固定路径，按「可靠性降序」多级发现：
+#   ① 命令行 -C / ② 环境变量 CUSTOS_HOME / ③ /etc/custos/custosctl.env（安装时写入）
+#   ④ 从运行中的容器反查（compose 写入的 working_dir 标签，最贴合实际部署）
+#   ⑤ 常见安装路径探测 / ⑥ 当前目录及其父级
+CUSTOS_HOME_ENV="${CUSTOS_HOME:-}"
 [ -r "$CONF" ] && . "$CONF" || true
-if [ -z "${CUSTOS_HOME:-}" ]; then
-  for d in /opt/Custos-HA /opt/custos /srv/Custos-HA "$HOME/Custos-HA"; do
-    if [ -f "$d/docker-compose.yml" ]; then CUSTOS_HOME=$d; break; fi
+if [ -n "${CUSTOS_HOME:-}" ] && [ -z "$HOME_SRC" ]; then
+  if [ -n "${CUSTOS_HOME_ENV:-}" ]; then HOME_SRC="环境变量 CUSTOS_HOME"; else HOME_SRC="$CONF"; fi
+fi
+
+if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
+  for _c in $SVC $(docker ps --format '{{.Names}}' 2>/dev/null || true); do
+    _d=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$_c" 2>/dev/null || true)
+    if [ -n "$_d" ] && [ -f "$_d/docker-compose.yml" ] && [ -f "$_d/custosctl" ]; then
+      CUSTOS_HOME=$_d; HOME_SRC="容器标签($_c)"; break
+    fi
   done
 fi
+
 if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
-  if [ -f "./docker-compose.yml" ]; then
-    CUSTOS_HOME=$(pwd)
-  else
-    echo "错误：找不到 Custos 项目目录（需含 docker-compose.yml）。" >&2
-    echo "请在 $CONF 中设置 CUSTOS_HOME=<项目目录>，或 cd 到项目目录后执行。" >&2
-    exit 1
-  fi
+  for d in /opt/Custos-HA /opt/custos /srv/Custos-HA /usr/local/Custos-HA "$HOME/Custos-HA"; do
+    if [ -f "$d/docker-compose.yml" ]; then CUSTOS_HOME=$d; HOME_SRC="常见路径探测"; break; fi
+  done
+fi
+
+if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
+  _p=$(pwd)
+  _i=0
+  while [ $_i -lt 4 ]; do
+    if [ -f "$_p/docker-compose.yml" ] && [ -f "$_p/custosctl" ]; then
+      CUSTOS_HOME=$_p; HOME_SRC="当前目录/父级"; break
+    fi
+    [ "$_p" = "/" ] && break
+    _p=$(dirname "$_p"); _i=$((_i + 1))
+  done
+fi
+
+if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
+  echo "错误：未能定位 Custos 项目目录（需含 docker-compose.yml 与 custosctl）。" >&2
+  echo "任选一种方式即可：" >&2
+  echo "  1) custosctl -C <项目目录> status" >&2
+  echo "  2) cd <项目目录> && custosctl status" >&2
+  echo "  3) 重新执行安装以记录路径：sudo <项目目录>/scripts/install-custosctl.sh" >&2
+  echo "  4) 手动写入：echo 'CUSTOS_HOME=<项目目录>' | sudo tee $CONF" >&2
+  exit 1
 fi
 cd "$CUSTOS_HOME"
 
@@ -74,14 +115,20 @@ web_port() {
 
 usage() {
   cat <<EOF
-用法: $PROG <命令> [参数]
+用法: $PROG [-C <项目目录>] <命令> [参数]
+
+全局选项
+  -C, --dir <目录>     显式指定 Custos 项目目录（最高优先级）
+                       不指定时按：环境变量 CUSTOS_HOME → /etc/custos/custosctl.env
+                       → 运行中容器的 compose 标签 → 常见路径 → 当前目录/父级，自动发现
+                       （custosctl status 会显示目录来源）
 
 部署 / 生命周期
   deploy|up [-d] [--build]   构建并后台启动（默认命令；--build 强制重建镜像）
-  rebuild                    重建管理器镜像并重启（= deploy --build，最常用）
-  start                      启动已存在的容器（不重建、不删容器）
-  stop                       停止容器（保留容器与数据）
-  restart                    重启容器（不重建镜像）
+  rebuild                    重建【管理器镜像】并重启（= up -d --build，改完 app/ 必做）
+  start                      创建并启动容器（= docker compose up -d）
+  stop                       停止并移除容器（= docker compose down）
+  restart                    先 down 再 up -d（不重建镜像）
   down [--volumes]           停止并移除容器（--volumes 连匿名卷一起删）
 
 查看 / 排障
@@ -98,9 +145,12 @@ usage() {
 
 安装 / 卸载
   install                    安装自身到 /usr/bin/custosctl（需 root）
-  uninstall [--purge]        卸载管理器：停并移除容器、删除 /usr/bin/custosctl
-                             --purge 额外删除本项目镜像与匿名卷
-                             默认【不删除】backups/ data/ generated_nodes，也【不动被管节点】
+  uninstall [-f|--purge] [--yes]
+                             卸载管理器：停并移除容器 + 删除本项目镜像与匿名卷
+                             + 删除 /usr/bin/custosctl 与 /etc/custos
+                             -f/--purge 额外【永久删除】backups/ data/ generated_nodes/
+                             （含 data/custos-ha/），需输入 DELETE 二次确认
+                             两种模式都【不动被管节点】上的数据库与 keepalived
 
 其他
   help                       显示本帮助
@@ -144,16 +194,20 @@ case "$cmd" in
     exec $COMPOSE up -d --build $SVC
     ;;
 
+  # 语义（按运维习惯统一，均不重建镜像；重建镜像用 rebuild）：
+  #   start   = up -d      （创建并启动）
+  #   stop    = down       （停止并移除容器）
+  #   restart = down && up -d
   start)
-    exec $COMPOSE start $SVC
+    exec $COMPOSE up -d
     ;;
 
   stop)
-    exec $COMPOSE stop $SVC
+    exec $COMPOSE down
     ;;
 
   restart)
-    exec $COMPOSE restart $SVC
+    $COMPOSE down && exec $COMPOSE up -d
     ;;
 
   down)
@@ -187,7 +241,7 @@ case "$cmd" in
 
   status)
     echo "版本      : $VERSION"
-    echo "项目目录  : $CUSTOS_HOME"
+    echo "项目目录  : $CUSTOS_HOME  （来源：${HOME_SRC:-默认}）"
     echo "服务      : $SVC"
     st=$(docker inspect -f '{{.State.Status}}' $SVC 2>/dev/null || echo "未运行/不存在")
     up=$(docker inspect -f '{{.State.StartedAt}}' $SVC 2>/dev/null || echo "-")

@@ -69,7 +69,21 @@
     - 重建成功后 `rebuild.last_rebuilt_at()` 记录时间戳，monitor 立即清理该节点的自愈退避 / 卡死计数 / 需重建标记，避免「重建已完成但页面仍显示旧状态」。
     - **「重建成功但复制仍断、仍显示需重建」的根因与修复**：逻辑重建 = 主库 dump + 从库 restore（且 `SET sql_log_bin=0`），**不会写入从库 GTID 状态**；重建完的从库 `gtid_slave_pos` / `gtid_executed` 为空，以 GTID 自动定位（`MASTER_USE_GTID=slave_pos` / `MASTER_AUTO_POSITION=1`）连主库时等于从「时间起点」请求，而主库早期 binlog 多半已清理 → 恒报 1236。修复：`rebuild` 在重链复制前新增 `_align_gtid_after_restore()`，把从库位点对齐到**主库导出结束时**的位置（MariaDB `SET GLOBAL gtid_slave_pos`；MySQL 8 执行集为空时 `SET GLOBAL gtid_purged`）；仅当从库位点为空/非主库子集时才动作，已有且是子集则不动。导出窗口内提交的事务可能未被 dump 捕获，故完成消息里提示跑一次一致性校验。
     - **重建后仍 1236 的三级兜底（彻底根治）**：GTID 对齐后若 IO 仍报 1236，rebuild 依次尝试——① 重新取主库**当前** `gtid_binlog_pos` 再对齐（位点可能被 `make_slave_of` 的分叉处理冲掉，或导出期间主库已切换）；② 仍不通则改用**主库当前 binlog 文件+位点**（`SHOW BINLOG STATUS`/`SHOW MASTER STATUS`）做 `CHANGE MASTER TO ... MASTER_USE_GTID=no`（MySQL 用 `MASTER_AUTO_POSITION=0`）坐标续传，彻底绕开已被清理的 GTID 历史；③ 最终仍 `IO/SQL ≠ Yes` 则**如实返回失败**并把 `Last_IO_Error` 原文写进消息（旧实现一律返回成功，掩盖「数据恢复了但复制是断的」）。
-    - **MariaDB 日志刷 1064（CHANGE REPLICATION FILTER）**：`mysql_compat` 原注释误判为「MariaDB 只是等号无空格」，实际 **MariaDB 根本没有 `CHANGE REPLICATION FILTER` 语句**（动态复制过滤是 MySQL 独有，MariaDB 只能写配置文件），故每次 `make_slave_of` 都刷一条 `1064 ... near 'REPLICATION FILTER REPLICATE_IGNORE_DB=(ha_local)'`。修正：MariaDB 返回 `None` 直接跳过（`ha_local` 写入已由 `SET SESSION sql_log_bin=0` 保证不进 binlog，不依赖该过滤器）。
+- **新增命令行工具 `custosctl`（可安装到 `/usr/bin`，随卸载脚本一同卸载）**：
+  - 来源：`custosctl`（仓库根，POSIX sh）为 `deploy.sh` 的 superset；`deploy.sh` 与 `Makefile` **保留**不变（Makefile 仅新增 `install`/`uninstall`，并把 `restart` 语义改为「down && up -d」与 custosctl 对齐）。
+  - 安装/卸载：`sudo ./scripts/install-custosctl.sh [项目目录]`（或 `sudo make install` / 已部署后 `sudo custosctl install`）→ 写入 `/usr/bin/custosctl`；项目目录记录在 `/etc/custos/custosctl.env`（`CUSTOS_HOME`）。`custosctl uninstall` 会删除 `/usr/bin/custosctl` 与 `/etc/custos`。
+  - **项目目录定位（不猜固定路径）**：各人安装习惯不同，故按可靠性降序多级发现——① 命令行 `-C/--dir <目录>` ② 环境变量 `CUSTOS_HOME` ③ `/etc/custos/custosctl.env` ④ **从运行中的容器反查**（`docker inspect` 读 compose 写入的 `com.docker.compose.project.working_dir` 标签，最贴合真实部署，实测在任意目录下都能自动命中）⑤ 常见路径探测 ⑥ 当前目录及父级。全部失败时给出 4 条修法指引。`custosctl status` 会打印「项目目录来源」便于排查。
+  - 命令：`deploy|up`、`rebuild`（**重建管理器镜像**）、`start`(up -d)、`stop`(down)、`restart`(down && up -d)、`down`、`status`、`ps`、`tail [-n N] [--no-follow]`、`logs`、`shell`、`version`、`rebuild-node --host --port --cluster`（走 API 触发**从库**重建，与界面「重建」等价）、`install`、`uninstall [-f|--purge] [--yes]`、`help`；未识别子命令原样透传给 `docker compose`。
+  - ⚠ 语义约定：`rebuild` = 重建**管理器镜像**；从库数据重建用 `rebuild-node`。二者不可混用。
+  - 卸载策略：`uninstall` 默认停删容器 + 删除本项目镜像与匿名卷 + 删除 custosctl（**保留** `backups/ data/ generated_nodes/`）；加 `-f/--purge` 才**永久删除**这三个目录（含 `data/custos-ha/`），需输入 `DELETE` 二次确认（`--yes` 跳过）。**两种模式都绝不动被管节点**上的数据库与 keepalived。
+- **新增 `setup.sh`：【交互式一键安装】（解决「新用户首次部署不简便」）**：
+  - 问题：仓库里 `env.example`、`docker-compose-example.yml` 都是脱敏模板，旧流程要 `cp env.example .env` + 手工改 `docker-compose.yml` 里的真实 IP / 管理库 / VIP / 网卡 / Web 口令，新人极易漏配或配错。
+  - 方案：一条命令完成首次部署——`sudo sh setup.sh`（交互）或 `sudo sh setup.sh -y`（非交互，全默认 + 随机口令，适合脚本化）。
+    1. 检查 docker / docker compose；2. 交互收集（管理库、管理器对外 IP、VIP、网卡、Web 账号端口，默认值从现有 compose / 自动探测取）；3. 生成 `.env`（**SECRET_KEY / WEB_PASS 自动生成强随机值**，不再用 admin/admin）；4. 把参数写回 `docker-compose.yml`（含 `set_yaml` 改值 + 取消注释 VIP，免手工编辑）；5. root 时自动 `install-custosctl.sh` 装到 `/usr/bin`；6. 构建启动 + 自检 + 打印访问地址与账号。
+  - **幂等**：已有 `.env` / `docker-compose.yml` 时以现有值为默认；无 `docker-compose.yml` 时从 `docker-compose-example.yml` 复制再注入。重复执行安全。
+  - `.gitignore` 已正确忽略 `.env` / `data/` / `generated_nodes/` / `backups/` / `docker-compose.yml`：真实 IP 与口令只留本地、不入库，故「脱敏」问题已被 `.gitignore` 解决，无需在仓库内改 compose。
+  - 新增用户标准流程：`git clone` → `sudo sh setup.sh` → 浏览器访问提示的地址登录。
+- **MariaDB 日志刷 1064（CHANGE REPLICATION FILTER）**：`mysql_compat` 原注释误判为「MariaDB 只是等号无空格」，实际 **MariaDB 根本没有 `CHANGE REPLICATION FILTER` 语句**（动态复制过滤是 MySQL 独有，MariaDB 只能写配置文件），故每次 `make_slave_of` 都刷一条 `1064 ... near 'REPLICATION FILTER REPLICATE_IGNORE_DB=(ha_local)'`。修正：MariaDB 返回 `None` 直接跳过（`ha_local` 写入已由 `SET SESSION sql_log_bin=0` 保证不进 binlog，不依赖该过滤器）。
 
 ## v2.2.19 GTID 分叉感知（续传优先，解 v2.2.18 误判）
 
