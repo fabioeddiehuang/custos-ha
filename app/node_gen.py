@@ -181,8 +181,12 @@ def _render_keepalived_conf(local_ip, peers, vip, vip_prefix, interface, vrid, r
 
 vrrp_script chk_mysql_master {{
     script "/etc/keepalived/check_mysql_master.sh"
-    interval 3
-    timeout 2
+    # 脚本顺序执行 4 次 mysql 探活（SELECT 1 / read_only / super_read_only / current_master），
+    # 单次内部上限 timeout 2s，最坏累计约 8s（见 check_mysql_master.sh）。keepalived 的 timeout
+    # 必须明显大于脚本最坏耗时，否则节点一忙/重启恢复时脚本尚未返回就被误杀，触发
+    # “failed to terminate after kill / timed out, expect idle - skipping run”，健康检查冻死。
+    interval 12
+    timeout 10
     fall 2
     rise 2
     user root
