@@ -392,12 +392,29 @@ def _update_host(h, st, is_master=False):
         )
 
 
+def _in_maintenance(cluster_id, host=None):
+    """v2.3.3：集群/节点是否处于维护窗口。
+
+    异常时一律按「不在维护」处理 —— 宁可多切一次，也不能因为维护表故障
+    而把「该切换却不切换」这个更严重的故障藏起来。
+    """
+    try:
+        from .maintenance import is_in_maintenance
+        return bool(is_in_maintenance(cluster_id, host))
+    except Exception:
+        return False
+
+
 def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, cluster_id, semi=None):
     """根据与上一次观测的差异发送告警，仅在状态跃迁时触发（避免刷屏）。"""
     prev = _PREV.get(key)
     _PREV[key] = dict(status=status, is_master=is_master, repl_ok=repl_ok, delay=delay, semi=semi)
     if prev is None:
         return  # 首次观测只建立基线，不告警
+    # v2.3.3：维护窗口内抑制状态类告警（离线/复制/延迟/半同步），避免维护期刷屏。
+    # 切换类与「需人工处理」类不受影响（见 alerts._subject_pass_maintenance）。
+    if _in_maintenance(cluster_id, key[0]):
+        return
     host = f"{key[0]}:{key[1]}"
     h_host, h_port, h_cid = key[0], key[1], key[2]
     tag = f"【{cluster_name}】" if cluster_name else ""
@@ -984,6 +1001,12 @@ def _act_once():
             if key[2] != cid:
                 continue
             if is_master and fails.get(key, 0) >= FAIL_THRESHOLD and get_setting("AUTO_FAILOVER", "1") == "1":
+                # v2.3.3：维护窗口内不自动切换 —— 升级/重建/排障期间被切走会造成业务
+                # 闪断并让操作半途而废。节点级窗口只挡「以该节点为当前主库」的切换。
+                if _in_maintenance(cid, key[0]):
+                    print(f"[monitor] 集群[{cluster_name}] 主库 {cur_h}:{cur_p} 探活失败，"
+                          f"但处于维护窗口内，已抑制自动切换")
+                    continue
                 print(f"[monitor] 集群[{cluster_name}] 主库 {cur_h}:{cur_p} "
                       f"连续 {fails[key]} 次探活失败，触发自动切换")
                 if do_failover(cid, "auto: master unreachable"):
@@ -992,7 +1015,11 @@ def _act_once():
 
         # 高延迟 / 主库压力持续超阈值 -> 自动切换（默认关闭，需显式开启）
         try:
-            _auto_switch_on_lag_or_pressure(cid, cluster_name, cache)
+            # v2.3.3：维护窗口内不因延迟/压力自动切换（维护期本就可能人为制造压力）
+            if _in_maintenance(cid):
+                _SWITCH_STREAK[cid] = 0
+            else:
+                _auto_switch_on_lag_or_pressure(cid, cluster_name, cache)
         except Exception as e:
             print(f"[monitor] 延迟/压力自动切换判定异常(可忽略): {e}")
 

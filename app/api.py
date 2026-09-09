@@ -584,14 +584,64 @@ def api_metric_history(cluster_id: int = 0, host: str = "", port: int = 0, hours
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
+def _slow_log_hint(cid):
+    """慢日志为空时的诊断提示（v2.3.5）。
+
+    三种形态共有的空结果原因只有三类：采集开关没开、节点没开慢日志、
+    或开了但没写表（log_output 不含 TABLE，采集读的是 mysql.slow_log）。
+    """
+    parts = []
+    try:
+        if not slow_log.slowlog_enabled():
+            parts.append("采集开关 SLOWLOG_ENABLED 未开启（系统设置 → 慢日志采集）")
+    except Exception:
+        pass
+    try:
+        from .ha_client import connect_robust
+        from .clusters import get_cluster_creds
+        creds = get_cluster_creds(cid) or {}
+        cm = query("SELECT host, port FROM current_master WHERE cluster_id=%s", (cid,))
+        if cm and creds.get("ha_pass"):
+            conn = connect_robust(cm[0]["host"], int(cm[0]["port"]),
+                                  creds.get("ha_user") or "", creds.get("ha_pass") or "",
+                                  timeout=3)
+            if conn:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT @@slow_query_log, @@log_output, @@long_query_time")
+                        r = cur.fetchone() or ("", "", "")
+                        sq, lo, lqt = (str(r[0] or ""), str(r[1] or ""), str(r[2] or ""))
+                        if sq.upper() not in ("1", "ON", "YES"):
+                            parts.append("节点 slow_query_log=%s（未开启慢日志）" % (sq or "OFF"))
+                        if "TABLE" not in lo.upper():
+                            parts.append("节点 log_output=%s（不含 TABLE，慢日志没写进 mysql.slow_log，采集读不到）"
+                                         % (lo or "空"))
+                        parts.append("long_query_time=%ss" % (lqt or "?"))
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return "；".join(parts) if parts else "暂无慢日志（也可能是本时段确无超阈值查询）"
+
+
 @app.get("/api/slow_log")
 def api_slow_log(cluster_id: int = 0, host: str = "", port: int = 0, limit: int = 200,
                  min_ms: int = 0, user=Depends(auth_required)):
-    """慢日志明细（按耗时倒序）。"""
+    """慢日志明细（按耗时倒序）。
+
+    v2.3.5：为空时附带「为什么空」的诊断（慢日志开关 / log_output / 采集开关），
+    避免三形态下都只看到一句「暂无慢日志」而无从下手。
+    """
     try:
         rows = slow_log.get_slow_log(int(cluster_id), host or None, port or None, int(limit),
                                      int(min_ms) if min_ms else None)
-        return _json_ok({"ok": True, "rows": rows})
+        out = {"ok": True, "rows": rows}
+        if not rows:
+            out["hint"] = _slow_log_hint(int(cluster_id))
+        return _json_ok(out)
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
@@ -1398,6 +1448,12 @@ def _cluster_view(cid: int):
         cc["creds"] = get_cluster_creds(cid)
     except Exception:
         cc["creds"] = None
+    # v2.3.3：维护窗口状态（页面显著提示，避免「开了忘了关」）
+    try:
+        from .maintenance import summary as _maint_summary
+        cc["maint"] = _maint_summary(cid)
+    except Exception:
+        cc["maint"] = None
     cc["js"] = _cluster_js(cc)
     return cc
 
@@ -1800,7 +1856,16 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
                 _lt = (cur.fetchone() or ("",))[0] or ""
                 _log_ts_utc = str(_lt).strip().upper().startswith("UTC")
             except Exception:
-                pass
+                # v2.3.5：MariaDB **没有** log_timestamps 变量（MySQL 专属），
+                # 上面必然抛异常。MariaDB 的错误日志按 system_time_zone 落盘：
+                # 容器已设 TZ=Asia/Shanghai，通常为本地时间；但若宿主时区是 UTC，
+                # 落盘就是 UTC，展示会整整差 8 小时——必须换算，不能静默不处理。
+                try:
+                    cur.execute("SELECT @@system_time_zone")
+                    _stz = (cur.fetchone() or ("",))[0] or ""
+                    _log_ts_utc = str(_stz).strip().upper() in ("UTC", "GMT", "UTC0")
+                except Exception:
+                    pass
             cur.execute("SELECT @@log_error")
             path = (cur.fetchone() or ("",))[0] or ""
             # 相对路径按数据目录解析（部分部署 @@log_error 仅返回文件名）
@@ -1830,9 +1895,35 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
                     return JSONResponse({"ok": False, "path": path,
                                          "error": "读取错误日志失败(可能无 FILE 权限或 secure_file_priv 限制): " + str(e2)})
         if not rows:
+            # v2.3.5：把「为什么读不到」讲清楚。三种形态根因各不相同：
+            #   MySQL 8.0 容器  -> 有 mysql.error_log 表（log_error_services 含 log_sink_internal）
+            #   MariaDB 裸机/容器 -> **没有**该表，只能 LOAD_FILE 读 log_error 指向的文件；
+            #                       secure_file_priv 非空 或 log_error 未配置 → 恒为空
+            _sfp, _ler = "", path
+            try:
+                cur.execute("SELECT @@secure_file_priv")
+                _sfp = (cur.fetchone() or ("",))[0] or ""
+            except Exception:
+                pass
+            if not _ler:
+                try:
+                    cur.execute("SELECT @@log_error")
+                    _ler = (cur.fetchone() or ("",))[0] or ""
+                except Exception:
+                    pass
+            _why = []
+            if _sfp:
+                _why.append("secure_file_priv=%s（非空时 LOAD_FILE 只能读取该目录）" % _sfp)
+            if not _ler:
+                _why.append("log_error 未配置（官方镜像默认写 stdout，磁盘上根本没有错误日志文件）")
+            if not _why:
+                _why.append("文件为空，或账号缺少 FILE 权限")
+            note = ("未开启错误日志表（MariaDB 无 mysql.error_log，该表仅 MySQL 8.0 支持），"
+                    "也未能读到错误日志文件：" + "；".join(_why) + "。"
+                    " 修复：在节点 my.cnf / docker-my.cnf 设置 log_error=<统一日志目录>/error.log "
+                    "且 secure_file_priv=''，然后**重建容器**生效（静态参数，restart 不生效）。")
             return JSONResponse({"ok": True, "source": source or "none", "rows": [],
-                                 "note": "该节点未开启错误日志表(mysql.error_log)，且无法读取错误日志文件"
-                                         "(LOAD_FILE 被 secure_file_priv 限制，或 log_error 指向 stdout)。"})
+                                 "path": path, "note": note})
         return JSONResponse({"ok": True, "source": source, "rows": rows})
     finally:
         conn.close()
@@ -2270,6 +2361,63 @@ def api_node_detail(cluster_id: int = Form(...), host: str = Form(...), port: in
     except Exception as e:
         out["conn_error"] = f"{type(e).__name__}: {e}"
     return JSONResponse(out)
+
+
+@app.get("/api/maintenance")
+def api_maintenance(cluster_id: int = 0, user=Depends(auth_required)):
+    """列出生效中的维护窗口（v2.3.3）。cluster_id=0 表示全部集群。"""
+    try:
+        from .maintenance import active_windows
+        rows = active_windows(int(cluster_id) if cluster_id else None)
+        for r in rows:
+            for k in ("started_at", "end_at", "created_at", "ended_at"):
+                if r.get(k) is not None:
+                    r[k] = str(r[k])
+        return JSONResponse({"ok": True, "items": rows})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.post("/api/maintenance/begin")
+def api_maintenance_begin(cluster_id: int = Form(...), scope: str = Form("cluster"),
+                          target: str = Form(""), reason: str = Form(""),
+                          minutes: int = Form(0), user=Depends(auth_required)):
+    """开启维护窗口：期间抑制自动切换与状态类告警（v2.3.3）。
+
+    minutes>0 表示到期自动结束；0 表示不限时，必须手动结束。
+    """
+    try:
+        from .maintenance import begin
+        _who = user.get("username") if isinstance(user, dict) else str(user)
+        begin(int(cluster_id), scope, target, reason, minutes, created_by=_who)
+        try:
+            audit.add_audit(_who, "maintenance_begin", f"cluster={cluster_id}",
+                            f"scope={scope} target={target or '-'} minutes={minutes} "
+                            f"reason={reason}", cluster_id=int(cluster_id))
+        except Exception:
+            pass
+        tip = "（%s 分钟后自动结束）" % minutes if minutes > 0 else "（不限时，需手动结束）"
+        return JSONResponse({"ok": True, "msg": f"✓ 已进入维护模式{tip}"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/maintenance/end")
+def api_maintenance_end(cluster_id: int = Form(...), scope: str = Form(""),
+                        target: str = Form(""), user=Depends(auth_required)):
+    """结束维护窗口。scope 为空时结束该集群的全部窗口（v2.3.3）。"""
+    try:
+        from .maintenance import end as _mend
+        _who = user.get("username") if isinstance(user, dict) else str(user)
+        _mend(int(cluster_id), scope=(scope or None), target=target)
+        try:
+            audit.add_audit(_who, "maintenance_end", f"cluster={cluster_id}",
+                            f"scope={scope or 'all'}", cluster_id=int(cluster_id))
+        except Exception:
+            pass
+        return JSONResponse({"ok": True, "msg": "✓ 已结束维护模式"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"})
 
 
 @app.get("/api/alerts")

@@ -14,6 +14,12 @@ mysqldump 去连 MySQL 8.0 会撞上 caching_sha2_password 等鉴权/语法差�
 
   同名 .meta.json 为备份元信息；所有时间戳一律为中国时间（Asia/Shanghai, UTC+8）。
 
+  v2.3.2 起：带数据的备份在【一致性快照事务】内完成（REPEATABLE READ +
+  START TRANSACTION WITH CONSISTENT SNAPSHOT），跨表数据属同一时点；meta 记录
+  复制位点（MariaDB: gtid_binlog_pos/gtid_slave_pos；MySQL: gtid_executed +
+  binlog file/pos），为将来的时间点恢复（PITR）打地基。老备份无这些字段，
+  仍可正常列出、预览、恢复。
+
 备份范围
 --------
   scope = "all"    全库（排除 information_schema / mysql / performance_schema / sys）
@@ -190,7 +196,7 @@ def _scalar(cur, sql, args=None):
 
 
 def _dump_database(conn, cur, w, db, with_data: bool,
-                   host=None, port=None, cid=None) -> dict:
+                   host=None, port=None, cid=None, data_conn=None) -> dict:
     """导出单个库（表结构 + 数据 + 视图），返回统计。
 
     数据流式读取使用「独立连接」上的服务端游标（SSCursor），与跑元数据的
@@ -204,13 +210,18 @@ def _dump_database(conn, cur, w, db, with_data: bool,
       f"/*!40100 DEFAULT CHARACTER SET utf8mb4 */;\n")
     w(f"USE {_ident(db)};\n\n")
 
-    # 单独开一个连接专供数据流式导出，避免与上面的元数据游标争用同一连接
+    # 单独开一个连接专供数据流式导出，避免与上面的元数据游标争用同一连接。
+    # v2.3.2：若调用方传入 data_conn（一致性快照事务连接），则**复用它**——
+    # 每个库各自开连接会让各库落在不同时点的快照上，跨库数据依旧不一致。
     sconn = None
     if with_data:
-        try:
-            sconn = _conn(cid, host, port) if (cid is not None) else conn
-        except Exception as e:
-            w(f"-- 数据导出连接建立失败（仅跳过数据，结构仍会导出）：{e}\n")
+        if data_conn is not None:
+            sconn = data_conn
+        else:
+            try:
+                sconn = _conn(cid, host, port) if (cid is not None) else conn
+            except Exception as e:
+                w(f"-- 数据导出连接建立失败（仅跳过数据，结构仍会导出）：{e}\n")
 
     # ---- 基表 ----
     cur.execute(
@@ -328,6 +339,83 @@ def _dump_database(conn, cur, w, db, with_data: bool,
     return stat
 
 
+def _capture_position(cur, flavour=None):
+    """在一致性快照事务内采集复制位点（v2.3.2）。
+
+    位点必须在快照建立**之后**读取，才能与导出的数据严格对应：先于快照采集会得到
+    「位点比数据旧」的备份，将来按位点做 PITR 会重复应用事务；晚于快照则会丢事务。
+
+    MariaDB 与 MySQL 的位点语义完全不同，必须分派：
+      MariaDB: gtid_binlog_pos（本实例已写入 binlog 的 GTID）
+               gtid_slave_pos （已从主库回放的 GTID —— 从库备份时是关键位点）
+      MySQL  : gtid_executed + binlog file/pos
+    """
+    out = {}
+    if flavour is None:
+        try:
+            from .mysql_compat import detect_flavour
+            flavour = detect_flavour(cur)
+        except Exception:
+            flavour = "unknown"
+    out["flavour"] = flavour
+    try:
+        if flavour == "mariadb":
+            for var in ("gtid_binlog_pos", "gtid_slave_pos", "gtid_current_pos"):
+                try:
+                    cur.execute("SELECT @@" + var)
+                    r = cur.fetchone()
+                    out[var] = (r[0] if r and r[0] is not None else "")
+                except Exception:
+                    out[var] = ""
+        else:
+            try:
+                cur.execute("SELECT @@gtid_executed")
+                r = cur.fetchone()
+                out["gtid_executed"] = (r[0] if r and r[0] is not None else "")
+            except Exception:
+                out["gtid_executed"] = ""
+            # MySQL 8.4 起 SHOW MASTER STATUS 更名 SHOW BINARY LOG STATUS；
+            # 项目锁定 8.0.46（旧名仍有效），失败再回退新名，两头都兜住。
+            for stmt in ("SHOW MASTER STATUS", "SHOW BINARY LOG STATUS"):
+                try:
+                    cur.execute(stmt)
+                    r = cur.fetchone()
+                    if r:
+                        out["binlog_file"] = r[0]
+                        try:
+                            out["binlog_pos"] = int(r[1])
+                        except (TypeError, ValueError):
+                            pass
+                    break
+                except Exception:
+                    continue
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+def _write_backup_header(w, cid, host, port, scope, targets, with_data,
+                         position, snap_ok, snap_err):
+    """备份文件头注释（v2.3.4 抽出，单文件/分库目录两种形态共用）。"""
+    w("-- Custos 逻辑备份\n")
+    w(f"-- 集群     : {_cluster_dir_name(cid)} (id={cid})\n")
+    w(f"-- 源节点    : {host}:{port}\n")
+    w(f"-- 生成时间  : {now_cn().strftime('%Y-%m-%d %H:%M:%S')} (UTC+8)\n")
+    w(f"-- 备份范围  : {'全库' if scope == 'all' else '指定库'}\n")
+    w(f"-- 包含数据  : {'是' if with_data else '否（仅结构）'}\n")
+    w(f"-- 数据库    : {', '.join(targets)}\n")
+    if position:
+        w(f"-- 复制位点  : {json.dumps(position, ensure_ascii=False)}\n")
+    w(f"-- 一致性快照: {'是（REPEATABLE READ + WITH CONSISTENT SNAPSHOT）' if snap_ok else ('否（%s）' % (snap_err or '仅结构备份'))}\n")
+    w("--\n")
+    w("/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\n")
+    w("/*!40101 SET NAMES utf8mb4 */;\n")
+    w("SET FOREIGN_KEY_CHECKS=0;\n")
+    w("SET UNIQUE_CHECKS=0;\n")
+    w("SET TIME_ZONE='+08:00';\n")
+    w("SET AUTOCOMMIT=0;\n\n")
+
+
 def run_backup(cid, host, port, databases=None, with_data: bool = True,
                scope: str = "all"):
     """执行备份。databases 为空(None/[]) 且 scope='all' 时备份全部业务库。"""
@@ -356,39 +444,115 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
         sql_path = bdir / f"{label}_{ts}.sql.gz"
         meta_path = bdir / f"{label}_{ts}.meta.json"
 
+        # ---- v2.3.2：一致性快照事务 ----
+        # 所有库的数据读取必须在【同一个】REPEATABLE READ 快照事务内完成：
+        # 备份期间若有写入，先导出的表与后导出的表会属于不同时点，恢复出来
+        # 跨表不一致（典型：订单表有这笔、库存表没扣）。位点也必须在快照建立
+        # 之后采集，才能与导出的数据严格对应（为将来的 PITR 打地基）。
+        snap_conn = None
+        snap_ok, snap_err, position = False, "", {}
+        if with_data:
+            try:
+                snap_conn = _conn(cid, host, port, timeout=15)
+                with snap_conn.cursor() as _sc:
+                    _sc.execute("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                    _sc.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+                    snap_ok = True
+                with snap_conn.cursor() as _sc:
+                    position = _capture_position(_sc)
+            except Exception as _e:
+                snap_ok, snap_err = False, str(_e)
+                try:
+                    if snap_conn:
+                        snap_conn.close()
+                except Exception:
+                    pass
+                snap_conn = None
+
         total = {"tables": 0, "views": 0, "rows": 0}
+        # v2.3.4：多库全备改为「目录模式」——每库一个 .sql.gz + index.json。
+        # 价值：恢复指定库时只读对应文件，不必解压整库全集（库多/库大时差异显著）；
+        # 单库备份与「指定库」备份仍走单文件，保持兼容。
+        multi = (len(targets) >= 2 and scope == "all")
+        if multi:
+            set_dir = bdir / f"{label}_{ts}"
+            set_dir.mkdir(parents=True, exist_ok=True)
+            index = {
+                "ts": ts,
+                "time": now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+                "timezone": "Asia/Shanghai (UTC+8)",
+                "cluster_id": int(cid),
+                "cluster_name": _cluster_dir_name(cid),
+                "label": label,
+                "host": host, "port": int(port),
+                "scope": scope,
+                "kind": "set",
+                "databases": [],
+                "with_data": bool(with_data),
+                "tables": 0, "views": 0, "rows": 0, "size": 0,
+                "file": set_dir.name,
+                "position": position,
+                "consistent": bool(snap_ok and with_data),
+            }
+            with conn.cursor() as cur:
+                for db in targets:
+                    db_path = set_dir / f"{db}.sql.gz"
+                    with gzip.open(db_path, "wt", encoding="utf-8", newline="\n") as f:
+                        def w(s):
+                            f.write(s)
+                        _write_backup_header(w, cid, host, port, scope, [db],
+                                             with_data, position, snap_ok, snap_err)
+                        st = _dump_database(conn, cur, w, db, with_data,
+                                            host=host, port=port, cid=cid,
+                                            data_conn=snap_conn)
+                        total["tables"] += st["tables"]
+                        total["views"] += st["views"]
+                        total["rows"] += st["rows"]
+                        w("SET FOREIGN_KEY_CHECKS=1;\n")
+                        w("SET UNIQUE_CHECKS=1;\n")
+                        w("COMMIT;\n")
+                        w("-- 备份结束\n")
+                    index["databases"].append(db)
+                    index["size"] += db_path.stat().st_size
+            # 数据全部导出完毕后才提交快照事务，释放一致性视图
+            if snap_conn is not None:
+                try:
+                    with snap_conn.cursor() as _c:
+                        _c.execute("COMMIT")
+                except Exception:
+                    pass
+            index["tables"] = total["tables"]
+            index["views"] = total["views"]
+            index["rows"] = total["rows"]
+            (set_dir / "index.json").write_text(
+                json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+            return {"ok": True, "file": set_dir.name, "meta": index}
+
+        # 单文件模式（单库 / 指定库并集）——兼容老备份格式
+        meta_path = bdir / f"{label}_{ts}.meta.json"
         with conn.cursor() as cur:
             with gzip.open(sql_path, "wt", encoding="utf-8", newline="\n") as f:
                 def w(s):
                     f.write(s)
-
-                w("-- Custos 逻辑备份\n")
-                w(f"-- 集群     : {_cluster_dir_name(cid)} (id={cid})\n")
-                w(f"-- 源节点    : {host}:{port}\n")
-                w(f"-- 生成时间  : {now_cn().strftime('%Y-%m-%d %H:%M:%S')} (UTC+8)\n")
-                w(f"-- 备份范围  : {'全库' if scope == 'all' else '指定库'}\n")
-                w(f"-- 包含数据  : {'是' if with_data else '否（仅结构）'}\n")
-                w(f"-- 数据库    : {', '.join(targets)}\n")
-                w("--\n")
-                w("/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\n")
-                w("/*!40101 SET NAMES utf8mb4 */;\n")
-                w("SET FOREIGN_KEY_CHECKS=0;\n")
-                w("SET UNIQUE_CHECKS=0;\n")
-                w("SET TIME_ZONE='+08:00';\n")
-                w("SET AUTOCOMMIT=0;\n\n")
-
+                _write_backup_header(w, cid, host, port, scope, targets,
+                                     with_data, position, snap_ok, snap_err)
                 for db in targets:
                     st = _dump_database(conn, cur, w, db, with_data,
-                                        host=host, port=port, cid=cid)
+                                        host=host, port=port, cid=cid,
+                                        data_conn=snap_conn)
                     total["tables"] += st["tables"]
                     total["views"] += st["views"]
                     total["rows"] += st["rows"]
-
                 w("SET FOREIGN_KEY_CHECKS=1;\n")
                 w("SET UNIQUE_CHECKS=1;\n")
                 w("COMMIT;\n")
                 w("-- 备份结束\n")
-
+            if snap_conn is not None:
+                try:
+                    with snap_conn.cursor() as _c:
+                        _c.execute("COMMIT")
+                except Exception:
+                    pass
         size = sql_path.stat().st_size
         meta = {
             "ts": ts,
@@ -399,24 +563,36 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
             "label": label,
             "host": host, "port": int(port),
             "scope": scope,
+            "kind": "file",
             "databases": targets,
             "with_data": bool(with_data),
             "tables": total["tables"], "views": total["views"],
             "rows": total["rows"], "size": size,
             "file": sql_path.name,
+            "position": position,
+            "consistent": bool(snap_ok and with_data),
         }
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2),
                              encoding="utf-8")
         return {"ok": True, "file": sql_path.name, "meta": meta}
     except Exception as e:
-        # 备份失败要清理半截文件，避免留下不可用的残档
+        # 备份失败要清理半截文件/目录，避免留下不可用的残档
         try:
-            if sql_path is not None and sql_path.exists():
+            sd = locals().get("set_dir")
+            if sd is not None and getattr(sd, "is_dir", lambda: False)():
+                import shutil
+                shutil.rmtree(sd, ignore_errors=True)
+            elif sql_path is not None and sql_path.exists():
                 sql_path.unlink()
         except Exception:
             pass
         return {"ok": False, "error": str(e)}
     finally:
+        try:
+            if snap_conn is not None:
+                snap_conn.close()
+        except Exception:
+            pass
         conn.close()
 
 
@@ -424,8 +600,14 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
 # 备份列表 / 读取 / 删除
 # --------------------------------------------------------------------------
 def list_backups(cid):
+    """列出备份。v2.3.4 起支持两种形态：
+      - 单文件备份：<label>_<ts>.sql.gz + .meta.json（kind="file"）
+      - 分库集备份：<label>_<ts>/ 目录，每库一个 .sql.gz + index.json（kind="set"）
+    两类按生成时间倒序合并；老备份（无 kind 字段）按 "file" 处理。
+    """
     d = _dir(cid)
     out = []
+    # 单文件备份
     for p in sorted(d.glob("*.sql.gz"), reverse=True):
         meta_p = p.with_suffix("").with_suffix(".meta.json")
         meta = None
@@ -435,8 +617,6 @@ def list_backups(cid):
             except Exception:
                 meta = None
         # 备份目录按集群【名】划分：删掉旧集群又用同名重建时，旧备份会残留在同一目录。
-        # 按 meta 里的 cluster_id 过滤，只列出真正属于当前集群的备份，
-        # 避免列出上一代同名集群的备份（误恢复会把旧数据写进新集群）。
         if isinstance(meta, dict) and meta.get("cluster_id"):
             try:
                 if int(meta.get("cluster_id")) != int(cid):
@@ -444,12 +624,35 @@ def list_backups(cid):
             except (TypeError, ValueError):
                 pass
         st = p.stat()
+        m = dict(meta) if isinstance(meta, dict) else {}
+        m["kind"] = m.get("kind", "file")
         out.append({
             "file": p.name,
             "size": st.st_size,
             "mtime": from_ts_cn(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            "meta": meta,
+            "meta": m,
         })
+    # 分库集备份
+    for idx in sorted(d.glob("*/index.json"), reverse=True):
+        try:
+            meta = json.loads(idx.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("cluster_id") and int(meta.get("cluster_id")) != int(cid):
+            continue
+        set_dir = idx.parent
+        st = set_dir.stat()
+        m = dict(meta)
+        m["kind"] = m.get("kind", "set")
+        out.append({
+            "file": set_dir.name,
+            "size": m.get("size", st.st_size),
+            "mtime": from_ts_cn(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "meta": m,
+        })
+    out.sort(key=lambda x: (x.get("meta") or {}).get("time", ""), reverse=True)
     return out
 
 
@@ -589,6 +792,9 @@ def restore_backup(cid, host, port, filename, databases=None, no_binlog=False):
       该变量是 session 级（不能 SET GLOBAL），故只能在本函数建连后设置。
     """
     path = get_backup_path(cid, filename)
+    if path.is_dir():
+        # v2.3.4：分库集备份目录 -> 按 index.json 逐个库文件恢复
+        return _restore_backup_set(cid, host, port, path, databases, no_binlog)
     try:
         with gzip.open(path, "rt", encoding="utf-8") as f:
             text = f.read()
@@ -626,27 +832,8 @@ def restore_backup(cid, host, port, filename, databases=None, no_binlog=False):
                                       or s.lstrip().upper().startswith("/*!"))]
 
     conn = _conn(cid, host, port, timeout=20)
-    ok_n, err_n, errors = 0, 0, []
     try:
-        with conn.cursor() as cur:
-            if no_binlog:
-                try:
-                    cur.execute("SET sql_log_bin = 0")
-                except Exception as e:
-                    return {"ok": False,
-                            "error": f"无法关闭会话 binlog（需 SUPER 权限）：{e}"}
-            for s in stmts:
-                try:
-                    cur.execute(s)
-                    ok_n += 1
-                except Exception as e:
-                    err_n += 1
-                    if len(errors) < 10:
-                        errors.append(f"{str(e)[:200]} —— 语句：{s[:120]}")
-        try:
-            conn.commit()
-        except Exception:
-            pass
+        ok_n, err_n, errors = _exec_stmts(conn, stmts, no_binlog)
     finally:
         conn.close()
 
@@ -654,6 +841,78 @@ def restore_backup(cid, host, port, filename, databases=None, no_binlog=False):
         "ok": err_n == 0,
         "total": len(stmts), "ok_statements": ok_n, "failed": err_n,
         "errors": errors,
+        "msg": f"恢复完成：成功 {ok_n} 条" + (f"，失败 {err_n} 条" if err_n else ""),
+    }
+
+
+def _exec_stmts(conn, stmts, no_binlog):
+    """在建连后的 conn 上执行切好的语句（v2.3.4 抽出，单文件/目录恢复共用）。
+
+    返回 (ok_n, err_n, errors)。no_binlog 时关闭本会话 binlog，避免恢复产生的
+    DML 写入从库 binlog 而与主库历史 GTID 冲突。
+    """
+    ok_n, err_n, errors = 0, 0, []
+    with conn.cursor() as cur:
+        if no_binlog:
+            try:
+                cur.execute("SET sql_log_bin = 0")
+            except Exception as e:
+                return ok_n, err_n, [f"无法关闭会话 binlog（需 SUPER 权限）：{e}"]
+        for s in stmts:
+            try:
+                cur.execute(s)
+                ok_n += 1
+            except Exception as e:
+                err_n += 1
+                if len(errors) < 10:
+                    errors.append(f"{str(e)[:200]} —— 语句：{s[:120]}")
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    return ok_n, err_n, errors
+
+
+def _restore_backup_set(cid, host, port, set_dir, databases, no_binlog):
+    """恢复分库集备份目录（v2.3.4）。
+
+    databases 非空前只恢复其中的库（目录内每个 .sql.gz 已是独立库，无需再按 USE 切段）。
+    """
+    idx = set_dir / "index.json"
+    try:
+        meta = json.loads(idx.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": f"读取备份索引失败：{e}"}
+    all_dbs = meta.get("databases") or []
+    if databases:
+        want = set(databases)
+        files = [set_dir / f"{d}.sql.gz" for d in all_dbs if d in want]
+    else:
+        files = [set_dir / f"{d}.sql.gz" for d in all_dbs]
+    if not files:
+        return {"ok": False, "error": "该备份集内没有可恢复的库"}
+    conn = _conn(cid, host, port, timeout=20)
+    ok_n, err_n, errors = 0, 0, []
+    try:
+        for fp in files:
+            try:
+                with gzip.open(fp, "rt", encoding="utf-8") as f:
+                    text = f.read()
+            except Exception as e:
+                err_n += 1
+                errors.append(f"{fp.name} 读取失败: {e}")
+                continue
+            _ok, _en, _ers = _exec_stmts(conn, split_statements(text), no_binlog)
+            ok_n += _ok
+            err_n += _en
+            errors.extend(_ers)
+    finally:
+        conn.close()
+    return {
+        "ok": err_n == 0,
+        "total": ok_n + err_n, "ok_statements": ok_n, "failed": err_n,
+        "errors": errors[:50],
+        "restored": [f.stem for f in files],
         "msg": f"恢复完成：成功 {ok_n} 条" + (f"，失败 {err_n} 条" if err_n else ""),
     }
 

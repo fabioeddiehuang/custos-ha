@@ -6,6 +6,7 @@
 import pymysql
 from pymysql.cursors import DictCursor
 from .config import MGMT, ROLE_ADMIN, ROLE_VIEWER
+from . import crypto as _crypto
 
 
 def _create():
@@ -318,6 +319,26 @@ def init_schema():
                 c.execute("ALTER TABLE nodes MODIFY mysql_version varchar(48) DEFAULT NULL")
             except Exception:
                 pass
+            # ---- v2.3.3：维护模式窗口表 ----
+            # scope=cluster 抑制整个集群的自动切换与状态告警；scope=node 只覆盖单个节点。
+            # end_at 为 NULL 表示不限时（必须手动结束）；到期由查询时 purge 兜底。
+            try:
+                c.execute("""CREATE TABLE IF NOT EXISTS maintenance (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    cluster_id INT NOT NULL,
+                    scope VARCHAR(8) NOT NULL DEFAULT 'cluster',
+                    target VARCHAR(64) DEFAULT '',
+                    reason VARCHAR(255) DEFAULT '',
+                    started_at DATETIME NOT NULL,
+                    end_at DATETIME DEFAULT NULL,
+                    created_by VARCHAR(64) DEFAULT '',
+                    created_at DATETIME NOT NULL,
+                    ended_at DATETIME DEFAULT NULL,
+                    active TINYINT(1) NOT NULL DEFAULT 1,
+                    INDEX idx_cluster_active (cluster_id, active)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+            except Exception as e:
+                print(f"[init_db] 创建 maintenance 表失败(可忽略): {e}")
             # ---- v2.3.0：节点「配置待生效」提示 ----
             # gen_fingerprint：最近一次生成的部署文件指纹（路径+内容），用于判断配置是否又变了
             # pending_actions：regen 后需在节点执行的动作清单（JSON，空串=无待办）
@@ -443,9 +464,24 @@ def init_schema():
         conn.commit()
     finally:
         conn.close()
+    # v2.3.1：表结构与默认值就绪后，把存量明文凭证加密（幂等，失败下一轮重试）
+    try:
+        migrate_encrypt_credentials()
+    except Exception as _ce:
+        print(f"[init_db] 凭证加密迁移失败(可忽略，下轮启动重试): {_ce}")
 
 
-def query(sql, args=None):
+# v2.3.1：需要「透明解密」的凭证列。凡是 SELECT 出这些列的地方都会自动拿到明文，
+# 无需任何调用方改动（全系统凭证读取都收敛在 db.query 这一个出口）。
+_SECRET_COLS = ("root_pass", "ha_pass", "repl_pass", "app_pass")
+
+
+def query_raw(sql, args=None):
+    """与 query() 相同，但**不做凭证解密**——仅供加密迁移使用。
+
+    迁移必须拿到库里的原始值才能判断「是否已加密」；走 query() 会被透明解密，
+    结果永远判成明文、每次启动都把密文重写一遍。
+    """
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -453,6 +489,61 @@ def query(sql, args=None):
             return c.fetchall()
     finally:
         conn.close()
+
+
+def query(sql, args=None):
+    """查询并返回 dict 列表；命中的凭证列**自动解密**（v2.3.1）。
+
+    这是全系统凭证读取的统一出口：13 个模块、数百处调用无需任何改动即可拿到明文，
+    也杜绝「某处漏解密、拿着密文去连数据库」这类难以定位的故障。
+    """
+    rows = query_raw(sql, args)
+    if not rows:
+        return rows
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        for k in _SECRET_COLS:
+            v = r.get(k)
+            if v and _crypto.is_encrypted(v):
+                r[k] = _crypto.decrypt(v)
+    return rows
+
+
+def migrate_encrypt_credentials():
+    """把存量明文凭证加密（v2.3.1）。幂等：已加密的跳过。
+
+    必要性：升级前入库的凭证全是明文。不迁移就会长期「新写入加密、存量明文」并存，
+    管理库备份与 dump 文件里依旧躺着生产库 root 口令 —— 加密形同虚设。
+    """
+    changed = 0
+    for tbl, key_cols, pk in (
+        ("clusters", ("ha_pass", "repl_pass", "app_pass"), "id"),
+        ("nodes", ("root_pass",), "ip"),
+    ):
+        try:
+            cols = ", ".join((pk,) + key_cols)
+            rows = query_raw(f"SELECT {cols} FROM {tbl}")
+        except Exception:
+            continue
+        for r in rows:
+            upd, vals = [], []
+            for k in key_cols:
+                v = r.get(k)
+                if v and not _crypto.is_encrypted(v):
+                    upd.append(f"{k}=%s")
+                    vals.append(_crypto.encrypt(v))
+            if not upd:
+                continue
+            vals.append(r.get(pk))
+            try:
+                execute(f"UPDATE {tbl} SET {', '.join(upd)} WHERE {pk}=%s", vals)
+                changed += 1
+            except Exception as e:
+                print(f"[init_db] 加密 {tbl}({pk}={r.get(pk)}) 失败: {e}")
+    if changed:
+        print(f"[init_db] 凭证加密迁移：已加密 {changed} 条存量记录", flush=True)
+    return changed
 
 
 def execute(sql, args=None):

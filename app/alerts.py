@@ -178,6 +178,17 @@ def resolve_recipients(cluster_id=None):
 last_error = ""
 
 
+# v2.3.3：维护窗口内**仍然要发出去**的告警关键字。
+# 维护期出事（切换失败、数据冲突、备份失败）反而更要看得到，绝不能一并静默。
+_MAINT_PASS_KEYWORDS = ("切换", "数据冲突", "备份失败", "重建")
+
+
+def _subject_pass_maintenance(subject):
+    """判断该告警在维护窗口内是否仍需发送（切换类 / 需人工处理类放行）。"""
+    s = str(subject or "")
+    return any(k in s for k in _MAINT_PASS_KEYWORDS)
+
+
 def send_alert(subject, body, cluster_id=None, recipients=None, force=False,
                grace=None, cancel_key=None):
     """发送告警邮件。
@@ -211,6 +222,17 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
     """真正投递（含同类冷却节流）。由 send_alert 或观察期到点后调用。"""
     global last_error
     last_error = ""
+    # v2.3.3：维护窗口内抑制「状态类」告警（离线/复制/延迟/半同步），避免维护期刷屏。
+    # 放在投递层而不是 send_alert：自愈观察期挂起的告警是到点后直接走 _deliver 的，
+    # 只在 send_alert 判断会漏掉这批，维护期照样收到一堆邮件。
+    if cluster_id and not force and not _subject_pass_maintenance(subject):
+        try:
+            from .maintenance import is_in_maintenance
+            if is_in_maintenance(int(cluster_id)):
+                print(f"[alert:skip] 维护窗口内，已抑制状态类告警：{subject}")
+                return False
+        except Exception:
+            pass
     c = _cfg()
     if recipients is None:
         recipients = resolve_recipients(cluster_id)

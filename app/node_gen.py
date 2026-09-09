@@ -26,7 +26,7 @@ from .db import get_setting, query, execute
 from .mysql_compat import default_auth_plugin, is_mariadb_node
 from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, is_semi_sync_enabled
 from . import mariadb_matrix
-from . import mariadb_matrix
+from . import crypto as _crypto
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
 
@@ -1633,13 +1633,15 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     #    root_pass 一并入库：节点 MySQL root 密码在容器创建时固定，作为 ha_monitor 凭证
     #    自愈与切换回退的权威凭据（不随 HA_PASS 漂移）。
     host_compose = f"{NODES_HOST_BASE}/{ip}"
+    # v2.3.1：root 口令落库前加密（后续写 ha_check.conf 等仍用局部明文变量，不受影响）
+    _root_pass_enc = _crypto.encrypt(root_pass)
     execute(
         "INSERT INTO nodes (ip, port, root_user, root_pass, server_id, compose_path, cluster_id, node_type, mysql_version) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON DUPLICATE KEY UPDATE port=%s, root_user=%s, root_pass=%s, server_id=%s, "
         "compose_path=%s, cluster_id=%s, node_type=%s, mysql_version=%s",
-        (ip, port, root_user, root_pass, server_id, host_compose, cluster_id, node_type, mysql_version,
-         port, root_user, root_pass, server_id, host_compose, cluster_id, node_type, mysql_version),
+        (ip, port, root_user, _root_pass_enc, server_id, host_compose, cluster_id, node_type, mysql_version,
+         port, root_user, _root_pass_enc, server_id, host_compose, cluster_id, node_type, mysql_version),
     )
     execute(
         "INSERT INTO hosts (host, port, role, status, initial_role, cluster_id) "

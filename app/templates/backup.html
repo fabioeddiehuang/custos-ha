@@ -235,6 +235,7 @@
             <td>
               {% if b.meta %}
                 {% if b.meta.scope == 'all' %}<span class="badge sky">全库</span>{% else %}<span class="badge warn">指定库</span>{% endif %}
+                {% if b.meta.kind == 'set' %}<span class="badge" style="background:#1e6f5c;color:#fff" title="多库分文件备份：每库一个 .sql.gz + index.json">分库集</span>{% endif %}
                 {% if not b.meta.with_data %}<span class="badge">仅结构</span>{% endif %}
               {% else %}<span class="badge">—</span>{% endif %}
             </td>

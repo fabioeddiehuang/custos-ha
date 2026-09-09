@@ -6,6 +6,10 @@
 """
 from .db import query, execute, get_setting
 from .config import rand_secret, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT
+from . import crypto as _crypto
+
+# v2.3.1：落库前需加密的凭证列（读取由 db.query 统一透明解密）
+_SECRET_CLUSTER_COLS = ("ha_pass", "repl_pass", "app_pass")
 from .mysql_compat import node_family
 
 
@@ -42,7 +46,8 @@ def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=N
         (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
          vip, vip_prefix, interface, vrid, vip_port, node_type, mysql_version)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
+        (name, ha_user, _crypto.encrypt(ha_pass), repl_user,
+         _crypto.encrypt(repl_pass), app_user, _crypto.encrypt(app_pass),
          vip, vip_prefix, interface, vrid, int(vip_port), node_type, mysql_version),
     )
     return new_id
@@ -96,7 +101,7 @@ def update_cluster(cluster_id, **fields):
     for k, v in fields.items():
         if k in allowed and v is not None:
             sets.append(f"{k}=%s")
-            args.append(v)
+            args.append(_crypto.encrypt(v) if k in _SECRET_CLUSTER_COLS else v)
     if not sets:
         return
     args.append(cluster_id)
