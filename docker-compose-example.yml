@@ -76,7 +76,7 @@ services:
       WEB_USER: admin
       WEB_PASS: ""   # 留空=首次启动随机生成并打印到日志；填写=固定密码（生产务必修改）
       SECRET_KEY: "${SECRET_KEY}"   # 留空（不在 .env 设置）则首次启动自动生成随机密钥并持久化到 ./data/secret_key；或在 .env 设置 SECRET_KEY=<强随机值> 固定
-      SEMI_SYNC: "0"   # 半同步复制开关：置 "1" 启用（主库提交等待从库 ACK，压缩切换数据丢失窗口）；需节点插件可用
+      SEMI_SYNC: "1"   # 半同步复制开关：默认 "1" 启用（主库提交等待从库 ACK，压缩切换数据丢失窗口）；需节点插件可用
       CHECK_INTERVAL: 3
       FAIL_THRESHOLD: 2
       FAILOVER_COOLDOWN_SEC: 120   # 两次切换最小间隔(秒)；仅约束手动切换与「延迟/压力」自动切换，不影响主库失联的紧急切换

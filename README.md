@@ -135,7 +135,7 @@ cd custos-ha
 | `NODES_DIR` | 容器内节点生成目录 | `/app/generated_nodes` |
 | `NODES_HOST_BASE` | 节点目录在宿主机的**显示路径**（Web 展示用） | `custos-ha/generated_nodes` |
 | `VIP` / `VIP_PREFIX` / `INTERFACE` / `VRID` / `VIP_PORT` | VIP / 掩码位 / 网卡 / 虚拟路由ID / VIP 对外访问端口 | 空 / `24` / `eth0` / `51` / `3307` |
-| `SEMI_SYNC` | 半同步复制开关：置 `"1"` 启用（主库提交等待从库 ACK，压缩切换数据丢失窗口）；节点 my.cnf 自动注入插件与开启参数，随启动生效、重启不丢。MySQL 8.0（≥8.0.26 用 source/replica 命名，更早用 master/slave）与 MariaDB 均支持 | `"0"` |
+| `SEMI_SYNC` | 半同步复制开关：置 `"1"` 启用（默认即开；主库提交等待从库 ACK，压缩切换数据丢失窗口）；节点 my.cnf 自动注入插件与开启参数，随启动生效、重启不丢。MySQL 8.0（≥8.0.26 用 source/replica 命名，更早用 master/slave）与 MariaDB 均支持 | `"1"` |
 
 > **运行时配置项**（settings 表，Web「系统设置」可改，改后无需重启）：
 > - 备份调度：`BACKUP_SCHEDULE_ENABLED`（`0` 默认关闭）/ `BACKUP_INTERVAL_HOURS`（`24`）/ `BACKUP_RETENTION_DAYS`（`7`，`0`=不清理）/ `BACKUP_TARGET`（`slave`，优先从库，无可用从库时回退主库）/ `BACKUP_WITH_DATA`（`1`）

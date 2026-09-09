@@ -124,10 +124,8 @@ if [ "$ASSUME_YES" = "1" ]; then
   WEB_PASS=$(rand_secret); SECRET_KEY=$(rand_secret)
   info "Web 密码与 SECRET_KEY 已随机生成"
 else
-  printf '  Web 管理员密码（留空=随机生成）: '
-  stty -echo 2>/dev/null || true
+  printf '  Web 管理员密码（留空=随机生成，明文输入）: '
   read -r WEB_PASS || true
-  stty echo 2>/dev/null || true
   printf '\n'
   [ -n "$WEB_PASS" ] || { WEB_PASS=$(rand_secret); info "已生成随机 Web 密码"; }
 fi
@@ -165,6 +163,8 @@ set_yaml VRID "$VRID"
 set_yaml WEB_PORT "$WEB_PORT"
 set_yaml WEB_USER "$WEB_USER"
 set_yaml WEB_PASS "$WEB_PASS"
+# 半同步复制默认开启（主库提交等待从库 ACK，压缩切换数据丢失窗口）
+set_yaml SEMI_SYNC "1"
 # VIP 可选：留空则不在 compose 写入，稍后可在后台「服务端配置」填写
 if [ -n "$VIP" ]; then
   if grep -Eq '^[[:space:]]*#[[:space:]]*VIP:' "$COMPOSE_FILE"; then
