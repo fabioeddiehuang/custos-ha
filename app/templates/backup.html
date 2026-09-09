@@ -15,9 +15,42 @@
   .db-bar{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
   .db-bar .sp{flex:1}
   .bk-note{font-size:12px;color:var(--muted);line-height:1.7;margin-top:10px}
-  .bk-table td,.bk-table th{white-space:nowrap}
-  .bk-table td.wrap{white-space:normal;word-break:break-all}
+  /* 历史表格列多且有长文件名/长库名/操作按钮组，若不锁定列宽又不给滚动容器，
+     表格会撑破卡片边框造成整页布局变形。改为：定宽布局 + 外层横向滚动。 */
+  .bk-scroll{
+    overflow-x:auto;-webkit-overflow-scrolling:touch;
+    border:1px solid var(--border);border-radius:10px;
+  }
+  .bk-table{table-layout:fixed;min-width:940px;margin:0}
+  .bk-table th,.bk-table td{
+    white-space:normal;overflow-wrap:anywhere;word-break:break-word;vertical-align:middle;
+  }
+  .bk-table th{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .bk-scope{font-size:11.5px;color:var(--muted)}
+  /* 库名 chips：超长不撑列，多余折叠为 +N */
+  .chips{display:flex;flex-wrap:wrap;gap:4px}
+  .chip{
+    display:inline-block;max-width:100%;padding:2px 8px;border-radius:999px;
+    background:var(--surface-2);border:1px solid var(--border);
+    font-family:var(--mono);font-size:11.5px;color:var(--text);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .chip.more{color:var(--muted)}
+  /* 操作按钮组：定宽内换行，不再把列撑开 */
+  .ops-cell{display:flex;flex-wrap:wrap;gap:6px}
+  .btn-danger{background:var(--danger);border-color:var(--danger);color:#fff}
+  .btn-danger:hover{background:var(--danger);color:#fff;filter:brightness(1.08)}
+  /* 历史区 Tab：把四个长区块折叠成一个卡片，避免页面过长 */
+  .bk-tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+  .bk-tab{
+    padding:7px 14px;border-radius:8px;border:1px solid var(--border);
+    background:var(--surface-2);color:var(--muted);
+    font-size:13px;font-weight:600;font-family:inherit;cursor:pointer;transition:.15s;
+  }
+  .bk-tab:hover{color:var(--primary);border-color:var(--primary)}
+  .bk-tab.on{background:var(--primary-light);color:var(--primary);border-color:var(--primary)}
+  .tab-pane{display:none}
+  .tab-pane.on{display:block}
   .bk-preview{
     background:var(--surface-3);color:var(--text);border-radius:10px;padding:12px 14px;
     font-family:var(--mono);font-size:12px;line-height:1.6;max-height:52vh;overflow:auto;white-space:pre-wrap;
@@ -167,85 +200,119 @@
   </div>
 </div>
 
-<!-- ============ 备份历史 ============ -->
+<!-- ============ 历史记录（Tab：备份文件 / 备份记录 / 恢复记录 / 操作日志） ============ -->
 <div class="card">
-  <h3>备份历史<span style="flex:1"></span>
-    <span class="badge sky">{{ backups|length }} 个文件</span>
+  <h3>历史记录<span style="flex:1"></span>
+    <span class="badge sky">{{ backups|length }} 个备份文件</span>
+    <button class="btn btn-sm btn-ghost" onclick="refreshAll()">⟳ 刷新</button>
   </h3>
-  <table class="tbl bk-table">
-    <thead>
-      <tr><th>文件名</th><th>时间</th><th>范围</th><th>数据库</th><th>表/视图/行</th><th>大小</th><th>源节点</th><th>操作</th></tr>
-    </thead>
-    <tbody id="bkBody">
-      {% for b in backups %}
-      <tr data-file="{{ b.file }}">
-        <td class="mono">{{ b.file }}</td>
-        <td>{{ (b.meta.time if b.meta else b.mtime) }}</td>
-        <td>{% if b.meta %}{% if b.meta.scope == 'all' %}<span class="badge sky">全库</span>{% else %}<span class="badge warn">指定库</span>{% endif %}{% if not b.meta.with_data %}<span class="badge">仅结构</span>{% endif %}{% else %}<span class="badge">—</span>{% endif %}</td>
-        <td class="wrap">{% if b.meta and b.meta.scope == 'all' %}<span class="badge sky">全部业务库</span>{% elif b.meta %}{{ b.meta.databases|join(', ') }}{% else %}—{% endif %}</td>
-        <td class="mono">{% if b.meta %}{{ b.meta.tables }}/{{ b.meta.views }}/{{ b.meta.rows }}{% else %}—{% endif %}</td>
-        <td class="mono">{{ (b.size/1024)|round(1) }} KB</td>
-        <td class="mono">{% if b.meta %}{{ b.meta.host }}:{{ b.meta.port }}{% else %}—{% endif %}</td>
-        <td>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;max-width:260px">
-          <button class="btn btn-sm" onclick="restoreFile('{{ b.file }}')">恢复</button>
-          <a class="btn btn-sm btn-ghost" href="/api/backup/download?cluster_id={{ cluster.id }}&file={{ b.file }}">下载</a>
-          <button class="btn btn-sm" onclick="previewFile('{{ b.file }}')">预览</button>
-          <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delBackup('{{ b.file }}')">删除</button>
-          </div>
-        </td>
-      </tr>
-      {% else %}
-      <tr><td colspan="8" style="color:var(--muted);text-align:center;padding:24px;">暂无备份文件。在上方「创建备份」执行一次即可。</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  <div class="note">表/视图/行 为备份时的统计；时间取自备份元信息。</div>
-</div>
 
-<!-- ============ 备份恢复日志 ============ -->
-<div class="card">
-  <h3>备份/恢复日志<span style="flex:1"></span>
-    <span class="badge sky">{{ blog|length }} 条</span>
-    <button class="btn btn-sm btn-ghost" onclick="loadLog()">⟳ 刷新</button>
-  </h3>
-  <div id="bkLog" class="bk-preview" style="max-height:40vh">{% if blog %}{% for l in blog %}{{ l }}
+  <div class="bk-tabs">
+    <button class="bk-tab on" data-tab="files" onclick="switchTab('files')">备份文件</button>
+    <button class="bk-tab" id="tabBtn-brec" data-tab="brec" onclick="switchTab('brec')">备份记录</button>
+    <button class="bk-tab" id="tabBtn-rrec" data-tab="rrec" onclick="switchTab('rrec')">恢复记录</button>
+    <button class="bk-tab" data-tab="log" onclick="switchTab('log')">操作日志</button>
+  </div>
+
+  <!-- ---------- 备份文件 ---------- -->
+  <div class="tab-pane on" id="tab-files">
+    <div class="bk-scroll">
+      <table class="tbl bk-table">
+        <colgroup>
+          <col style="width:22%"><col style="width:12%"><col style="width:10%">
+          <col style="width:17%"><col style="width:11%"><col style="width:8%">
+          <col style="width:10%"><col style="width:150px">
+        </colgroup>
+        <thead>
+          <tr><th>文件名</th><th>时间</th><th>范围</th><th>数据库</th><th>表/视图/行</th><th>大小</th><th>源节点</th><th>操作</th></tr>
+        </thead>
+        <tbody id="bkBody">
+          {% for b in backups %}
+          {% set dbs = (b.meta.databases if b.meta and b.meta.databases else []) %}
+          <tr data-file="{{ b.file }}">
+            <td class="mono">{{ b.file }}</td>
+            <td class="mono">{{ (b.meta.time if b.meta else b.mtime) }}</td>
+            <td>
+              {% if b.meta %}
+                {% if b.meta.scope == 'all' %}<span class="badge sky">全库</span>{% else %}<span class="badge warn">指定库</span>{% endif %}
+                {% if not b.meta.with_data %}<span class="badge">仅结构</span>{% endif %}
+              {% else %}<span class="badge">—</span>{% endif %}
+            </td>
+            <td>
+              {% if b.meta and b.meta.scope == 'all' %}
+                <span class="badge sky">全部业务库</span>
+              {% elif dbs %}
+                <div class="chips">
+                  {% for d in dbs[:3] %}<span class="chip" title="{{ d }}">{{ d }}</span>{% endfor %}
+                  {% if (dbs|length) > 3 %}<span class="chip more" title="{{ dbs[3:]|join(', ') }}">+{{ (dbs|length) - 3 }}</span>{% endif %}
+                </div>
+              {% else %}—{% endif %}
+            </td>
+            <td class="mono">{% if b.meta %}{{ b.meta.tables }}/{{ b.meta.views }}/{{ b.meta.rows }}{% else %}—{% endif %}</td>
+            <td class="mono">{{ (b.size/1024)|round(1) }} KB</td>
+            <td class="mono">{% if b.meta %}{{ b.meta.host }}:{{ b.meta.port }}{% else %}—{% endif %}</td>
+            <td>
+              <div class="ops-cell">
+                <button class="btn btn-sm" onclick="restoreFile('{{ b.file }}')">恢复</button>
+                <a class="btn btn-sm btn-ghost" href="/api/backup/download?cluster_id={{ cluster.id }}&file={{ b.file }}">下载</a>
+                <button class="btn btn-sm btn-ghost" onclick="previewFile('{{ b.file }}')">预览</button>
+                <button class="btn btn-sm btn-danger" onclick="delBackup('{{ b.file }}')">删除</button>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="8" style="color:var(--muted);text-align:center;padding:24px;">暂无备份文件。在上方「创建备份」执行一次即可。</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="note">表/视图/行 为备份时的统计；时间取自备份元信息（UTC+8）。列多时可横向滚动查看。</div>
+  </div>
+
+  <!-- ---------- 备份记录 ---------- -->
+  <div class="tab-pane" id="tab-brec">
+    <div class="bk-scroll">
+      <table class="tbl bk-table" style="min-width:760px">
+        <colgroup>
+          <col style="width:15%"><col style="width:14%"><col style="width:22%">
+          <col style="width:20%"><col style="width:19%"><col style="width:10%">
+        </colgroup>
+        <thead>
+          <tr><th>时间</th><th>源节点</th><th>备份文件</th><th>范围</th><th>结果</th><th>操作者</th></tr>
+        </thead>
+        <tbody id="bkRecBody">
+          <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">备份记录按操作时间倒序，仅展示本集群的备份历史（落盘保存，最多保留 200 条）。</div>
+  </div>
+
+  <!-- ---------- 恢复记录 ---------- -->
+  <div class="tab-pane" id="tab-rrec">
+    <div class="bk-scroll">
+      <table class="tbl bk-table" style="min-width:760px">
+        <colgroup>
+          <col style="width:15%"><col style="width:14%"><col style="width:22%">
+          <col style="width:20%"><col style="width:19%"><col style="width:10%">
+        </colgroup>
+        <thead>
+          <tr><th>时间</th><th>目标节点</th><th>备份文件</th><th>范围</th><th>结果</th><th>操作者</th></tr>
+        </thead>
+        <tbody id="rsBody">
+          <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">恢复记录按操作时间倒序，仅展示本集群的恢复历史（落盘保存，最多保留 200 条）。</div>
+  </div>
+
+  <!-- ---------- 操作日志 ---------- -->
+  <div class="tab-pane" id="tab-log">
+    <div id="bkLog" class="bk-preview" style="max-height:40vh">{% if blog %}{% for l in blog %}{{ l }}
 {% endfor %}{% else %}（暂无日志）{% endif %}</div>
-  <div class="bk-note">每行格式：<code class="mono">[时间] [类型] 集群=名称(id) 节点=host:port ... 成功=N 失败=M</code>。备份按「库」统计成功/失败，恢复按「SQL 语句」统计成功/失败。</div>
-</div>
-
-<!-- ============ 备份记录 ============ -->
-<div class="card">
-  <h3>备份记录<span style="flex:1"></span>
-    <span class="badge sky" id="bkCount">…</span>
-    <button class="btn btn-sm btn-ghost" onclick="loadBackupRecords()">⟳ 刷新</button>
-  </h3>
-  <table class="tbl bk-table">
-    <thead>
-      <tr><th>时间</th><th>源节点</th><th>备份文件</th><th>范围</th><th>结果</th><th>操作者</th></tr>
-    </thead>
-    <tbody id="bkRecBody">
-      <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">加载中…</td></tr>
-    </tbody>
-  </table>
-  <div class="note">备份记录按操作时间倒序，仅展示本集群的备份历史（落盘保存，最多保留 200 条）。</div>
-</div>
-
-<!-- ============ 恢复记录 ============ -->
-<div class="card">
-  <h3>恢复记录<span style="flex:1"></span>
-    <span class="badge sky" id="rsCount">…</span>
-    <button class="btn btn-sm btn-ghost" onclick="loadRestores()">⟳ 刷新</button>
-  </h3>
-  <table class="tbl bk-table">
-    <thead>
-      <tr><th>时间</th><th>目标节点</th><th>备份文件</th><th>范围</th><th>结果</th><th>操作者</th></tr>
-    </thead>
-    <tbody id="rsBody">
-      <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">加载中…</td></tr>
-    </tbody>
-  </table>
-  <div class="note">恢复记录按操作时间倒序，仅展示本集群的恢复历史（落盘保存，最多保留 200 条）。</div>
+    <div class="bk-note">每行格式：<code class="mono">[时间] [类型] 集群=名称(id) 节点=host:port ... 成功=N 失败=M</code>。备份按「库」统计成功/失败，恢复按「SQL 语句」统计成功/失败。</div>
+  </div>
 </div>
 
 <!-- 预览 modal -->
@@ -283,6 +350,26 @@
     if(!v) return null;
     var p=v.split(":");
     return {host:p[0], port:p[1]};
+  }
+
+  // ---------- 历史区 Tab ----------
+  var TAB_LABEL={files:"备份文件", brec:"备份记录", rrec:"恢复记录", log:"操作日志"};
+  function switchTab(name){
+    document.querySelectorAll(".bk-tab").forEach(function(b){
+      b.classList.toggle("on", b.getAttribute("data-tab")===name);
+    });
+    document.querySelectorAll(".tab-pane").forEach(function(p){
+      p.classList.toggle("on", p.id==="tab-"+name);
+    });
+  }
+  function setTabCount(name,n){
+    var el=document.getElementById("tabBtn-"+name);
+    if(!el) return;
+    var label=TAB_LABEL[name]||name;
+    el.textContent = (n==null) ? label : label+" ("+n+")";
+  }
+  function refreshAll(){
+    loadBackupRecords(); loadRestores(); loadLog();
   }
 
   // ---------- 库列表 ----------
@@ -409,13 +496,12 @@
   // ---------- 备份记录 ----------
   function loadBackupRecords(){
     var box=document.getElementById("bkRecBody");
-    var cnt=document.getElementById("bkCount");
     box.innerHTML='<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">加载中…</td></tr>';
     fetch("/api/backup/history?cluster_id="+CID)
       .then(function(r){return r.json();})
       .then(function(d){
         if(d.ok && d.records && d.records.length){
-          cnt.textContent=d.records.length+" 条";
+          setTabCount("brec", d.records.length);
           box.innerHTML=d.records.map(function(x){
             var scope = (x.scope==="all") ? "全库" : "指定库";
             var dbs = (x.databases && x.databases.length) ? x.databases.join(", ") : "全部";
@@ -434,12 +520,12 @@
               +'</tr>';
           }).join("");
         } else {
-          cnt.textContent="0 条";
+          setTabCount("brec", 0);
           box.innerHTML='<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">暂无备份记录。在上方「创建备份」执行一次即可。</td></tr>';
         }
       })
       .catch(function(e){
-        cnt.textContent="—";
+        setTabCount("brec", null);
         box.innerHTML='<tr><td colspan="6" style="color:var(--danger);text-align:center;padding:24px;">加载失败：'+esc(e)+'</td></tr>';
       });
   }
@@ -447,13 +533,12 @@
   // ---------- 恢复记录 ----------
   function loadRestores(){
     var box=document.getElementById("rsBody");
-    var cnt=document.getElementById("rsCount");
     box.innerHTML='<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">加载中…</td></tr>';
     fetch("/api/restore/history?cluster_id="+CID)
       .then(function(r){return r.json();})
       .then(function(d){
         if(d.ok && d.records && d.records.length){
-          cnt.textContent=d.records.length+" 条";
+          setTabCount("rrec", d.records.length);
           box.innerHTML=d.records.map(function(x){
             var scope = (x.scope==="all") ? "全库" : "指定库";
             var dbs = (x.databases && x.databases.length) ? x.databases.join(", ") : "全部";
@@ -472,12 +557,12 @@
               +'</tr>';
           }).join("");
         } else {
-          cnt.textContent="0 条";
+          setTabCount("rrec", 0);
           box.innerHTML='<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px;">暂无恢复记录。在上方「恢复备份」执行一次即可。</td></tr>';
         }
       })
       .catch(function(e){
-        cnt.textContent="—";
+        setTabCount("rrec", null);
         box.innerHTML='<tr><td colspan="6" style="color:var(--danger);text-align:center;padding:24px;">加载失败：'+esc(e)+'</td></tr>';
       });
   }

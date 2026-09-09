@@ -1,7 +1,7 @@
 # Custos
 
 > 当前版本：**v2.2.20**
-> 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)。
+> 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)；**v2.3 起**每个版本的独立规划（含功能目的 / 功能目标）与变更记录见 [`doc/releases/`](./doc/releases/)；总体待办与版本索引见 [`TODO.md`](./TODO.md)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
 
 基于 **Keepalived + MySQL/MariaDB 主从（GTID）** 的 MySQL 高可用方案，附带一个轻量管理器：
