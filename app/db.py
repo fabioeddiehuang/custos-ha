@@ -252,6 +252,22 @@ def init_schema():
                 c.execute("ALTER TABLE hosts ADD COLUMN err TEXT")
             except Exception:
                 pass
+            # 兼容旧 schema：新增「数据交互状态」字段（v2.2.20 就地修复）
+            # repl_state: offline/primary/repl_ok/repl_broken/repl_stuck/orphan
+            # upstream:    从库的上游主库 host:port；主库为空
+            # downstream:  主库的下游从库列表（JSON 数组字符串）；从库为空
+            try:
+                c.execute("ALTER TABLE hosts ADD COLUMN repl_state VARCHAR(16)")
+            except Exception:
+                pass
+            try:
+                c.execute("ALTER TABLE hosts ADD COLUMN upstream VARCHAR(64)")
+            except Exception:
+                pass
+            try:
+                c.execute("ALTER TABLE hosts ADD COLUMN downstream TEXT")
+            except Exception:
+                pass
             # 兼容旧 schema：alert_emails 新增 enabled（收件开关，默认开启）
             try:
                 c.execute(

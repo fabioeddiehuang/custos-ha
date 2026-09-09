@@ -233,6 +233,17 @@ def _json_ok(payload):
     return Response(content=body, media_type="application/json")
 
 
+def _parse_downstream(s):
+    """把 hosts.downstream（JSON 文本）解析为从库列表；解析失败返回空列表。"""
+    if not s:
+        return []
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
 def _build_status_payload():
     """构造与仪表盘同源的状态载荷（含 hosts.err / display_role / is_cm）。
 
@@ -241,7 +252,8 @@ def _build_status_payload():
     hosts = query(
         "SELECT h.host, h.port, h.cluster_id, h.role, h.status, h.is_current_master, "
         "h.initial_role, h.repl_delay, h.slave_io, h.slave_sql, h.last_seen, h.err, "
-        "h.semi_sync, h.semi_clients, h.semi_no_times, h.semi_no_tx, h.semi_yes_tx "
+        "h.semi_sync, h.semi_clients, h.semi_no_times, h.semi_no_tx, h.semi_yes_tx, "
+        "h.repl_state, h.upstream, h.downstream "
         "FROM hosts h ORDER BY h.id"
     )
     cms = {}
@@ -254,6 +266,7 @@ def _build_status_payload():
         hh = dict(h)
         hh["display_role"] = "master" if is_cm else "slave"
         hh["is_cm"] = 1 if is_cm else 0
+        hh["downstream"] = _parse_downstream(h.get("downstream"))
         hosts_out.append(hh)
     clusters = [{"id": c["id"], "name": c.get("name") or f"集群{c['id']}"}
                 for c in list_clusters()]
@@ -332,7 +345,8 @@ def dashboard(request: Request, user=Depends(auth_required)):
             hosts = query(
                 "SELECT h.host, h.port, h.role, h.status, h.is_current_master, h.initial_role, "
                 "h.repl_delay, h.slave_io, h.slave_sql, h.last_seen, h.err, "
-                "h.semi_sync, h.semi_clients, h.semi_no_times, h.semi_no_tx, h.semi_yes_tx "
+                "h.semi_sync, h.semi_clients, h.semi_no_times, h.semi_no_tx, h.semi_yes_tx, "
+                "h.repl_state, h.upstream, h.downstream "
                 "FROM hosts h WHERE h.cluster_id=%s ORDER BY h.id", (cid,)
             )
             cm = query("SELECT host, port FROM current_master WHERE cluster_id=%s", (cid,))
@@ -345,6 +359,7 @@ def dashboard(request: Request, user=Depends(auth_required)):
                 hh = dict(h)
                 hh["display_role"] = "master" if is_cm else "slave"
                 hh["is_cm"] = is_cm
+                hh["downstream"] = _parse_downstream(h.get("downstream"))
                 annotated.append(hh)
             dash.append(dict(
                 cluster_id=cid, name=cl.get("name") or f"集群{cid}",
@@ -1331,7 +1346,7 @@ def _cluster_view(cid: int):
     cm_rows = query("SELECT host, port FROM current_master WHERE cluster_id=%s", (cid,))
     cm = f"{cm_rows[0]['host']}:{cm_rows[0]['port']}" if cm_rows else ""
     hs = query(
-        "SELECT host, port, status, role, slave_io, slave_sql, err, "
+        "SELECT host, port, status, role, slave_io, slave_sql, err, repl_state, upstream, downstream, "
         "(SELECT m.seconds_behind FROM metric_history m WHERE m.host=h.host AND m.port=h.port "
         "ORDER BY m.id DESC LIMIT 1) AS seconds_behind "
         "FROM hosts h WHERE h.cluster_id=%s", (cid,))
@@ -1357,6 +1372,9 @@ def _cluster_view(cid: int):
             "slave_sql": h.get("slave_sql") or "—",
             "err": (h.get("err") or "").strip(),
             "seconds_behind": h.get("seconds_behind"),
+            "repl_state": h.get("repl_state"),
+            "upstream": h.get("upstream"),
+            "downstream": _parse_downstream(h.get("downstream")),
             "bad": bool(repl_bad or down),
         })
     has_issue = (online != node_count) or any(r["bad"] for r in host_rows)

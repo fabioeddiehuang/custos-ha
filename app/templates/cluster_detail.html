@@ -78,6 +78,9 @@
   .auto-row{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:9px 12px;font-size:13px;color:var(--text);cursor:default}
   .auto-row:hover{background:var(--primary-light);border-radius:8px}
   .auto-row>span{font-weight:500}
+  /* 数据交互状态徽标（repl_state） */
+  .pill.primary{background:rgba(10,186,181,.16);color:#0ABAB5;border:1px solid rgba(10,186,181,.4)}
+  .repl-link{font-size:11.5px;color:#8b9ac0;margin-top:2px;font-family:var(--mono);word-break:break-all}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -142,13 +145,34 @@
   </h3>
   <table class="tbl">
     <thead>
-      <tr><th>节点</th><th>角色</th><th>在线状态</th><th>复制</th><th>延迟</th><th>操作</th></tr>
+      <tr><th>节点</th><th>角色</th><th>数据交互</th><th>在线状态</th><th>复制</th><th>延迟</th><th>操作</th></tr>
     </thead>
     <tbody>
       {% for r in cluster.host_rows %}
       <tr data-host="{{ r.host }}:{{ r.port }}" data-role="{{ 'master' if r.role == '主库' else 'slave' }}" data-cluster="{{ cluster.id }}">
         <td class="mono">{{ r.host }}:{{ r.port }}</td>
         <td><span class="role {{ 'role-master' if r.role == '主库' else 'role-slave' }}">{{ r.role }}</span></td>
+        <td data-f="repl-cd">
+          {% if r.repl_state == 'primary' %}
+            <span class="pill primary">● 主库·可写</span>
+            {% if r.downstream %}<div class="repl-link">→ {{ r.downstream|length }} 个从库</div>{% endif %}
+          {% elif r.repl_state == 'repl_ok' %}
+            <span class="pill up">● 复制正常</span>
+            {% if r.upstream %}<div class="repl-link">← {{ r.upstream }}</div>{% endif %}
+          {% elif r.repl_state == 'repl_broken' %}
+            <span class="pill down">● 复制中断</span>
+            {% if r.upstream %}<div class="repl-link">← {{ r.upstream }}</div>{% endif %}
+          {% elif r.repl_state == 'repl_stuck' %}
+            <span class="pill warn">● 复制卡死</span>
+            {% if r.upstream %}<div class="repl-link">← {{ r.upstream }}</div>{% endif %}
+          {% elif r.repl_state == 'orphan' %}
+            <span class="pill warn">● 脱管异常</span>
+          {% elif r.repl_state == 'offline' %}
+            <span class="pill down">● 离线</span>
+          {% else %}
+            <span class="pill">—</span>
+          {% endif %}
+        </td>
         <td>{% if r.status == 'up' %}<span class="badge up">在线</span>{% else %}<span class="badge down">离线</span>{% endif %}</td>
         <td>{% if r.role == '主库' %}<span class="badge ok">正常</span>{% elif r.status != 'up' %}<span class="badge down">未启动</span>{% elif r.bad %}<span class="badge warn">异常</span>{% else %}<span class="badge ok">正常</span>{% endif %}</td>
         <td class="mono">{% if r.role == '主库' %}—{% else %}{{ r.seconds_behind if r.seconds_behind is not none else '—' }}s{% endif %}</td>

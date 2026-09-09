@@ -2,6 +2,7 @@
 import concurrent.futures as _cf
 import threading
 import time
+import json
 from datetime import datetime, timedelta
 from .config import (CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENABLED,
                      HEARTBEAT_INTERVAL, METRICS_INTERVAL, DRIFT_INTERVAL,
@@ -269,6 +270,29 @@ def _same(a, b):
     return ("" if a is None else str(a)) == ("" if b is None else str(b))
 
 
+def _classify_repl_state(st, is_master):
+    """数据交互状态分类：节点在集群中是否处于数据交互、健康度如何。
+
+    - offline     节点探活失败（不在数据交互）
+    - primary     主库·可写（接受写入并把 binlog 推给下游从库）
+    - orphan      当前主身份但与只读矛盾（脱管/异常）
+    - repl_ok     从库·复制正常（从上游拉数据、位点持续前进）
+    - repl_broken 从库·复制中断（IO/SQL 线程非 Yes）
+    - repl_stuck  从库·复制卡死（线程在跑但 exec_gtid 锁死不前进）
+    """
+    if not st.get("alive"):
+        return "offline"
+    if is_master:
+        if st.get("ro") == 1:
+            return "orphan"
+        return "primary"
+    if st.get("stuck"):
+        return "repl_stuck"
+    if st.get("slave_io") != "Yes" or st.get("slave_sql") != "Yes":
+        return "repl_broken"
+    return "repl_ok"
+
+
 def _update_host(h, st, is_master=False):
     """把节点探活结果写回 hosts；在线但复制线程中断时，记录真实复制错误便于排错。
 
@@ -304,6 +328,14 @@ def _update_host(h, st, is_master=False):
     semi_no_times = st.get("semi_no_times")
     semi_no_tx = st.get("semi_no_tx")
     semi_yes_tx = st.get("semi_yes_tx")
+    # 数据交互状态：角色 + 复制健康 + 卡死；upstream/downstream 用于展示「与谁在数据交互」
+    repl_state = _classify_repl_state(st, is_master)
+    _up = st.get("master_host")
+    upstream = ("%s:%s" % (_up, st["master_port"])) if _up else None
+    try:
+        downstream = json.dumps(st.get("downstream") or [])
+    except Exception:
+        downstream = None
 
     # 与库中当前值逐字段比对，全部一致则视为「无变化」
     changed = not (
@@ -311,8 +343,10 @@ def _update_host(h, st, is_master=False):
         and _same(delay, h.get("repl_delay")) and _same(s_io, h.get("slave_io"))
         and _same(s_sql, h.get("slave_sql")) and _same(err, h.get("err"))
         and _same(semi, h.get("semi_sync")) and _same(semi_clients, h.get("semi_clients"))
-        and _same(semi_no_times, h.get("semi_no_times")) and _same(semi_no_tx, h.get("semi_no_tx"))
+        and _same(semi_no_times, h.get("semi_no_times"))         and _same(semi_no_tx, h.get("semi_no_tx"))
         and _same(semi_yes_tx, h.get("semi_yes_tx"))
+        and _same(repl_state, h.get("repl_state")) and _same(upstream, h.get("upstream"))
+        and _same(downstream, h.get("downstream"))
     )
 
     hb_due = False
@@ -329,18 +363,22 @@ def _update_host(h, st, is_master=False):
         execute(
             """UPDATE hosts SET status=%s, role=%s, repl_delay=%s, slave_io=%s, slave_sql=%s,
                err=%s, semi_sync=%s, semi_clients=%s, semi_no_times=%s, semi_no_tx=%s,
-               semi_yes_tx=%s, last_seen=NOW() WHERE cluster_id=%s AND host=%s AND port=%s""",
+               semi_yes_tx=%s, repl_state=%s, upstream=%s, downstream=%s,
+               last_seen=NOW() WHERE cluster_id=%s AND host=%s AND port=%s""",
             (status, role, delay, s_io, s_sql, err,
              semi, semi_clients, semi_no_times, semi_no_tx, semi_yes_tx,
+             repl_state, upstream, downstream,
              h["cluster_id"], h["host"], int(h["port"])),
         )
     else:
         execute(
             """UPDATE hosts SET status=%s, role=%s, repl_delay=%s, slave_io=%s, slave_sql=%s,
                err=%s, semi_sync=%s, semi_clients=%s, semi_no_times=%s, semi_no_tx=%s,
-               semi_yes_tx=%s WHERE cluster_id=%s AND host=%s AND port=%s""",
+               semi_yes_tx=%s, repl_state=%s, upstream=%s, downstream=%s
+               WHERE cluster_id=%s AND host=%s AND port=%s""",
             (status, role, delay, s_io, s_sql, err,
              semi, semi_clients, semi_no_times, semi_no_tx, semi_yes_tx,
+             repl_state, upstream, downstream,
              h["cluster_id"], h["host"], int(h["port"])),
         )
 
@@ -602,6 +640,18 @@ def _probe_all():
             is_master = ((host, port) == cur_key) and (st.get("mode") != "slave")
             # 节点半同步状态：主库看 master_status，从库看 slave_status
             semi = st.get("semi_master_status") if is_master else st.get("semi_slave_status")
+            # 卡死预标记：供 repl_state 落库（独立 key 计数，不与下方自愈块耦合）
+            if not is_master:
+                _sb = st.get("seconds_behind")
+                _eg = st.get("exec_gtid") or ""
+                _pk_s = ("stuck_pre", cid, host, port)
+                if _sb is not None and _sb > 600 and _eg:
+                    _pe, _c = _STUCK_PREV.get(_pk_s, ("", 0))
+                    _STUCK_PREV[_pk_s] = (_eg, _c + 1) if _pe == _eg else (_eg, 1)
+                    if _STUCK_PREV[_pk_s][1] >= 3:
+                        st["stuck"] = True
+                else:
+                    _STUCK_PREV[_pk_s] = ("", 0)
             _update_host({"host": host, "port": port, "cluster_id": cid}, st, is_master)
             # 连续失败计数（用于阈值触发自动切换）
             f = run_once._fails.setdefault(cid, {})

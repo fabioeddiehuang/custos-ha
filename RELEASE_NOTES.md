@@ -45,6 +45,11 @@
     - `ha_client.get_status` 新增返回 `exec_gtid`（`Executed_Gtid_Set` / MariaDB `Gtid_Slave_Pos`），使 monitor 能感知位点是否前进。
     - `monitor` 新增卡死检测：`seconds_behind > 600` 且 `exec_gtid` 连续 3 个周期不变 → 判定卡死，自动调用 `_repoint_slave`（内部 `make_slave_of`：`RESET SLAVE` 丢弃坏 relay + 重 `CHANGE MASTER` + `START SLAVE`，**不 RESET MASTER**）重挂当前主做 GTID 续传；带 5 分钟冷却退避。
   - **生效**：重建管理器（`./deploy.sh up -d --build custos-server`）。现场急救：从库 `STOP SLAVE; RESET SLAVE; CHANGE MASTER TO MASTER_AUTO_POSITION=1`（MySQL）/ `MASTER_USE_GTID=slave_pos`（MariaDB）; `START SLAVE;`（前提主库对应 binlog 未 purge，否则需 rebuild 从库）。
+- **新增「数据交互状态」展示（节点在集群中是否处于数据交互、与谁读写）**：
+  - **展示内容**：每个节点一行「数据交互」徽标 + 上下游箭头——主库显示 `主库·可写 → N 个从库`；从库显示 `复制正常/中断/卡死 ← 上游主库:port`；离线/脱管也有对应标识。状态枚举 `repl_state`：`primary`/`repl_ok`/`repl_broken`/`repl_stuck`/`orphan`/`offline`。
+  - **后端采集**：`ha_client.get_status` 主库分支新增 `SHOW REPLICAS`/`SHOW SLAVE HOSTS` 取下游从库列表；`monitor._classify_repl_state` 据角色/复制线程/`stuck` 判定状态；卡死预标记用独立 key `stuck_pre` 在 `_update_host` 前设 `st["stuck"]`（原卡死自愈在写库之后，故需前置标记）。
+  - **落库与接口**：`hosts` 表新增 `repl_state`/`upstream`/`downstream` 三列（`db.py` 迁移）；`_update_host` 写入（纳入空闲零写入的 changed 比对）；`api` 的 `_build_status_payload`/`get_cluster_detail` 的 `host_rows` 均 `SELECT` 三列并 `_parse_downstream` 把 JSON 还原为数组。
+  - **前端**：仪表盘与集群详情的节点表格新增「数据交互」列（徽标 + 上下游），仪表盘刷新 JS 由 `renderReplState` 维护。版本号仍为 `v2.2.20`，重建管理器生效。
 
 ## v2.2.19 GTID 分叉感知（续传优先，解 v2.2.18 误判）
 

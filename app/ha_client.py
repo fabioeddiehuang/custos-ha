@@ -930,6 +930,8 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
         semi_no_tx=None, semi_yes_tx=None,
         # 复制位点（GTID 执行集合）：用于 monitor 区分「真在追平」与「SQL 线程卡死」
         exec_gtid="",
+        # 数据交互状态：主库视角下的下游从库列表（SHOW REPLICAS / SHOW SLAVE HOSTS）
+        downstream=[],
     )
     try:
         conn = connect_robust(host, port, user, password, root_user, root_pass, timeout=timeout)
@@ -975,6 +977,19 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
                 result["role"] = result.get("role") or "master"
                 result["slave_io"] = None
                 result["slave_sql"] = None
+                # 主库视角：列出下游从库（数据推送给谁）。SHOW REPLICAS(>=8.0.22/10.5)
+                # / SHOW SLAVE HOSTS 的 Host 取自从库 report_host，可能为空（故仅保留非空项）。
+                try:
+                    cur.execute("SHOW REPLICAS" if syntax == "new" else "SHOW SLAVE HOSTS")
+                    for _r in cur.fetchall():
+                        _d = dict(zip([c[0] for c in cur.description], _r))
+                        _dh = (_d.get("Host") or "").strip()
+                        _dp = _d.get("Port")
+                        if _dh:
+                            result["downstream"].append(
+                                {"host": _dh, "port": int(_dp) if _dp else None})
+                except Exception:
+                    pass
         except Exception:
             pass
         # 半同步复制健康指标（与复制探测同级；SEMI_SYNC 关闭时变量恒为 OFF，不告警）
