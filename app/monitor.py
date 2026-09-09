@@ -38,6 +38,10 @@ _HEAL_NEXT_AT = {}
 _HEAL_FAILS = {}
 # 已打印过「源库不可达，跳过自愈」提示的 key（避免每周期刷屏）
 _HEAL_SKIP_LOGGED = set()
+# 卡死检测：(cluster_id, host, port) -> (上一周期 exec_gtid, 连续不变计数)
+_STUCK_PREV = {}
+# 卡死自愈冷却时间戳（避免每周期重挂当前主）
+_STUCK_NEXT_AT = {}
 _HEAL_MIN_BACKOFF = 30      # 连续失败后首次冷却秒数（按失败次数线性放大）
 _HEAL_MAX_BACKOFF = 300     # 冷却上限（5 分钟）
 
@@ -721,6 +725,40 @@ def _act_once():
                     print(f"[monitor] 主库 {h_host}:{h_port} 清残留复制通道成功")
                 else:
                     print(f"[monitor] 主库 {h_host}:{h_port} 清残留通道失败: {msg_p}")
+            # ---- 卡死检测：区分「真在追平」与「SQL 线程卡死」----
+            # 现象：断电/异常恢复后从库延迟锁死在固定高位（如 54559s）且不下降，主库已无写入却追不平
+            # —— 实为 SQL 线程卡在断点处某事务（relay 损坏/半途 DDL）不前进。
+            # Seconds_Behind_Master 此时 =「卡住事务的提交时间距现在的秒数」，因线程不动而恒定不变。
+            # 现有自愈仅触发于 slave_sql=="No"，会漏掉「线程在跑但卡住」；故用
+            # 「exec_gtid 连续多周期不变 + 延迟高位」识别卡死，命中则重挂当前主：
+            # _repoint_slave 内部 make_slave_of 会 RESET SLAVE（丢弃坏 relay）+ 重新 CHANGE MASTER
+            # （MASTER_AUTO_POSITION=1 / MASTER_USE_GTID=slave_pos）+ START SLAVE，GTID 续传且不 RESET MASTER。
+            if not is_master and get_setting("AUTO_REPAIR", "1") == "1":
+                _sb = st.get("seconds_behind")
+                _eg = st.get("exec_gtid") or ""
+                _pk = ("stuck", cid, h_host, h_port)
+                if _sb is not None and _sb > 600 and _eg:
+                    _prev_eg, _cnt = _STUCK_PREV.get(_pk, ("", 0))
+                    _STUCK_PREV[_pk] = (_eg, _cnt + 1) if _prev_eg == _eg else (_eg, 1)
+                    if _STUCK_PREV[_pk][1] >= 3 and time.monotonic() >= _STUCK_NEXT_AT.get(_pk, 0.0):
+                        _STUCK_NEXT_AT[_pk] = time.monotonic() + 300  # 冷却 5 分钟，避免每周期重挂
+                        if cur_h:
+                            ok_r, msg_r = _repoint_slave(
+                                cid, {"host": h_host, "port": h_port, "status": "up"},
+                                cur_h, cur_p, creds)
+                            if ok_r:
+                                print(f"[monitor] 卡死自愈(重挂载) {h_host}:{h_port}: {msg_r}")
+                                _STUCK_PREV[_pk] = ("", 0)
+                                try:
+                                    if not query("SELECT 1 FROM alerts WHERE cluster_id=%s AND host=%s AND port=%s AND status='healed' AND alert_type='stuck' AND created_at > NOW()-INTERVAL 10 MINUTE LIMIT 1", (cid, h_host, int(h_port))):
+                                        execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) VALUES(%s,%s,%s,'stuck','healed',%s,NOW())", (cid, h_host, int(h_port), msg_r))
+                                except Exception:
+                                    pass
+                            else:
+                                print(f"[monitor] 卡死自愈失败 {h_host}:{h_port}: {msg_r}")
+                        continue
+                else:
+                    _STUCK_PREV[_pk] = ("", 0)
             # 复制 SQL 线程中断（多为幂等冲突导致的 1007/1062），尝试自愈跳过冲突事务。
             # 仅当 SQL 线程明确为 "No"（非 None/空，即确有复制通道且停了）才触发，
             # 避免无复制通道节点（slave_sql=None）被误判为「需自愈」刷日志。

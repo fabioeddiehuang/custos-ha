@@ -928,6 +928,8 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
         semi_master_status=None, semi_slave_status=None,
         semi_master_clients=None, semi_no_times=None,
         semi_no_tx=None, semi_yes_tx=None,
+        # 复制位点（GTID 执行集合）：用于 monitor 区分「真在追平」与「SQL 线程卡死」
+        exec_gtid="",
     )
     try:
         conn = connect_robust(host, port, user, password, root_user, root_pass, timeout=timeout)
@@ -963,6 +965,10 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
                 result["seconds_behind"] = sb
                 result["master_host"] = d.get("Master_Host") or d.get("Source_Host")
                 result["master_port"] = d.get("Master_Port") or d.get("Source_Port")
+                # 复制位点（GTID 执行集合）：断电位点不前进 = SQL 线程卡死，而非真落后。
+                # MySQL/MariaDB GTID 模式均返回 Executed_Gtid_Set；老 MariaDB 退回 Gtid_Slave_Pos。
+                eg = (d.get("Executed_Gtid_Set") or d.get("Gtid_Slave_Pos") or "").strip()
+                result["exec_gtid"] = eg
             else:
                 # 无复制通道：主库或尚未建立复制。slave_io/sql 保持 None，避免被误判为 No/No 故障
                 result["mode"] = result.get("mode") or "master"

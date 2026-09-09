@@ -38,6 +38,13 @@
   - `/api/status` 返回的 `clusters` 仅有 `id` / `name`，前端却取 `cl.cluster_id` → `undefined` → `getElementById("osmetrics-undefined")` 为 `null` → 静默 return，占位文案永不刷新。改为 `cl.cluster_id || cl.id`。
   - `/api/os_metrics` 响应补 `ok: True`（`_json_ok` 不会自动补 `ok`），否则前端 `if (!d.ok)` 会显示「OS 指标加载失败」。
 - **新增节点 agent 容器部署模板** `scripts/node-agent.compose.yml`：`custos-node-agent` 独立 compose（host 网络、端口 `28889`、`pid: host`、`/:/host:ro` 配 `--root /host` 读宿主机真实指标），便于在**已部署但缺少 agent** 的节点上单独拉起 OS 指标采集；也可把该 service 并入现有节点 compose。
+- **复制卡死自愈（断电 / 异常恢复后延迟锁死）**：
+  - **问题**：测试环境从库断电 1 天恢复后，`Seconds_Behind_Master` 锁死在固定高位（如 `54559s`）且恒定不变，主库无新写入也追不平。
+  - **根因**：`Seconds_Behind_Master` = SQL 线程「当前正在执行的 event 在主库的提交时间」距 now 的秒数。断电复活时 SQL 线程卡在断点处半途事务（relay 损坏 / 半途 DDL）不前进 → `Executed_Gtid_Set` 停住 → 延迟恒等于「卡住事务提交时间距 now」；是**卡死而非真落后**。原自愈仅触发于 `slave_sql=="No"`，漏掉「线程在跑但卡住」；且 `get_status` 不返回复制位点，无法区分「卡死」与「正在追平」。
+  - **修复**：
+    - `ha_client.get_status` 新增返回 `exec_gtid`（`Executed_Gtid_Set` / MariaDB `Gtid_Slave_Pos`），使 monitor 能感知位点是否前进。
+    - `monitor` 新增卡死检测：`seconds_behind > 600` 且 `exec_gtid` 连续 3 个周期不变 → 判定卡死，自动调用 `_repoint_slave`（内部 `make_slave_of`：`RESET SLAVE` 丢弃坏 relay + 重 `CHANGE MASTER` + `START SLAVE`，**不 RESET MASTER**）重挂当前主做 GTID 续传；带 5 分钟冷却退避。
+  - **生效**：重建管理器（`./deploy.sh up -d --build custos-server`）。现场急救：从库 `STOP SLAVE; RESET SLAVE; CHANGE MASTER TO MASTER_AUTO_POSITION=1`（MySQL）/ `MASTER_USE_GTID=slave_pos`（MariaDB）; `START SLAVE;`（前提主库对应 binlog 未 purge，否则需 rebuild 从库）。
 
 ## v2.2.19 GTID 分叉感知（续传优先，解 v2.2.18 误判）
 
