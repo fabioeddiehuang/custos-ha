@@ -138,11 +138,15 @@
     <label class="rule-field"><span>复制延迟阈值</span>
       <div class="rule-input"><input id="ruleLag" value="{{ rules.lag_threshold }}"><span class="unit">秒</span></div>
     </label>
+    <label class="rule-field"><span>自愈观察期</span>
+      <div class="rule-input"><input id="ruleGrace" value="{{ rules.grace }}"><span class="unit">秒</span></div>
+    </label>
     <label class="rule-field"><span>合并同类告警</span>
       <label class="switch"><input type="checkbox" id="ruleMerge" {% if rules.merge == '1' %}checked{% endif %}><span class="slider"></span></label>
     </label>
     <label class="rule-field full"><span>接收邮箱（每行一个，追加到「提醒邮箱」）</span><textarea id="ruleReceivers" placeholder="admin@example.com">{{ rules.receivers }}</textarea></label>
   </div>
+  <div class="smtp-desc" style="margin-top:8px">自愈观察期：故障出现后先挂起告警 N 秒，期间若被自愈逻辑修复则<strong>只记录到告警中心、不发送邮件</strong>（0 = 关闭观察期，立即发送）。自动切换类邮件不受此影响，仍立即发送。</div>
   <div style="margin-top:14px"><button class="btn btn-sm btn-primary" onclick="saveRules()">保存规则</button></div>
 </div>
 
@@ -298,7 +302,8 @@
       cooldown:document.getElementById("ruleCooldown").value,
       merge:document.getElementById("ruleMerge").checked?"1":"0",
       lag_threshold:document.getElementById("ruleLag").value,
-      receivers:document.getElementById("ruleReceivers").value
+      receivers:document.getElementById("ruleReceivers").value,
+      grace:document.getElementById("ruleGrace").value
     },function(d){toast(d.msg||(d.ok?"规则已保存":"保存失败"),d.ok?"ok":"err");});
   }
 

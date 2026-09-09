@@ -10,11 +10,11 @@ from .config import (CHECK_INTERVAL, FAIL_THRESHOLD, PROBE_TIMEOUT, SLOWLOG_ENAB
 from .db import query, execute, get_setting
 from .ha_client import (get_status, ensure_semisync_runtime, heal_replication, heal_io_gtid_gap,
                         get_binlog_usage, purge_binlog_before,
-                        set_read_only, get_node_utc_time)
+                        set_read_only, get_node_utc_time, is_gtid_purged_error)
 from .state import get_current_master
 from .failover import (do_failover, do_failover_to, ensure_topology, load_creds,
                       node_root, _repoint_slave, promote_to_master)
-from .alerts import send_alert
+from .alerts import send_alert, cancel_alert, record_alert
 from .clusters import list_clusters
 from . import node_gen
 from . import backup, metrics, slow_log, config_drift
@@ -43,6 +43,12 @@ _HEAL_SKIP_LOGGED = set()
 _STUCK_PREV = {}
 # 卡死自愈冷却时间戳（避免每周期重挂当前主）
 _STUCK_NEXT_AT = {}
+# 已告警过「主库 binlog 已清理，需重建」的节点（避免每周期重复发信）
+_PURGE_LOGGED = set()
+# 自动重建触发冷却（AUTO_REBUILD_ON_PURGE=1 时），避免同节点重复触发
+_AUTO_REBUILD_AT = {}
+# 已因「重建完成」清理过退避状态的节点（值=该次重建完成时间戳）
+_REBUILT_CLEARED = {}
 _HEAL_MIN_BACKOFF = 30      # 连续失败后首次冷却秒数（按失败次数线性放大）
 _HEAL_MAX_BACKOFF = 300     # 冷却上限（5 分钟）
 
@@ -279,6 +285,7 @@ def _classify_repl_state(st, is_master):
     - repl_ok     从库·复制正常（从上游拉数据、位点持续前进）
     - repl_broken 从库·复制中断（IO/SQL 线程非 Yes）
     - repl_stuck  从库·复制卡死（线程在跑但 exec_gtid 锁死不前进）
+    - repl_purged 主库 binlog 已清理（1236），复制无解，必须重建该从库
     """
     if not st.get("alive"):
         return "offline"
@@ -286,6 +293,8 @@ def _classify_repl_state(st, is_master):
         if st.get("ro") == 1:
             return "orphan"
         return "primary"
+    if st.get("purged"):
+        return "repl_purged"
     if st.get("stuck"):
         return "repl_stuck"
     if st.get("slave_io") != "Yes" or st.get("slave_sql") != "Yes":
@@ -390,45 +399,113 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
     if prev is None:
         return  # 首次观测只建立基线，不告警
     host = f"{key[0]}:{key[1]}"
+    h_host, h_port, h_cid = key[0], key[1], key[2]
     tag = f"【{cluster_name}】" if cluster_name else ""
+    # 自愈观察期：以下「状态类」告警先挂起 ALERT_GRACE_SEC 秒。期间若故障被自愈逻辑
+    # 修复，cancel_alert() 会撤销邮件，只往告警中心记一条 info（见各分支的 healed 判定）。
+    # 这样短时抖动（<观察期）不再产生「故障+恢复」的无效邮件对。
+    _ck_offline = ("offline", h_cid, h_host, h_port)
+    _ck_repl = ("repl", h_cid, h_host, h_port)
+    _ck_lag = ("lag", h_cid, h_host, h_port)
+    _ck_semi = ("semi", h_cid, h_host, h_port)
     try:
         # 1) 节点离线 / 恢复
         if prev["status"] != status:
             if status == "down":
                 send_alert("节点离线", f"{tag}节点 {host} 已离线，监控连续探活失败。若为主库将触发自动切换。",
-                           cluster_id=cluster_id)
+                           cluster_id=cluster_id, cancel_key=_ck_offline)
             else:
-                send_alert("节点恢复在线", f"{tag}节点 {host} 已恢复在线，若为旧主将自动重新加入集群为从库。",
-                           cluster_id=cluster_id)
+                # 观察期内就恢复了：不发「离线」也不发「恢复」邮件，只记录
+                if cancel_alert(_ck_offline, note=f"{host} 已恢复在线"):
+                    record_alert(cluster_id, h_host, h_port, "selfheal",
+                                 f"{tag}节点 {host} 短时离线后已自动恢复（观察期内，未发送邮件）")
+                else:
+                    send_alert("节点恢复在线", f"{tag}节点 {host} 已恢复在线，若为旧主将自动重新加入集群为从库。",
+                               cluster_id=cluster_id)
         # 2) 复制中断（仅非主库且节点在线时；节点离线属于「节点离线」告警，不重复报）
         if status == "up" and not is_master and prev["repl_ok"] and not repl_ok:
             send_alert("复制中断", f"{tag}节点 {host} 复制异常（Slave_IO 或 Slave_SQL 非 Yes），请检查复制链路。",
-                       cluster_id=key[2])
+                       cluster_id=h_cid, cancel_key=_ck_repl)
+        elif status == "up" and not is_master and (not prev["repl_ok"]) and repl_ok:
+            # 观察期内复制已自愈：撤销待发的「复制中断」邮件，只记一条自愈记录
+            if cancel_alert(_ck_repl, note=f"{host} 复制已恢复"):
+                record_alert(cluster_id, h_host, h_port, "selfheal",
+                             f"{tag}节点 {host} 复制中断后已自动恢复（观察期内，未发送邮件）")
         # 3) 复制延迟过高（仅在「跨过阈值」那一刻告警，且仅在线节点）
         if status == "up" and not is_master and delay is not None:
             crossed = delay >= REPL_LAG_ALERT_SEC and (
                 prev["delay"] is None or prev["delay"] < REPL_LAG_ALERT_SEC)
             if crossed:
                 send_alert("复制延迟过高", f"{tag}节点 {host} 复制延迟 {delay}s，已超过阈值 {REPL_LAG_ALERT_SEC}s。",
-                           cluster_id=cluster_id)
+                           cluster_id=cluster_id, cancel_key=_ck_lag)
+            elif (prev["delay"] is not None and prev["delay"] >= REPL_LAG_ALERT_SEC
+                  and delay < REPL_LAG_ALERT_SEC):
+                if cancel_alert(_ck_lag, note=f"{host} 延迟已回落至 {delay}s"):
+                    record_alert(cluster_id, h_host, h_port, "selfheal",
+                                 f"{tag}节点 {host} 复制延迟已回落至 {delay}s（观察期内，未发送邮件）")
         # 4) 半同步退化（RPO 风险）：主库 master_status / 从库 slave_status 由 ON 变非 ON
         if semi is not None and prev.get("semi") is not None and prev["semi"] == "ON" and semi != "ON":
             if is_master:
                 send_alert("半同步退化(异步)",
                            f"{tag}主库 {host} 已退化为异步复制（半同步 master_status=OFF）。此期间提交的事务不等待从库 ACK，"
                            f"存在故障切换后数据丢失(RPO)风险。请检查从库连通性与 Slave_IO 线程、rpl_semi_sync_master_timeout。",
-                           cluster_id=cluster_id)
+                           cluster_id=cluster_id, cancel_key=_ck_semi)
             else:
                 send_alert("半同步降级",
                            f"{tag}从库 {host} 未处于半同步态（slave_status=OFF）。若该从库被提升为主库，可能缺失主库已提交事务。",
-                           cluster_id=cluster_id)
+                           cluster_id=cluster_id, cancel_key=_ck_semi)
         # 5) 半同步恢复：由非 ON 回到 ON
         if semi is not None and prev.get("semi") is not None and prev["semi"] != "ON" and semi == "ON":
-            send_alert("半同步恢复",
-                       f"{tag}节点 {host} 半同步已恢复（status=ON），数据丢失(RPO)风险解除。",
-                       cluster_id=cluster_id)
+            if cancel_alert(_ck_semi, note=f"{host} 半同步已恢复"):
+                record_alert(cluster_id, h_host, h_port, "selfheal",
+                             f"{tag}节点 {host} 半同步已恢复（观察期内，未发送邮件）")
+            else:
+                send_alert("半同步恢复",
+                           f"{tag}节点 {host} 半同步已恢复（status=ON），数据丢失(RPO)风险解除。",
+                           cluster_id=cluster_id)
     except Exception as e:
         print(f"[monitor] 发送告警失败(可忽略): {e}")
+
+
+def _purge_guard(cid, cluster_name, host, port, cur_h, cur_p, st, key):
+    """从库请求的 GTID 已被主库清理（1236 purge）：自愈无解，只能重建该从库。
+
+    ① 不再每周期做无意义的自愈尝试（重挂复制 / 注入空事务都必失败），退避 10 分钟；
+    ② 首次发现时发一封**可操作**的告警（明确写明「对该节点执行重建」）并落库一条记录；
+    ③ 若开启 AUTO_REBUILD_ON_PURGE，则自动触发在线重建（默认关闭：重建会用主库数据
+       覆盖该节点，属破坏性操作，默认只在界面上给出一键入口，由运维确认后执行）。
+    """
+    _HEAL_NEXT_AT[key] = time.monotonic() + 600
+    io_err = (st.get("slave_io_err") or "")[:400]
+    pkey = (cid, host, port)
+    if pkey not in _PURGE_LOGGED:
+        _PURGE_LOGGED.add(pkey)
+        print(f"[monitor] {host}:{port} 主库 binlog 已清理(1236)，复制无法自愈，需重建从库：{io_err}")
+        try:
+            send_alert(
+                "从库需重建(主库binlog已清理)",
+                f"【{cluster_name}】从库 {host}:{port} 请求复制的 GTID 在主库中已不存在"
+                f"（主库 binlog 已被清理，或该节点数据过旧 / 被重装过）。\n"
+                f"该类故障【无法自动修复】：重挂复制、注入空事务均无效。\n"
+                f"处理：在「仪表盘 / 集群管理」对该节点点击【重建】，用主库数据重做该从库。\n"
+                f"错误信息：{io_err}",
+                cluster_id=cid, force=True)
+            record_alert(cid, host, port, "need_rebuild",
+                         f"主库 binlog 已清理，复制无法自愈，需重建该从库：{io_err}",
+                         status="unresolved")
+        except Exception as e:
+            print(f"[monitor] 需重建告警发送失败(可忽略): {e}")
+    if get_setting("AUTO_REBUILD_ON_PURGE", "0") == "1" and cur_h:
+        rk = ("autorebuild", cid, host, port)
+        if time.monotonic() >= _AUTO_REBUILD_AT.get(rk, 0.0):
+            _AUTO_REBUILD_AT[rk] = time.monotonic() + 1800
+            try:
+                from . import rebuild
+                tid = rebuild.start_rebuild(cid, host, port, actor="auto:binlog-purged")
+                print(f"[monitor] {host}:{port} 已自动触发在线重建"
+                      f"（AUTO_REBUILD_ON_PURGE=1），task={tid}")
+            except Exception as e:
+                print(f"[monitor] 自动重建触发失败 {host}:{port}: {e}")
 
 
 # 互斥锁：后台 monitor 线程与手动「刷新全部」(/api/refresh) 都调用 run_once，
@@ -642,6 +719,9 @@ def _probe_all():
             semi = st.get("semi_master_status") if is_master else st.get("semi_slave_status")
             # 卡死预标记：供 repl_state 落库（独立 key 计数，不与下方自愈块耦合）
             if not is_master:
+                # 主库 binlog 已清理（1236）：无法自愈，状态直接标为「需重建」
+                if is_gtid_purged_error(st.get("slave_io_err") or ""):
+                    st["purged"] = True
                 _sb = st.get("seconds_behind")
                 _eg = st.get("exec_gtid") or ""
                 _pk_s = ("stuck_pre", cid, host, port)
@@ -711,6 +791,22 @@ def _act_once():
                 continue
             h_host, h_port = key[0], key[1]
             ru, rp = node_root(h_host, cid)
+            # ---- 重建完成后立即解除退避 ----
+            # 运维点「重建」后，该节点此前累积的自愈退避 / 卡死计数 / 需重建标记若不清理，
+            # 会出现「重建其实已完成，但页面仍显示旧状态、且监控长时间不再管它」的错觉。
+            try:
+                from . import rebuild as _rebuild_mod
+                _rts = _rebuild_mod.last_rebuilt_at(cid, h_host, h_port)
+                if _rts and _REBUILT_CLEARED.get(key) != _rts:
+                    _REBUILT_CLEARED[key] = _rts
+                    _HEAL_NEXT_AT.pop(key, None)
+                    _HEAL_FAILS.pop(key, None)
+                    _STUCK_PREV.pop(("stuck", cid, h_host, h_port), None)
+                    _STUCK_NEXT_AT.pop(("stuck", cid, h_host, h_port), None)
+                    _PURGE_LOGGED.discard((cid, h_host, h_port))
+                    print(f"[monitor] {h_host}:{h_port} 重建已完成，重置自愈退避与卡死计数")
+            except Exception:
+                pass
             # ---- binlog 空间守卫（仅主库，每小时一次）----
             if is_master and time.monotonic() >= _BINLOG_AT.get(key, 0.0):
                 _BINLOG_AT[key] = time.monotonic() + _BINLOG_INTERVAL
@@ -764,6 +860,13 @@ def _act_once():
                 _HEAL_SKIP_LOGGED.discard(key)
                 if time.monotonic() < _HEAL_NEXT_AT.get(key, 0.0):
                     continue
+            # ---- 主库 binlog 已清理（1236 purge）：自愈无解，只引导/触发重建 ----
+            if not is_master and st.get("purged"):
+                _purge_guard(cid, cluster_name, h_host, h_port, cur_h, cur_p, st, key)
+                continue
+            # 复制已恢复正常：解除「需重建」标记，使其后再次发生时能重新告警
+            if not is_master and st.get("slave_io") == "Yes" and st.get("slave_sql") == "Yes":
+                _PURGE_LOGGED.discard((cid, h_host, h_port))
             # 当前主库但若仍挂着复制通道（SHOW REPLICA STATUS 有输出）：这是提升为主时
             # RESET SLAVE ALL 未清干净、或被 ensure_topology 误 repoint 的残留。它会让主库
             # 仍尝试拉旧源 binlog 而报 1236（"master 却 IO 错误"的矛盾现象）。

@@ -11,7 +11,7 @@ import time
 import threading
 from email.mime.text import MIMEText
 from .config import env
-from .db import get_setting, query
+from .db import get_setting, query, execute
 
 
 def _cfg():
@@ -67,6 +67,82 @@ def _alert_merge_enabled():
     return v in ("1", "true", "yes", "on")
 
 
+def _alert_grace_sec():
+    """自愈观察期（秒）：状态类告警先挂起这么久，期间若故障自动恢复则【只记录、不发信】。
+
+    背景：监控每 CHECK_INTERVAL(默认 2s) 探活一次，复制中断/节点抖动往往在 1~2 个周期
+    内被自愈逻辑（重挂复制、注入空事务、重新选主）修好。若一冒头就发信，运维会收到
+    大量「故障 + 已恢复」的无效邮件对。默认 30s：足够覆盖自愈耗时，又不会过度延迟
+    真实故障的通知（自动切换类邮件由 failover 立即发送，不受此观察期影响）。
+    设为 0 表示关闭观察期，立即发送（等同旧行为）。
+    """
+    try:
+        v = int(get_setting("ALERT_GRACE_SEC", "30") or 0)
+    except Exception:
+        v = 30
+    return v if v > 0 else 0
+
+
+# ---- 观察期待发告警：key -> {timer, subject, at} ----
+_pending_lock = threading.Lock()
+_pending = {}
+
+
+def _defer_alert(cancel_key, delay, subject, body, cluster_id, recipients):
+    """挂起一封告警：delay 秒后若未被 cancel_alert 取消，才真正投递。"""
+    with _pending_lock:
+        old = _pending.pop(cancel_key, None)
+        if old:
+            try:
+                old["timer"].cancel()
+            except Exception:
+                pass
+        t = threading.Timer(delay, _flush_alert,
+                            args=(cancel_key, subject, body, cluster_id, recipients))
+        t.daemon = True
+        _pending[cancel_key] = {"timer": t, "subject": subject, "at": time.time() + delay}
+        t.start()
+    print(f"[alert:pending] 「{subject}」进入 {delay}s 自愈观察期，期内恢复则只记录不发送")
+
+
+def _flush_alert(cancel_key, subject, body, cluster_id, recipients):
+    """观察期结束仍未取消 -> 故障是真实的，投递邮件。"""
+    with _pending_lock:
+        _pending.pop(cancel_key, None)
+    _deliver(subject, body, cluster_id, recipients)
+
+
+def cancel_alert(cancel_key, note=""):
+    """观察期内故障已自愈 -> 撤销待发邮件。
+
+    返回 True 表示确实撤销了一封待发告警（调用方应改走「只记录」分支）；
+    False 表示没有待发告警（说明故障持续超过了观察期，邮件早已发出）。
+    """
+    with _pending_lock:
+        p = _pending.pop(cancel_key, None)
+        if not p:
+            return False
+        try:
+            p["timer"].cancel()
+        except Exception:
+            pass
+    print(f"[alert:cancel] 「{p.get('subject')}」观察期内已自愈 -> 不发送邮件（仅记录）"
+          + (f"：{note}" if note else ""))
+    return True
+
+
+def record_alert(cluster_id, host, port, alert_type, message, status="healed"):
+    """只记录、不发信：写入 alerts 表（告警中心可见，级别 info）。"""
+    try:
+        execute(
+            "INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,NOW())",
+            (cluster_id, host, port, alert_type, status, message),
+        )
+    except Exception as e:
+        print(f"[alert:record] 写入告警记录失败(可忽略): {e}")
+
+
 def resolve_recipients(cluster_id=None):
     """返回应当接收告警的邮箱列表（去重）。"""
     emails = []
@@ -102,7 +178,37 @@ def resolve_recipients(cluster_id=None):
 last_error = ""
 
 
-def send_alert(subject, body, cluster_id=None, recipients=None, force=False):
+def send_alert(subject, body, cluster_id=None, recipients=None, force=False,
+               grace=None, cancel_key=None):
+    """发送告警邮件。
+
+    grace/cancel_key：启用「自愈观察期」。传入 cancel_key 后，告警不会立刻投递，
+    而是挂起 grace 秒（缺省取 ALERT_GRACE_SEC）；期间若调用方用同一 cancel_key
+    调用 cancel_alert()（表示故障已自愈），邮件被撤销，调用方改走「只记录」分支。
+    force=True 时忽略观察期（测试邮件等）。
+    """
+    global last_error
+    last_error = ""
+    c = _cfg()
+    if recipients is None:
+        recipients = resolve_recipients(cluster_id)
+    if not c["host"] or not recipients:
+        last_error = "未配置 SMTP 服务器或告警接收邮箱"
+        print(f"[alert:skip] {subject} | {body}")
+        return False
+
+    # ---- 自愈观察期：状态类告警先挂起，期间自愈则只记录不发信 ----
+    if not force and cancel_key:
+        g = _alert_grace_sec() if grace is None else int(grace or 0)
+        if g > 0:
+            _defer_alert(cancel_key, g, subject, body, cluster_id, recipients)
+            return False
+
+    return _deliver(subject, body, cluster_id, recipients, force=force)
+
+
+def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
+    """真正投递（含同类冷却节流）。由 send_alert 或观察期到点后调用。"""
     global last_error
     last_error = ""
     c = _cfg()

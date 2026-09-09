@@ -175,8 +175,29 @@ def _run(task_id, cluster_id, host, port):
         return False, f"{type(e).__name__}: {e}"
 
 
+# (cluster_id, host, port) -> 最近一次**成功**重建的 time.time()
+_RECENT_OK = {}
+
+
+def last_rebuilt_at(cluster_id, host, port):
+    """该节点最近一次成功重建的时间戳（无则 None）。
+
+    供 monitor 在重建完成后立即解除该节点的自愈退避 / 卡死计数 / 需重建标记，
+    避免出现「重建其实已完成，但页面仍显示旧状态」的错觉。
+    """
+    try:
+        return _RECENT_OK.get((int(cluster_id), host, int(port)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _worker(task_id, cluster_id, host, port):
     ok, msg = _run(task_id, cluster_id, host, port)
+    if ok:
+        try:
+            _RECENT_OK[(int(cluster_id), host, int(port))] = time.time()
+        except (TypeError, ValueError):
+            pass
     _set(task_id, status="done" if ok else "failed", msg=msg,
          pct=100 if ok else None, finished=time.time())
 

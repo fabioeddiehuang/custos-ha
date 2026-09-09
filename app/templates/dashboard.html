@@ -93,6 +93,7 @@
         <span class="badge drift-ok" id="driftbadge-{{ c.cluster_id }}" title="配置一致性巡检">配置检测中…</span>
         <span class="status-pill {{ '' if c.offline == 0 else 'warn' }}" id="statuspill-{{ c.cluster_id }}">{{ '正常' if c.offline == 0 else '存在异常' }}</span>
         <button class="btn btn-sm btn-ghost" type="button" data-cid="{{ c.cluster_id }}" onclick="precheckCluster(this)">预检</button>
+        <button class="btn btn-sm btn-ghost" type="button" id="driftfix-{{ c.cluster_id }}" style="display:none" title="一键修复配置漂移（按集群基线回写不一致的参数）" onclick="remediateDrift('{{ c.cluster_id }}', this)">一键修复</button>
       </div>
     </div>
     <div class="dh-clus-metrics">
@@ -125,6 +126,9 @@
             {% elif h.repl_state == 'repl_stuck' %}
               <span class="pill warn">● 复制卡死</span>
               {% if h.upstream %}<div class="repl-link">← {{ h.upstream }}</div>{% endif %}
+            {% elif h.repl_state == 'repl_purged' %}
+              <span class="pill down" title="主库 binlog 已清理，复制无法自愈，需重建该从库">● 需重建</span>
+              {% if h.upstream %}<div class="repl-link">← {{ h.upstream }}</div>{% endif %}
             {% elif h.repl_state == 'orphan' %}
               <span class="pill warn">● 脱管异常</span>
             {% elif h.repl_state == 'offline' %}
@@ -151,6 +155,7 @@
               <div class="op-cell" style="display:flex;gap:6px;">
                 <button class="btn btn-sm" onclick="doFailover('/api/failover/to', 'host={{ h.host }}&port={{ h.port }}&cluster_id={{ c.cluster_id }}', this)">设为主库</button>
                 <button class="btn btn-sm btn-ghost" type="button" onclick="healNode('{{ h.host }}', '{{ h.port }}', {{ c.cluster_id }}, this)">修复复制</button>
+                <button class="btn btn-sm btn-ghost" type="button" style="border-color:#f0a02055;color:#f0a020;" title="复制无法自愈时（如主库 binlog 已清理 / 数据冲突）：用主库数据重做本节点。重建期间该节点不可用，耗时随数据量增长" onclick="rebuildNodeDash({{ c.cluster_id }}, '{{ h.host }}', '{{ h.port }}', this)">重建</button>
               </div>
             {% else %}
               <span class="badge" style="background:rgba(52,211,153,.14);color:#34d399;">当前主</span>
@@ -364,6 +369,8 @@
             return '<span class="pill down">● 复制中断</span>' + (up ? '<div class="repl-link">← ' + esc(up) + '</div>' : '');
           } else if (s === 'repl_stuck') {
             return '<span class="pill warn">● 复制卡死</span>' + (up ? '<div class="repl-link">← ' + esc(up) + '</div>' : '');
+          } else if (s === 'repl_purged') {
+            return '<span class="pill down" title="主库 binlog 已清理，复制无法自愈，需重建该从库">● 需重建</span>' + (up ? '<div class="repl-link">← ' + esc(up) + '</div>' : '');
           } else if (s === 'orphan') {
             return '<span class="pill warn">● 脱管异常</span>';
           } else if (s === 'offline') {
@@ -774,6 +781,8 @@
           if (!d || !d.ok) return;
           if (d.drift > 0) { b.className = "badge drift-bad"; b.textContent = "配置漂移 " + d.drift; }
           else { b.className = "badge drift-ok"; b.textContent = "配置一致"; }
+          var fb2 = document.getElementById("driftfix-" + cid);
+          if (fb2) fb2.style.display = d.drift > 0 ? "" : "none";
         })
         .catch(function () {});
     });
@@ -834,11 +843,16 @@
         if (body) body.innerHTML = '<div class="obs-empty" style="color:#fb7185;">' + esc(e.message) + '</div>';
       });
   }
-  function remediateDrift() {
-    var sel = document.getElementById("obsCluster");
-    if (!sel) return;
-    var cid = sel.value;
-    var btn = document.getElementById("driftFixBtn");
+  // 观测中心与「集群健康」卡片共用：传 (cid, btn) 即按指定集群修复；
+  // 不传参时沿用观测中心当前选中的集群（兼容旧调用 remediateDrift()）。
+  function remediateDrift(cid, btn) {
+    if (cid === undefined || cid === null || cid === "") {
+      var sel = document.getElementById("obsCluster");
+      if (!sel) return;
+      cid = sel.value;
+      btn = btn || document.getElementById("driftFixBtn");
+    }
+    if (!btn) { btn = document.getElementById("driftfix-" + cid); }
     if (btn) { btn.disabled = true; btn.textContent = "修复中…"; }
     fetch("/api/config_drift/remediate?cluster_id=" + cid, { method: "POST", cache: "no-store", credentials: "same-origin" })
       .then(function (r) { return r.text().then(function (t) { try { return JSON.parse(t); } catch (e) { return null; } }); })
@@ -956,6 +970,68 @@
     });
   }
 
+  // ---- 一键重建从库（复制无法自愈时使用，如主库 binlog 已清理 / 数据冲突）----
+  function rebuildNodeDash(cid, host, port, btn) {
+    if (!confirm("确认从主库重建 " + host + ":" + port + " ？\n\n"
+      + "该操作会用【主库数据覆盖本节点】，并重新挂载复制；\n"
+      + "重建期间该节点不可用，耗时随数据量增长。\n\n"
+      + "仅在复制无法自愈（如主库 binlog 已清理、数据冲突）时使用。")) return;
+    if (btn) { btn.disabled = true; btn.textContent = "重建中…"; }
+    var fd = new FormData();
+    fd.append("cluster_id", cid); fd.append("host", host); fd.append("port", port);
+    fetch("/api/node/rebuild", { method: "POST", body: fd, credentials: "same-origin" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (btn) { btn.disabled = false; btn.textContent = "重建"; }
+        if (!d || !d.ok) { alert("重建失败：" + ((d && (d.error || d.msg)) || "未知错误")); return; }
+        rebuildToast(d.task);
+      })
+      .catch(function (e) {
+        if (btn) { btn.disabled = false; btn.textContent = "重建"; }
+        alert("重建请求异常：" + e.message);
+      });
+  }
+  function rebuildToast(task) {
+    var box = document.getElementById("rebuildBar");
+    if (!box) {
+      box = document.createElement("div"); box.id = "rebuildBar";
+      box.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:9999;width:320px;padding:14px 16px;border-radius:12px;background:#151b2b;border:1px solid rgba(255,255,255,.12);box-shadow:0 10px 34px rgba(0,0,0,.45);color:#e6e9f0;font-size:13px";
+      document.body.appendChild(box);
+    }
+    function bar(pct) {
+      return '<div style="height:6px;background:rgba(255,255,255,.12);border-radius:4px;overflow:hidden;margin:8px 0">'
+        + '<div style="height:100%;width:' + pct + '%;background:linear-gradient(90deg,#0ABAB5,#E11D74);transition:width .4s"></div></div>';
+    }
+    function poll() {
+      fetch("/api/node/rebuild_status?task=" + encodeURIComponent(task),
+            { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (t) {
+          t = t || {};
+          var st = t.status || "running";
+          if (st === "running") {
+            box.innerHTML = '<div style="font-weight:600">从库重建中… ' + (t.pct || 0) + '%</div>'
+              + bar(t.pct || 0) + '<div style="color:#9aa5b8">' + esc(t.msg || "") + '</div>';
+            setTimeout(poll, 3000);
+          } else if (st === "done") {
+            box.innerHTML = '<div style="font-weight:600;color:#34d399">✓ 重建完成</div>'
+              + '<div style="margin-top:6px;color:#9aa5b8">' + esc(t.msg || "") + '</div>'
+              + '<div style="margin-top:10px"><button class="btn btn-sm" onclick="var b=document.getElementById(\'rebuildBar\');if(b)b.remove();refreshStatus(true);">关闭并刷新</button></div>';
+            refreshStatus(true);
+          } else {
+            box.innerHTML = '<div style="font-weight:600;color:#fb7185">✗ 重建失败</div>'
+              + '<div style="margin-top:6px;color:#9aa5b8">' + esc(t.msg || "") + '</div>'
+              + '<div style="margin-top:10px"><button class="btn btn-sm" onclick="var b=document.getElementById(\'rebuildBar\');if(b)b.remove();">关闭</button></div>';
+          }
+        })
+        .catch(function (e) {
+          box.innerHTML = '<div style="color:#fb7185">重建状态查询失败：' + esc(e.message) + '</div>';
+        });
+    }
+    box.innerHTML = '<div style="font-weight:600">已提交重建任务…</div>';
+    poll();
+  }
+
   // ---- 切换历史（集群/时间筛选 + 分页）----
   var _swPage = 1;
   function swPage(d) { _swPage = Math.max(1, _swPage + d); loadSwitchHistory(); }
@@ -1017,7 +1093,10 @@
 
   var _obsSel = document.getElementById("obsCluster");
   var _hasObs = !!(_obsSel && _obsSel.options && _obsSel.options.length);
+  // 无论是否有「观测中心」的集群下拉，都要跑一次 loadDrift：
+  // 集群健康卡片上的「配置漂移 N」徽标与「一键修复」按钮依赖它渲染。
   if (_hasObs) { autoPickObsCluster(function () { loadTrend(); loadSlow(); loadDrift(); }); }
+  else { loadDrift(); }
   loadActivity();
   setInterval(function () { refreshStatus(false); }, 10000);
   setInterval(checkVip, 15000);

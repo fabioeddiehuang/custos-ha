@@ -304,6 +304,29 @@ def parse_gtid_set(s):
     return res
 
 
+def is_gtid_purged_error(err):
+    """复制 IO 错误是否为「主库 binlog 已清理 / 从库状态过旧」类 1236。
+
+    典型文本：
+      Got fatal error 1236 from master when reading data from binary log:
+      'Could not find GTID state requested by slave in any binlog files.
+       Probably the slave state is too old and required binlog files have been purged.'
+
+    这类故障【无法自愈】：重挂复制（RESET SLAVE + CHANGE MASTER）只会重新请求同一批
+    已被清理的 GTID，注入空事务（heal_io_gtid_gap）解决的是相反方向（从库比主库多
+    GTID）。唯一解法是从主库重新做一份数据——即「重建从库」。
+    """
+    e = (err or "").lower()
+    if not e:
+        return False
+    return (
+        "could not find gtid state requested by slave" in e
+        or "required binlog files have been purged" in e
+        or "slave state is too old" in e
+        or ("1236" in e and ("purged" in e or "too old" in e))
+    )
+
+
 def heal_io_gtid_gap(slave_host, slave_port, ha_user, ha_pass,
                      slave_root_user="root", slave_root_pass="",
                      master_host=None, master_port=None,

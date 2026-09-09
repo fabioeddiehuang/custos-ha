@@ -31,7 +31,7 @@ from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
 from .clusters import list_clusters, validate_node_version, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
 from .alerts import send_alert, last_error, smtp_view
 from .ha_client import (connect, heal_replication, heal_io_gtid_gap, heal_io_auth,
-                       get_status, make_slave_of,
+                       get_status, make_slave_of, is_gtid_purged_error,
                        fix_node_mysql_params, reset_replication_creds_on_master,
                        restart_slave_io, connect_robust)
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
@@ -777,6 +777,15 @@ def api_heal(request: Request, user=Depends(auth_required),
         # 主库无复制通道 / 双线程均正常：无需自愈
         if mode == "master" or (io_ok and sql_ok):
             return JSONResponse({"ok": True, "msg": "复制正常，无需自愈"})
+
+        # 主库 binlog 已清理（1236）：任何自愈都无效，直接给出可操作的指引，
+        # 避免用户反复点「修复复制」却每次都失败（体验上等同于卡死）。
+        if is_gtid_purged_error(st.get("slave_io_err") or ""):
+            return JSONResponse({
+                "ok": False,
+                "msg": ("主库 binlog 已清理，该从库请求的 GTID 在主库中已不存在，复制无法自愈"
+                        "（重挂载 / 注入空事务均无效）。\n"
+                        "请对该节点点击【重建】：用主库数据重做该从库并重新挂载复制。")})
 
         steps = []
         cm = query("SELECT host, port FROM current_master WHERE cluster_id=%s", (cluster_id,))
@@ -1658,7 +1667,9 @@ def api_setting_set(key: str = Form(...), value: str = Form(...),
                # 自愈 / 半同步 / binlog 守卫（默认保守，页面与 /api/setting_set 共用白名单）
                "SKIP_DATA_CONFLICT", "REQUIRE_WITNESS_FOR_FAILOVER",
                "AUTO_PURGE_BINLOG", "BINLOG_SIZE_ALERT_MB",
-               "BINLOG_KEEP_HOURS", "SEMI_SYNC"}
+               "BINLOG_KEEP_HOURS", "SEMI_SYNC",
+               # 告警自愈观察期（秒）与「binlog 已清理时自动重建」（默认关闭）
+               "ALERT_GRACE_SEC", "AUTO_REBUILD_ON_PURGE"}
     if key not in allowed:
         return JSONResponse({"ok": False, "error": "不允许修改该项"})
     upsert_setting(key, value)
@@ -2034,6 +2045,7 @@ def alerts_page(request: Request, user=Depends(auth_required), msg: str = "", er
         "merge": get_setting("ALERT_MERGE", "1"),
         "lag_threshold": get_setting("ALERT_LAG_THRESHOLD", "30"),
         "receivers": get_setting("ALERT_RECEIVERS", ""),
+        "grace": get_setting("ALERT_GRACE_SEC", "30"),
     }
     return render("alerts.html", request, user=user, cfg=cfg, alert_emails=alert_emails,
                   clusters=clusters, rules=rules, msg=msg, error=error)
@@ -2150,12 +2162,14 @@ def api_user_delete(username: str = Form(...), user=Depends(auth_required)):
 @app.post("/api/alert_rules")
 def api_alert_rules(cooldown: str = Form(""), merge: str = Form(""),
                     lag_threshold: str = Form(""), receivers: str = Form(""),
-                    user=Depends(auth_required)):
-    """保存告警规则（冷却/合并/延迟阈值/额外收件人）。"""
+                    grace: str = Form(""), user=Depends(auth_required)):
+    """保存告警规则（冷却/合并/延迟阈值/额外收件人/自愈观察期）。"""
     upsert_setting("ALERT_COOLDOWN_SEC", cooldown)
     upsert_setting("ALERT_MERGE", merge)
     upsert_setting("ALERT_LAG_THRESHOLD", lag_threshold)
     upsert_setting("ALERT_RECEIVERS", receivers)
+    if grace.strip():
+        upsert_setting("ALERT_GRACE_SEC", grace.strip())
     return JSONResponse({"ok": True, "msg": "✓ 已保存告警规则"})
 
 

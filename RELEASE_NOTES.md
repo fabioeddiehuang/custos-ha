@@ -50,6 +50,23 @@
   - **后端采集**：`ha_client.get_status` 主库分支新增 `SHOW REPLICAS`/`SHOW SLAVE HOSTS` 取下游从库列表；`monitor._classify_repl_state` 据角色/复制线程/`stuck` 判定状态；卡死预标记用独立 key `stuck_pre` 在 `_update_host` 前设 `st["stuck"]`（原卡死自愈在写库之后，故需前置标记）。
   - **落库与接口**：`hosts` 表新增 `repl_state`/`upstream`/`downstream` 三列（`db.py` 迁移）；`_update_host` 写入（纳入空闲零写入的 changed 比对）；`api` 的 `_build_status_payload`/`get_cluster_detail` 的 `host_rows` 均 `SELECT` 三列并 `_parse_downstream` 把 JSON 还原为数组。
   - **前端**：仪表盘与集群详情的节点表格新增「数据交互」列（徽标 + 上下游），仪表盘刷新 JS 由 `renderReplState` 维护。版本号仍为 `v2.2.20`，重建管理器生效。
+- **仪表盘：集群健康卡片内新增配置漂移「一键修复」**：
+  - 原「一键修复」只在页面下方的「观测中心 → 配置一致性」卡片里，需先切集群下拉再点；现每个集群健康卡片头部（「预检」旁）在检测到漂移时自动出现同名同款按钮（`btn btn-sm btn-ghost`，样式与「预检」一致），无漂移时隐藏。
+  - 实现：`dashboard.html` 卡片头新增 `driftfix-{cluster_id}` 按钮；`loadDrift()` 刷新徽标时同步按 `drift > 0` 显隐；`remediateDrift(cid, btn)` 通用化（不传参时沿用观测中心当前集群，兼容旧调用）。
+- **告警邮件：新增「自愈观察期」（短时自愈只记录、不发信）**：
+  - **问题**：节点抖动 / 复制瞬断常在 1~2 个探活周期内被自愈逻辑修好，却仍会发出「故障 + 已恢复」的无效邮件对，运维被刷屏。
+  - **机制**：`alerts.send_alert` 新增 `grace` / `cancel_key`——状态类告警（节点离线、复制中断、复制延迟超阈、半同步退化）先挂起 `ALERT_GRACE_SEC` 秒；期间若故障自愈，monitor 用同一 `cancel_key` 调 `cancel_alert()` 撤销待发邮件，并 `record_alert()` 往告警中心记一条 **info 级**记录（`alert_type=selfheal`，status=`healed`），**不发邮件**。观察期结束仍未恢复才真正投递。
+  - **默认 30 秒**（可在「告警 → 告警发送规则 → 自愈观察期」调整；填 0 = 关闭观察期、立即发送）。自动切换类邮件（`failover.py`）不受影响，仍立即发送。
+  - 覆盖范围：节点离线/恢复、复制中断/恢复、延迟跨阈/回落、半同步退化/恢复。
+- **主库 binlog 已清理（1236 purge）场景优化（体验 + 可操作性）**：
+  - **问题**：节点被重装 / 数据清空后重新上线，IO 线程报 `Got fatal error 1236 ... 'Could not find GTID state requested by slave in any binlog files. Probably the slave state is too old and required binlog files have been purged.'`。该类故障**任何自愈都无效**（重挂复制只会重新请求同一批已被清理的 GTID；`heal_io_gtid_gap` 解决的是相反方向），但旧逻辑每周期反复尝试且界面无任何指引，表现为「点了修复也没用、看不到下一步」。
+  - **修复**：
+    - `ha_client.is_gtid_purged_error()` 判定该类错误；monitor 探活阶段置 `st["purged"]`，`repl_state` 新增 **`repl_purged`** → 界面显示 **「● 需重建」** 徽标（仪表盘 + 集群详情，含 tooltip 说明）。
+    - 新增 `_purge_guard()`：命中即**停止无效自愈**（退避 10 分钟，不再每周期重挂）、首次发现时发一封**可操作**的告警（明确写「对该节点点击【重建】」）并落一条 `need_rebuild` 记录；复制恢复后自动解除标记。
+    - 可选自动重建：设置 `AUTO_REBUILD_ON_PURGE=1`（默认 **0 关闭**，因重建会用主库数据覆盖该节点）后自动触发在线重建，带 30 分钟触发冷却。
+    - 一键重建入口下沉到**仪表盘节点操作列**（原只在集群管理页），带二次确认 + 右下角进度条（轮询 `/api/node/rebuild_status`），完成后自动刷新状态。
+    - `/api/heal`（「修复复制」按钮）命中该类错误时直接返回明确指引，不再空转。
+    - 重建成功后 `rebuild.last_rebuilt_at()` 记录时间戳，monitor 立即清理该节点的自愈退避 / 卡死计数 / 需重建标记，避免「重建已完成但页面仍显示旧状态」。
 
 ## v2.2.19 GTID 分叉感知（续传优先，解 v2.2.18 误判）
 
