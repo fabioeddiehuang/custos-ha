@@ -1356,8 +1356,7 @@ def _cluster_view(cid: int):
     cm = f"{cm_rows[0]['host']}:{cm_rows[0]['port']}" if cm_rows else ""
     hs = query(
         "SELECT host, port, status, role, slave_io, slave_sql, err, repl_state, upstream, downstream, "
-        "(SELECT m.seconds_behind FROM metric_history m WHERE m.host=h.host AND m.port=h.port "
-        "ORDER BY m.id DESC LIMIT 1) AS seconds_behind "
+        "repl_delay AS seconds_behind "
         "FROM hosts h WHERE h.cluster_id=%s", (cid,))
     host_rows = []
     slaves = []
