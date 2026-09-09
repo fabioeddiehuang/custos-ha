@@ -34,7 +34,7 @@ from pymysql.cursors import DictCursor
 from .db import query
 from .state import get_current_master
 from .clusters import get_cluster_creds
-from .ha_client import connect_robust, make_slave_of
+from .ha_client import connect_robust, make_slave_of, is_gtid_purged_error
 from . import backup, audit
 
 # 任务表（进程内内存态；管理器为单实例，无需跨进程共享）
@@ -186,6 +186,51 @@ def _align_gtid_after_restore(slave_host, slave_port, sru, srp,
             pass
 
 
+def _repl_io_err(ip, port, user, pwd):
+    """读取从库 Last_IO_Error（用于重建后判断是否真的链上了）。"""
+    conn = connect_robust(ip, port, user, pwd)
+    if not conn:
+        return ""
+    try:
+        with conn.cursor(DictCursor) as cur:
+            cur.execute("SHOW SLAVE STATUS")
+            row = cur.fetchone() or {}
+        return str(row.get("Last_IO_Error") or "")
+    except Exception:
+        return ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _master_binlog_coords(ip, port, user, pwd):
+    """读取主库当前 binlog 文件与位点（GTID 定位失败时的兜底坐标）。
+
+    MariaDB 12 起 `SHOW MASTER STATUS` 改名为 `SHOW BINLOG STATUS`，故两种都试。
+    """
+    conn = connect_robust(ip, port, user, pwd)
+    if not conn:
+        return "", 0
+    try:
+        with conn.cursor() as cur:
+            for sql in ("SHOW BINLOG STATUS", "SHOW MASTER STATUS"):
+                try:
+                    cur.execute(sql)
+                    row = cur.fetchone() or ()
+                    if row and row[0]:
+                        return str(row[0]), int(row[1] or 0)
+                except Exception:
+                    continue
+        return "", 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _node_root(cluster_id, host):
     rows = query("SELECT root_user, root_pass FROM nodes WHERE cluster_id=%s AND ip=%s",
                  (cluster_id, host))
@@ -235,9 +280,10 @@ def _run(task_id, cluster_id, host, port):
 
         step(80, "对齐 GTID 复制位点…")
         mru, mrp = _node_root(cluster_id, m_host)
+        flavour, _mgtid = _gtid_state(m_host, m_port, mru, mrp)
         gt_msg = _align_gtid_after_restore(host, port, root_user, root_pass,
                                            m_host, m_port, mru, mrp)
-        print(f"[rebuild] {host}:{port} {gt_msg}")
+        print(f"[rebuild] {host}:{port} 主库 {m_host}:{m_port} GTID={_mgtid or '未知'}；{gt_msg}")
 
         step(85, "重新建立复制链路…")
         ok, msg = make_slave_of(host, port, root_user, root_pass,
@@ -247,8 +293,67 @@ def _run(task_id, cluster_id, host, port):
         if not ok:
             return False, f"重链复制失败：{msg}"
 
-        step(96, "校验复制状态…")
+        step(92, "校验复制状态…")
+        time.sleep(3)
         io, sq, d = _repl_state(host, port, root_user, root_pass)
+        io_err = _repl_io_err(host, port, root_user, root_pass)
+
+        # ---- 兜底：GTID 自动定位仍报「主库 binlog 已清理」(1236) 时改按【文件位点】重链 ----
+        # GTID 定位要求主库能找到从库所请求位点对应的 binlog；主库早期 binlog 一旦被
+        # 清理（或位点集合对不上），无论怎么对齐都会反复 1236。此时数据本就来自该主库
+        # 的全量导出，直接用主库【当前 binlog 文件+位点】做坐标续传即可，不再依赖历史。
+        if io != "Yes" and is_gtid_purged_error(io_err):
+            # ① 先用【主库当前 GTID 位点】重新对齐再拉起 IO 线程。
+            #    位点可能被 make_slave_of 的分叉处理（RESET MASTER）冲掉，或导出期间
+            #    主库又切换过，故这里重新取一次主库位点。
+            _flv2, _mgtid2 = _gtid_state(m_host, m_port, mru, mrp)
+            if _mgtid2 and flavour == "mariadb":
+                _exec(host, port, root_user, root_pass, "STOP SLAVE")
+                _ok_a, _err_a = _exec(host, port, root_user, root_pass,
+                                      f"SET GLOBAL gtid_slave_pos='{_mgtid2}'")
+                _exec(host, port, root_user, root_pass, "START SLAVE")
+                time.sleep(4)
+                io, sq, d = _repl_state(host, port, root_user, root_pass)
+                io_err = _repl_io_err(host, port, root_user, root_pass)
+                if io == "Yes":
+                    gt_msg += f"；已按主库当前 GTID 位点 {_mgtid2} 重新对齐后恢复"
+                elif not _ok_a:
+                    print(f"[rebuild] {host}:{port} 重新对齐 GTID 失败：{_err_a}")
+
+            # ② 仍不通 -> 改按【主库当前 binlog 文件+位点】重链（绕开 GTID 历史）
+            mfile, mpos = _master_binlog_coords(m_host, m_port, mru, mrp)
+            print(f"[rebuild] {host}:{port} GTID 定位失败（{io_err[:160]}），"
+                  f"改用文件位点 {mfile}:{mpos} 兜底重链")
+            if mfile and mpos:
+                _rp = str(creds.get("repl_pass") or "").replace("\\", "\\\\").replace("'", "\\'")
+                if flavour == "mariadb":
+                    gtid_opt = "MASTER_USE_GTID=no"
+                else:
+                    gtid_opt = "MASTER_AUTO_POSITION=0"
+                _ok_c, _err_c = _exec(
+                    host, port, root_user, root_pass,
+                    f"STOP SLAVE;")
+                _ok_c, _err_c = _exec(
+                    host, port, root_user, root_pass,
+                    f"CHANGE MASTER TO MASTER_HOST='{m_host}', MASTER_PORT={int(m_port)}, "
+                    f"MASTER_USER='{creds.get('repl_user')}', MASTER_PASSWORD='{_rp}', "
+                    f"MASTER_LOG_FILE='{mfile}', MASTER_LOG_POS={int(mpos)}, {gtid_opt}")
+                if _ok_c:
+                    _exec(host, port, root_user, root_pass, "START SLAVE")
+                    time.sleep(5)
+                    io, sq, d = _repl_state(host, port, root_user, root_pass)
+                    io_err = _repl_io_err(host, port, root_user, root_pass)
+                    if io == "Yes":
+                        gt_msg += f"；GTID 定位失败，已按主库文件位点 {mfile}:{mpos} 兜底重链成功"
+                else:
+                    print(f"[rebuild] {host}:{port} 文件位点重链失败：{_err_c}")
+
+        # 复制没起来就如实报失败：旧实现一律返回成功，导致「数据恢复了但复制是断的」，
+        # 界面却显示「重建完成」，问题被掩盖。
+        if io != "Yes" or sq != "Yes":
+            return False, (f"已从主库 {m_host}:{m_port} 恢复数据到 {host}:{port}，"
+                           f"但复制未起来：IO={io} SQL={sq}；"
+                           f"错误：{(io_err or '无')[:300]}；{gt_msg}")
         step(100, "重建完成")
         return True, (f"已从主库 {m_host}:{m_port} 重建 {host}:{port}；"
                       f"复制线程 IO={io} SQL={sq} 延迟={d}；{gt_msg}。"
