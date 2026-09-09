@@ -312,6 +312,25 @@ def init_schema():
                 c.execute("ALTER TABLE clusters ADD COLUMN vip_port INT NOT NULL DEFAULT 3307")
             except Exception:
                 pass
+            # v2.3.0：mysql_version 存 SELECT VERSION() 原文（如 10.6.21-MariaDB-log
+            # 达 19 字符），原 varchar(16) 会被截断，扩容到 48。
+            try:
+                c.execute("ALTER TABLE nodes MODIFY mysql_version varchar(48) DEFAULT NULL")
+            except Exception:
+                pass
+            # ---- v2.3.0：节点「配置待生效」提示 ----
+            # gen_fingerprint：最近一次生成的部署文件指纹（路径+内容），用于判断配置是否又变了
+            # pending_actions：regen 后需在节点执行的动作清单（JSON，空串=无待办）
+            # pending_since：待办产生时间（运维执行后点「已执行」清空）
+            for _tbl, _col, _def in (
+                ("nodes", "gen_fingerprint", "varchar(64) DEFAULT ''"),
+                ("nodes", "pending_actions", "TEXT"),
+                ("nodes", "pending_since", "DATETIME NULL"),
+            ):
+                try:
+                    c.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_def}")
+                except Exception:
+                    pass
             # ---- v2.1：节点/集群支持裸机（node_type）与 MySQL 大版本（mysql_version）----
             # 默认 node_type='docker' 行为完全不变；mysql_version=NULL 表示沿用旧复制语法。
             for _tbl, _col, _def in (

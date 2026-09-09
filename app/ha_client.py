@@ -33,6 +33,7 @@ from .mysql_compat import (detect_syntax, detect_flavour, flavour_from_node_type
                            stop_replication_sql, reset_replica_sql, show_replica_status_sql,
                            default_auth_plugin, F_MYSQL8, F_MARIADB)
 from .config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, is_semi_sync_enabled
+from . import mariadb_matrix
 
 
 # 复制错误码分类 —— 两类语义完全不同，绝不可混为一谈：
@@ -2114,13 +2115,15 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             # 缺它时 manager 写 ha_local.state（必须禁 binlog，否则从库 1062）会报 1227，
             # 结果主库标记一直写不进去、keepalived 读不到 current_master 而退化判定。
             # 与 node_gen 的 render_mariadb_init_sql / fix-node-creds.sql 保持一致。
-            ha_grant = ("GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, "
-                        "REPLICATION SLAVE, REPLICATION SLAVE ADMIN, SLAVE MONITOR, "
-                        "READ_ONLY ADMIN, BINLOG ADMIN, REPLICATION CLIENT, PROCESS, "
-                        "SELECT, RELOAD, SUPER ON *.* "
-                        "TO '%s'@'%%'" % _esc_sql(ha_user))
-            repl_grant = ("GRANT REPLICATION SLAVE, REPLICATION SLAVE ADMIN ON *.* "
-                          "TO '%s'@'%%'" % _esc_sql(repl_user))
+            # v2.3.0：特权集由 mariadb_matrix 单一来源提供，并**按服务器真实支持的
+            # 特权名过滤**（SHOW PRIVILEGES）—— 不再按版本号猜，也不再靠 except 吞
+            # 1064/1227。此前 ha_client 这份比 node_gen 少了 REPLICATION MASTER
+            # ADMIN，导致「init 建号有、自愈补号无」的不一致，一并消除。
+            _avail = mariadb_matrix.server_privileges(cur)
+            ha_grant = ("GRANT %s ON *.* TO '%s'@'%%'"
+                        % (mariadb_matrix.ha_privs(_avail), _esc_sql(ha_user)))
+            repl_grant = ("GRANT %s ON *.* TO '%s'@'%%'"
+                          % (mariadb_matrix.repl_privs(_avail), _esc_sql(repl_user)))
         else:
             idn = "IDENTIFIED WITH " + auth_plugin + " BY %s"
             idn_root = "IDENTIFIED WITH " + auth_plugin + " BY %s"
@@ -2194,7 +2197,15 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             _binlog_off = True
         except Exception:
             pass  # 缺 BINLOG ADMIN/SUPER（如 ha_monitor 首跑尚未获得）时跳过，由复制自愈兜底
-        for extra in ("CREATE USER", "READ_ONLY ADMIN", "BINLOG ADMIN", "REPLICATION MASTER ADMIN"):
+        # v2.3.0：补授列表同样按服务器能力过滤（仅 MariaDB 分支）；MySQL 分支保持
+        # 原列表与原有行为不变（不存在的特权依旧被 except 吞掉，无副作用）。
+        if flavour == F_MARIADB:
+            _extra_privs = mariadb_matrix.optional_privs(
+                mariadb_matrix.server_privileges(cur))
+        else:
+            _extra_privs = ("CREATE USER", "READ_ONLY ADMIN", "BINLOG ADMIN",
+                            "REPLICATION MASTER ADMIN")
+        for extra in _extra_privs:
             # 同时授予 @'%' 与管理器实际连入用的 @manager_ip 账号（精确 host 优先匹配，
             # 管理器大多以 ha_monitor@<manager_ip> 连入，缺 REPLICATION MASTER ADMIN 会导致
             # enable_semisync 的 SET GLOBAL rpl_semi_sync_master_* 报 Access Denied）。

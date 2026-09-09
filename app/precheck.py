@@ -68,6 +68,21 @@ def check_node(ip, port, user, password, role=None):
         ro = _var(conn, "read_only")
         sid = _var(conn, "server_id")
         if flavour == "mariadb":
+            # ---- v2.3.0：版本准入（支持矩阵）----
+            # MariaDB 各系列在特权名、半同步变量、复制参数上存在差异，低于最低支持线
+            # 的版本不保证纳管正确性，必须在预检阶段显式暴露，而不是等自愈静默失败。
+            try:
+                from . import mariadb_matrix as _mm
+                _sc = _mm.support_check(v)
+                if not _sc["supported"]:
+                    findings.append({"level": "ERR", "var": "version",
+                                     "message": "MariaDB 版本不支持：%s %s"
+                                                 % (_sc["message"], _sc["advice"])})
+                elif _sc["level"] == "legacy":
+                    findings.append({"level": "WARN", "var": "version",
+                                     "message": "%s（%s）" % (_sc["message"], _sc["advice"])})
+            except Exception:
+                pass
             # MariaDB：检查 gtid_domain_id 已设置（非 0 或已显式配置），log_bin 开启即可
             dom = _var(conn, "gtid_domain_id")
             if str(logbin).upper() != "ON":

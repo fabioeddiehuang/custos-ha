@@ -109,7 +109,10 @@
       {% for n in g.nodes %}
       <tr data-host="{{ n.ip }}:{{ n.port }}" data-cluster="{{ n.cluster_id or '' }}">
         <td><input type="checkbox" class="node-sel" value="{{ n.ip }}" onchange="syncBatchBar()" title="选择该节点"></td>
-        <td class="mono">{{ n.ip }}:{{ n.port }}</td>
+        <td class="mono">{{ n.ip }}:{{ n.port }}
+          {% if n.pending_actions %}<span class="badge" style="margin-left:6px;background:#E11D74;color:#fff;cursor:pointer"
+            onclick="showPending('{{ n.ip }}')" title="有配置变更尚未在节点生效，点击查看需要在节点执行的操作">配置待生效</span>{% endif %}
+        </td>
         <td>
           {% if n.mysql_version %}{{ n.mysql_version }}{% endif %}
           {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-left:4px">MariaDB 裸机</span>
@@ -147,6 +150,7 @@
             <button class="btn btn-sm btn-primary" onclick="showSelfhealSql({{ n.cluster_id or 0 }}, '{{ n.ip }}', {{ n.port }})">查看/下载自愈 SQL</button>
             {% endif %}
             <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
+            {% if n.pending_actions %}<button class="btn btn-sm" style="background:#E11D74;color:#fff" onclick="showPending('{{ n.ip }}')">待生效操作</button>{% endif %}
             <a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none" href="/nodes/{{ n.ip }}/creds_sql" download>下载修复SQL</a>
             <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delNode('{{ n.ip }}')">删除节点</button>
           </div>
@@ -460,6 +464,61 @@
     });
     toast("已触发 " + ips.length + " 个修复 SQL 下载，请留意浏览器下载提示","ok");
   }
+  // ---- v2.3.0：变更生效动作清单 ----
+  var PENDING_CMDS = [];
+  function actColor(level){
+    if(level==='recreate')return '#E11D74';
+    if(level==='restart')return '#0ABAB5';
+    if(level==='exec')return '#7C2D52';
+    return '#64748b';
+  }
+  function copyCmd(el, idx){
+    copyTxt(el, PENDING_CMDS[idx] || '');
+  }
+  function actionsHtml(acts, ip){
+    if(!acts || !acts.length) return '';
+    var h = '<div style="margin:12px 0 6px;font-weight:600">需要在节点上执行以下操作，配置才会生效：</div>';
+    acts.forEach(function(a){
+      var idx = PENDING_CMDS.length;
+      PENDING_CMDS.push(a.cmd || '');
+      h += '<div style="border:1px solid var(--border,#22304a);border-radius:8px;padding:10px 12px;margin-bottom:10px">'
+        + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+        + '<span class="badge" style="background:'+actColor(a.level)+';color:#fff">'+esc(a.level_label||a.level)+'</span>'
+        + '<b>'+esc(a.title||'')+'</b></div>'
+        + '<div style="color:var(--muted,#94a3b8);font-size:12.5px;margin:6px 0">'+esc(a.why||'')+'</div>'
+        + (a.cmd ? ('<div class="runcmd">'+esc(a.cmd)+'</div>'
+                   + '<button class="btn btn-sm" onclick="copyCmd(this,'+idx+')">复制命令</button>') : '')
+        + ((a.files&&a.files.length) ? '<div style="color:var(--muted,#94a3b8);font-size:12px;margin-top:8px">涉及文件：'+esc(a.files.join('、'))+'</div>' : '')
+        + '</div>';
+    });
+    if(ip){
+      h += '<button class="btn btn-sm btn-primary" onclick="ackDeploy(\''+ip+'\')">已在节点执行，清除提示</button>';
+    }
+    return h;
+  }
+  function ackDeploy(ip){
+    fetch("/nodes/"+encodeURIComponent(ip)+"/ack_deploy",{method:"POST"})
+      .then(function(r){return r.json();})
+      .then(function(d){toast(d.msg||(d.ok?"已清除":"操作失败"), d.ok?"ok":"err"); if(d.ok)setTimeout(function(){location.reload();},800);})
+      .catch(function(e){toast("请求失败: "+e,"err");});
+  }
+  function showPending(ip){
+    PENDING_CMDS = [];
+    fetch("/api/nodes/"+encodeURIComponent(ip)+"/pending")
+      .then(function(r){return r.json();})
+      .then(function(d){
+        var body = document.getElementById("regenBody");
+        var acts = (d.ok && d.actions) ? d.actions : [];
+        if(!acts.length){
+          body.innerHTML = '<div class="banner ok">✓ <div>该节点没有待生效的配置变更。</div></div>';
+        } else {
+          body.innerHTML = '<div style="background:rgba(225,29,116,.12);border:1px solid #E11D74;color:#fecdd3;border-radius:8px;padding:10px 12px;margin-bottom:12px">'
+            + '⚠ ' + esc(ip) + ' 有 ' + acts.length + ' 项配置变更尚未在节点生效。</div>' + actionsHtml(acts, ip);
+        }
+        document.getElementById("regenModal").classList.add("show");
+      })
+      .catch(function(e){toast("请求失败: "+e,"err");});
+  }
   function regenNode(ip,btn){
     if(!confirm("确认重新生成 "+ip+" 的配置文件？将覆盖原文件。"))return;
     var old=btn.textContent;btn.disabled=true;btn.textContent="生成中…";
@@ -473,9 +532,11 @@
           var md5html='<ul class="md5-list">';
           (d.md5s||[]).forEach(function(x){md5html+='<li><span class="f">'+esc(x.file)+'</span><span class="m">'+esc(x.md5)+'</span></li>';});
           md5html+='</ul>';
+          PENDING_CMDS = [];
+          var _ah = actionsHtml(d.actions, (d.actions && d.actions.length) ? ip : '');
           body.innerHTML='<div class="banner ok">✓ <div>'+esc(d.msg||"")+'</div></div>'
-            +(d.run_cmd?'<div class="runcmd">到目标主机执行：\n'+esc(d.run_cmd)+'</div>':'')
-            +'<p class="note" style="margin:8px 0 4px;">生成文件 MD5（用于核对一致性）：</p>'+md5html;
+            +(_ah ? _ah : (d.run_cmd?'<div class="runcmd">到目标主机执行：\n'+esc(d.run_cmd)+'</div>':''))
+            +'<p style="margin:8px 0 4px;color:var(--muted,#94a3b8)">生成文件 MD5（用于核对一致性）：</p>'+md5html;
         }
         document.getElementById("regenModal").classList.add("show");
       })

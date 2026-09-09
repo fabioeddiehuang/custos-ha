@@ -1,6 +1,6 @@
 # Custos
 
-> 当前版本：**v2.2.20**
+> 当前版本：**v2.3.0**
 > 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)；**v2.3 起**每个版本的独立规划（含功能目的 / 功能目标）与变更记录见 [`doc/releases/`](./doc/releases/)；总体待办与版本索引见 [`TODO.md`](./TODO.md)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
 
@@ -28,6 +28,8 @@
 | Web 控制台 | 仪表盘（实时拓扑 / 统计 / 刷新）、集群管理（单色系卡片 + SVG 图标 + 按集群配置凭证与 VIP）、节点配置（生成 / 重新生成 / 删除）、系统配置（SMTP 多收件人告警 + 按集群路由）。 |
 | 切换历史与告警 | 记录每次切换（from→to + 原因）；支持邮件告警与异常日志一键复制排错。 |
 | 安全 | 账号密码可自动生成、明文不回显；「同步密码到节点」用 root 自愈全部节点；`SECRET_KEY` / `WEB_PASS` 生产须改。 |
+| 变更生效提示 | 重新生成/改配置后自动 diff 部署文件，给出「需在节点执行的操作」并区分级别：**重建容器**（my.cnf 静态参数/镜像/编排，restart **不生效**）、**重启服务**（keepalived / node-agent）、**节点执行一次**（`prepare-logs.sh` / `fix-node-creds.sql`）、**人工确认**（init SQL 仅对空数据目录的首次启动生效）。节点列表显示「配置待生效」徽标，执行完可一键清除。 |
+| 版本支持矩阵 | MariaDB 12.3 为主线，10.6/10.11 兼容、<10.6 不支持（预检拦截）；MySQL 8.0 冻结。授权按 `SHOW PRIVILEGES` 能力探测，不按版本号硬编码。见 [3.1 支持矩阵](#31-数据库版本支持矩阵)。 |
 
 ---
 
@@ -107,6 +109,34 @@ custos-ha/
 - 一个**独立的外部管理 MySQL**（推荐），用户/密码/库名统一约定为 `ha`（也可自定义）；
 - 一个与节点同网段、**当前空闲**的 VIP（如 `192.0.2.10`），本工具无法自动探测，必须填写。
 - 节点机器的 Docker 必须允许给容器附加 `NET_ADMIN` / `NET_BROADCAST` / **`NET_RAW`** 能力（`keepalived` 用原始套接字发 VRRP 通告，缺 `NET_RAW` 会报 `Cant send advert ... Operation not permitted` 并导致双主/split-brain）。节点 `docker-compose.yaml`（由 `app/node_assets` 渲染）已显式 `cap_add: - NET_RAW`。
+
+---
+
+### 3.1 数据库版本支持矩阵
+
+主线为 **MariaDB 12.3.3**（裸机 tarball + 官方容器镜像），MySQL 侧**冻结**（只修 bug、不做新功能）。
+
+| 系列 | 级别 | 说明 |
+|------|------|------|
+| MariaDB **12.3** | **主线** | 推荐。容器镜像 `mariadb:12.3.3`；裸机 `mariadb-12.3.3-linux-systemd-x86_64.tar.gz` |
+| MariaDB 12.0 / 12.1 / 12.2 | 支持 | 建议升级至 12.3 主线 |
+| MariaDB 11.4 / 11.8 | 支持 | LTS，建议升级至 12.3 主线 |
+| MariaDB 10.6 / 10.11 | 兼容 | 可纳管，但不再主动回归验证（预检给 WARN） |
+| MariaDB < 10.6 | **不支持** | 预检报 ERR，不建议纳管 |
+| MySQL 8.0.26 ~ 8.0.46 | 支持（冻结） | 仅修 bug；**禁止与 MariaDB 同集群混部**（GTID 机制不兼容） |
+
+判定与实现要点（v2.3.0 起）：
+
+- **版本自动登记**：节点真实版本由管理器连库 `SELECT VERSION()` 探测并回写 `nodes.mysql_version`，
+  不再依赖建节点时手填（此前该字段常年为空/过期）。
+- **特权按能力探测，不按版本号硬编码**：`READ_ONLY ADMIN` / `SLAVE MONITOR` / `BINLOG ADMIN` /
+  `REPLICATION SLAVE ADMIN` / `REPLICATION MASTER ADMIN` 等，运行时用 `SHOW PRIVILEGES`
+  过滤，服务器不支持的直接跳过——不再靠 `except` 静默吞掉 1064/1227。
+- **半同步变量名**：MariaDB 全系列沿用 `rpl_semi_sync_master/slave`
+  （11.5+ 的 `source/replica` 只是别名，旧名仍有效），**不要**照 MySQL 8.0.26+ 改名，
+  否则 10.6~11.4 节点会因未知变量启动即崩。
+- 授权串的唯一来源是 `app/mariadb_matrix.py`（`ha_privs()` / `repl_privs()` / `app_privs()`），
+  `node_gen` 与 `ha_client` 均引用它，杜绝两份权限集不一致。
 
 ---
 

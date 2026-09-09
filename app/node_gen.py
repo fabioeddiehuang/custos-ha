@@ -12,6 +12,8 @@
 用户只需在目标主机上 `cd <目录> && docker compose up -d` 即可完成节点安装与基础配置。
 每个节点归属一个集群（cluster_id），其账号/VIP 均取自该集群配置。
 """
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -23,6 +25,8 @@ import pymysql
 from .db import get_setting, query, execute
 from .mysql_compat import default_auth_plugin, is_mariadb_node
 from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, is_semi_sync_enabled
+from . import mariadb_matrix
+from . import mariadb_matrix
 from .ha_client import get_status, ensure_ha_creds
 from .clusters import get_cluster_creds
 
@@ -341,7 +345,10 @@ def _semisync_block():
         return ""
     return (
         "# ---- 半同步复制（SEMI_SYNC=1：插件内置，随启动生效，重启不丢）----\n"
-        "plugin_load_add = rpl_semi_sync_master;rpl_semi_sync_slave\n"
+        # v2.3.0：插件名由 mariadb_matrix 提供。MariaDB 全系列沿用 master/slave 命名，
+        # 11.5+ 新增的 source/replica 只是**别名**、且旧名仍有效，故不做版本分支——
+        # 切勿照 MySQL 8.0.26+ 改成 source/replica，会让 10.6~11.4 节点启动即崩。
+        "plugin_load_add = " + mariadb_matrix.semisync_plugin_load() + "\n"
         "rpl_semi_sync_master_enabled = 1\n"
         "rpl_semi_sync_slave_enabled = 1\n"
         "rpl_semi_sync_master_timeout = 10000\n"
@@ -559,6 +566,11 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
       - CREATE/ALTER USER 用 mysql_native_password（MariaDB 10.4+ 默认 ed25519，
         显式指定以确保管理器用 native 密码协议连接稳定）。
     """
+    # v2.3.0：特权集统一由 mariadb_matrix 提供，与 ha_client.ensure_ha_creds 同源，
+    # 消除「node_gen 有 REPLICATION MASTER ADMIN、ha_client 没有」的两处不一致。
+    _HA_PRIVS = mariadb_matrix.ha_privs()
+    _REPL_PRIVS = mariadb_matrix.repl_privs()
+    _APP_PRIVS = mariadb_matrix.app_privs()
     return (
         # MariaDB 默认已开启 GTID（gtid_domain_id 在 my.cnf 指定），无需 SET gtid_mode。
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
@@ -568,30 +580,26 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
         # BINLOG ADMIN 必须显式授予：MariaDB 10.5+ 把 `SET SESSION sql_log_bin` 从 SUPER 中拆出，
         # 缺它时管理器写 ha_local.state（需禁 binlog）会报 1227，主库标记一直写不进去、
         # keepalived 只能拿到空状态退化判定。
-        "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
-        "REPLICATION SLAVE ADMIN, REPLICATION MASTER ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
-        "REPLICATION CLIENT, PROCESS, "
-        "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
+        "GRANT %s ON *.* TO '%s'@'%%';\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         # replication 复制账号（从库从其自身 IP 连，必须 @'%%'）
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
-        "GRANT REPLICATION SLAVE, REPLICATION SLAVE ADMIN ON *.* TO '%s'@'%%';\n"
+        "GRANT %s ON *.* TO '%s'@'%%';\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         # 业务最小权限账号
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
-        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, "
-        "REFERENCES, EXECUTE, SHOW VIEW, CREATE TEMPORARY TABLES ON *.* TO '%s'@'%%';\n"
+        "GRANT %s ON *.* TO '%s'@'%%';\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         # 本地状态库：切换主库时写入当前主，keepalived 检查脚本据此持有/释放 VIP
         "CREATE DATABASE IF NOT EXISTS ha_local;\n"
         "CREATE TABLE IF NOT EXISTS ha_local.state (k VARCHAR(32) PRIMARY KEY, v VARCHAR(255));\n"
         "FLUSH PRIVILEGES;\n"
     ) % (
-        _q(ha_user), _q(ha_pass), _q(ha_user),
+        _q(ha_user), _q(ha_pass), _HA_PRIVS, _q(ha_user),
         _q(ha_user), _q(ha_pass),
-        _q(repl_user), _q(repl_pass), _q(repl_user),
+        _q(repl_user), _q(repl_pass), _REPL_PRIVS, _q(repl_user),
         _q(repl_user), _q(repl_pass),
-        _q(app_user), _q(app_pass), _q(app_user),
+        _q(app_user), _q(app_pass), _APP_PRIVS, _q(app_user),
         _q(app_user), _q(app_pass),
     )
 
@@ -1017,6 +1025,9 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
     """
     # 注意：这里必须赋值给 content 而非直接 return —— 否则下方「同机子网放行」
     # 这段代码永远不会执行（此前正是因此成了死代码）。
+    # v2.3.0：特权集与 init SQL / ha_client.ensure_ha_creds 同源（mariadb_matrix）。
+    _HA_PRIVS = mariadb_matrix.ha_privs()
+    _REPL_PRIVS = mariadb_matrix.repl_privs()
     content = (
         "-- MariaDB 节点账号/权限修复脚本（由管理器生成，已注入真实凭证）\n"
         "-- ⚠ 无需手动执行：Install-ha-mariadb-Node.sh 在节点准备阶段【自动重放】本文件。\n"
@@ -1025,17 +1036,11 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
         "SET SQL_LOG_BIN=0;\n"
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
-        # BINLOG ADMIN：见 render_mariadb_init_sql 的说明，缺它 ha_local.state 写不进去。
-        "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
-        "REPLICATION SLAVE ADMIN, REPLICATION MASTER ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
-        "REPLICATION CLIENT, PROCESS, "
-        "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%%';\n"
+        # v2.3.0：特权集由 mariadb_matrix 提供（与 init SQL / ensure_ha_creds 同源）。
+        "GRANT %s ON *.* TO '%s'@'%%';\n"
         "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "ALTER USER '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
-        "GRANT CREATE USER, CREATE, INSERT, UPDATE, DELETE, REPLICATION SLAVE, "
-        "REPLICATION SLAVE ADMIN, REPLICATION MASTER ADMIN, SLAVE MONITOR, READ_ONLY ADMIN, BINLOG ADMIN, "
-        "REPLICATION CLIENT, PROCESS, "
-        "SELECT, RELOAD, SUPER ON *.* TO '%s'@'%s';\n"
+        "GRANT %s ON *.* TO '%s'@'%s';\n"
         "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "ALTER USER '%s'@'%s' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION;\n"
@@ -1047,20 +1052,20 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
         "ALTER USER '%s'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "GRANT ALL PRIVILEGES ON *.* TO '%s'@'127.0.0.1' WITH GRANT OPTION;\n"
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
-        "GRANT REPLICATION SLAVE, REPLICATION SLAVE ADMIN ON *.* TO '%s'@'%%';\n"
+        "GRANT %s ON *.* TO '%s'@'%%';\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "CREATE DATABASE IF NOT EXISTS ha_local;\n"
         "CREATE TABLE IF NOT EXISTS ha_local.state (k VARCHAR(32) PRIMARY KEY, v VARCHAR(255));\n"
         "FLUSH PRIVILEGES;\n"
         "SET SQL_LOG_BIN=1;\n"
     ) % (
-        _q(ha_user), _q(ha_pass), _q(ha_user), _q(ha_pass), _q(ha_user),
-        _q(ha_user), _q(manager_ip), _q(ha_pass), _q(ha_user), _q(manager_ip), _q(ha_pass), _q(ha_user), _q(manager_ip),
+        _q(ha_user), _q(ha_pass), _q(ha_user), _q(ha_pass), _HA_PRIVS, _q(ha_user),
+        _q(ha_user), _q(manager_ip), _q(ha_pass), _q(ha_user), _q(manager_ip), _q(ha_pass), _HA_PRIVS, _q(ha_user), _q(manager_ip),
         _q(root_user), _q(manager_ip), _q(root_pass),
         _q(root_user), _q(manager_ip), _q(root_pass),
         _q(root_user), _q(manager_ip),
         _q(root_user), _q(root_pass), _q(root_user), _q(root_pass), _q(root_user),
-        _q(repl_user), _q(repl_pass), _q(repl_user), _q(repl_user), _q(repl_pass),
+        _q(repl_user), _q(repl_pass), _REPL_PRIVS, _q(repl_user), _q(repl_user), _q(repl_pass),
     )
     if manager_subnet:
         # 同机（管理器容器与本节点同宿主机）场景：连接源是 docker 网关/容器 IP，
@@ -1219,6 +1224,212 @@ def _safe_node_path(ip):
     return d
 
 
+# ---------------------------------------------------------------------------
+# v2.3.0：变更生效动作 —— 把「哪些文件变了」翻译成「运维要在节点上做什么」
+#
+# 为什么需要：Web 上改配置/regen 后页面只说「已重新生成」，不说接下来做什么。
+# 而不同文件的生效方式**完全不同**且容易踩坑：
+#   - my.cnf 类的**静态参数**改了，只 `docker compose restart` 根本不生效，必须重建容器；
+#   - keepalived 配置/脚本改了，只需 restart keepalived；
+#   - init SQL **只在数据目录为空的首次启动**执行，已初始化的实例改它毫无效果；
+#   - fix-node-creds.sql 必须**登录节点本机**用 root 执行（含真实凭证，不经过管理器）。
+# 这里把差异固化成规则表，regen 后直接给出可复制的命令，杜绝「以为改了其实没生效」。
+# ---------------------------------------------------------------------------
+
+DEPLOY_LEVEL_LABEL = {
+    "recreate": "必须重建容器",
+    "restart": "重启服务",
+    "exec": "节点执行一次",
+    "manual": "人工确认",
+}
+
+
+def _db_service(node_type):
+    """compose 中数据库服务的服务名；裸机形态返回 None（由 systemd 管理，不在 compose 内）。"""
+    if node_type == "mariadb-docker":
+        return "mariadb"
+    if node_type in ("docker", "mysql", "mysql-docker", ""):
+        return "mysql"
+    return None
+
+
+def _snapshot_dir(d):
+    """读取节点生成目录下所有文件的内容（用于变更比对）。失败返回空 dict。"""
+    out = {}
+    try:
+        for f in Path(d).rglob("*"):
+            if f.is_file():
+                rel = str(f.relative_to(d)).replace("\\", "/")
+                try:
+                    out[rel] = f.read_bytes()
+                except Exception:
+                    out[rel] = b""
+    except Exception:
+        pass
+    return out
+
+
+def _fingerprint(snapshot):
+    """生成文件内容指纹（路径 + 内容），用于判断「配置是否又变了」。"""
+    h = hashlib.md5()
+    for k in sorted(snapshot):
+        h.update(k.encode("utf-8"))
+        h.update(snapshot[k])
+    return h.hexdigest()
+
+
+def deploy_actions(changed_files, node_type, host_dir, fresh=False):
+    """把变更文件列表翻译成「需要在节点上执行的动作清单」。
+
+    changed_files: 相对节点目录的文件路径列表（如 "docker-my.cnf"、"keepalived/keepalived.conf"）
+    fresh:         是否为首次生成（旧目录为空）—— 首次生成给「首次部署」引导，不逐文件提示。
+
+    返回 [{level, level_label, title, why, cmd, files}]，level 取值：
+      recreate —— 必须重建容器才生效（数据库静态配置 / compose 编排 / 镜像）
+      restart  —— 重启对应服务即可（keepalived / node-agent）
+      exec     —— 需登录节点本机执行一次（prepare-logs.sh / fix-node-creds.sql）
+      manual   —— 需人工确认（首次部署；init SQL 仅对空数据目录生效）
+    """
+    d = host_dir
+    db = _db_service(node_type)
+    acts = []
+
+    def add(level, title, why, cmd, files):
+        acts.append({
+            "level": level,
+            "level_label": DEPLOY_LEVEL_LABEL.get(level, level),
+            "title": title,
+            "why": why,
+            "cmd": cmd or "",
+            "files": files or [],
+        })
+
+    files = [str(f).replace("\\", "/") for f in (changed_files or [])]
+
+    def hit(*names):
+        out = []
+        for f in files:
+            base = f.rsplit("/", 1)[-1]
+            for n in names:
+                if "/" in n:
+                    if f == n:
+                        out.append(f)
+                elif base == n:
+                    out.append(f)
+        return out
+
+    if fresh:
+        if node_type == "mariadb":
+            add("manual", "首次部署：安装 MariaDB 并拉起 keepalived",
+                "裸机形态需先执行安装脚本（全量安装 MariaDB + 初始化账号），再拉起 "
+                "keepalived 与节点 agent；安装脚本会自动重放 fix-node-creds.sql。",
+                "cd %s && sudo bash Install-ha-mariadb-Node.sh "
+                "&& docker compose up -d keepalived custos-node-agent" % d, [])
+        else:
+            add("manual", "首次部署：启动节点容器（数据库 + keepalived 合一）",
+                "把整个目录拷到目标机后执行一次即可；数据目录为空时会自动执行 init SQL 初始化账号。",
+                "cd %s && docker compose up -d" % d, [])
+        return acts
+
+    # 1) 数据库配置（my.cnf 类）：静态参数，必须重建/重启数据库
+    cnf = hit("docker-my.cnf", "my.cnf", "ha-overrides.cnf")
+    if cnf:
+        if db:
+            add("recreate", "数据库配置已变更：必须重建数据库容器",
+                "my.cnf 中的 server_id / 半同步插件 / buffer pool / 日志路径等均为"
+                "**静态参数**，容器启动时读取，restart 不会重新加载——必须 "
+                "--force-recreate 才生效。",
+                "cd %s && docker compose up -d --force-recreate %s" % (d, db), cnf)
+        else:
+            add("restart", "数据库配置已变更：需重启 MariaDB 服务",
+                "裸机 MariaDB 由 systemd 管理（不在 compose 内），改 my.cnf 后需重启服务生效。",
+                "sudo systemctl restart mariadb || sudo systemctl restart mysqld", cnf)
+
+    # 2) compose 编排（镜像版本 / 端口 / 挂载）
+    cf = hit("docker-compose.yaml", "docker-compose.yml")
+    if cf:
+        add("recreate", "compose 编排已变更：需按新编排重建",
+            "docker-compose.yaml 变更（镜像版本 / 端口 / 挂载 / 服务定义）必须重新 up 才会应用；"
+            "镜像版本变更需先 docker compose pull。",
+            "cd %s && docker compose pull && docker compose up -d" % d, cf)
+
+    # 3) keepalived 配置与脚本
+    kf = hit("keepalived/keepalived.conf", "keepalived/ha_check.conf",
+             "keepalived/check_mysql_master.sh", "keepalived/notify_master.sh",
+             "keepalived/notify_backup.sh", "keepalived/entrypoint.sh",
+             "keepalived/Dockerfile")
+    if kf:
+        add("restart", "keepalived 配置/脚本已变更：重启 keepalived",
+            "keepalived.conf、ha_check.conf 及探活/通知脚本均为容器启动时读取"
+            "（脚本还是 :ro 挂载），需重启 keepalived 容器生效。",
+            "cd %s && docker compose restart keepalived" % d, kf)
+
+    # 4) init SQL：只对空数据目录生效（最常见的「改了没用」）
+    sf = hit("init.sql", "init_mariadb.sql")
+    if sf:
+        add("manual", "初始化 SQL 已变更：仅对空数据目录的首次启动生效",
+            "init SQL 只在数据目录为空时执行一次。已初始化的实例**不会**被覆盖；"
+            "若确需重刷账号/权限，请在节点本机执行 fix-node-creds.sql。",
+            "", sf)
+
+    # 5) 账号修复脚本：需登录节点本机执行
+    fx = hit("fix-node-creds.sql")
+    if fx:
+        add("exec", "账号/权限修复脚本已更新：需在节点本机执行",
+            "该文件含节点真实凭证，不经管理器下发，需登录节点用 root 执行"
+            "（命令会交互式提示输入 root 密码）。",
+            "cd %s && mysql -uroot -p < fix-node-creds.sql" % d, fx)
+
+    # 6) 节点 Agent（OS 指标采集）
+    af = hit("node_agent.py")
+    if af:
+        add("restart", "节点 Agent 已更新：重启 custos-node-agent",
+            "agent 脚本为 :ro 挂载，重启容器即可加载新版本。",
+            "cd %s && docker compose restart custos-node-agent" % d, af)
+
+    # 7) 日志目录 / logrotate
+    lf = hit("prepare-logs.sh", "custos-ha-logrotate.conf")
+    if lf:
+        add("exec", "日志目录/logrotate 配置已更新：需在节点执行一次",
+            "统一日志目录需预先创建并把属主改为容器内 mysql(uid 999)，否则 "
+            "mariadbd/mysqld 写 error.log 会 Permission denied 启动失败。",
+            "cd %s && sudo bash prepare-logs.sh" % d, lf)
+
+    # 8) 安装/卸载脚本：仅在重装/卸载场景执行
+    inf = hit("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh",
+              "Uninstall-mariadb-docker-Node.sh")
+    if inf:
+        add("manual", "安装/卸载脚本已更新：仅在重装或卸载时需要执行",
+            "正常运行中的节点无需执行；重装/改密重跑 Install，下线节点跑 Uninstall。",
+            "", inf)
+
+    # update-node.sh 为工具脚本（按需手动用），不产生待办动作
+    return acts
+
+
+def node_pending_actions(ip):
+    """读取节点当前的「配置待生效」动作清单（无待办返回 []）。"""
+    try:
+        rows = query("SELECT pending_actions FROM nodes WHERE ip=%s", (ip,))
+    except Exception:
+        return []
+    if not rows:
+        return []
+    raw = (rows[0] or {}).get("pending_actions") or ""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def ack_node_pending(ip):
+    """运维已在节点执行完动作后调用，清空「配置待生效」提示。"""
+    execute("UPDATE nodes SET pending_actions='' WHERE ip=%s", (ip,))
+
+
 def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None,
                   node_type="docker", mysql_version=None):
     ip = (ip or "").strip()
@@ -1281,6 +1492,9 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     local_host = "127.0.0.1" if is_mariadb_node(node_type) else ip
 
     d = _safe_node_path(ip)
+    # v2.3.0：清空前先快照旧文件，用于生成后 diff 出「变更了什么」，
+    # 进而算出「需要在节点上执行哪些动作」给运维看。
+    _old_snap = _snapshot_dir(d) if d.exists() else {}
     d.mkdir(parents=True, exist_ok=True)
     _clean_generated_dir(d)
     kd = d / "keepalived"
@@ -1433,6 +1647,26 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         "ON DUPLICATE KEY UPDATE initial_role=%s, cluster_id=%s",
         (ip, port, initial_role, cluster_id, initial_role, cluster_id),
     )
+    # ---- v2.3.0：变更生效提示 ----
+    # 只有指纹真的变了才刷新待办（幂等：重复 regen 不会把已确认的待办又刷回来，
+    # 也不会因为「无变化」而误清空运维尚未执行的动作）。
+    _new_snap = _snapshot_dir(d)
+    _changed = sorted(k for k in (set(_new_snap) | set(_old_snap))
+                      if _new_snap.get(k) != _old_snap.get(k))
+    _fp = _fingerprint(_new_snap)
+    _actions = deploy_actions(_changed, node_type, host_compose, fresh=not _old_snap)
+    try:
+        _prev = query("SELECT gen_fingerprint FROM nodes WHERE ip=%s", (ip,))
+        _prev_fp = ((_prev[0] or {}).get("gen_fingerprint") or "") if _prev else ""
+    except Exception:
+        _prev_fp = ""
+    if _fp != _prev_fp:
+        try:
+            execute("UPDATE nodes SET gen_fingerprint=%s, pending_actions=%s, "
+                    "pending_since=NOW() WHERE ip=%s",
+                    (_fp, json.dumps(_actions, ensure_ascii=False) if _actions else "", ip))
+        except Exception:
+            pass
     # 若指定为初始主库，则登记为当前主库，使 keepalived VIP 选举偏向上位
     if initial_role == "master":
         execute("UPDATE hosts SET is_current_master=0 WHERE cluster_id=%s", (cluster_id,))
@@ -1459,6 +1693,8 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         node_type=node_type,
         image=(MARIADB_DOCKER_IMAGE if node_type == "mariadb-docker" else ""),
         run_cmd=run_cmd,
+        actions=_actions,
+        changed_files=_changed,
         **extra_files,
     )
 
@@ -1659,7 +1895,7 @@ def list_nodes(cluster_id=None):
             )
         return query(
             "SELECT n.ip, n.port, n.root_user, n.root_pass, n.server_id, n.compose_path, n.created_at, "
-            "n.node_type, n.mysql_version, "
+            "n.node_type, n.mysql_version, n.pending_actions, n.pending_since, "
             "h.initial_role, h.role, h.status, n.cluster_id "
             "FROM nodes n LEFT JOIN hosts h ON h.host = n.ip AND h.cluster_id=n.cluster_id "
             "ORDER BY n.cluster_id, n.ip"

@@ -2224,6 +2224,25 @@ def api_node_detail(cluster_id: int = Form(...), host: str = Form(...), port: in
                     _is_maria = (detect_flavour(cur) == F_MARIADB)
                 except Exception:
                     pass
+                # v2.3.0：采集真实版本并回写（mysql_version 此前靠手填，常年空/过期，
+                # 导致预检与权限分派拿不到版本）。同时给出支持矩阵判定供前端展示。
+                try:
+                    cur.execute("SELECT VERSION()")
+                    _vr = cur.fetchone()
+                    _ver = (_vr[0] if _vr else "") or ""
+                    out["version"] = _ver
+                    try:
+                        from . import mariadb_matrix as _mm
+                        out["version_support"] = _mm.support_check(_ver)
+                    except Exception:
+                        pass
+                    if _ver:
+                        execute("UPDATE nodes SET mysql_version=%s WHERE ip=%s AND port=%s "
+                                "AND (mysql_version IS NULL OR mysql_version='' "
+                                "OR mysql_version<>%s)",
+                                (_ver[:48], host, port, _ver[:48]))
+                except Exception:
+                    pass
                 _vars = ("('server_id','datadir','read_only','enforce_gtid_consistency'"
                          + (",'gtid_strict_mode','gtid_domain_id')" if _is_maria else ",'gtid_mode')"))
                 cur.execute("SHOW VARIABLES WHERE Variable_name IN " + _vars)
@@ -2730,6 +2749,9 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
             "msg": f"已重新生成节点 {info['node_name']}",
             "run_cmd": info.get("run_cmd"),
             "md5s": md5s,
+            # v2.3.0：变更生效动作清单（recreate / restart / exec / manual）
+            "actions": info.get("actions") or [],
+            "changed_files": info.get("changed_files") or [],
         })
     except Exception as e:
         return JSONResponse({"ok": False, "msg": f"重新生成失败: {e}"})
@@ -2784,6 +2806,31 @@ def _render_node_fix_sql(n, creds, manager_ip, manager_subnet=None):
         ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass,
         manager_ip, manager_subnet,
         auth_plugin=_auth_plugin_for(n.get("mysql_version"), n.get("node_type")))
+
+
+@app.get("/api/nodes/{ip}/pending")
+def api_node_pending(ip: str, user=Depends(auth_required)):
+    """查询节点当前的「配置待生效」动作清单（无待办返回空数组）。
+
+    v2.3.0：regen / 改配置后，页面据此提示运维「去节点上做什么」，
+    并区分「重启即可 / 必须重建容器 / 要执行 SQL」。
+    """
+    try:
+        from .node_gen import node_pending_actions
+        return JSONResponse({"ok": True, "actions": node_pending_actions(ip)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.post("/nodes/{ip}/ack_deploy")
+def nodes_ack_deploy(ip: str, user=Depends(auth_required)):
+    """运维已在节点上执行完动作后点「已执行」，清空该节点的待生效提示。"""
+    try:
+        from .node_gen import ack_node_pending
+        ack_node_pending(ip)
+        return JSONResponse({"ok": True, "msg": "已标记为已执行"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"标记失败：{type(e).__name__}: {e}"})
 
 
 @app.get("/nodes/{ip}/creds_sql")
