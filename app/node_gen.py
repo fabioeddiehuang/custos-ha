@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pymysql
@@ -27,7 +28,7 @@ from .mysql_compat import default_auth_plugin, is_mariadb_node
 from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, is_semi_sync_enabled
 from . import mariadb_matrix
 from . import crypto as _crypto
-from .ha_client import get_status, ensure_ha_creds
+from .ha_client import get_status, ensure_ha_creds, db_uptime
 from .clusters import get_cluster_creds
 
 logger = logging.getLogger("node_gen")
@@ -410,7 +411,46 @@ def _semisync_block_mysql(mysql_version=None):
     )
 
 
-def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/mariadb", install_dir="/opt/mariadb"):
+# ---------------------------------------------------------------------------
+# 内存封顶（根治 MariaDB 容器/裸机内存膨胀）
+# ---------------------------------------------------------------------------
+# 为什么要显式写死这些值（而不是依赖官方镜像/发行版默认）：
+#   1) 各构建的默认值不一致，且 key_buffer_size(默认 128M) / aria_pagecache_buffer_size(默认 128M)
+#      这类「固定大缓存」对以 InnoDB 为主的业务纯属浪费；显式给小值即可省下约 200M/节点。
+#   2) performance_schema 若被镜像/发行版默认打开，会随运行时间**持续增长**（可达数百 MB~GB），
+#      是容器内存悄悄变大的头号嫌疑；本产品不依赖它（备份/一致性巡检均显式排除该库），显式关闭。
+#   3) 会话级缓冲（sort/join/read/tmp_table…）是【每连接】的，连接数一多会成倍放大——
+#      必须显式封顶，避免「连接数 × 缓冲」把内存顶穿。
+# 注意：以下取值均为「不超过发行版默认」的保守上限，只封顶、不放大，故不会增加内存占用。
+_MEMORY_CNF_BLOCK = (
+    "# ---- 内存封顶（显式设置，避免随默认值/连接数/运行时长膨胀）----\n"
+    "# performance_schema 纯 InnoDB 业务不需要，且开启后会随运行时间持续占用内存：显式关闭。\n"
+    "performance_schema = OFF\n"
+    "# MyISAM/Aria 固定大缓存瘦身（默认各 128M，对 InnoDB 业务基本无用）\n"
+    "key_buffer_size = 16M\n"
+    "aria_pagecache_buffer_size = 32M\n"
+    "# InnoDB 其它缓冲\n"
+    "innodb_log_buffer_size = 16M\n"
+    "innodb_buffer_pool_instances = 4\n"
+    "# 表缓存 / 线程缓存 / 连接数（够用即可）\n"
+    "table_open_cache = 2000\n"
+    "table_definition_cache = 800\n"
+    "thread_cache_size = 16\n"
+    "max_connections = 200\n"
+    "# 会话级缓冲（每连接，逐个封顶，防「连接数 × 缓冲」顶穿内存）\n"
+    "sort_buffer_size = 1M\n"
+    "join_buffer_size = 256K\n"
+    "read_buffer_size = 128K\n"
+    "read_rnd_buffer_size = 256K\n"
+    "tmp_table_size = 16M\n"
+    "max_heap_table_size = 16M\n"
+    "binlog_cache_size = 32K\n"
+    "binlog_stmt_cache_size = 32K\n"
+    "net_buffer_length = 16K\n"
+)
+
+
+def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/custos-ha/mariadb", install_dir="/opt/mariadb"):
     """生成 MariaDB 裸机节点的【完整 my.cnf】（非片段，可直接用）。
 
     MariaDB 的 GTID 机制与 MySQL【根本不兼容】：MariaDB 用 gtid_domain_id + 基于 server_id
@@ -447,6 +487,7 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         "innodb_io_capacity_max = 4000\n"
         "slave_parallel_threads = 4\n"
         "slave_parallel_mode = optimistic\n"
+        + _MEMORY_CNF_BLOCK +
         "# 慢日志（供观测/排错）\n"
         "slow_query_log = 1\n"
         "long_query_time = 0.5\n"
@@ -522,6 +563,7 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
         "innodb_io_capacity_max = 4000\n"
         "slave_parallel_threads = 4\n"
         "slave_parallel_mode = optimistic\n"
+        + _MEMORY_CNF_BLOCK +
         "# 慢日志（供观测/排错）\n"
         "slow_query_log = 1\n"
         "long_query_time = 0.5\n"
@@ -704,6 +746,10 @@ services:
       TZ: "Asia/Shanghai"
       # 低内存主机友好：官方默认与裸机模板为 1G，小内存机易 OOM。内存充足可调至 1G/2G。
       MARIADB_INNODB_BUFFER_POOL_SIZE: "{buffer_pool}"
+      # glibc malloc 的 arena 数量上限：容器内多线程进程会为每个线程建独立 arena，
+      # 释放后常驻不归还 OS，典型表现是「RSS 只涨不降、容器内存越来越大」（可达数百 MB）。
+      # 限制为 2 可显著抑制该膨胀，是容器化 MySQL/MariaDB 内存治理的常规手段。
+      MALLOC_ARENA_MAX: "2"
       # 跨小版本升级时自动执行 mariadb-upgrade，避免数据字典未升级导致起不来
       MARIADB_AUTO_UPGRADE: "1"
     ports:
@@ -1294,7 +1340,7 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
     db = _db_service(node_type)
     acts = []
 
-    def add(level, title, why, cmd, files):
+    def add(level, title, why, cmd, files, verify="manual"):
         acts.append({
             "level": level,
             "level_label": DEPLOY_LEVEL_LABEL.get(level, level),
@@ -1302,6 +1348,11 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
             "why": why,
             "cmd": cmd or "",
             "files": files or [],
+            # verify：管理器「自动核验」该待办是否已在节点落实的方式（见 verify_node_pending）：
+            #   db_uptime    —— 数据库进程重启（Uptime 归零）即视为落实（重建/重启数据库类）
+            #   proc:<svc>   —— 节点 agent 报告的服务进程启动时间晚于 pending_since（重启 keepalived/agent）
+            #   manual       —— 节点侧一次性动作，无法远程观测，仍由运维点「已执行」
+            "verify": verify,
         })
 
     files = [str(f).replace("\\", "/") for f in (changed_files or [])]
@@ -1335,23 +1386,24 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
     cnf = hit("docker-my.cnf", "my.cnf", "ha-overrides.cnf")
     if cnf:
         if db:
-            add("recreate", "数据库配置已变更：必须重建数据库容器",
+            add("recreate", "数据库配置已变更：必须重建数据库容器（在节点安装目录下执行）",
                 "my.cnf 中的 server_id / 半同步插件 / buffer pool / 日志路径等均为"
                 "**静态参数**，容器启动时读取，restart 不会重新加载——必须 "
-                "--force-recreate 才生效。",
-                "cd %s && docker compose up -d --force-recreate %s" % (d, db), cnf)
+                "--force-recreate 才生效。下方命令的 `cd` 路径即**节点安装目录**，请先进入该目录再执行。",
+                "cd %s && docker compose up -d --force-recreate %s" % (d, db), cnf, "db_uptime")
         else:
             add("restart", "数据库配置已变更：需重启 MariaDB 服务",
-                "裸机 MariaDB 由 systemd 管理（不在 compose 内），改 my.cnf 后需重启服务生效。",
-                "sudo systemctl restart mariadb || sudo systemctl restart mysqld", cnf)
+                "裸机 MariaDB 由 systemd 管理（单元名 mariadb-ha.service，二进制 mariadbd），"
+                "改 my.cnf 后需重启该单元生效（注意不是 mysqld/mariadb，那是官方包的服务名）。",
+                "sudo systemctl restart mariadb-ha.service", cnf, "db_uptime")
 
     # 2) compose 编排（镜像版本 / 端口 / 挂载）
     cf = hit("docker-compose.yaml", "docker-compose.yml")
     if cf:
-        add("recreate", "compose 编排已变更：需按新编排重建",
+        add("recreate", "compose 编排已变更：需按新编排重建（在节点安装目录下执行）",
             "docker-compose.yaml 变更（镜像版本 / 端口 / 挂载 / 服务定义）必须重新 up 才会应用；"
-            "镜像版本变更需先 docker compose pull。",
-            "cd %s && docker compose pull && docker compose up -d" % d, cf)
+            "镜像版本变更需先 docker compose pull。下方命令的 `cd` 路径即**节点安装目录**。",
+            "cd %s && docker compose pull && docker compose up -d" % d, cf, "db_uptime")
 
     # 3) keepalived 配置与脚本
     kf = hit("keepalived/keepalived.conf", "keepalived/ha_check.conf",
@@ -1362,7 +1414,7 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
         add("restart", "keepalived 配置/脚本已变更：重启 keepalived",
             "keepalived.conf、ha_check.conf 及探活/通知脚本均为容器启动时读取"
             "（脚本还是 :ro 挂载），需重启 keepalived 容器生效。",
-            "cd %s && docker compose restart keepalived" % d, kf)
+            "cd %s && docker compose restart keepalived" % d, kf, "proc:keepalived")
 
     # 4) init SQL：只对空数据目录生效（最常见的「改了没用」）
     sf = hit("init.sql", "init_mariadb.sql")
@@ -1385,7 +1437,7 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
     if af:
         add("restart", "节点 Agent 已更新：重启 custos-node-agent",
             "agent 脚本为 :ro 挂载，重启容器即可加载新版本。",
-            "cd %s && docker compose restart custos-node-agent" % d, af)
+            "cd %s && docker compose restart custos-node-agent" % d, af, "proc:node-agent")
 
     # 7) 日志目录 / logrotate
     lf = hit("prepare-logs.sh", "custos-ha-logrotate.conf")
@@ -1408,7 +1460,15 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
 
 
 def node_pending_actions(ip):
-    """读取节点当前的「配置待生效」动作清单（无待办返回 []）。"""
+    """读取节点当前的「配置待生效」动作清单（无待办返回 []）。
+
+    v2.3.7：读取前先自动核验一次（verify_node_pending），已落实的动作被自动清除，
+    因此页面看到的就是「真实仍未生效」的待办，无需运维每次手动点「已执行」。
+    """
+    try:
+        verify_node_pending(ip)
+    except Exception:
+        pass
     try:
         rows = query("SELECT pending_actions FROM nodes WHERE ip=%s", (ip,))
     except Exception:
@@ -1428,6 +1488,153 @@ def node_pending_actions(ip):
 def ack_node_pending(ip):
     """运维已在节点执行完动作后调用，清空「配置待生效」提示。"""
     execute("UPDATE nodes SET pending_actions='' WHERE ip=%s", (ip,))
+
+
+def _node_creds(ip):
+    """取节点连接数据库所需的端口与 root 凭证（root_pass 由 db.query 透明解密）。"""
+    try:
+        rows = query("SELECT port, root_user, root_pass FROM nodes WHERE ip=%s", (ip,))
+    except Exception:
+        return None
+    if not rows:
+        return None
+    r = rows[0] or {}
+    if not r.get("port"):
+        return None
+    return {
+        "port": int(r["port"]),
+        "root_user": (r.get("root_user") or "root"),
+        "root_pass": (r.get("root_pass") or ""),
+    }
+
+
+def _agent_svc_started(agent, svc):
+    """从节点 agent /stats 负载里取某服务进程的启动 epoch 秒；取不到返回 None。"""
+    if not isinstance(agent, dict):
+        return None
+    if svc == "node-agent":
+        v = agent.get("agent_started_at")
+    elif svc == "keepalived":
+        v = agent.get("keepalived_started_at")
+    else:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _save_pending(ip, acts):
+    """写回剩余待办；acts 为空则同时清空 pending_since（页面徽标随之消失）。"""
+    try:
+        if acts:
+            execute("UPDATE nodes SET pending_actions=%s WHERE ip=%s",
+                    (json.dumps(acts, ensure_ascii=False), ip))
+        else:
+            execute("UPDATE nodes SET pending_actions='', pending_since=NULL WHERE ip=%s", (ip,))
+    except Exception as e:
+        logger.warning("写回节点[%s]待生效清单失败(可忽略): %s", ip, e)
+
+
+def verify_node_pending(ip):
+    """自动核验节点「配置待生效」中哪些已在节点上落实，落实的自动移除（徽标随之消失）。
+
+    落实判定（与 deploy_actions 写入的 verify 字段一一对应）：
+      - db_uptime  ：数据库进程 Uptime < 待办产生后的经过秒数 → 数据库已被重建/重启；
+      - proc:svc   ：节点 agent 报告的服务进程启动时间晚于 pending_since → 该服务已被重启；
+      - manual     ：exec / 首次部署等节点侧一次性动作，无法远程观测，保留（仍由运维点「已执行」）。
+
+    全程只读探测（DB 查 Uptime / 节点 agent 读 /proc），不改动节点任何配置；
+    仅在确认落实时更新管理库 nodes 表。
+    """
+    try:
+        rows = query(
+            "SELECT pending_actions, pending_since, "
+            "TIMESTAMPDIFF(SECOND, pending_since, NOW()) AS elapsed "
+            "FROM nodes WHERE ip=%s", (ip,))
+    except Exception:
+        return
+    if not rows:
+        return
+    row = rows[0] or {}
+    raw = row.get("pending_actions") or ""
+    if not raw:
+        return
+    try:
+        acts = json.loads(raw)
+    except Exception:
+        return
+    if not isinstance(acts, list) or not acts:
+        return
+
+    # 待办产生时间与「已过去秒数」。elapsed 由管理库用同一时钟算出（TIMESTAMPDIFF），
+    # 与数据库 Uptime 同源，避免管理器容器与管理库时区不一致造成误判。
+    ps_dt = None
+    ps = row.get("pending_since")
+    if ps:
+        try:
+            ps_dt = ps if isinstance(ps, datetime) else datetime.strptime(str(ps), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ps_dt = None
+    try:
+        elapsed = int(row.get("elapsed")) if row.get("elapsed") is not None else None
+    except (TypeError, ValueError):
+        elapsed = None
+
+    # 按需取证：只在确有对应类型待办时才连 DB / 拉 agent，避免无谓开销。
+    db_up, agent = None, None
+    if any(a.get("verify") == "db_uptime" for a in acts):
+        c = _node_creds(ip)
+        if c:
+            db_up = db_uptime(ip, c["port"], c["root_user"], c["root_pass"],
+                              c["root_user"], c["root_pass"])
+    if any(str(a.get("verify", "")).startswith("proc:") for a in acts):
+        try:
+            from .os_metrics import fetch_node_stats
+            agent = fetch_node_stats(ip)
+        except Exception:
+            agent = None
+
+    remain = []
+    for a in acts:
+        v = a.get("verify")
+        if v == "db_uptime":
+            # 数据库在待办产生之后被重建/重启过（Uptime 比经过时间短）即视为落实。
+            if elapsed is not None and db_up is not None and db_up < elapsed - 2:
+                logger.info("节点[%s] 待办已落实(数据库已重启, Uptime=%ss<%.0fs)：%s",
+                            ip, db_up, elapsed, a.get("title"))
+                continue
+            remain.append(a)
+        elif isinstance(v, str) and v.startswith("proc:"):
+            svc = v.split(":", 1)[1]
+            started = _agent_svc_started(agent, svc)
+            if started is not None and ps_dt is not None and started > ps_dt.timestamp() - 2:
+                logger.info("节点[%s] 待办已落实(%s 已于待办后重启)：%s",
+                            ip, svc, a.get("title"))
+                continue
+            remain.append(a)
+        else:
+            # manual / exec：节点侧一次性动作，保留待运维确认或后续人工处理。
+            remain.append(a)
+
+    if len(remain) != len(acts):
+        _save_pending(ip, remain)
+
+
+def verify_pending_all():
+    """后台监控周期调用：对全部「有待办」的节点跑一次自动核验。"""
+    try:
+        rows = query("SELECT ip FROM nodes WHERE pending_actions IS NOT NULL AND pending_actions != ''")
+    except Exception:
+        return
+    for r in rows:
+        ip = (r or {}).get("ip")
+        if not ip:
+            continue
+        try:
+            verify_node_pending(ip)
+        except Exception as e:
+            logger.warning("自动核验节点[%s]待生效异常(可忽略): %s", ip, e)
 
 
 def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None,

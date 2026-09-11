@@ -312,7 +312,7 @@
   <div class="tab-pane" id="tab-log">
     <div id="bkLog" class="bk-preview" style="max-height:40vh">{% if blog %}{% for l in blog %}{{ l }}
 {% endfor %}{% else %}（暂无日志）{% endif %}</div>
-    <div class="bk-note">每行格式：<code class="mono">[时间] [类型] 集群=名称(id) 节点=host:port ... 成功=N 失败=M</code>。备份按「库」统计成功/失败，恢复按「SQL 语句」统计成功/失败。</div>
+    <div class="bk-note">每行格式：<code class="mono">[时间] id=集群ID 集群=名称 备份/恢复 节点=host:port … 成功=N 失败=M</code>。备份按「库」统计成功/失败，恢复按「SQL 语句」统计成功/失败；按集群过滤，最新在前（最多 200 行）。</div>
   </div>
 </div>
 
@@ -322,6 +322,28 @@
     <header><b id="pvTitle">备份预览</b><span class="close" onclick="closePreview()">×</span></header>
     <div class="body"><div class="bk-preview" id="pvBody">加载中…</div></div>
     <footer><button class="btn" onclick="closePreview()">关闭</button></footer>
+  </div>
+</div>
+
+<!-- 恢复进度 modal（恢复为后台任务，前端轮询展示，避免误认为卡死） -->
+<div class="overlay" id="rsOverlay">
+  <div class="modal" style="max-width:560px">
+    <header><b id="rsTitle">恢复进行中…</b></header>
+    <div class="body">
+      <div id="rsPhase" style="font-size:13px;margin-bottom:10px;color:var(--text)">准备中…</div>
+      <div style="height:10px;background:var(--surface-3);border-radius:999px;overflow:hidden">
+        <div id="rsBar" style="height:100%;width:0%;background:linear-gradient(135deg,var(--accent),var(--primary));transition:width .3s"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:8px">
+        <span id="rsCount">进度 0 / 0</span>
+        <span id="rsElapsed">已用 0s</span>
+      </div>
+      <div id="rsErr" class="bk-preview" style="display:none;margin-top:10px;max-height:26vh"></div>
+    </div>
+    <footer>
+      <button class="btn" id="rsBgBtn" onclick="runRestoreBg()">后台运行</button>
+      <button class="btn btn-primary" id="rsCloseBtn" style="display:none" onclick="closeRestoreProgress()">关闭</button>
+    </footer>
   </div>
 </div>
 
@@ -362,6 +384,7 @@
     document.querySelectorAll(".tab-pane").forEach(function(p){
       p.classList.toggle("on", p.id==="tab-"+name);
     });
+    if(name==="log") loadLog();
   }
   function setTabCount(name,n){
     var el=document.getElementById("tabBtn-"+name);
@@ -438,6 +461,48 @@
     document.getElementById("rtNode").scrollIntoView({behavior:"smooth",block:"center"});
     toast("已选中备份 "+f+"，请在右侧确认目标节点后执行恢复","ok");
   }
+  // ---------- 恢复（后台任务 + 进度轮询） ----------
+  var _rsTimer=null, _rsBtn=null;
+  function rsRender(t){
+    if(!t)return;
+    var pct=t.pct||0;
+    document.getElementById("rsBar").style.width=pct+"%";
+    document.getElementById("rsPhase").textContent=t.phase||"";
+    document.getElementById("rsCount").textContent="进度 "+(t.done||0)+" / "+(t.total||0);
+    document.getElementById("rsElapsed").textContent="已用 "+(t.elapsed||0)+"s";
+    if(t.finished){
+      document.getElementById("rsBar").style.width="100%";
+      document.getElementById("rsTitle").textContent=(t.ok?"恢复完成":"恢复结束（存在失败）");
+      document.getElementById("rsCloseBtn").style.display="";
+      document.getElementById("rsBgBtn").style.display="none";
+      var ers=((t.result&&t.result.errors)||[]);
+      var box=document.getElementById("rsErr");
+      if(ers.length){box.style.display="";box.textContent="失败明细（最多 10 条）：\n"+ers.join("\n");}
+      if(_rsTimer){clearInterval(_rsTimer);_rsTimer=null;}
+      if(_rsBtn){_rsBtn.disabled=false;_rsBtn.textContent="执行恢复";_rsBtn=null;}
+      var m=(t.msg||(t.ok?"恢复完成":"恢复失败"));
+      if(t.result&&t.result.ok_statements!=null){
+        m+=" ｜ 成功 "+(t.result.ok_statements||0)+" 条"
+          +((t.result.failed||0)?"，失败 "+(t.result.failed||0)+" 条":"");
+      }
+      toast(m,t.ok?"ok":"err");
+      loadRestores(); loadLog();
+    }
+  }
+  function rsPoll(tid){
+    fetch("/api/backup/restore_progress?task_id="+encodeURIComponent(tid))
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.ok){ if(_rsTimer){clearInterval(_rsTimer);_rsTimer=null;} return; }
+        rsRender(d.task);
+      })
+      .catch(function(){});
+  }
+  function closeRestoreProgress(){
+    if(_rsTimer){clearInterval(_rsTimer);_rsTimer=null;}
+    document.getElementById("rsOverlay").classList.remove("show");
+  }
+  function runRestoreBg(){ closeRestoreProgress(); toast("恢复已在后台继续执行，可稍后在「恢复记录」查看结果","ok"); }
   function runRestore(){
     var n=hp("rtNode"), f=document.getElementById("rtFile").value;
     if(!n){toast("请选择恢复目标节点","err");return;}
@@ -448,12 +513,32 @@
       +"\n\n该操作会 DROP 并重建同名对象，且不可撤销。";
     if(!confirm(tip))return;
     var btn=event.target; btn.disabled=true; btn.textContent="恢复中…";
+    _rsBtn=btn;
+    // 先开进度弹窗，再发起请求（长恢复不会再有「点了没反应」的观感）
+    document.getElementById("rsTitle").textContent="恢复进行中…";
+    document.getElementById("rsPhase").textContent="正在启动恢复任务…";
+    document.getElementById("rsBar").style.width="0%";
+    document.getElementById("rsCount").textContent="进度 0 / 0";
+    document.getElementById("rsElapsed").textContent="已用 0s";
+    document.getElementById("rsErr").style.display="none";
+    document.getElementById("rsCloseBtn").style.display="none";
+    document.getElementById("rsBgBtn").style.display="";
+    document.getElementById("rsOverlay").classList.add("show");
     post("/api/backup/restore",{
       cluster_id:CID, host:n.host, port:n.port, file:f, databases:dbs
     },function(d){
-      btn.disabled=false; btn.textContent="执行恢复";
-      toast(d.msg||(d.ok?"恢复完成":"恢复失败"), d.ok?"ok":"err");
-      if(d.errors && d.errors.length) console.warn("恢复错误明细：", d.errors);
+      if(!d.ok){
+        document.getElementById("rsTitle").textContent="恢复启动失败";
+        document.getElementById("rsPhase").textContent=d.msg||"启动失败";
+        document.getElementById("rsCloseBtn").style.display="";
+        document.getElementById("rsBgBtn").style.display="none";
+        if(_rsBtn){_rsBtn.disabled=false;_rsBtn.textContent="执行恢复";_rsBtn=null;}
+        toast(d.msg||"恢复启动失败","err");
+        return;
+      }
+      var tid=d.task_id;
+      rsPoll(tid);
+      _rsTimer=setInterval(function(){rsPoll(tid);},1000);
     });
   }
 
@@ -482,17 +567,30 @@
   function closePreview(){document.getElementById("pvOverlay").classList.remove("show");}
 
   function loadLog(){
+    var el=document.getElementById("bkLog");
     fetch("/api/backup/log?cluster_id="+CID).then(function(r){return r.json();}).then(function(d){
-      var el=document.getElementById("bkLog");
       if(d.ok && d.log && d.log.length){ el.textContent=d.log.join("\n"); }
       else { el.textContent="（暂无日志）"; }
-    }).catch(function(e){ el.textContent="加载失败："+e; });
+    }).catch(function(e){ if(el) el.textContent="加载失败："+e; });
   }
 
   onScopeChange();
   onFileChange();
   loadBackupRecords();
   loadRestores();
+  loadLog();
+  // 若上次离开/刷新页面时仍有恢复任务在跑，自动接着显示进度（后台任务不随页面关闭中断）
+  fetch("/api/backup/restore_progress?cluster_id="+CID).then(function(r){return r.json();}).then(function(d){
+    var t=d&&d.task;
+    if(t&&!t.finished){
+      document.getElementById("rsTitle").textContent="恢复进行中…";
+      document.getElementById("rsOverlay").classList.add("show");
+      document.getElementById("rsBgBtn").style.display="";
+      document.getElementById("rsCloseBtn").style.display="none";
+      rsRender(t);
+      _rsTimer=setInterval(function(){rsPoll(t.id);},1000);
+    }
+  }).catch(function(){});
 
   // ---------- 备份记录 ----------
   function loadBackupRecords(){

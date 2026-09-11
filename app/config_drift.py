@@ -114,12 +114,30 @@ def check_cluster(cluster_id):
             else:
                 status = "OK" if str(actual).upper() == exp else "DRIFT"
             out.append((snap["_ip"], snap["_port"], var, exp, str(actual), status))
-        # 3) read_only 与角色匹配（SHOW VARIABLES 返回 ON/OFF，需归一化为 0/1 再比对）
-        ro = snap.get("read_only")
-        exp_ro = "0" if snap["_role"] == "master" else "1"
-        ro_norm = "1" if str(ro).strip().upper() in ("ON", "1", "TRUE", "YES") else "0"
-        out.append((snap["_ip"], snap["_port"], "read_only", exp_ro, str(ro),
-                    "OK" if ro_norm == exp_ro else "DRIFT"))
+        # 3) read_only：正确 HA 语义 = 全集群「恰好一个」可写节点（主），其余只读。
+        #    不依赖 hosts.role 表（该表易缺失/滞后，会把真正的主库误判为漂移——这是
+        #    之前「没切主从也反复出现配置漂移」的根因）。
+        _ro = {}
+        for snap in snapshots:
+            ro = snap.get("read_only")
+            _ro[snap["_ip"]] = "1" if str(ro).strip().upper() in ("ON", "1", "TRUE", "YES") else "0"
+        _writable = [ip for ip, v in _ro.items() if v == "0"]
+        if len(_writable) == 1:
+            # 健康：唯一可写=主，其余只读，read_only 全部 OK
+            for snap in snapshots:
+                out.append((snap["_ip"], snap["_port"], "read_only",
+                            "0" if snap["_ip"] in _writable else "1",
+                            str(snap.get("read_only")), "OK"))
+        elif len(_writable) == 0:
+            for snap in snapshots:
+                out.append((snap["_ip"], snap["_port"], "read_only",
+                            "1（需恰好 1 个主库）", str(snap.get("read_only")), "DRIFT"))
+        else:
+            # 多于一个可写：脑裂风险，把所有可写节点标 DRIFT
+            for snap in snapshots:
+                out.append((snap["_ip"], snap["_port"], "read_only",
+                            "恰好 1 个主库", str(snap.get("read_only")),
+                            "OK" if _ro.get(snap["_ip"]) != "0" else "DRIFT"))
         # 4) 版本主版本一致
         if base:
             b_mm = (base.get("version") or "").split("-")[0]

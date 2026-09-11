@@ -20,11 +20,13 @@
 # systemd 部署见同目录 node-agent.service。
 
 import argparse
+import glob
 import json
 import os
 import socket
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -172,11 +174,169 @@ class Collector:
             "disks": self.disks(),
             "host": self.host_info(),
             "agent": "custos-node-agent",
-            "version": 1,
+            "version": 2,
+            # 进程启动时间（epoch 秒）：管理器据此自动核验 keepalived / node-agent
+            # 是否已在节点上重启（「配置待生效」自动监测，无需人工点「已执行」）。
+            "agent_started_at": _self_started_at(self.root),
+            "keepalived_started_at": _proc_started_at(self.root, "keepalived"),
         }
         with self._lock:
             self._cache = {"ts": now, "data": data}
         return data
+
+
+# ---------------------------------------------------------------------------
+# 只读日志读取（管理器日志面板的兜底通道）
+# ---------------------------------------------------------------------------
+# 背景：MariaDB 没有 mysql.error_log 表，管理器只能靠 SQL 的 LOAD_FILE 读
+# @@log_error 指向的文件；而 mysqld 生成的 error.log 权限是 0660，LOAD_FILE
+# 对 0660 文件恒返回 NULL（实测 660→NULL、644→有内容），且还受 secure_file_priv
+# 限制。agent 以 root 身份直接读宿主机文件，绕开全部 SQL 侧限制。
+#
+# 安全约束：只读；只允许读取白名单目录下的文件；不接受任何写/执行参数。
+_LOG_NAME_CANDIDATES = (
+    "{root}/data/custos-ha/logs/*/{name}.log",
+    "{root}/data/custos-ha/logs/*/{name}.log.*",
+    "{root}/data/*/logs/*/{name}.log",
+    "{root}/var/log/custos-ha/{name}.log",
+    "{root}/var/log/mysql/{name}.log",
+    "{root}/var/log/mariadb/{name}.log",
+    "{root}/var/lib/mysql/{name}.err",
+)
+_LOG_ALLOW_PREFIX = (
+    "/data/",
+    "/var/log/",
+    "/var/lib/mysql/",
+    "/var/lib/mariadb/",
+)
+_LOG_TAIL_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _host_join(root, host_path):
+    """宿主机绝对路径 -> agent 视角的真实路径（容器里宿主机挂在 /host）。"""
+    r = (root or "/").rstrip("/")
+    if not r or r == "/":
+        return host_path
+    return r + "/" + host_path.lstrip("/")
+
+
+def _host_strip(root, real_path):
+    """agent 视角路径 -> 宿主机绝对路径（回显给管理器/前端）。"""
+    r = (root or "/").rstrip("/")
+    if r and r != "/" and real_path.startswith(r + "/"):
+        return real_path[len(r):]
+    return real_path
+
+
+def _log_allowed(root, real_path):
+    """只允许读取白名单目录下的文件（避免变成任意文件读取接口）。"""
+    host_path = _host_strip(root, os.path.realpath(real_path))
+    if ".." in host_path:
+        return False
+    return any(host_path.startswith(p) for p in _LOG_ALLOW_PREFIX)
+
+
+def find_log_file(root, name="error"):
+    """按常见布局搜索日志文件，返回 mtime 最新的那个真实路径（找不到返回 None）。"""
+    best = None
+    base = (root or "/").rstrip("/")
+    for pat in _LOG_NAME_CANDIDATES:
+        for p in glob.glob(pat.format(root=base, name=name)):
+            try:
+                if not os.path.isfile(p):
+                    continue
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if best is None or m > best[0]:
+                best = (m, p)
+    return best[1] if best else None
+
+
+def tail_lines(real_path, lines=400, max_bytes=_LOG_TAIL_MAX_BYTES):
+    """读文件末尾最多 max_bytes 再取最后 lines 行（只读）。返回 (行列表, 大小, 是否截断)。"""
+    size = os.path.getsize(real_path)
+    start = max(0, size - max_bytes)
+    with open(real_path, "rb") as f:
+        if start:
+            f.seek(start)
+        data = f.read()
+    arr = data.decode("utf-8", "replace").splitlines()
+    if start and arr:
+        arr = arr[1:]           # 丢弃可能被截断的首行
+    return arr[-lines:], size, bool(start)
+
+
+# ---------------------------------------------------------------------------
+# 进程启动时间（供管理器「配置待生效」自动核验：比对服务重启时间）
+# ---------------------------------------------------------------------------
+# 纯只读：仅读宿主机 /proc（容器内 root=/host 且 pid: host，即宿主机 /proc），
+# 不挂 docker.sock、不接受任何参数，延续 agent「只读」原则。
+# 为什么需要：keepalived / node-agent 重启属容器生命周期动作，管理器无法从 DB 侧观测，
+# 只能靠「进程启动时间晚于待办产生时间」来判断该待办是否已落实。
+_PROC_HZ = 100.0   # Linux USER_HZ（主流 x86_64/aarch64 为 100）
+
+
+def _proc_btime(root):
+    """宿主机开机时间（epoch 秒），读 /proc/stat 的 btime；失败返回 None。"""
+    try:
+        with open(os.path.join(root, "proc", "stat")) as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except Exception:
+        return None
+    return None
+
+
+def _proc_starttime_epoch(root, pid):
+    """某 pid 的启动 epoch 秒（btime + starttime ticks / HZ）；失败返回 None。"""
+    btime = _proc_btime(root)
+    if btime is None:
+        return None
+    try:
+        with open(os.path.join(root, "proc", str(pid), "stat")) as f:
+            s = f.read()
+    except Exception:
+        return None
+    rp = s.rfind(")")
+    if rp < 0:
+        return None
+    rest = s[rp + 1:].split()
+    # /proc/<pid>/stat 字段（1-based）：3=state … 22=starttime；
+    # comm 被括号包裹（可能含空格），故按最后一个 ')' 切分，rest 从 state 起算 → starttime=rest[19]。
+    if len(rest) < 20:
+        return None
+    try:
+        return btime + int(rest[19]) / _PROC_HZ
+    except (ValueError, IndexError):
+        return None
+
+
+def _proc_started_at(root, comm):
+    """返回名为 comm 的进程启动 epoch 秒（取第一个匹配）；找不到返回 None。"""
+    proc = os.path.join(root, "proc")
+    try:
+        for pid in os.listdir(proc):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(os.path.join(proc, pid, "stat")) as f:
+                    s = f.read()
+            except Exception:
+                continue
+            rp = s.rfind(")")
+            if rp < 0 or s[1:rp] != comm:
+                continue
+            return _proc_starttime_epoch(root, pid)
+    except Exception:
+        return None
+    return None
+
+
+def _self_started_at(root):
+    """本 agent 进程自身的启动 epoch 秒（读 /proc/self/stat）。"""
+    return _proc_starttime_epoch(root, "self")
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +379,48 @@ def make_handler(collector, token):
                     self._send(200, collector.collect())
                 except Exception as e:
                     self._send(500, {"error": str(e)})
+                return
+            if path == "/logs":
+                if not self._allow():
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                try:
+                    raw_q = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    qs = dict(urllib.parse.parse_qsl(raw_q))
+                    name = (qs.get("name") or "error").strip() or "error"
+                    try:
+                        n = int(qs.get("lines") or 400)
+                    except ValueError:
+                        n = 400
+                    n = max(1, min(2000, n))
+                    rp = None
+                    if qs.get("path"):
+                        cand = _host_join(collector.root, qs["path"])
+                        if os.path.isfile(cand):
+                            rp = cand
+                    if rp is None:
+                        rp = find_log_file(collector.root, name)
+                    if not rp or not os.path.isfile(rp):
+                        self._send(200, {"ok": False,
+                                         "error": f"未找到 {name} 日志文件",
+                                         "root": collector.root})
+                        return
+                    if not _log_allowed(collector.root, rp):
+                        self._send(403, {"ok": False,
+                                         "error": "路径不在允许的日志目录内"})
+                        return
+                    real = os.path.realpath(rp)
+                    arr, size, trunc = tail_lines(real, n)
+                    self._send(200, {
+                        "ok": True,
+                        "path": _host_strip(collector.root, real),
+                        "size": size,
+                        "truncated": trunc,
+                        "mtime": int(os.path.getmtime(real)),
+                        "lines": arr,
+                    })
+                except Exception as e:
+                    self._send(500, {"ok": False, "error": str(e)})
                 return
             self._send(404, {"error": "not found"})
 

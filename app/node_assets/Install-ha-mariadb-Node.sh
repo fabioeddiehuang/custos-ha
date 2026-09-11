@@ -26,7 +26,7 @@ MARIADB_DOWNLOAD_URL="${MARIADB_DOWNLOAD_URL:-https://mirrors.tuna.tsinghua.edu.
 
 # ---------- 安装路径（如需指定，改这里；或加环境变量 MARIADB_INSTALL_DIR 覆盖） ----------
 INSTALL_DIR="${MARIADB_INSTALL_DIR:-/opt/mariadb}"
-DATA_DIR="${MARIADB_DATA_DIR:-/data/mariadb}"
+DATA_DIR="${MARIADB_DATA_DIR:-/data/custos-ha/mariadb}"
 SYSTEMD_UNIT="mariadb-ha.service"
 
 log(){ echo -e "\033[1;32m[mariadb-install]\033[0m $*"; }
@@ -291,6 +291,9 @@ ExecStartPost=/bin/sleep 5
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
+# glibc malloc 的 arena 上限：抑制容器/裸机上「RSS 只涨不降」的经典膨胀
+# （多线程下 glibc 为每个线程建独立 arena，释放后不归还 OS，可达数百 MB）。
+Environment=MALLOC_ARENA_MAX=2
 PrivateTmp=false
 
 [Install]

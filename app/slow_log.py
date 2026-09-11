@@ -99,6 +99,9 @@ def _is_writable(cur):
 def _clear_node_table(cid, ip, port, cur, n):
     """尽力清空节点侧 mysql.slow_log。失败不影响采集（已有游标去重）。"""
     try:
+        # 日志表（CSV/ARCHIVE 引擎）DELETE 必须在 autocommit 下执行：pymysql 默认
+        # autocommit=False，DELETE 落在事务里会触发表级锁，而日志表禁止加锁→报 1556。
+        cur.connection.autocommit = True
         cur.execute("DELETE FROM mysql.slow_log")
         _clear_fail_at.pop((cid, ip, port), None)
         return
@@ -113,6 +116,7 @@ def _clear_node_table(cid, ip, port, cur, n):
         rconn = connect_robust(ip, port, n.get("root_user") or "root", n.get("root_pass") or "")
         if rconn:
             try:
+                rconn.autocommit = True
                 rc = rconn.cursor()
                 rc.execute("DELETE FROM mysql.slow_log")
                 _clear_fail_at.pop((cid, ip, port), None)
@@ -132,8 +136,8 @@ def _warn_clear_fail(cid, ip, port, err):
         return
     _clear_fail_at[key] = now
     print(f"[slow_log] 节点 {ip}:{port} 清空慢日志表失败({err})；"
-          f"已启用游标增量采集，不会重复入库。建议授予 ha_monitor DELETE，"
-          f"或让节点定期轮转 mysql.slow_log。该提示每 {_CLEAR_FAIL_GAP // 3600} 小时最多一次。")
+          f"已启用游标增量采集，不会重复入库。节点侧 mysql.slow_log 将在下次采集后自然为空"
+          f"（或配置定期轮转）。该提示每 {_CLEAR_FAIL_GAP // 3600} 小时最多一次。")
 
 
 def collect_slow_log(cluster_id=None):

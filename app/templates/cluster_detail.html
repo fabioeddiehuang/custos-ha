@@ -193,6 +193,7 @@
   <div class="history-tabs">
     <div class="tab active" onclick="switchLogTab(this,'err')">错误日志</div>
     <div class="tab" onclick="switchLogTab(this,'slow')">慢日志</div>
+    <div class="tab" onclick="switchLogTab(this,'startup')">启动日志</div>
     <span style="flex:1"></span>
     <label class="switch" style="align-self:center" title="开启后管理器定时采集各节点慢日志到 mysql.slow_log">
       <input type="checkbox" id="slowlogSwitch" {% if slowlog_enabled %}checked{% endif %} onchange="toggleSlowlog(this)">
@@ -202,11 +203,18 @@
     <span class="badge sky" id="logSrc">来源：mysql.error_log</span>
     <button class="btn btn-sm" onclick="exportLog()">导出TXT</button>
   </div>
+  <div class="log-filter" id="logFilter" style="display:none;margin:8px 0 0;">
+    <span class="lbl">级别</span>
+    <button class="lvl-btn active" data-lvl="all" onclick="setLogLevel(this)">全部</button>
+    <button class="lvl-btn" data-lvl="error" onclick="setLogLevel(this)">Error</button>
+    <button class="lvl-btn" data-lvl="warn" onclick="setLogLevel(this)">Warn</button>
+    <button class="lvl-btn" data-lvl="info" onclick="setLogLevel(this)">Info</button>
+  </div>
   <table class="tbl">
     <thead><tr><th>时间</th><th>节点</th><th>级别</th><th>内容</th></tr></thead>
     <tbody id="logBody"><tr><td colspan="4" style="color:#8b9ac0;text-align:center;">点击上方标签加载…</td></tr></tbody>
   </table>
-  <div class="note">错误日志读取 mysql.error_log 表（不使用 SSH）；慢日志读取 mysql.slow_log 表，默认近 24h，支持导出 TXT。</div>
+  <div class="note">错误日志三级读取：mysql.error_log 表 → 错误日志文件（LOAD_FILE）→ 节点 agent 直读宿主机文件（全程不使用 SSH；MariaDB 没有错误日志表，靠后两级，其中 agent 通道不受 FILE 权限、secure_file_priv 与 0660 权限限制）。慢日志读取 mysql.slow_log 表，默认近 24h，支持导出 TXT。</div>
 </div>
 
 <!-- 节点详情 drawer -->
@@ -537,12 +545,34 @@
   {% if cluster.current_master and cluster.current_master != "未选举" %}window._cmMap[{{ cluster.id }}] = "{{ cluster.current_master }}";{% endif %}
   function masterOfCluster(cid){ return window._cmMap ? (window._cmMap[cid]||null) : null; }
 
+  var _logLevel="all", _startup=false;
   function switchLogTab(el,kind){
     document.querySelectorAll(".history-tabs .tab").forEach(function(t){t.classList.remove("active");});
     el.classList.add("active");
-    _logTab=kind;
-    document.getElementById("logSrc").textContent = kind==="slow"?"来源：mysql.slow_log":"来源：mysql.error_log";
+    _startup = (kind==="startup");
+    _logTab = (kind==="startup") ? "err" : kind;
+    var lf=document.getElementById("logFilter"); if(lf) lf.style.display = (_logTab==="slow")?"none":"flex";
+    document.getElementById("logSrc").textContent = _logTab==="slow"
+      ? "来源：mysql.slow_log"
+      : ("来源：mysql.error_log" + (_startup?"（启动段）":""));
     loadCurrentLog();
+  }
+  function setLogLevel(btn){
+    document.querySelectorAll(".lvl-btn").forEach(function(b){b.classList.remove("active");});
+    btn.classList.add("active");
+    _logLevel=btn.getAttribute("data-lvl");
+    _applyLogFilter();
+  }
+  function _applyLogFilter(){
+    var body=document.getElementById("logBody"); if(!body)return;
+    var rows=body.querySelectorAll("tr[data-level]");
+    rows.forEach(function(tr){
+      var lvl=tr.getAttribute("data-level");
+      var st=tr.getAttribute("data-startup");
+      var okLvl=(_logLevel==="all"||_logLevel===lvl);
+      var okSt=(!_startup||st==="1");
+      tr.style.display=(okLvl&&okSt)?"":"none";
+    });
   }
   function loadCurrentLog(){
     var cid=document.getElementById("logCluster").value;
@@ -563,18 +593,40 @@
           }).join("");
         }).catch(function(e){body.innerHTML='<tr><td colspan="4" style="color:#fb7185;">请求失败：'+esc(e)+'</td></tr>';});
     }else{
-      apiPost("/api/node_error_log",{cluster_id:cid,host:p[0],port:p[1],limit:100},function(d){
+      // 「启动日志」走 segment=startup：后端在更大窗口内定位【最近一次启动段】整段返回，
+      // 避免"只取最新 100 行再过滤启动关键字"导致实例稳态运行时该标签恒空。
+      var _p={cluster_id:cid,host:p[0],port:p[1],limit:(_startup?2000:100)};
+      if(_startup)_p.segment="startup";
+      apiPost("/api/node_error_log",_p,function(d){
         if(!d.ok){body.innerHTML='<tr><td colspan="4" style="color:#fb7185;">'+(d.path?"路径: "+esc(d.path)+"<br>":"")+esc(d.error||"加载失败")+'</td></tr>';return;}
         var rows=(d.rows||[]);
-        if(d.source){document.getElementById("logSrc").textContent="来源：mysql.error_log（"+(d.source==="table"?"表":"文件")+"）";}
-        if(!rows.length){body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">错误日志为空'+(d.note?("："+esc(d.note)):"")+'</td></tr>';return;}
+        if(d.source){
+          var _srcMap={table:"mysql.error_log 表",file:"错误日志文件(LOAD_FILE)",
+                       agent:"节点 agent 直读文件",none:"读取失败"};
+          document.getElementById("logSrc").textContent="来源："+(_srcMap[d.source]||d.source)+(_startup?"（启动段）":"");
+        }
+        if(!rows.length){
+          body.innerHTML='<tr><td colspan="4" style="color:#8b9ac0;text-align:center;">'
+            + (_startup ? esc(d.note||"读取窗口内未找到启动段（实例近期未重启或日志已轮转）")
+                        : ("错误日志为空"+(d.note?("："+esc(d.note)):"")))
+            + '</td></tr>';
+          return;
+        }
+        // 后端已按「启动段」整段返回时，全部行都算启动行（避免前端关键字过滤把有效行滤掉）。
+        var forceStartup=(d.segment==="startup");
         body.innerHTML=rows.map(function(r){
           var lv=(r.level||"").toUpperCase();
-          var level=/ERROR|ABORTED|GLIBCXX/i.test(lv||r.message)?"down":(/WARN/i.test(lv||r.message)?"warn":"sky");
-          return '<tr><td>'+(r.time||"—")+'</td><td class="mono">'+esc(cm)+'</td>'
+          var isErr=/ERROR|ABORTED|GLIBCXX/i.test(lv||r.message);
+          var isWarn=/WARN/i.test(lv||r.message);
+          var level=isErr?"down":(isWarn?"warn":"sky");
+          var lvlName=isErr?"error":(isWarn?"warn":"info");
+          var isStartup=forceStartup||/ready for connections|starting|Version:|initialized|started|socket|Initiali|InnoDB:|mysqld|mariadbd|plugin|Server hostname|TCP|port/i.test(r.message||"");
+          return '<tr data-level="'+lvlName+'" data-startup="'+(isStartup?"1":"0")+'">'
+            +'<td>'+(r.time||"—")+'</td><td class="mono">'+esc(cm)+'</td>'
             +'<td><span class="badge '+level+'">'+(level==="down"?"Error":(level==="warn"?"Warn":"Info"))+'</span></td>'
             +'<td style="white-space:normal;word-break:break-word;">'+esc(r.message||"")+'</td></tr>';
         }).join("");
+        _applyLogFilter();
       });
     }
   }

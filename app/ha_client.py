@@ -906,6 +906,38 @@ def connect_robust(host, port, user, password, root_user="root", root_pass="", t
     raise ha_err
 
 
+def db_uptime(host, port, user, password, root_user="root", root_pass="", timeout=5):
+    """返回数据库进程已运行时长（秒）；失败返回 None。
+
+    用于「配置待生效」自动核验：recreate / 重建 / 重启数据库后，进程 Uptime 会重置为
+    很小的值；若 Uptime < 待办产生后的经过秒数，说明数据库在 regen 之后被重建或重启过，
+    该待办已落实，可自动清除。
+    """
+    try:
+        conn = connect_robust(host, port, user, password, root_user, root_pass, timeout=timeout)
+    except Exception:
+        return None
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SHOW STATUS LIKE 'Uptime'")
+        row = cur.fetchone()
+        if row:
+            try:
+                return int(row[1])
+            except (TypeError, ValueError):
+                return None
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def is_read_only(host, port, ha_user, ha_pass, root_user="root", root_pass="", timeout=5):
     """判断节点是否只读（副本）。
 

@@ -10,8 +10,9 @@ CPU/内存/磁盘占用，补进 dashboard。
 import json
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 
 from .config import (
     NODE_AGENT_PORT, NODE_AGENT_TOKEN, NODE_AGENT_TIMEOUT, NODE_AGENT_CACHE_TTL,
@@ -35,6 +36,46 @@ def _fetch(ip):
         return {"error": f"HTTP {e.code}"}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+def fetch_node_stats(ip):
+    """拉取节点 agent /stats 原始负载。
+
+    供「配置待生效」自动核验使用：负载里含 agent / keepalived 等进程的启动时间
+    （agent_started_at / keepalived_started_at），据此判断对应服务是否已在节点上重启。
+    失败时返回含 error 的 dict。
+    """
+    return _fetch(ip)
+
+
+def fetch_node_log(ip, name: str = "error", lines: int = 400, path: str = "",
+                   timeout: int = 8):
+    """通过节点 agent 的 /logs 读取节点宿主机上的日志文件（只读）。
+
+    为什么需要这条通道：MariaDB 没有 mysql.error_log 表，管理器只能靠 SQL 的
+    LOAD_FILE 读 @@log_error 指向的文件；但 mysqld 生成的 error.log 权限是 0660，
+    LOAD_FILE 对 0660 文件恒返回 NULL（实测 660→NULL、644→有内容），且还受
+    secure_file_priv 限制。节点 agent 以 root 直接读宿主机文件，绕开全部 SQL 侧限制。
+
+    返回 agent 原始 dict：
+      成功 {"ok": True, "path": <宿主机路径>, "lines": [...], "size": n, "truncated": bool}
+      失败 {"ok": False, "error": "..."}
+    """
+    q = {"name": name, "lines": str(int(lines))}
+    if path:
+        q["path"] = path
+    if NODE_AGENT_TOKEN:
+        q["token"] = NODE_AGENT_TOKEN
+    url = f"http://{ip}:{NODE_AGENT_PORT}/logs?" + urllib.parse.urlencode(q)
+    headers = {"Authorization": f"Bearer {NODE_AGENT_TOKEN}"} if NODE_AGENT_TOKEN else {}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def _node_ips(cluster_id):

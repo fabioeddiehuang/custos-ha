@@ -1229,6 +1229,25 @@ def _auto_switch_on_lag_or_pressure(cid, cluster_name, cache):
 _MONITOR_THREAD = None
 
 
+# 「配置待生效」自动核验上一次执行时刻（monotonic 秒），限频 ~60s。
+_VERIFY_PENDING_AT = 0.0
+
+
+def _verify_pending_once():
+    """每 ~60s 对全部「有待办」的节点跑一次「配置待生效」自动核验。
+
+    落实的动作（数据库/keepalived/node-agent 已重启等）会被自动清除，使节点页
+    「配置待生效」徽标无需运维手动点「已执行」即可自动消失。
+    核验全程只读探测（DB Uptime / 节点 agent /proc），不改动节点任何配置。
+    """
+    global _VERIFY_PENDING_AT
+    now = time.monotonic()
+    if now - _VERIFY_PENDING_AT < 60:
+        return
+    _VERIFY_PENDING_AT = now
+    node_gen.verify_pending_all()
+
+
 def run_forever():
     print("[monitor] 监控线程启动")
     while True:
@@ -1241,6 +1260,10 @@ def run_forever():
             _maybe_collect()
         except Exception as e:
             print(f"[monitor] 周期采集异常(已降级继续): {e}")
+        try:
+            _verify_pending_once()
+        except Exception as e:
+            print(f"[monitor] 配置待生效自动核验异常(已降级继续): {e}")
         # 轮询间隔动态读取 setting（页面可配置），默认 2s
         time.sleep(int(get_setting("CHECK_INTERVAL", "2") or 2))
 

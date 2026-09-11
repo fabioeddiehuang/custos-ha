@@ -19,26 +19,35 @@
 </div>
 
 <div class="card">
+  {# 字段名必须与 audit_log 表一致：actor / action / target / detail。
+     此前模板读 node / username / operation / details（不存在的列），Jinja 取不到值
+     渲染为空 —— 这就是「操作日志都是空的」的根因。 #}
+  {% set _ACT = {
+    'create_cluster':'创建集群','update_cluster':'修改配置','delete_cluster':'删除集群',
+    'run_backup':'执行备份','restore_backup':'恢复备份','clean_backup':'清理备份',
+    'maintain_toggle':'维护模式','exec':'执行命令','term_query':'终端查询',
+    'failover':'手动切换','rebuild_slave':'重建从库','add_node':'新增节点',
+    'del_node':'删除节点','semi_sync':'半同步设置'
+  } %}
   <table class="tbl">
     <thead>
-      <tr><th>时间</th><th>节点</th><th>类型</th><th>用户</th><th>操作</th><th>详情</th></tr>
+      <tr><th>时间</th><th>用户</th><th>操作</th><th>对象 / 节点</th><th>详情</th></tr>
     </thead>
     <tbody id="auditTbody">
       {% for row in rows %}
       <tr data-idx="{{ loop.index0 }}">
         <td data-c="time">{{ row.created_at }}</td>
-        <td class="mono" data-c="node">{{ row.node or '—' }}</td>
-        <td data-c="action">{% if row.action == 'term_query' %}<span class="badge sky">终端查询</span>{% else %}<span class="badge">{{ row.action or '操作' }}</span>{% endif %}</td>
-        <td data-c="user">{{ row.username or '—' }}</td>
-        <td data-c="op">{{ row.operation or row.action or '—' }}</td>
+        <td data-c="user">{{ row.actor or '—' }}</td>
+        <td data-c="action">{% if row.action == 'term_query' %}<span class="badge sky">终端查询</span>{% else %}<span class="badge">{{ _ACT.get(row.action, row.action) or '操作' }}</span>{% endif %}</td>
+        <td class="mono" data-c="node">{{ row.target or '—' }}</td>
         <td>
-          {% if row.details %}
+          {% if row.detail %}
           <button class="btn btn-sm" onclick="openAuditDetail({{ loop.index0 }})">查看</button>
           {% else %}—{% endif %}
         </td>
       </tr>
       {% else %}
-      <tr id="noAuditRow"><td colspan="6" style="color:#8b9ac0;text-align:center;padding:24px;">暂无审计记录</td></tr>
+      <tr id="noAuditRow"><td colspan="5" style="color:#8b9ac0;text-align:center;padding:24px;">暂无审计记录</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -52,7 +61,7 @@
 </div>
 
 <script>
-  var _rows = {{ (rows or []) | map(attribute='details') | list | tojson }};
+  var _rows = {{ (rows or []) | map(attribute='detail') | list | tojson }};
   function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
   function openAuditDetail(i){
     document.getElementById("auditDrawer").classList.add("show");

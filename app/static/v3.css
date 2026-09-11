@@ -273,6 +273,34 @@ textarea{resize:vertical;min-height:64px}
 .history-tabs .tab{padding:6px 14px;border-radius:999px;border:1px solid var(--border);background:var(--surface-2);cursor:pointer;font-size:13px;color:var(--text);transition:.15s}
 .history-tabs .tab:hover{border-color:var(--primary);color:var(--primary)}
 .history-tabs .tab.active{background:linear-gradient(135deg,var(--accent),var(--primary));border-color:transparent;color:#04121a;font-weight:700}
+/* 日志级别筛选（全部/Error/Warn/Info）——与 .history-tabs .tab 同款胶囊风格，
+   叠加「级别语义色」：每级一个色点，选中态填充该级语义色，沿用项目边框 token / hover 光环 */
+.log-filter{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.log-filter .lbl{font-size:12px;color:var(--muted);margin-right:2px}
+.lvl-btn{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:5px 13px;border-radius:999px;border:1px solid var(--border);
+  background:var(--surface-2);color:var(--text);cursor:pointer;
+  font-size:12.5px;font-weight:600;font-family:inherit;line-height:1.35;
+  transition:.15s;white-space:nowrap;
+}
+/* 级别色点（默认中性，各级覆盖） */
+.lvl-btn::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--muted);flex:0 0 auto;transition:.15s}
+.lvl-btn[data-lvl="all"]::before{background:var(--muted)}
+.lvl-btn[data-lvl="error"]::before{background:var(--danger)}
+.lvl-btn[data-lvl="warn"]::before{background:var(--warning)}
+.lvl-btn[data-lvl="info"]::before{background:var(--sky)}
+.lvl-btn:hover{border-color:var(--primary);color:var(--text);box-shadow:0 0 0 3px var(--primary-ring)}
+/* 选中态：填充该级语义色 + 深墨文字（与 .history-tabs .tab.active 同一深墨文字口径） */
+.lvl-btn.active{border-color:transparent;color:#04121a;font-weight:700}
+.lvl-btn[data-lvl="all"].active{background:linear-gradient(135deg,var(--accent),var(--primary))}
+.lvl-btn[data-lvl="error"].active{background:var(--danger)}
+.lvl-btn[data-lvl="warn"].active{background:var(--warning)}
+.lvl-btn[data-lvl="info"].active{background:var(--sky)}
+.lvl-btn[data-lvl="error"].active::before,
+.lvl-btn[data-lvl="warn"].active::before,
+.lvl-btn[data-lvl="info"].active::before{background:rgba(4,18,26,.55)}
+.lvl-btn .cnt{opacity:.7;font-weight:700;margin-left:2px}
 .detail-panel{display:none}.detail-panel.show{display:table-row}
 .sub{font-size:12px;color:var(--muted);margin:14px 0 6px}
 .term .hint{color:#94a3b8}

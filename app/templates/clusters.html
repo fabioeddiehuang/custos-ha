@@ -4,7 +4,9 @@
 {% block content %}
 <style>
   /* ===== 集群总览：每个集群一张独立卡片 ===== */
-  .cc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(336px,1fr));gap:16px}
+  /* auto-fit：空轨道被折叠，卡片自动撑满整行；auto-fill 会保留空轨道，
+     只有 1~2 个集群时卡片挤在左侧、右侧大片留白，视觉上极不协调。 */
+  .cc-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(336px,1fr));gap:16px}
   .cc-card{
     position:relative;overflow:hidden;
     background:var(--surface);border:1px solid var(--border);
@@ -46,7 +48,14 @@
   .cc-node.master{color:var(--success);border-color:var(--success-border);background:var(--success-bg);font-weight:700}
   .cc-node.down{color:var(--danger);border-color:var(--danger-border);background:var(--danger-bg)}
 
-  .cc-foot{display:flex;gap:8px;flex-wrap:wrap;margin-top:auto;padding-top:2px}
+  /* 4 个按钮始终排成一行：nowrap 不换行 + 允许等比收缩（卡片很窄时出省略号，
+     而不是折成第二行导致两卡片高度/观感不一致）。 */
+  .cc-foot{display:flex;gap:8px;flex-wrap:nowrap;margin-top:auto;padding-top:2px}
+  .cc-foot .btn{
+    flex:1 1 auto;min-width:0;padding:6px 8px;font-size:12px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    justify-content:center;text-align:center;
+  }
 
   .cc-empty{
     grid-column:1/-1;text-align:center;padding:52px 20px;color:var(--muted);
@@ -131,7 +140,7 @@
 
     <div class="cc-foot">
       <a class="btn btn-primary btn-sm" href="/clusters/{{ c.id }}">进入管理</a>
-      <button class="btn btn-sm" onclick="openEdit({{ c.id }})">修改配置/密码</button>
+      <button class="btn btn-sm" title="修改配置/密码" onclick="openEdit({{ c.id }})">配置/密码</button>
       <button class="btn btn-sm" style="background:#7C2D52;color:#fff" onclick="openMaint({{ c.id }}, '{{ c.name }}', {% if c.maint %}true{% else %}false{% endif %})">维护模式</button>
       <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delCluster({{ c.id }}, '{{ c.name }}')">删除</button>
     </div>

@@ -37,6 +37,8 @@ import json
 import os
 import time
 import re
+import threading
+import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -76,8 +78,10 @@ def read_backup_log(cid=None, limit: int = 200):
             return []
         lines = BACKUP_LOG.read_text(encoding="utf-8").splitlines()
         if cid is not None:
-            key = f"id={int(cid)}" if str(cid).isdigit() else f"集群={cid}"
-            lines = [l for l in lines if key in l]
+            # 用边界匹配而非子串包含：否则 id=1 会误命中 id=11/12…（集群号可能重叠）
+            tok = f"id={int(cid)}" if str(cid).isdigit() else f"集群={cid}"
+            pat = re.compile(r'(^|\s)' + re.escape(tok) + r'(\s|$)')
+            lines = [l for l in lines if pat.search(l)]
         out = [l for l in lines if l.strip()]
         out.reverse()
         return out[:limit]
@@ -696,10 +700,21 @@ def get_backup_path(cid, filename: str) -> Path:
 
 def delete_backup(cid, filename: str):
     p = get_backup_path(cid, filename)
-    p.unlink()
-    meta_p = p.with_suffix("").with_suffix(".meta.json")
-    if meta_p.exists():
-        meta_p.unlink()
+    # v2.3.4：分库集备份是目录（kind="set"），不能用 unlink()（会报
+    # [Errno 21] Is a directory）；单文件备份才是普通文件。
+    if p.is_dir():
+        import shutil
+        shutil.rmtree(p, ignore_errors=True)
+    else:
+        p.unlink()
+    # 元数据可能以 <name>.meta.json（单文件）或 <name>/index.json（目录）形式存在
+    for cand in (p.with_suffix("").with_suffix(".meta.json"), p / "index.json",
+                 p / ".meta.json"):
+        if cand.exists():
+            try:
+                cand.unlink()
+            except Exception:
+                pass
     return {"ok": True, "msg": f"已删除 {p.name}"}
 
 
@@ -780,7 +795,8 @@ def split_statements(text: str):
 # --------------------------------------------------------------------------
 # 恢复
 # --------------------------------------------------------------------------
-def restore_backup(cid, host, port, filename, databases=None, no_binlog=False):
+def restore_backup(cid, host, port, filename, databases=None, no_binlog=False,
+                   progress=None):
     """把备份恢复到指定节点。
 
     databases 为空则恢复备份内的全部库；否则只恢复其中的指定库
@@ -790,11 +806,22 @@ def restore_backup(cid, host, port, filename, databases=None, no_binlog=False):
       重建从库必须关掉，否则恢复产生的海量 DML 会写入从库 binlog、生成新的
       GTID 集合，与主库历史 GTID 冲突，重链时被判「分叉」进而触发 RESET MASTER。
       该变量是 session 级（不能 SET GLOBAL），故只能在本函数建连后设置。
+
+    progress(done, total, phase)：进度回调（可为 None），供后台任务展示进度。
     """
+    if progress:
+        def _pg(done, total, phase=""):
+            try:
+                progress(done, total, phase or "执行 SQL 语句…")
+            except Exception:
+                pass
+    else:
+        _pg = None
+
     path = get_backup_path(cid, filename)
     if path.is_dir():
         # v2.3.4：分库集备份目录 -> 按 index.json 逐个库文件恢复
-        return _restore_backup_set(cid, host, port, path, databases, no_binlog)
+        return _restore_backup_set(cid, host, port, path, databases, no_binlog, _pg)
     try:
         with gzip.open(path, "rt", encoding="utf-8") as f:
             text = f.read()
@@ -832,8 +859,10 @@ def restore_backup(cid, host, port, filename, databases=None, no_binlog=False):
                                       or s.lstrip().upper().startswith("/*!"))]
 
     conn = _conn(cid, host, port, timeout=20)
+    if _pg:
+        _pg(0, len(stmts), f"已解析 {len(stmts)} 条 SQL，开始执行…")
     try:
-        ok_n, err_n, errors = _exec_stmts(conn, stmts, no_binlog)
+        ok_n, err_n, errors = _exec_stmts(conn, stmts, no_binlog, _pg)
     finally:
         conn.close()
 
@@ -845,20 +874,34 @@ def restore_backup(cid, host, port, filename, databases=None, no_binlog=False):
     }
 
 
-def _exec_stmts(conn, stmts, no_binlog):
+# 每执行多少条语句提交一次事务。
+# 为什么需要：原实现用 dump 头部的 SET AUTOCOMMIT=0 把【整个恢复】放进一个超长事务，
+# 只在最后 commit。MySQL 8.0 对单个超长事务的处理明显差于 MariaDB——undo/history list
+# 持续膨胀、redo checkpoint 被反复推迟，插入海量数据时慢得多（同样的代码在 MariaDB
+# 上快得多，用户实测 MySQL 恢复远慢于数据量更大的 MariaDB）。按批提交把事务规模
+# 控制在有限大小即可显著提速，对 MariaDB 同样无害。
+# 恢复本来就不是原子操作（单条语句出错也继续执行、最后仍会 commit），因此分批提交
+# 不改变既有语义。
+_RESTORE_COMMIT_EVERY = 1000
+
+
+def _exec_stmts(conn, stmts, no_binlog, progress=None):
     """在建连后的 conn 上执行切好的语句（v2.3.4 抽出，单文件/目录恢复共用）。
 
     返回 (ok_n, err_n, errors)。no_binlog 时关闭本会话 binlog，避免恢复产生的
     DML 写入从库 binlog 而与主库历史 GTID 冲突。
+
+    progress(done, total, phase)：每提交一批回调一次，用于恢复进度展示（可为 None）。
     """
     ok_n, err_n, errors = 0, 0, []
+    total = len(stmts)
     with conn.cursor() as cur:
         if no_binlog:
             try:
                 cur.execute("SET sql_log_bin = 0")
             except Exception as e:
                 return ok_n, err_n, [f"无法关闭会话 binlog（需 SUPER 权限）：{e}"]
-        for s in stmts:
+        for i, s in enumerate(stmts, 1):
             try:
                 cur.execute(s)
                 ok_n += 1
@@ -866,17 +909,34 @@ def _exec_stmts(conn, stmts, no_binlog):
                 err_n += 1
                 if len(errors) < 10:
                     errors.append(f"{str(e)[:200]} —— 语句：{s[:120]}")
+            if i % _RESTORE_COMMIT_EVERY == 0:
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
+                if progress:
+                    try:
+                        progress(ok_n + err_n, total, "")
+                    except Exception:
+                        pass
         try:
             conn.commit()
+        except Exception:
+            pass
+    if progress:
+        try:
+            progress(ok_n + err_n, total, "")
         except Exception:
             pass
     return ok_n, err_n, errors
 
 
-def _restore_backup_set(cid, host, port, set_dir, databases, no_binlog):
+def _restore_backup_set(cid, host, port, set_dir, databases, no_binlog,
+                        progress=None):
     """恢复分库集备份目录（v2.3.4）。
 
     databases 非空前只恢复其中的库（目录内每个 .sql.gz 已是独立库，无需再按 USE 切段）。
+    进度按「库」粒度上报（分库集无法在执行前预知总语句数）。
     """
     idx = set_dir / "index.json"
     try:
@@ -893,21 +953,33 @@ def _restore_backup_set(cid, host, port, set_dir, databases, no_binlog):
         return {"ok": False, "error": "该备份集内没有可恢复的库"}
     conn = _conn(cid, host, port, timeout=20)
     ok_n, err_n, errors = 0, 0, []
-    try:
-        for fp in files:
+    n_files = len(files)
+    for fi, fp in enumerate(files, 1):
+        if progress:
             try:
-                with gzip.open(fp, "rt", encoding="utf-8") as f:
-                    text = f.read()
-            except Exception as e:
-                err_n += 1
-                errors.append(f"{fp.name} 读取失败: {e}")
-                continue
-            _ok, _en, _ers = _exec_stmts(conn, split_statements(text), no_binlog)
-            ok_n += _ok
-            err_n += _en
-            errors.extend(_ers)
-    finally:
+                progress(fi - 1, n_files, f"恢复库 {fp.stem}（{fi}/{n_files}）…")
+            except Exception:
+                pass
+        try:
+            with gzip.open(fp, "rt", encoding="utf-8") as f:
+                text = f.read()
+        except Exception as e:
+            err_n += 1
+            errors.append(f"{fp.name} 读取失败: {e}")
+            continue
+        _ok, _en, _ers = _exec_stmts(conn, split_statements(text), no_binlog, None)
+        ok_n += _ok
+        err_n += _en
+        errors.extend(_ers)
+    try:
         conn.close()
+    except Exception:
+        pass
+    if progress:
+        try:
+            progress(n_files, n_files, "全部库已执行完毕")
+        except Exception:
+            pass
     return {
         "ok": err_n == 0,
         "total": ok_n + err_n, "ok_statements": ok_n, "failed": err_n,
@@ -917,9 +989,173 @@ def _restore_backup_set(cid, host, port, set_dir, databases, no_binlog):
     }
 
 
+# --------------------------------------------------------------------------
+# 恢复任务（后台执行 + 进度轮询）
+# --------------------------------------------------------------------------
+# 为什么要有：恢复大库可能持续数分钟到数十分钟。原实现把整个恢复同步阻塞在一次
+# HTTP 请求里，前端只有一个「恢复中…」按钮——用户既看不到进展，也容易误判为卡死。
+# 改为后台线程执行、前端轮询进度。进度只在进程内存里，管理器重启即丢失（可接受：
+# 恢复本身也会随进程终止而中断）。
+_RESTORE_TASKS = {}
+_RESTORE_TASKS_LOCK = threading.Lock()
+_RESTORE_TASKS_KEEP = 50
+
+
+def _task_update(tid, **kw):
+    with _RESTORE_TASKS_LOCK:
+        rec = _RESTORE_TASKS.get(tid)
+        if rec:
+            rec.update(kw)
+
+
+def start_restore_task(cid, host, port, filename, databases=None,
+                       no_binlog=False, operator=""):
+    """启动一个后台恢复任务，立即返回 task_id（用于轮询进度）。"""
+    tid = "rst-" + uuid.uuid4().hex[:12]
+    rec = {
+        "id": tid, "cluster_id": int(cid),
+        "cluster_name": _cluster_dir_name(cid),
+        "target": f"{host}:{port}", "file": filename,
+        "databases": list(databases or []),
+        "operator": operator or "",
+        "started": now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+        "started_ts": time.time(),
+        "finished": False, "ok": None,
+        "phase": "准备中…", "done": 0, "total": 0, "pct": 0,
+        "elapsed": 0.0, "result": None, "msg": "",
+    }
+    with _RESTORE_TASKS_LOCK:
+        if len(_RESTORE_TASKS) >= _RESTORE_TASKS_KEEP:
+            old = sorted(_RESTORE_TASKS.values(), key=lambda r: r["started_ts"])
+            for r in old[:max(1, len(old) - _RESTORE_TASKS_KEEP + 1)]:
+                if r.get("finished"):
+                    _RESTORE_TASKS.pop(r["id"], None)
+        _RESTORE_TASKS[tid] = rec
+    threading.Thread(
+        target=_run_restore_task,
+        args=(tid, int(cid), host, int(port), filename, list(databases or []),
+              bool(no_binlog), operator or ""),
+        daemon=True,
+    ).start()
+    return tid
+
+
+def get_restore_task(tid):
+    """查询单个恢复任务进度（返回副本，取不到返回 None）。"""
+    with _RESTORE_TASKS_LOCK:
+        rec = _RESTORE_TASKS.get(tid)
+        return dict(rec) if rec else None
+
+
+def list_restore_tasks(limit: int = 20):
+    """列出最近的恢复任务（倒序）。"""
+    with _RESTORE_TASKS_LOCK:
+        arr = sorted(_RESTORE_TASKS.values(),
+                     key=lambda r: r["started_ts"], reverse=True)
+        return [dict(r) for r in arr[:limit]]
+
+
+def _run_restore_task(tid, cid, host, port, filename, dbs, no_binlog, operator):
+    """后台线程主体：执行恢复 -> 落恢复记录 -> 写操作日志 -> 写审计。"""
+    t0 = time.time()
+
+    def _prog(done, total, phase=""):
+        with _RESTORE_TASKS_LOCK:
+            rec = _RESTORE_TASKS.get(tid)
+            if not rec:
+                return
+            if total:
+                rec["done"] = int(done)
+                rec["total"] = int(total)
+                rec["pct"] = max(0, min(99, int(done * 100 / max(1, total))))
+            if phase:
+                rec["phase"] = phase
+            rec["elapsed"] = round(time.time() - t0, 1)
+
+    _task_update(tid, phase="读取备份文件…")
+    try:
+        r = restore_backup(cid, host, port, filename, databases=dbs or None,
+                           no_binlog=no_binlog, progress=_prog)
+    except Exception as e:
+        r = {"ok": False, "msg": f"恢复异常：{e}", "errors": [str(e)],
+             "total": 0, "ok_statements": 0, "failed": 0}
+    elapsed = round(time.time() - t0, 1)
+    ok = bool(r.get("ok"))
+    scope = "custom" if dbs else "all"
+
+    try:
+        record_restore(cid, {
+            "time": now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+            "cluster_id": int(cid),
+            "cluster_name": _cluster_dir_name(cid),
+            "target": f"{host}:{port}",
+            "file": filename,
+            "scope": scope,
+            "databases": dbs,
+            "ok": ok,
+            "total": r.get("total", 0),
+            "ok_statements": r.get("ok_statements", 0),
+            "failed": r.get("failed", 0),
+            "operator": operator,
+            "msg": r.get("msg", ""),
+            "elapsed": elapsed,
+        })
+    except Exception:
+        pass
+
+    # 操作日志（备份页「操作日志」页签按 id=<cid> 过滤）
+    try:
+        _log_event(
+            f"id={int(cid)} 集群={_cluster_dir_name(cid)} 恢复 目标={host}:{port} "
+            f"文件={filename} 范围="
+            f"{'指定库:' + ','.join(dbs) if dbs else '全部'} "
+            f"成功={r.get('ok_statements', 0)} 失败={r.get('failed', 0)} "
+            f"耗时={elapsed}s 结果={'成功' if ok else '失败'}"
+        )
+    except Exception:
+        pass
+
+    # 审计（失败静默，不影响恢复结果）
+    try:
+        from . import audit as _audit
+        _audit.add_audit(
+            operator or "system", "restore_backup", f"{host}:{port}",
+            f"file={filename} dbs={','.join(dbs) or 'ALL'} ok={ok} "
+            f"failed={r.get('failed', 0)} elapsed={elapsed}s",
+            cluster_id=int(cid))
+    except Exception:
+        pass
+
+    _task_update(tid, finished=True, ok=ok, pct=100, phase=(
+        "恢复完成" if ok else "恢复结束（存在失败语句）"),
+        elapsed=elapsed, result=r, msg=r.get("msg", ""))
+
+
 def read_backup_head(cid, filename, limit: int = 4000) -> str:
-    """预览备份头部（前若干字符）。"""
+    """预览备份头部（前若干字符）。
+
+    v2.3.4：分库集备份是目录（kind="set"），gzip.open 会报
+    [Errno 21] Is a directory；此时改为展示 index.json 概览 + 前几个库文件头。
+    """
     path = get_backup_path(cid, filename)
+    if path.is_dir():
+        parts = []
+        idx = path / "index.json"
+        if idx.exists():
+            try:
+                meta = json.loads(idx.read_text(encoding="utf-8"))
+                dbs = meta.get("databases") or meta.get("tables") or []
+                parts.append("/* 分库集备份：共 %s 个库 */" % len(dbs))
+                parts.append(json.dumps(meta, ensure_ascii=False, indent=2)[:800])
+            except Exception as e:
+                parts.append("(index.json 读取失败: %s)" % e)
+        for gz in sorted(path.glob("*.sql.gz"))[:3]:
+            try:
+                with gzip.open(gz, "rt", encoding="utf-8") as f:
+                    parts.append("\n--- %s ---\n%s" % (gz.name, f.read(600)))
+            except Exception:
+                pass
+        return ("\n".join(parts) or "（空备份目录）")[:limit]
     with gzip.open(path, "rt", encoding="utf-8") as f:
         return f.read(limit)
 

@@ -110,14 +110,14 @@
       <tr data-host="{{ n.ip }}:{{ n.port }}" data-cluster="{{ n.cluster_id or '' }}">
         <td><input type="checkbox" class="node-sel" value="{{ n.ip }}" onchange="syncBatchBar()" title="选择该节点"></td>
         <td class="mono">{{ n.ip }}:{{ n.port }}
-          {% if n.pending_actions %}<span class="badge" style="margin-left:6px;background:#E11D74;color:#fff;cursor:pointer"
+          {% if n.pending_actions %}<span class="badge pending-badge" style="margin-left:6px;background:#E11D74;color:#fff;cursor:pointer"
             onclick="showPending('{{ n.ip }}')" title="有配置变更尚未在节点生效，点击查看需要在节点执行的操作">配置待生效</span>{% endif %}
         </td>
         <td>
-          {% if n.mysql_version %}{{ n.mysql_version }}{% endif %}
-          {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-left:4px">MariaDB 裸机</span>
-          {% elif n.node_type == 'mariadb-docker' %}<span class="badge sky" style="margin-left:4px">MariaDB 容器</span>
-          {% elif n.node_type == 'docker' %}<span class="badge emerald" style="margin-left:4px">MySQL</span>{% endif %}
+          {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-right:4px">MariaDB 裸机</span>
+          {% elif n.node_type == 'mariadb-docker' %}<span class="badge sky" style="margin-right:4px">MariaDB 容器</span>
+          {% elif n.node_type == 'docker' %}<span class="badge emerald" style="margin-right:4px">MySQL</span>{% endif %}
+          {% if n.mysql_version %}<span class="mono">{{ n.mysql_version }}</span>{% endif %}
         </td>
         <td data-f="status"><span class="badge" style="background:var(--surface-3);color:var(--muted);">检测中…</span></td>
         <td><button class="btn btn-sm" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button></td>
@@ -150,7 +150,7 @@
             <button class="btn btn-sm btn-primary" onclick="showSelfhealSql({{ n.cluster_id or 0 }}, '{{ n.ip }}', {{ n.port }})">查看/下载自愈 SQL</button>
             {% endif %}
             <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
-            {% if n.pending_actions %}<button class="btn btn-sm" style="background:#E11D74;color:#fff" onclick="showPending('{{ n.ip }}')">待生效操作</button>{% endif %}
+            {% if n.pending_actions %}<button class="btn btn-sm pending-btn" style="background:#E11D74;color:#fff" onclick="showPending('{{ n.ip }}')">待生效操作</button>{% endif %}
             <a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none" href="/nodes/{{ n.ip }}/creds_sql" download>下载修复SQL</a>
             <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delNode('{{ n.ip }}')">删除节点</button>
           </div>
@@ -513,12 +513,37 @@
           body.innerHTML = '<div class="banner ok">✓ <div>该节点没有待生效的配置变更。</div></div>';
         } else {
           body.innerHTML = '<div style="background:rgba(225,29,116,.12);border:1px solid #E11D74;color:#fecdd3;border-radius:8px;padding:10px 12px;margin-bottom:12px">'
-            + '⚠ ' + esc(ip) + ' 有 ' + acts.length + ' 项配置变更尚未在节点生效。</div>' + actionsHtml(acts, ip);
+            + '⚠ ' + esc(ip) + ' 有 ' + acts.length + ' 项配置变更尚未在节点生效。'
+            + '<div style="margin-top:6px;font-size:12px;color:#fda4af">'
+            + '「重建数据库 / 重启 keepalived / 重启 agent」这几类动作，在节点上执行后会被管理器'
+            + '<b>自动检测并消除</b>（约 1 分钟内，无需手动确认）；'
+            + '仅「需在节点本机执行」（如 fix-node-creds.sql / prepare-logs.sh）等一次性动作保留手动清除。'
+            + '</div></div>' + actionsHtml(acts, ip);
         }
         document.getElementById("regenModal").classList.add("show");
       })
       .catch(function(e){toast("请求失败: "+e,"err");});
   }
+  // 「配置待生效」自动监测：每 30s 复核仍挂着徽标的节点，管理器已自动核验落实的
+  // 会隐去徽标与「待生效操作」按钮，无需运维每次手动点「已执行」。
+  // （exec / 首次部署等节点侧一次性动作无法远程观测，仍保留手动按钮。）
+  function refreshPendingBadges(){
+    document.querySelectorAll("tr[data-host] .pending-badge").forEach(function(badge){
+      var tr = badge.closest("tr"); if(!tr) return;
+      var ip = (tr.getAttribute("data-host")||"").split(":")[0]; if(!ip) return;
+      fetch("/api/nodes/"+encodeURIComponent(ip)+"/pending")
+        .then(function(r){return r.json();})
+        .then(function(d){
+          var acts = (d.ok && d.actions) ? d.actions : [];
+          if(!acts.length){
+            var b = tr.querySelector(".pending-badge"); if(b) b.remove();
+            var btn = tr.querySelector(".pending-btn"); if(btn) btn.remove();
+          }
+        })
+        .catch(function(){});
+    });
+  }
+  setInterval(refreshPendingBadges, 30000);
   function regenNode(ip,btn){
     if(!confirm("确认重新生成 "+ip+" 的配置文件？将覆盖原文件。"))return;
     var old=btn.textContent;btn.disabled=true;btn.textContent="生成中…";

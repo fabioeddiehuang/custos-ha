@@ -1544,7 +1544,8 @@ def cluster_backup_page(request: Request, cid: int, user=Depends(auth_required),
     if not c:
         return RedirectResponse("/clusters?error=集群不存在或已被删除", status_code=303)
     return render("backup.html", request, user=user, cluster=c,
-                  backups=backup.list_backups(cid), msg=msg, error=error)
+                  backups=backup.list_backups(cid),
+                  blog=backup.read_backup_log(cid), msg=msg, error=error)
 
 
 @app.get("/api/backup/databases")
@@ -1610,6 +1611,21 @@ def api_backup_run(cluster_id: int = Form(...), host: str = Form(...),
         })
     except Exception:
         pass
+    # 操作日志（备份页「操作日志」页签按 id=<cid> 过滤）——此前该页签恒为空，
+    # 根因是这些埋点从未被调用过。
+    try:
+        uname = user.get("username") if isinstance(user, dict) else str(user)
+        m = r.get("meta") or {}
+        backup._log_event(
+            f"id={int(cluster_id)} 集群={backup._cluster_dir_name(cluster_id)} 备份 "
+            f"节点={host.strip()}:{port} 范围={scope} "
+            f"文件={m.get('file', '') or '—'} "
+            f"表={m.get('tables', 0)} 行={m.get('rows', 0)} "
+            f"大小={round(m.get('size', 0) / 1024, 1)}KB "
+            f"操作者={uname} 结果={'成功' if r.get('ok') else '失败'}"
+        )
+    except Exception:
+        pass
     return JSONResponse(r)
 
 
@@ -1635,36 +1651,51 @@ def api_backup_history(cluster_id: int = 0, user=Depends(auth_required)):
 def api_backup_restore(cluster_id: int = Form(...), host: str = Form(...),
                        port: int = Form(3306), file: str = Form(...),
                        databases: str = Form(""), user=Depends(auth_required)):
-    """把备份恢复到指定节点（默认恢复备份内的全部库，可指定只恢复部分库）。"""
+    """把备份恢复到指定节点（默认恢复备份内的全部库，可指定只恢复部分库）。
+
+    v2.3.6：恢复改为**后台任务**执行，本接口立即返回 task_id；前端轮询
+    /api/backup/restore_progress 展示进度，避免长恢复被误认为卡死。
+    恢复记录 / 操作日志 / 审计改由 backup._run_restore_task 在任务结束时落库。
+    """
     dbs = [d.strip() for d in (databases or "").split(",") if d.strip()]
-    r = backup.restore_backup(int(cluster_id), host.strip(), int(port),
-                              file, databases=dbs or None)
+    uname = user.get("username") if isinstance(user, dict) else str(user)
     try:
-        uname = user.get("username") if isinstance(user, dict) else str(user)
-        backup.record_restore(int(cluster_id), {
-            "time": backup.now_cn().strftime("%Y-%m-%d %H:%M:%S"),
-            "cluster_id": int(cluster_id),
-            "cluster_name": backup._cluster_dir_name(cluster_id),
-            "target": f"{host}:{port}",
-            "file": file,
-            "scope": "custom" if dbs else "all",
-            "databases": dbs,
-            "ok": bool(r.get("ok")),
-            "total": r.get("total", 0),
-            "ok_statements": r.get("ok_statements", 0),
-            "failed": r.get("failed", 0),
-            "operator": uname,
-            "msg": r.get("msg", ""),
-        })
-    except Exception:
-        pass
+        tid = backup.start_restore_task(int(cluster_id), host.strip(), int(port),
+                                        file, databases=dbs or None, operator=uname)
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"启动恢复任务失败：{e}"})
+    return JSONResponse({"ok": True, "task_id": tid,
+                         "msg": "已开始恢复，请等待进度完成…"})
+
+
+@app.get("/api/backup/restore_progress")
+def api_backup_restore_progress(task_id: str = "", cluster_id: int = 0,
+                                user=Depends(auth_required)):
+    """查询恢复任务进度。task_id 为空时返回该集群最近的一次恢复任务。"""
     try:
-        audit.add_audit(uname, "restore_backup", f"{host}:{port}",
-                        f"file={file} dbs={','.join(dbs) or 'ALL'}",
-                        cluster_id=int(cluster_id))
-    except Exception:
-        pass
-    return JSONResponse(r)
+        if task_id:
+            t = backup.get_restore_task(task_id)
+            if not t:
+                return JSONResponse({"ok": False, "error": "任务不存在或已过期"})
+            return JSONResponse({"ok": True, "task": t})
+        arr = backup.list_restore_tasks(20)
+        if cluster_id:
+            arr = [t for t in arr
+                   if int(t.get("cluster_id") or 0) == int(cluster_id)]
+        return JSONResponse({"ok": True, "task": (arr[0] if arr else None)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+@app.get("/api/backup/log")
+def api_backup_log(cluster_id: int = 0, limit: int = 200,
+                   user=Depends(auth_required)):
+    """读取备份/恢复操作日志（倒序）。此前页面直接展示未传值导致页签恒为空。"""
+    try:
+        return JSONResponse({"ok": True,
+                             "log": backup.read_backup_log(cluster_id or None, limit)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e), "log": []})
 
 
 @app.get("/api/restore/history")
@@ -1708,6 +1739,13 @@ def api_backup_download(cluster_id: int = 0, file: str = "",
         headers={"Content-Disposition": f'attachment; filename="{p.name}"'})
 
 
+@app.get("/api/cred_status")
+def api_cred_status(user=Depends(auth_required)):
+    """凭证加密状态（系统设置「凭证加密」卡片展示用）。"""
+    from . import crypto as _crypto
+    return JSONResponse(_crypto.cred_status())
+
+
 @app.post("/api/setting_set")
 def api_setting_set(key: str = Form(...), value: str = Form(...),
                     user=Depends(auth_required)):
@@ -1746,33 +1784,62 @@ def _jsonable(v):
 _READONLY_RE = re.compile(r"^\s*(SELECT|SHOW|EXPLAIN|DESCRIBE|DESC|WITH|USE|HELP)\b", re.IGNORECASE)
 
 
-_ERR_TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2})?)')
+# 错误日志行首时间戳。要同时兼容三种写法：
+#   MySQL 8.0 : 2026-09-11T09:15:32.123456+08:00  /  2026-09-11T09:15:32.123456
+#   MariaDB   : 2026-09-11  9:15:32（空格分隔，小时用空格补齐，可能 1~2 位）
+#   MariaDB 老: 260911  9:15:32（YYMMDD）
+_ERR_TS_RE = re.compile(
+    r'^('
+    r'\d{4}-\d{2}-\d{2}[ T]\s?\d{1,2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2})?'
+    r'|\d{6}\s+\d{1,2}:\d{2}:\d{2}'
+    r')'
+)
+_ERR_TS_ISO_RE = re.compile(
+    r'^(\d{4}-\d{2}-\d{2})[ T]\s?(\d{1,2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:?\d{2})?$')
 _ERR_LV_RE = re.compile(r'\[([A-Za-z]+)\]')
 _CN_TZ = timezone(timedelta(hours=8))        # Asia/Shanghai（中国无夏令时，固定 +08:00）
 
 
 def _err_ts_to_cn(t):
-    """把错误日志行里的时间戳换算到 Asia/Shanghai。
+    """把错误日志行里的时间戳规整为界面统一格式（Asia/Shanghai 口径）。
 
-    MySQL 默认 log_timestamps=UTC，错误日志按 UTC 落盘；面板若原样展示，
-    时间会比全站统一的 Asia/Shanghai 早 8 小时。仅对"无时区标记的朴素时间"做换算。
+    时区处理差异（重要，MariaDB 与 MySQL 不同）：
+      - MySQL 8.0：log_timestamps 默认 UTC，文件里是 `2026-09-11T09:15:32.123`
+        （T 分隔、无时区标记）→ 按 UTC 解析并换算到 +08:00，否则面板时间会早 8 小时。
+      - MariaDB：错误日志时间戳是**本地时间**且用空格分隔（`2026-09-11  9:15:32`，
+        小时可能空格补齐）→ 不做时区换算，只规整显示，否则时间会多 8 小时。
+      - 带显式时区偏移（如 `+08:00`）→ 按偏移解析后再换算。
     """
     if not t:
         return t
     try:
         s0 = str(t).strip()
-        dt = None
-        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
-                    "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-            try:
-                dt = datetime.strptime(s0, fmt)
-                break
-            except ValueError:
-                continue
-        if dt is None:
+        # MariaDB 老格式 YYMMDD HH:MM:SS（本地时间）
+        m6 = re.match(r'^(\d{2})(\d{2})(\d{2})\s+(\d{1,2}:\d{2}:\d{2})', s0)
+        if m6:
+            return "20%s-%s-%s %s" % (m6.group(1), m6.group(2), m6.group(3),
+                                      m6.group(4).zfill(8))
+        m = _ERR_TS_ISO_RE.match(s0)
+        if not m:
             return t
-        dt = dt.replace(tzinfo=timezone.utc).astimezone(_CN_TZ)
-        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        date_s = m.group(1)
+        time_s = m.group(2).zfill(8)          # "9:15:32" -> "09:15:32"
+        frac = m.group(3) or ""
+        off = m.group(4) or ""
+        vals = "%s %s%s" % (date_s, time_s, frac)
+        fmt = "%Y-%m-%d %H:%M:%S" + (".%f" if frac else "")
+        if off:
+            tz = timezone.utc
+            try:
+                tz = datetime.strptime(off, "%z").tzinfo or timezone.utc
+            except ValueError:
+                pass
+            dt = datetime.strptime(vals, fmt).replace(tzinfo=tz).astimezone(_CN_TZ)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        if "T" in s0[:11]:                    # MySQL：T 分隔 + 朴素时间 => UTC
+            dt = datetime.strptime(vals, fmt).replace(tzinfo=timezone.utc)
+            return dt.astimezone(_CN_TZ).strftime("%Y-%m-%dT%H:%M:%S.%f")
+        return vals                           # MariaDB：本地时间，原样展示
     except Exception:
         return t
 
@@ -1794,9 +1861,44 @@ def _parse_err_line(line):
     return t, lv, msg
 
 
+# 「启动段」边界：一次实例启动从 BEGIN 标记开始，到 ready for connections 结束。
+# 为什么需要它：面板的「启动日志」标签若只是「取最新 N 行再按关键字过滤启动字样」，
+# 实例稳态运行一段时间后，最新 N 行里根本不含启动行 → 该标签恒为空（表现为"启动日志没有获取到"）。
+# 正确语义是「最近一次启动的完整片段」，故在更大读取窗口内定位最后一次启动边界后整段返回。
+_STARTUP_BEGIN_RE = re.compile(
+    r'Starting\s+(?:MariaDB|MySQL|mariadbd|mysqld)'      # MariaDB/MySQL 容器启动首行
+    r'|mysqld_safe\s+Starting'                            # 裸机 MariaDB（mysqld_safe 包装）
+    r'|starting\s+as\s+process',                          # MySQL 8.0 启动首行
+    re.I)
+_STARTUP_END_RE = re.compile(r'ready\s+for\s+connections', re.I)
+
+
+def _extract_last_startup(rows, cap=400):
+    """从（最新在前）错误日志行里抽取「最近一次启动段」。
+
+    返回按时间正序排列的启动段（从 Starting… 到 ready for connections），便于像看引导日志一样阅读。
+    读取窗口内找不到启动标记时返回 []（说明近期日志里确实没有启动记录）。
+    """
+    if not rows:
+        return []
+    chron = list(reversed(rows))          # 转时间正序，便于「取最后一次」
+    start = None
+    for i, r in enumerate(chron):
+        if _STARTUP_BEGIN_RE.search(r.get("message") or ""):
+            start = i                     # 持续覆盖 → 取最后一次启动
+    if start is None:
+        return []
+    seg = []
+    for r in chron[start:start + int(cap)]:
+        seg.append(r)
+        if _STARTUP_END_RE.search(r.get("message") or ""):
+            break
+    return seg
+
+
 @app.post("/api/node_error_log")
 def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port: int = Form(...),
-                       limit: int = Form(500), user=Depends(auth_required)):
+                       limit: int = Form(500), segment: str = Form(""), user=Depends(auth_required)):
     """读取节点错误日志（文件 LOAD_FILE 为主，MySQL 8.0 额外支持错误日志表）。
 
     一级（仅 MySQL 8.0）：错误日志表 mysql.error_log（log_sink_table 组件写入，
@@ -1804,7 +1906,12 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
     二级（MySQL 8.0 / MariaDB 通用）：原始错误日志文件（LOAD_FILE @@log_error）。
     注意：MariaDB 不支持错误日志写表（仅 general/slow 日志可写表），故 MariaDB
     节点必须落盘到文件并放开 secure_file_priv，面板才能读到（见 node_gen 配置）。
+
+    segment="startup" 时返回「最近一次启动段」（先按更大窗口读取，再定位最后一次启动边界整段返回），
+    解决「启动日志」标签只过滤最新 N 行导致实例稳态运行时该标签恒空的问题。
     """
+    want_startup = str(segment or "").strip().lower() == "startup"
+    _flimit = 2000 if want_startup else int(limit)
     try:
         port = int(port)
     except (TypeError, ValueError):
@@ -1833,7 +1940,7 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
                 sel = ("time, %s, message" % level_col) if level_col else "time, message"
                 cur.execute(
                     "SELECT %s FROM mysql.error_log ORDER BY time DESC LIMIT %%s" % sel,
-                    (int(limit),),
+                    (int(_flimit),),
                 )
                 for r in cur.fetchall():
                     t = r[0]; lv = r[1] if level_col else ""; msg = r[-1]
@@ -1847,6 +1954,7 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
             source = None
         # 二级：原始错误日志文件（LOAD_FILE），兼容未开启表日志的节点
         path = ""
+        _load_err = ""
         if not rows:
             # 错误日志时间戳的落盘时区：MySQL 默认 log_timestamps=UTC，
             # 直接展示会比 Asia/Shanghai 早 8 小时，需按实际值换算。
@@ -1885,15 +1993,52 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
                         blob = bytes(blob).decode("utf-8", "replace")
                     if blob:
                         lines = [l for l in str(blob).split("\n") if l.strip()]
-                        lines = lines[-int(limit):]
+                        lines = lines[-int(_flimit):]
                         for ln in reversed(lines):
                             t, lv, msg = _parse_err_line(ln)
                             rows.append({"time": _err_ts_to_cn(t) if _log_ts_utc else t,
                                          "level": lv, "message": msg})
                         source = "file"
                 except Exception as e2:
-                    return JSONResponse({"ok": False, "path": path,
-                                         "error": "读取错误日志失败(可能无 FILE 权限或 secure_file_priv 限制): " + str(e2)})
+                    # 无 FILE 权限 / secure_file_priv 限制：不再直接返回失败，
+                    # 交给三级（节点 agent）兜底，避免 MariaDB 面板永远是空的。
+                    _load_err = str(e2)
+        # 三级（v2.3.6）：节点 agent 直读宿主机日志文件——MariaDB 的根治通道。
+        #   根因：MariaDB **没有** mysql.error_log 表，只能靠 LOAD_FILE 读 @@log_error
+        #   指向的文件；但 mysqld 生成的 error.log 权限是 0660，LOAD_FILE 对 0660 文件
+        #   恒返回 NULL（实测 660→NULL / 644→有内容），另外还受 secure_file_priv 限制。
+        #   custos-node-agent 以 root 直接读宿主机文件（绕开 FILE 权限、secure_file_priv
+        #   与 0660 权限），只要节点上 agent 在跑就能拿到错误日志（启动段同源同文件）。
+        if not rows:
+            try:
+                _ag = os_metrics.fetch_node_log(host, name="error", lines=int(_flimit))
+                _ag_lines = list(_ag.get("lines") or [])
+                if _ag.get("ok") and _ag_lines:
+                    for ln in reversed(_ag_lines):
+                        t, lv, msg = _parse_err_line(ln)
+                        rows.append({"time": _err_ts_to_cn(t) if _log_ts_utc else t,
+                                     "level": lv, "message": msg})
+                    source = "agent"
+                    if _ag.get("path"):
+                        path = _ag["path"]
+                elif not path and _ag.get("path"):
+                    path = _ag["path"]
+                else:
+                    _load_err = _load_err or (_ag.get("error") or "")
+            except Exception as e3:
+                _load_err = _load_err or str(e3)
+        # 「启动段」：在大窗口内定位【最近一次】启动边界后整段返回（时间正序，便于阅读）。
+        if rows and want_startup:
+            rows = _extract_last_startup(rows)
+            if not rows:
+                # 日志通道本身可读，只是窗口内没有启动记录（实例近期未重启 / 日志已轮转）。
+                return JSONResponse({
+                    "ok": True, "source": source or "none", "rows": [], "path": path,
+                    "segment": "startup",
+                    "note": ("日志通道可读，但当前读取窗口内未找到「启动段」"
+                             "（未匹配到 Starting… / ready for connections）。"
+                             "通常是实例近期未重启、启动记录已远在窗口之外，或错误日志已轮转；"
+                             "可先切到「错误日志」标签确认通道是否正常。")})
         if not rows:
             # v2.3.5：把「为什么读不到」讲清楚。三种形态根因各不相同：
             #   MySQL 8.0 容器  -> 有 mysql.error_log 表（log_error_services 含 log_sink_internal）
@@ -1918,13 +2063,22 @@ def api_node_error_log(cluster_id: int = Form(...), host: str = Form(...), port:
                 _why.append("log_error 未配置（官方镜像默认写 stdout，磁盘上根本没有错误日志文件）")
             if not _why:
                 _why.append("文件为空，或账号缺少 FILE 权限")
+            if _load_err:
+                _why.append("节点 agent 读取也失败：%s" % str(_load_err)[:160])
+            else:
+                _why.append("节点 agent 未返回内容（agent 未运行，或仍是旧版本、"
+                            "需重建/重启 custos-node-agent 才能读取日志）")
             note = ("未开启错误日志表（MariaDB 无 mysql.error_log，该表仅 MySQL 8.0 支持），"
                     "也未能读到错误日志文件：" + "；".join(_why) + "。"
-                    " 修复：在节点 my.cnf / docker-my.cnf 设置 log_error=<统一日志目录>/error.log "
-                    "且 secure_file_priv=''，然后**重建容器**生效（静态参数，restart 不生效）。")
+                    " 三级读取顺序：错误日志表 → LOAD_FILE → 节点 agent（直读宿主机文件）。"
+                    " 修复：确保节点 my.cnf / docker-my.cnf 已设 log_error=<统一日志目录>/error.log，"
+                    "并让 custos-node-agent 运行（它会以 root 直读宿主机日志，"
+                    "不受 FILE 权限、secure_file_priv 与 0660 权限限制）。")
             return JSONResponse({"ok": True, "source": source or "none", "rows": [],
-                                 "path": path, "note": note})
-        return JSONResponse({"ok": True, "source": source, "rows": rows})
+                                 "path": path, "segment": ("startup" if want_startup else "err"),
+                                 "note": note})
+        return JSONResponse({"ok": True, "source": source, "rows": rows,
+                             "segment": ("startup" if want_startup else "err")})
     finally:
         conn.close()
 

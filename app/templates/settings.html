@@ -64,6 +64,12 @@
 </div>
 
 <div class="card">
+  <h3>凭证加密</h3>
+  <div class="note">集群/节点的 root、HA、复制、业务账号密码均以密文（<code>ENC1:</code>）存储于管理库，密钥由下方来源派生；仅管理库持有密钥，<b>备份项目 <code>data/</code> 目录即可完整恢复凭证</b>。</div>
+  <div id="credStatus" style="font-size:13px;line-height:1.9">加载中…</div>
+</div>
+
+<div class="card">
   <h3>高级切换 / 监控</h3>
   <div class="note">以下为<b>全局</b>自动运维开关与阈值（对所有集群生效）。修改即时写入 <code>monitor_settings</code> 并记入审计。危险项默认关闭，开启前请确认理解其触发条件，避免误切或抖动。</div>
 
@@ -337,6 +343,21 @@
       .catch(function(e){toast("导出失败: "+e,"err");});
   }
 
+  function loadCredStatus(){
+    var el=document.getElementById("credStatus"); if(!el)return;
+    fetch("/api/cred_status",{credentials:"same-origin"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.enabled){el.innerHTML='<span style="color:#fb7185">未启用：'+esc(d.error||"未知")+'</span>';return;}
+        el.innerHTML='<div class="setting-item" style="border:none;padding:6px 0"><span class="setting-info"><span class="setting-title">加密状态</span></span><span class="badge ok">已启用</span></div>'
+          +'<div class="setting-item" style="border:none;padding:6px 0"><span class="setting-info"><span class="setting-title">算法</span></span><span>'+esc(d.algo||"")+'</span></div>'
+          +'<div class="setting-item" style="border:none;padding:6px 0"><span class="setting-info"><span class="setting-title">密钥来源</span></span><span>'+esc(d.key_source||"")+'</span></div>'
+          +'<div class="setting-item" style="border:none;padding:6px 0"><span class="setting-info"><span class="setting-title">密钥指纹(掩码)</span></span><span class="mono">'+esc(d.key_masked||"")+'</span></div>'
+          +'<div class="adv-desc" style="margin-top:6px">'+esc(d.note||"")+'</div>';
+      })
+      .catch(function(e){el.textContent="加载失败: "+e;});
+  }
+
   // 动态填充「本机实际存在」的容器，避免点到本机没有的容器
   function loadSrvUnits(){
     var sel=document.getElementById("srvUnit");
@@ -358,6 +379,7 @@
       .catch(function(){});
   }
 
+  loadCredStatus();
   loadSrvUnits();
   loadSrvLog();
   loadUsers();

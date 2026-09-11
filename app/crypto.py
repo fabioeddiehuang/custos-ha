@@ -184,6 +184,24 @@ def status():
             "mirrored_to_db": False}
 
 
+def cred_status():
+    """返回凭证加密状态（供「系统设置 → 凭证加密」展示）。"""
+    try:
+        key, src = _load_or_create_key()
+        kb = (key or b"")
+        masked = (kb[:4].decode("utf-8", "replace") + "…" + kb[-4:].decode("utf-8", "replace")) if kb else "—"
+        return {
+            "enabled": True,
+            "algo": "Fernet (AES-128-CBC + HMAC-SHA256)",
+            "key_source": src,
+            "key_masked": masked,
+            "note": "所有集群/节点凭证均以 ENC1: 前缀密文存储于管理库；密钥由上述来源派生，"
+                    "备份项目 data/ 目录即可完整恢复凭证。",
+        }
+    except Exception as e:
+        return {"enabled": False, "error": str(e)}
+
+
 def bootstrap():
     """启动时确保密钥已就绪（CRED_KEY / 旧 cred.key / SECRET_KEY 派生）并返回其 base64 串。
 
