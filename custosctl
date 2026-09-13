@@ -60,6 +60,10 @@ node_main() {
   fi
   cd "$ndir" || exit 1
 
+  # 节点包 compose 文件名：node_gen 生成 docker-compose.yaml；个别/历史场景可能是 .yml。
+  # 统一用本函数拿当前目录的 compose 文件，避免 .yaml/.yml 混用导致检测失效。
+  _cf() { [ -f docker-compose.yaml ] && echo docker-compose.yaml || echo docker-compose.yml; }
+
   # 风味检测：mysql8.0/conf → mysql；mariadb12.3.3/conf → mariadb
   flavor=""; data_base=""
   if [ -d mysql8.0/conf ]; then flavor=mysql; data_base=mysql8; fi
@@ -70,11 +74,11 @@ node_main() {
     exit 1
   fi
   # 以 compose 中真实数据目录基名覆盖默认（兼容自定义数据目录）
-  dd=$(grep -oE '/data/custos-ha/[A-Za-z0-9._-]+:/var/lib/(mysql|mariadb)' docker-compose.yml 2>/dev/null | head -1 | cut -d: -f1 | xargs basename 2>/dev/null || true)
+  dd=$(grep -oE '/data/custos-ha/[A-Za-z0-9._-]+:/var/lib/(mysql|mariadb)' "$(_cf)" 2>/dev/null | head -1 | cut -d: -f1 | xargs basename 2>/dev/null || true)
   [ -n "$dd" ] && data_base=$dd
   # docker 节点判定：compose 顶层含 mysql/mariadb 服务
   is_docker=0
-  if grep -qE '^[[:space:]]*(mysql|mariadb):[[:space:]]*$' docker-compose.yml 2>/dev/null; then is_docker=1; fi
+  if grep -qE '^[[:space:]]*(mysql|mariadb):[[:space:]]*$' "$(_cf)" 2>/dev/null; then is_docker=1; fi
   db_svc=$( [ "$flavor" = "mariadb" ] && echo mariadb || echo mysql )
   dump_args="--single-transaction --routines --events --all-databases"
   sock_path="/data/custos-ha/$data_base/mysql.sock"
@@ -99,7 +103,7 @@ EOF
   #   裸机 MariaDB —— my.cnf 的 datadir 基名（默认 mariadb，区别于容器形态的 mariadb12）。
   _node_data_base() {
     local b=""
-    b=$(grep -oE '/data/custos-ha/[A-Za-z0-9._-]+:/var/lib/(mysql|mariadb)' docker-compose.yaml 2>/dev/null | head -1 | cut -d: -f1 | xargs basename 2>/dev/null || true)
+    b=$(grep -oE '/data/custos-ha/[A-Za-z0-9._-]+:/var/lib/(mysql|mariadb)' "$(_cf)" 2>/dev/null | head -1 | cut -d: -f1 | xargs basename 2>/dev/null || true)
     if [ -z "$b" ] && [ "$flavor" = "mariadb" ] && [ -f mariadb12.3.3/conf/my.cnf ]; then
       b=$(grep -E '^[[:space:]]*datadir[[:space:]]*=' mariadb12.3.3/conf/my.cnf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d ' \t\r\n"'"'"'' | xargs basename 2>/dev/null || true)
     fi
