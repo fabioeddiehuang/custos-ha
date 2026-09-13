@@ -86,6 +86,8 @@ fi
 
 # 3) 删除命令行工具与配置（实现「随卸载脚本一同卸载」）
 rm -f /usr/bin/custosctl
+rm -f /usr/share/bash-completion/completions/custosctl 2>/dev/null || true
+rm -f /etc/bash_completion.d/custosctl 2>/dev/null || true
 rm -rf /etc/custos
 
 echo "==> 卸载完成：容器与本项目镜像已移除，custosctl 已删除。"

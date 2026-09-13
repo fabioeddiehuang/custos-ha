@@ -40,6 +40,14 @@ chmod 644 "$CONF"
 
 install -m 0755 "$CUSTOS_HOME/custosctl" "$TARGET"
 
+# 安装 bash 补全（装了 bash-completion 的新终端会自动加载）
+if [ -f "$CUSTOS_HOME/scripts/custosctl-completion.bash" ]; then
+  BC_DIR=/usr/share/bash-completion/completions
+  mkdir -p "$BC_DIR"
+  install -m 0644 "$CUSTOS_HOME/scripts/custosctl-completion.bash" "$BC_DIR/custosctl"
+  echo "    已安装 bash 补全：$BC_DIR/custosctl（新开终端或 source 它立即生效）"
+fi
+
 echo "==> 已安装 $TARGET"
 echo "    项目目录：$CUSTOS_HOME（记录在 $CONF）"
 echo "    用法：custosctl help"
