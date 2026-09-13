@@ -31,6 +31,12 @@ if [ $# -gt 0 ]; then
   esac
 fi
 
+# 0.5 脚本自身所在目录优先：./custosctl 在仓库根直接定位（优先级高于容器标签/常见路径探测）
+PROG_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+if [ -z "${CUSTOS_HOME:-}" ] && [ -n "$PROG_DIR" ] && [ -f "$PROG_DIR/docker-compose.yml" ] && [ -f "$PROG_DIR/custosctl" ]; then
+  CUSTOS_HOME=$PROG_DIR; HOME_SRC="脚本所在目录"
+fi
+
 # ===========================================================================
 # 节点控制分支（custosctl node <cmd>）：控制【数据库节点】，与管理器互不干扰
 #   节点包结构（见节点部署改造）：docker-compose.yaml / keepalived/ /
@@ -103,7 +109,18 @@ EOF
       if [ "$is_docker" = 1 ]; then
         docker compose up -d || { echo "docker compose up -d 失败" >&2; exit 1; }
       else
-        sh "$flavor"12.3.3/scripts/Install-ha-mariadb-Node.sh || { echo "Install 脚本失败" >&2; exit 1; }
+        # 兼容两种节点包布局（节点部署目录归整前后）：
+        #   新：<db>/scripts/Install-*-Node.sh（<db> 如 mariadb12.3.3 / mysql8.0）
+        #   旧：Install-*-Node.sh 直接在节点包根
+        inst=""
+        inst=$(ls "${flavor}"*/scripts/Install-*-Node.sh 2>/dev/null | head -1)
+        [ -z "$inst" ] && inst=$(ls Install-*-Node.sh 2>/dev/null | head -1)
+        if [ -z "$inst" ]; then
+          echo "错误：未找到裸机节点安装脚本（期望 <db>/scripts/Install-*-Node.sh 或节点包根 Install-*-Node.sh）。" >&2
+          echo "请确认在节点包根目录执行；若节点包是旧版，请用最新管理器重新生成（regen）后重试。" >&2
+          exit 1
+        fi
+        sh "$inst" || { echo "Install 脚本失败：$inst" >&2; exit 1; }
       fi
       link_logs
       if [ "$(id -u)" = "0" ]; then
@@ -216,8 +233,8 @@ fi
 if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
   _p=$(pwd)
   _i=0
-  while [ $_i -lt 4 ]; do
-    if [ -f "$_p/docker-compose.yml" ] && [ -f "$_p/custosctl" ]; then
+  while [ $_i -lt 8 ]; do
+    if [ -f "$_p/docker-compose.yml" ]; then
       CUSTOS_HOME=$_p; HOME_SRC="当前目录/父级"; break
     fi
     [ "$_p" = "/" ] && break
