@@ -165,6 +165,10 @@ def _repoint_slave(cluster_id, h, target_host, target_port, creds):
       存在同名对象而 GTID 集合未记录该事务）；
     - IO 线程 1236（源端主库缺失 GTID，从库已执行过）。
     START SLAVE 后错误往往延迟上报，故重试几次直至复制线程双 Yes 或已自愈。
+
+    返回 (ok, msg)：调用方必须按【元组】解包（monitor.py 两处即按 `ok_r, msg_r` 解包，
+    早期返回裸 bool 会抛 `TypeError: cannot unpack non-iterable bool object`）。
+    ok 为**真实**复制状态：重试耗尽仍未双 Yes 时返回 False，绝不返回假成功。
     """
     host, port = h["host"], int(h["port"])
     ru, rp = node_root(host, cluster_id)
@@ -173,14 +177,16 @@ def _repoint_slave(cluster_id, h, target_host, target_port, creds):
                             creds["repl_pass"], ru, rp)
     if not ok:
         _warn_repoint(host, port, f"重指向 {host}:{port} 失败: {err}")
-        return False
+        return False, f"重指向 {host}:{port} 失败: {err}"
+    last_err = ""
     for _ in range(8):
         try:
             st = get_status(host, port, creds["ha_user"], creds["ha_pass"], ru, rp)
         except Exception:
             st = {}
         if st.get("slave_io") == "Yes" and st.get("slave_sql") == "Yes" and not st.get("error"):
-            break
+            return True, f"{host}:{port} 已重指向 {target_host}:{target_port}（复制双 Yes）"
+        last_err = (st.get("error") or st.get("slave_io_err") or st.get("slave_sql_err") or "")
         try:
             heal_replication(host, port, creds["ha_user"], creds["ha_pass"], ru, rp)
         except Exception as e:
@@ -207,7 +213,15 @@ def _repoint_slave(cluster_id, h, target_host, target_port, creds):
         except Exception as e:
             print(f"[failover] 复制密码重置异常 {host}:{port}: {e}")
         time.sleep(2)
-    return True
+    # 重试耗尽仍未达双 Yes：必须返回失败。
+    # 原实现这里无条件 return True，导致 ensure_topology 打印「已重指向新主」的假成功、
+    # 不产生任何告警，节点实际一直没加入集群、复制持续中断（典型静默故障，极难排查）。
+    _msg = (f"{host}:{port} 重指向 {target_host}:{target_port} 后复制仍未就绪"
+            f"（8 次自愈未达双 Yes）")
+    if last_err:
+        _msg += f"，最后错误：{last_err}"
+    print(f"[failover] {_msg}")
+    return False, _msg
 
 
 def _gtid_is_superset(a, b):
@@ -658,7 +672,7 @@ def ensure_topology(cluster_id):
             continue
         _TOPO_AT[_rk] = time.monotonic()
         was_stale_master = is_stale_master(st)
-        ok = _repoint_slave(cluster_id, h, cur_h, cur_p, creds)
+        ok, _rmsg = _repoint_slave(cluster_id, h, cur_h, cur_p, creds)
         if ok:
             msg = f"{h['host']}:{h['port']} 已重指向新主 {cur_h}:{cur_p}"
             if was_stale_master:

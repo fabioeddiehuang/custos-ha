@@ -65,8 +65,19 @@
 
 <div class="card">
   <h3>凭证加密</h3>
-  <div class="note">集群/节点的 root、HA、复制、业务账号密码均以密文（<code>ENC1:</code>）存储于管理库，密钥由下方来源派生；仅管理库持有密钥，<b>备份项目 <code>data/</code> 目录即可完整恢复凭证</b>。</div>
+  <div class="note">
+    集群 / 节点的 root、HA、复制、业务账号口令的存储方式。<b>默认关闭</b>：明文落库、<b>完全不依赖任何密钥</b>，SECRET_KEY 变动、重装、重建镜像都不会让凭证失效。
+    有合规 / 高安全需求时可开启（密钥持久化在 <code>data/cred.key</code>，解密会自动在 <code>CRED_KEY</code> → <code>data/cred.key</code> → <code>SECRET_KEY</code> 派生之间回退）。
+    <br><b style="color:#fb7185">密钥一旦丢失，已加密的口令在密码学上无法恢复</b>：此时可「关闭加密」止血（新写入变明文），但已解不开的口令仍须到「集群设置 / 节点」重新录入。
+  </div>
   <div id="credStatus" style="font-size:13px;line-height:1.9">加载中…</div>
+  <div id="credHealth"></div>
+  <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-sm" id="credDisable">关闭加密（保底）</button>
+    <button class="btn btn-primary btn-sm" id="credEnable">开启加密</button>
+    <button class="btn btn-sm" id="credReset" style="border-color:#fb7185;color:#fb7185">重置密钥</button>
+  </div>
+  <div id="credMsg" style="margin-top:8px;font-size:13px"></div>
 </div>
 
 <div class="card">
@@ -343,20 +354,62 @@
       .catch(function(e){toast("导出失败: "+e,"err");});
   }
 
+  function credMsg(t, bad){
+    var el=document.getElementById("credMsg"); if(!el)return;
+    el.innerHTML='<span style="color:'+(bad?'#fb7185':'#34d399')+'">'+esc(t||'')+'</span>';
+  }
+  // 凭证体检：密钥丢失时必须明确指出「哪些口令解不开」，否则用户会误以为关掉加密就恢复了
+  function renderCredHealth(h){
+    var el=document.getElementById("credHealth"); if(!el||!h)return;
+    var items=h.items||[];
+    var bad=items.filter(function(x){return x.status==='broken';});
+    var s='<div style="margin-top:10px;font-size:13px"><b>凭证体检</b>：共 '+items.length+' 项，'
+      +'<span style="color:#34d399">正常 '+(items.length-bad.length)+'</span> · '
+      +'<span style="color:#fb7185">解不开 '+bad.length+'</span></div>';
+    if(bad.length){
+      s+='<div style="color:#fb7185;font-size:13px;margin-top:4px">以下口令已加密且当前密钥解不开，'
+        +'<b>必须到对应「集群设置 / 节点」重新录入</b>（关闭加密或重置密钥都无法恢复）：</div>'
+        +'<ul style="margin:6px 0 0 18px;color:#fb7185;font-size:13px">';
+      bad.forEach(function(x){s+='<li>'+esc(x.scope)+' · '+esc(x.name)+' · '+esc(x.column)+'</li>';});
+      s+='</ul>';
+    }
+    if(h.error){s+='<div style="color:#fb7185;font-size:13px">体检失败：'+esc(h.error)+'</div>';}
+    el.innerHTML=s;
+  }
   function loadCredStatus(){
     var el=document.getElementById("credStatus"); if(!el)return;
     fetch("/api/cred_status",{credentials:"same-origin"})
       .then(function(r){return r.json();})
       .then(function(d){
-        if(!d.enabled){el.innerHTML='<span style="color:#fb7185">未启用：'+esc(d.error||"未知")+'</span>';return;}
-        el.innerHTML='<div class="setting-item" style="border:none;padding:6px 0"><span class="setting-info"><span class="setting-title">加密状态</span></span><span class="badge ok">已启用</span></div>'
+        var on=!!d.enabled;
+        el.innerHTML='<div class="setting-item" style="border:none;padding:6px 0"><span class="setting-info"><span class="setting-title">加密状态</span></span>'
+          +(on?'<span class="badge ok">已启用</span>':'<span class="badge">已关闭（明文存储）</span>')+'</div>'
           +'<div class="setting-item" style="border:none;padding:6px 0"><span class="setting-info"><span class="setting-title">算法</span></span><span>'+esc(d.algo||"")+'</span></div>'
           +'<div class="setting-item" style="border:none;padding:6px 0"><span class="setting-info"><span class="setting-title">密钥来源</span></span><span>'+esc(d.key_source||"")+'</span></div>'
           +'<div class="setting-item" style="border:none;padding:6px 0"><span class="setting-info"><span class="setting-title">密钥指纹(掩码)</span></span><span class="mono">'+esc(d.key_masked||"")+'</span></div>'
           +'<div class="adv-desc" style="margin-top:6px">'+esc(d.note||"")+'</div>';
+        if(d.last_error){el.innerHTML+='<div style="color:#fb7185;margin-top:6px">最近错误：'+esc(d.last_error)+'</div>';}
+        renderCredHealth(d.health);
       })
       .catch(function(e){el.textContent="加载失败: "+e;});
   }
+  function credAction(a){
+    if(a==='disable'&&!confirm('关闭凭证加密？\n\n· 新写入的口令将明文存储，此后不再依赖任何密钥。\n· 已解不开的口令不会因此恢复，仍需重新录入。'))return;
+    if(a==='reset_key'&&!confirm('重置凭证密钥？\n\n· 当前可解开的口令会先转明文，再用新密钥重新加密（不会丢失）。\n· 已解不开的口令无法恢复，仍需重新录入。'))return;
+    var fd=new FormData(); fd.append('action',a);
+    fetch('/api/cred_encryption',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        credMsg(d.msg||(d.ok?'已完成':'操作失败'), !d.ok);
+        loadCredStatus();
+      })
+      .catch(function(e){credMsg('操作失败: '+e,true);});
+  }
+  (function(){
+    var b=document.getElementById('credDisable'); if(b)b.onclick=function(){credAction('disable');};
+    b=document.getElementById('credEnable');      if(b)b.onclick=function(){credAction('enable');};
+    b=document.getElementById('credReset');       if(b)b.onclick=function(){credAction('reset_key');};
+  })();
 
   // 动态填充「本机实际存在」的容器，避免点到本机没有的容器
   function loadSrvUnits(){

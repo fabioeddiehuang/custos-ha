@@ -475,6 +475,11 @@ def init_schema():
         migrate_encrypt_credentials()
     except Exception as _ce:
         print(f"[init_db] 凭证加密迁移失败(可忽略，下轮启动重试): {_ce}")
+    # v2.3.10：加密默认关闭 —— 把存量 ENC1 密文还原为明文，彻底解除对密钥的依赖
+    try:
+        migrate_decrypt_credentials()
+    except Exception as _cd:
+        print(f"[init_db] 凭证明文还原失败(可忽略，下轮启动重试): {_cd}")
 
 
 # v2.3.1：需要「透明解密」的凭证列。凡是 SELECT 出这些列的地方都会自动拿到明文，
@@ -522,6 +527,8 @@ def migrate_encrypt_credentials():
     必要性：升级前入库的凭证全是明文。不迁移就会长期「新写入加密、存量明文」并存，
     管理库备份与 dump 文件里依旧躺着生产库 root 口令 —— 加密形同虚设。
     """
+    if not _crypto.enabled():
+        return 0      # v2.3.10：加密关闭时不再把明文加密入库（否则与反向迁移互相抵消）
     changed = 0
     for tbl, key_cols, pk in (
         ("clusters", ("ha_pass", "repl_pass", "app_pass"), "id"),
@@ -550,6 +557,151 @@ def migrate_encrypt_credentials():
     if changed:
         print(f"[init_db] 凭证加密迁移：已加密 {changed} 条存量记录", flush=True)
     return changed
+
+
+def migrate_decrypt_credentials(force=False):
+    """v2.3.10：凭证加密**关闭**时，把仍能解开的 ENC1 凭证还原为明文（幂等、尽最大努力）。
+
+    ``force=True``：即使加密处于开启也强制执行 —— 「重置密钥」流程必须先把它全部
+    转为明文，再换新密钥重新加密，否则换密钥会让原可解的凭证变成永久死数据。
+
+
+    为什么需要反向迁移：
+      仅把 encrypt() 改成不加密，库里历史 ENC1 密文依然存在，其可用性仍绑在密钥上。
+      一旦将来密钥丢失，这批凭证就变成永久读不出的死数据（表现为复制口令是密文、
+      CHANGE MASTER 报 1470）。故在**当前密钥还有效**时主动还原，彻底解除该依赖。
+
+    安全性：解不开的一律跳过、**绝不改写**（decrypt 失败会原样返回密文，此处据此判定），
+    由 crypto.last_error() 与 make_slave_of 的 ENC1 守卫暴露给运维，不会静默损坏凭证。
+    """
+    if _crypto.enabled() and not force:
+        return 0
+    changed = 0
+    for tbl, key_cols, pk in (
+        ("clusters", ("ha_pass", "repl_pass", "app_pass"), "id"),
+        ("nodes", ("root_pass",), "ip"),
+    ):
+        try:
+            cols = ", ".join((pk,) + key_cols)
+            rows = query_raw(f"SELECT {cols} FROM {tbl}")
+        except Exception:
+            continue
+        for r in rows:
+            upd, vals = [], []
+            for k in key_cols:
+                v = r.get(k)
+                if not (v and _crypto.is_encrypted(v)):
+                    continue
+                plain = _crypto.decrypt(v)
+                # 仍以 ENC1 开头 == 解密失败：原样保留，绝不覆盖为密文或空值
+                if _crypto.is_encrypted(plain):
+                    continue
+                upd.append(f"{k}=%s")
+                vals.append(plain)
+            if not upd:
+                continue
+            vals.append(r.get(pk))
+            try:
+                execute(f"UPDATE {tbl} SET {', '.join(upd)} WHERE {pk}=%s", vals)
+                changed += 1
+            except Exception as e:
+                print(f"[init_db] 还原 {tbl}({pk}={r.get(pk)}) 凭证明文失败: {e}")
+    if changed:
+        print(f"[init_db] 凭证加密已关闭：已将 {changed} 条凭证还原为明文存储"
+              f"（此后不再依赖任何密钥）", flush=True)
+    return changed
+
+
+def credential_health():
+    """审计全部凭证的可解密状态（Web「设置 → 凭证加密」卡片展示用）。
+
+    这是「密钥丢失」场景下的**关键可观测性**：光告诉用户「加密已关闭」毫无意义，
+    必须指出**具体哪些口令已经解不开**，因为它们无论如何都必须在「集群设置 / 节点」
+    重新录入（关闭加密也无法让密文变回明文）。
+
+    status: ``plain``=明文存储 ｜ ``ok``=密文且可解 ｜ ``broken``=密文但当前所有候选
+    密钥均解不开（decrypt 会原样返回密文，据此判定）。
+    """
+    items = []
+    for tbl, scope, key_cols, pk, name_col, cid_col in (
+        ("clusters", "集群", ("ha_pass", "repl_pass", "app_pass"), "id", "name", "id"),
+        ("nodes", "节点", ("root_pass",), "ip", "ip", "cluster_id"),
+    ):
+        try:
+            cols = ", ".join(dict.fromkeys((pk, name_col, cid_col) + key_cols))
+            rows = query_raw("SELECT %s FROM %s" % (cols, tbl))
+        except Exception as e:
+            print(f"[db] 凭证体检跳过 {tbl}: {e}")
+            continue
+        for r in rows:
+            nm = r.get(name_col) or r.get(pk)
+            for k in key_cols:
+                v = r.get(k)
+                if not v:
+                    continue
+                if not _crypto.is_encrypted(v):
+                    st = "plain"
+                elif _crypto.is_encrypted(_crypto.decrypt(v)):
+                    st = "broken"          # 解密失败会原样返回密文 → 据此判定
+                else:
+                    st = "ok"
+                items.append({"scope": scope, "name": str(nm), "column": k,
+                              "status": st, "cluster_id": r.get(cid_col)})
+    broken = [i for i in items if i["status"] == "broken"]
+    return {"total": len(items), "broken": len(broken), "items": items}
+
+
+def startup_credential_check():
+    """启动自检：存在「解不开」的凭证必须**立刻**暴露到告警中心与启动日志。
+
+    为什么必须在启动时做：这类故障原本是**完全静默**的 —— 管理库读出来的是密文，
+    上层拿到就当口令用，只有等到复制建立时把密文拼进 CHANGE MASTER 报
+    ``1470 - String 'ENC1:...' is too long for MASTER_PASSWORD`` 才会暴露，
+    届时现象是「复制起不来 / 源库不可达」，与「密钥不匹配」毫无字面关联，排查成本极高。
+
+    注意：这里直接写 alerts 表而**不用** alerts.send_alert —— 后者是邮件通道，
+    未配置 SMTP 时只会 print，无法保证在 Web 界面可见。
+    """
+    try:
+        h = credential_health()
+    except Exception as e:
+        print(f"[init_db] 凭证自检跳过: {e}")
+        return 0
+    broken = [i for i in h.get("items", []) if i.get("status") == "broken"]
+    if not broken:
+        return 0
+
+    print("=" * 62, flush=True)
+    print("[严重] 检测到 %d 项凭证已加密但当前密钥解不开：" % len(broken), flush=True)
+    for i in broken:
+        print("        - %s %s · %s" % (i["scope"], i["name"], i["column"]), flush=True)
+    print("  这些口令无法自动恢复，必须到「集群设置 / 节点」重新录入；", flush=True)
+    print("  否则复制会因口令为 ENC1 密文而报 1470 无法建立。", flush=True)
+    print("  建议：设置 → 凭证加密 →「关闭加密（保底）」后重录上述口令。", flush=True)
+    print("=" * 62, flush=True)
+
+    n = 0
+    by_cluster = {}
+    for i in broken:
+        by_cluster.setdefault(i.get("cluster_id"), []).append(i)
+    for cid, items in by_cluster.items():
+        names = "、".join("%s %s·%s" % (x["scope"], x["name"], x["column"]) for x in items)
+        msg = (f"【凭证密钥不匹配】{len(items)} 项凭证已加密但当前密钥解不开（{names}）。"
+               f"密文无法自动恢复，必须到「集群设置 / 节点」重新录入；否则复制会因复制口令为 "
+               f"ENC1 密文而报 1470 无法建立。建议：设置 → 凭证加密 →「关闭加密（保底）」后重录。")
+        try:
+            # 24 小时内同内容不重复写，避免每次重启刷屏
+            old = query("SELECT id FROM alerts WHERE alert_type='cred_key' AND message=%s "
+                        "AND created_at > NOW() - INTERVAL 24 HOUR LIMIT 1", (msg,))
+            if old:
+                continue
+            execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,"
+                    "created_at) VALUES(%s,NULL,NULL,'cred_key','open',%s,NOW())",
+                    (cid, msg))
+            n += 1
+        except Exception as e:
+            print(f"[init_db] 写入凭证告警失败(可忽略): {e}")
+    return n
 
 
 def execute(sql, args=None):

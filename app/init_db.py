@@ -1,12 +1,18 @@
 """初始化管理库表结构与管理员账号。"""
 import hashlib
 import secrets
-from .db import init_schema, get_conn
+from .db import init_schema, get_conn, startup_credential_check
 from .config import WEB_USER, WEB_PASS, hash_pwd
 
 
 def main():
     init_schema()
+    # v2.3.10：启动即自检凭证可解密性。存在「解不开」的凭证必须立刻告警，
+    # 否则要等到复制建立时密文被当口令报 1470 才会暴露（现象与密钥毫无关联，极难定位）。
+    try:
+        startup_credential_check()
+    except Exception as e:
+        print(f"[init_db] 凭证自检异常(可忽略): {e}")
     conn = get_conn()
     try:
         with conn.cursor() as c:

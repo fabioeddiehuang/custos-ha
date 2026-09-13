@@ -262,6 +262,27 @@ info "已生成 .env（权限 600）"
 
 mkdir -p data backups generated_nodes logs
 
+# 凭证密钥保底恢复（v2.3.10）：密钥若随项目目录一起丢失，库里所有 ENC1 凭证将永久解不开。
+# 卸载脚本会把它镜像到项目目录之外的 /var/lib/custos/，这里在重装时自动取回 ——
+# 于是「删掉整个项目目录后重装」也能自动恢复密钥，凭证照常可读。
+# 仅当 data/ 下缺失时才恢复，绝不覆盖现有密钥（现有密钥必然是最近一次在用的）。
+KEY_VAULT=/var/lib/custos
+for k in cred.key secret_key; do
+  if [ ! -f "data/$k" ] && [ -f "$KEY_VAULT/$k" ]; then
+    cp -f "$KEY_VAULT/$k" "data/$k" 2>/dev/null || true
+    chmod 600 "data/$k" 2>/dev/null || true
+    info "已从 $KEY_VAULT/$k 恢复凭证密钥（重装后凭证加解密保持不变）"
+  fi
+done
+# 反向：项目内已有密钥则顺手镜像一份，保证保险库始终是最新的
+for k in cred.key secret_key; do
+  if [ -f "data/$k" ]; then
+    mkdir -p "$KEY_VAULT" 2>/dev/null || true
+    cp -f "data/$k" "$KEY_VAULT/$k" 2>/dev/null || true
+    chmod 600 "$KEY_VAULT/$k" 2>/dev/null || true
+  fi
+done
+
 # ---------------------------------------------------------------------------
 say "5/6 安装命令行工具 custosctl"
 if [ "$(id -u)" = "0" ]; then

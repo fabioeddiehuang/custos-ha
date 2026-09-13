@@ -913,9 +913,16 @@ def _act_once():
                     if _STUCK_PREV[_pk][1] >= 3 and time.monotonic() >= _STUCK_NEXT_AT.get(_pk, 0.0):
                         _STUCK_NEXT_AT[_pk] = time.monotonic() + 300  # 冷却 5 分钟，避免每周期重挂
                         if cur_h:
-                            ok_r, msg_r = _repoint_slave(
-                                cid, {"host": h_host, "port": h_port, "status": "up"},
-                                cur_h, cur_p, creds)
+                            # 必须就地兜异常：这里一旦抛出（如早期 _repoint_slave 返回裸 bool
+                            # 导致解包 TypeError），会中断整个节点循环，使其后的
+                            # ensure_topology 永不执行 —— 表现为「节点装完不自动加入、
+                            # 复制断了也没人自愈」。任何异常都不得逃出本循环。
+                            try:
+                                ok_r, msg_r = _repoint_slave(
+                                    cid, {"host": h_host, "port": h_port, "status": "up"},
+                                    cur_h, cur_p, creds)
+                            except Exception as _rpe:
+                                ok_r, msg_r = False, f"{type(_rpe).__name__}: {_rpe}"
                             if ok_r:
                                 print(f"[monitor] 卡死自愈(重挂载) {h_host}:{h_port}: {msg_r}")
                                 _STUCK_PREV[_pk] = ("", 0)
@@ -960,9 +967,12 @@ def _act_once():
                 io_err = st.get("slave_io_err") or ""
                 if "anonymous transaction" in io_err and cur_h:
                     # (A) 匿名事务 1236：强制重挂载（带 ASSIGN_GTIDS），不治本则永久循环
-                    ok_r, msg_r = _repoint_slave(
-                        cid, {"host": h_host, "port": h_port, "status": "up"},
-                        cur_h, cur_p, creds)
+                    try:
+                        ok_r, msg_r = _repoint_slave(
+                            cid, {"host": h_host, "port": h_port, "status": "up"},
+                            cur_h, cur_p, creds)
+                    except Exception as _rpe:
+                        ok_r, msg_r = False, f"{type(_rpe).__name__}: {_rpe}"
                     if ok_r:
                         print(f"[monitor] 匿名事务1236 自愈(重挂载) {h_host}:{h_port}: {msg_r}")
                         _heal_ok(key)

@@ -76,6 +76,13 @@ services:
       WEB_USER: admin
       WEB_PASS: ""   # 留空=首次启动随机生成并打印到日志；填写=固定密码（生产务必修改）
       SECRET_KEY: "${SECRET_KEY}"   # 留空（不在 .env 设置）则首次启动自动生成随机密钥并持久化到 ./data/secret_key；或在 .env 设置 SECRET_KEY=<强随机值> 固定
+      # 管理库凭证（root/ha/repl/app 口令）静态加密开关：
+      #   "off"（默认）—— 明文落库，**完全不依赖任何密钥**，SECRET_KEY 变动 / 重装 / 重建镜像
+      #                   都不会再导致存量凭证失效（v2.3.10 起默认，推荐）。
+      #   "on"          —— 加密存储。密钥自动持久化在 ./data/cred.key（不随 SECRET_KEY 变化），
+      #                   且解密走「钥匙串」多候选回退（CRED_KEY / cred.key / SECRET_KEY 派生），
+      #                   单一来源失效不会让存量凭证集体解不开。
+      CRED_ENCRYPTION: "off"
       SEMI_SYNC: "1"   # 半同步复制开关：默认 "1" 启用（主库提交等待从库 ACK，压缩切换数据丢失窗口）；需节点插件可用
       CHECK_INTERVAL: 3
       FAIL_THRESHOLD: 2

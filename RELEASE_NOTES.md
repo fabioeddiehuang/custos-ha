@@ -1,6 +1,6 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> 当前版本：**v2.3.9**（镜像标签 `custos-server:v2.3.9`）
+> 当前版本：**v2.3.10**（镜像标签 `custos-server:v2.3.10`）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
 > 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
 
@@ -30,6 +30,7 @@
 | v2.3.7 | 体验 | 待生效自动核验（`verify` 字段，落实后徽标自动消失） |
 | v2.3.8 | 防呆 | 待生效徽标真实性（ack 核验门禁）；凭证解密防覆盖；半同步 SHOW VARIABLES 复核；`/api/heal` 冷却去重；只读 403 提示 |
 | v2.3.9 | 重构 | 节点部署目录结构归整（配置/脚本/agent 分目录）；`custosctl node prepare` 自检；`.env` 去密（SECRET_KEY→`data/secret_key`，WEB_PASS/MGMT_MYSQL_PASS→compose，`.env` 纳入 git） |
+| v2.3.10 | 修复 | 凭证加密改为**默认关闭**（`CRED_ENCRYPTION`，零密钥依赖）；密钥持久化 + 解密钥匙串回退；修 ENC1 密文当复制口令导致复制集体瘫痪（1470）；`_repoint_slave` 返回值契约与假成功；`custosctl node install` 支持容器 MySQL/MariaDB |
 
 ---
 
@@ -80,6 +81,19 @@
   - `.env` 现仅含 `VERSION` + `COMPOSE_PROJECT_NAME` 等非密钥项，已纳入 git 跟踪（仓库不再忽略）。
 - **升级注意（重要）**：从 v2.3.8 及更早升级时，`install.sh` 重跑会自动把旧 `.env` 的 `SECRET_KEY` 迁移到 `data/secret_key`（仅当 `data/secret_key` 不存在），**请勿在旧 `SECRET_KEY` 未迁移前手动删掉它**；否则由它派生的凭据密钥会变化、旧 `ENC1:` 凭据需靠管理库 `secrets` 表自愈（见 v2.3.1）。建议升级步骤：拉取新代码 → `sh install.sh`（自动迁移）→ 重启管理器。
 - 详见 [`doc/releases/v2.3.9.md`](./doc/releases/v2.3.9.md)。
+
+### v2.3.10 · 凭证加密默认关闭 + 复制自愈保底
+
+- **凭证静态加密改为默认关闭（可按需开启）**：新增 `CRED_ENCRYPTION`（默认 `off`）。关闭时凭证明文落库、**完全不依赖任何密钥**，SECRET_KEY 变动 / 重装 / 重建镜像都不再导致存量凭证失效；有合规或高安全需求时置 `on` 启用。
+  - 理由：凭证密钥（`data/cred.key`）与密文（管理库）同机同备份，加密实际只防「仅泄露 dump」一种场景，却引入「密钥一变全集群复制瘫痪且静默失败」的高危失效模式。
+- **凭证密钥三层保底**（启用加密时）：① 主密钥持久化到 `data/cred.key`（0600，不再随 SECRET_KEY 变化，存量升级以当前派生密钥为种子、主密钥不变）；② 解密走**钥匙串**回退（`CRED_KEY` → `cred.key` → `SECRET_KEY` 派生，任一命中即成功）；③ SECRET_KEY 不可用时退化为随机密钥（原实现直接 `raise` 会导致应用起不来）。
+- **反向迁移**：加密关闭时启动自动把仍可解开的 `ENC1:` 还原为明文；解不开的一律跳过、绝不改写。
+- **修复（重大）**：复制口令为 `ENC1` 密文导致复制集体瘫痪 —— `decrypt()` 解密失败会原样返回密文，密文被当口令拼进 `CHANGE REPLICATION SOURCE`，报 `1470 - String 'ENC1:...' is too long for MASTER_PASSWORD (max 96)`。现于 `make_slave_of` 入口拦截未解密的 `ENC1:` 口令并给出可操作结论，**绝不把密文写进复制配置**。
+- **修复**：`_repoint_slave` 返回值契约改为 `(ok, msg)`（原返回裸 bool，monitor 两处按元组解包会抛 `TypeError`，且该调用无 try 保护会中断整个监控循环、使 `ensure_topology` 永不执行）；重试耗尽仍未双 Yes 时返回**真实失败**（原无条件 `return True` 的假成功会掩盖故障、不告警）。
+- **修复**：`custosctl node install` 不支持容器版 MySQL / MariaDB —— 节点包 compose 名为 `docker-compose.yaml` 而检测读 `docker-compose.yml`，导致容器节点被误判为裸机而找不到安装脚本。新增 `_cf()` 统一解析 compose 文件名。
+- **卸载保底：密钥保险库（`/var/lib/custos`）**：`scripts/uninstall.sh` 无论是否 `-f`，都会先把 `data/cred.key` / `data/secret_key` 镜像到**项目目录之外**的 `/var/lib/custos/`（该目录卸载不删除）；`install.sh` 重装时若 `data/` 下缺失会自动取回，应用启动时 `crypto.bootstrap()` 也会从保险库回补，并把它纳入解密钥匙串。效果：**即便整个项目目录被删除后重装，存量凭证仍能解开**；只有删除 `/var/lib/custos` 才会真正失效。
+- **启动自检（主动告警）**：`init_db` 启动时执行 `startup_credential_check()`，若存在解不开的凭证，立即在启动日志打印明细并写入告警中心（`alert_type=cred_key`，按集群聚合、24h 内同内容不重复）。这类故障原本**完全静默** —— 要等复制把密文当口令报 1470 才暴露，现象是「源库不可达」，与密钥毫无关联，排查成本极高。
+- 详见 [`doc/releases/v2.3.10.md`](./doc/releases/v2.3.10.md)。
 
 ---
 

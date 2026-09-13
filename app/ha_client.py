@@ -1340,6 +1340,23 @@ def make_slave_of(host, port, user, password, master_host, master_port,
 
     返回 (ok, msg)。
     """
+    # ---- 凭证解密失败守卫（必须在连库前拦截）----
+    # crypto.decrypt() 在密钥不匹配时会【原样返回密文】（刻意设计：绝不返回空串，
+    # 否则空口令会在下次写库时被永久落库、覆盖真实凭证）。但密文一旦被当明文口令
+    # 拼进 CHANGE MASTER，MySQL/MariaDB 会报：
+    #   1470 - String 'ENC1:...' is too long for MASTER_PASSWORD (should be no longer than 96)
+    # 该报错完全看不出「密钥不匹配」这一真实根因，且会把密文写进复制配置，
+    # 表现为「复制永久起不来、源库不可达」，极难定位。这里显式拦截并给出可操作结论。
+    if isinstance(repl_pass, str) and repl_pass.startswith("ENC1:"):
+        return False, (
+            f"{host}:{port} 复制口令仍是 ENC1 密文（解密失败），已中止 CHANGE MASTER 以避免"
+            f"把密文写进复制配置。根因：凭证密钥与加密时不一致 —— SECRET_KEY / CRED_KEY 变动，"
+            f"或 data/secret_key 丢失被重新生成。处理二选一：① 恢复原 SECRET_KEY 后重启管理器"
+            f"（凭证自动恢复）；② 在「集群设置」重新录入复制口令，使其按当前密钥重新加密。")
+    if isinstance(password, str) and password.startswith("ENC1:"):
+        # 不阻断：ha_monitor 失败时 connect_robust 还能回退 root，贸然中断会扩大故障面。
+        print(f"[cred] 警告：{host}:{port} 的 ha_monitor 口令仍是 ENC1 密文（解密失败），"
+              f"当前连接将回退 root。请检查凭证密钥是否与加密时一致。")
     conn = connect_robust(host, port, user, password, root_user, root_pass)
     if conn is None:
         return False, "无法连接节点(ha_monitor/root均失败)"

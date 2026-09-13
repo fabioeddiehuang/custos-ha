@@ -1788,9 +1788,78 @@ def api_backup_download(cluster_id: int = 0, file: str = "",
 
 @app.get("/api/cred_status")
 def api_cred_status(user=Depends(auth_required)):
-    """凭证加密状态（系统设置「凭证加密」卡片展示用）。"""
+    """凭证加密状态 + 凭证体检（系统设置「凭证加密」卡片展示用）。"""
     from . import crypto as _crypto
-    return JSONResponse(_crypto.cred_status())
+    from .db import credential_health
+    d = _crypto.cred_status()
+    d["enabled"] = _crypto.enabled()      # cred_status() 恒 True，这里给真实开关值
+    d["last_error"] = _crypto.last_error()
+    try:
+        d["health"] = credential_health()
+    except Exception as e:
+        d["health"] = {"total": 0, "broken": 0, "items": [], "error": str(e)}
+    return JSONResponse(d)
+
+
+@app.post("/api/cred_encryption")
+def api_cred_encryption(action: str = Form(...), user=Depends(auth_required)):
+    """凭证加密开关 / 重置密钥（Web「设置 → 凭证加密」）。
+
+    action:
+      - ``disable``   关闭加密：可解的一律还原明文（保底，此后零密钥依赖）
+      - ``enable``    开启加密：明文重新加密入库
+      - ``reset_key`` 重置密钥：先强制全部转明文 → 换新密钥 → 再重新加密
+
+    重要：密钥丢失后**关闭加密无法让已损坏的密文恢复**，只能止血；这类凭证必须在
+    「集群设置 / 节点」重新录入。故每个操作都返回体检结果，由前端明确列出损坏项。
+    """
+    import os as _os
+    from . import crypto as _crypto
+    from .db import (upsert_setting, migrate_encrypt_credentials,
+                     migrate_decrypt_credentials, credential_health)
+
+    action = (action or "").strip().lower()
+    if action not in ("enable", "disable", "reset_key"):
+        return JSONResponse({"ok": False, "msg": "未知操作"}, status_code=400)
+
+    if action == "disable":
+        upsert_setting("CRED_ENCRYPTION", "off")
+        conv = migrate_decrypt_credentials()
+        h = credential_health()
+        return JSONResponse({
+            "ok": True, "health": h,
+            "msg": f"已关闭凭证加密：{conv} 条凭证还原为明文，此后不再依赖任何密钥。"
+                   + (f"但仍有 {h.get('broken', 0)} 条解不开，必须重新录入。"
+                      if h.get("broken") else "")})
+
+    if action == "enable":
+        upsert_setting("CRED_ENCRYPTION", "on")
+        n = migrate_encrypt_credentials()
+        h = credential_health()
+        return JSONResponse({
+            "ok": True, "health": h,
+            "msg": f"已开启凭证加密：{n} 条明文凭证已加密入库。"
+                   + (f"注意仍有 {h.get('broken', 0)} 条此前已损坏、需重新录入。"
+                      if h.get("broken") else "")})
+
+    # reset_key：先把「当前还能解开的」全部转明文保住，再换新密钥重新加密。
+    # 顺序不可颠倒 —— 直接换密钥会让原本可解的凭证变成永久死数据。
+    conv = migrate_decrypt_credentials(force=True)
+    try:
+        p = _crypto._key_path()
+        if _os.path.exists(p):
+            _os.remove(p)
+    except Exception as e:
+        print(f"[api] 删除旧凭证密钥失败(继续): {e}")
+    _crypto._fernet = None                # 清缓存，下次取密钥时按规则重建
+    upsert_setting("CRED_ENCRYPTION", "on")
+    n = migrate_encrypt_credentials()
+    h = credential_health()
+    return JSONResponse({
+        "ok": True, "health": h,
+        "msg": f"已重置凭证密钥：{conv} 条转明文、{n} 条用新密钥重新加密。"
+               + (f"仍有 {h.get('broken', 0)} 条解不开，必须重新录入。"
+                  if h.get("broken") else "")})
 
 
 @app.post("/api/setting_set")

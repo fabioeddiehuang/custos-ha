@@ -11,6 +11,10 @@
 #              需输入 DELETE 二次确认（--yes 可跳过确认，供脚本化使用）
 #   --yes      跳过交互确认
 #
+#   密钥保底  无论是否 -f，凭证密钥（data/cred.key、data/secret_key）都会先镜像到
+#             /var/lib/custos/（项目目录之外，本脚本不删除）；重装时 install.sh 自动取回，
+#             故「删掉整个项目目录后重装」仍能解开存量凭证。需彻底作废请手动删该目录。
+#
 # ⚠ 被管节点（MySQL/MariaDB + keepalived + 业务数据）不在本脚本范围内：
 #    节点上的库是业务库，删除不可逆。需要清理节点请到各节点执行
 #    generated_nodes/<ip>/Uninstall-*.sh（或节点部署目录下的卸载脚本）。
@@ -43,6 +47,24 @@ fi
 
 cd "$CUSTOS_HOME"
 
+# 0) 凭证密钥保底（v2.3.10）：先把密钥镜像到【项目目录之外】的保险库。
+#    否则 -f 删除 data/、或用户直接删掉整个项目目录后，管理库里所有 ENC1 凭证将
+#    永久解不开 —— 表现为复制口令变成密文、CHANGE MASTER 报 1470、复制集体瘫痪，
+#    且没有任何显式告警，极难定位。
+#    保险库位于 /var/lib/custos（不属项目目录），默认卸载与 -f 都**不会**删除它；
+#    重装时 install.sh 会自动取回，从而实现「删掉项目目录重装也能恢复凭证」。
+KEY_VAULT=/var/lib/custos
+PRESERVED_KEYS=""
+mkdir -p "$KEY_VAULT" 2>/dev/null || true
+for k in cred.key secret_key; do
+  if [ -f "$CUSTOS_HOME/data/$k" ]; then
+    if cp -f "$CUSTOS_HOME/data/$k" "$KEY_VAULT/$k" 2>/dev/null; then
+      chmod 600 "$KEY_VAULT/$k" 2>/dev/null || true
+      PRESERVED_KEYS="$PRESERVED_KEYS $k"
+    fi
+  fi
+done
+
 echo "即将卸载 Custos 管理器"
 echo "  项目目录：$CUSTOS_HOME"
 echo "  动作     ：停止并移除容器 + 删除本项目镜像与匿名卷 + 删除 custosctl"
@@ -55,6 +77,9 @@ if [ "$PURGE" = "1" ]; then
   done
 fi
 echo "  不动     ：被管节点上的数据库与 keepalived（请到各节点单独处理）"
+if [ -n "$PRESERVED_KEYS" ]; then
+  echo "  保留     ：凭证密钥$PRESERVED_KEYS 已镜像到 $KEY_VAULT（重装 install.sh 自动取回）"
+fi
 
 if [ "$ASSUME_YES" != "1" ]; then
   printf '确认继续？请输入 yes： '
@@ -97,5 +122,9 @@ if [ "$PURGE" = "1" ]; then
   echo "    数据目录已删除：backups/ data/ generated_nodes/"
 else
   echo "    数据仍在：$CUSTOS_HOME（backups/ data/ generated_nodes/ 未动）"
+fi
+if [ -n "$PRESERVED_KEYS" ]; then
+  echo "    凭证密钥已保留在 $KEY_VAULT（重装时 install.sh 自动恢复；"
+  echo "    如需连同管理库凭证一起彻底作废，请手动删除该目录）"
 fi
 echo "    如需清理被管节点，请到各节点执行对应的 Uninstall 脚本（谨慎：会删业务库）。"
