@@ -6,14 +6,17 @@ echo "[entrypoint] 等待管理 MySQL (${MGMT_MYSQL_HOST}:${MGMT_MYSQL_PORT}) �
 READY=0
 for i in $(seq 1 10); do
   if python - <<'PY'
-import pymysql, os
+import pymysql, os, sys
+host = os.environ.get('MGMT_MYSQL_HOST', '127.0.0.1')
+port = int(os.environ.get('MGMT_MYSQL_PORT', 3306))
+user = os.environ.get('MGMT_MYSQL_USER', 'root')
 try:
-    pymysql.connect(host=os.environ.get('MGMT_MYSQL_HOST','127.0.0.1'),
-                    port=int(os.environ.get('MGMT_MYSQL_PORT',3306)),
-                    user=os.environ.get('MGMT_MYSQL_USER','root'),
-                    password=os.environ.get('MGMT_MYSQL_PASS',''),
+    pymysql.connect(host=host, port=port, user=user,
+                    password=os.environ.get('MGMT_MYSQL_PASS', ''),
                     connect_timeout=3)
-except Exception:
+except Exception as e:
+    # 打印真实错误（2003 连不上 / 1045 鉴权失败 / 1049 库不存在…），避免静默退出无从排障
+    print(f"[entrypoint] 连接管理 MySQL {host}:{port} (user={user}) 失败：{e}", file=sys.stderr)
     raise SystemExit(1)
 PY
   then
@@ -25,7 +28,9 @@ PY
   fi
 done
 if [ "$READY" -ne 1 ]; then
-  echo "[entrypoint] 管理 MySQL 在 10 次重试后仍不可用，退出。请检查 MGMT_MYSQL_* 配置或管理库是否已启动。"
+  echo "[entrypoint] 管理 MySQL (${MGMT_MYSQL_HOST}:${MGMT_MYSQL_PORT}) 在 10 次重试后仍不可用，退出。"
+  echo "[entrypoint] 请检查：① MGMT_MYSQL_HOST 是否为真实管理库主机（独立机，非 127.0.0.1、非集群节点）；"
+  echo "[entrypoint] ② 端口/账号/口令/库名是否正确；③ docker 容器内能否路由到该地址（防火墙是否放行）。"
   exit 1
 fi
 

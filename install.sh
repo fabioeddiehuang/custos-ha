@@ -67,6 +67,49 @@ detect_iface() {
   ip route 2>/dev/null | awk '/^default/{print $5; exit}' || echo "eth0"
 }
 
+# 管理库连通性预检（根治：错误/不可达的 MGMT_MYSQL_HOST 会让管理器启动即连不上管理库、
+# 容器反复重启、Web 与「重新生成配置」等全部不可用，且失败被 docker-entrypoint 静默吞掉。
+# 安装期校验可提前暴露，避免装完才发现服务起不来。
+# 返回 0=通过；非 0=未通过（调用方据此中止安装）。
+check_mgmt() {
+  _h=$1; _p=$2; _u=$3; _pw=$4; _db=$5
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 - "$_h" "$_p" "$_u" "$_pw" "$_db" <<'PY'
+import sys, socket
+h, p, u, pw, db = sys.argv[1:6]
+try:
+    s = socket.create_connection((h, int(p)), timeout=3)
+    s.close()
+except Exception as e:
+    sys.stderr.write(f"TCP 连接失败: {e}\n")
+    sys.exit(2)
+sys.exit(0)
+PY
+    then
+      info "管理库 TCP 可达：$_h:$_p"
+    else
+      echo "错误：管理库 $_h:$_p TCP 不可达（连接失败）。" >&2
+      echo "      请确认：① MGMT_MYSQL_HOST 是真实管理库所在主机（独立机，勿填 127.0.0.1、勿填集群节点 IP）；" >&2
+      echo "      ② 端口正确且防火墙放行；③ 本机/管理容器能路由到该地址。" >&2
+      return 1
+    fi
+  elif [ -n "${BASH_VERSION:-}" ] && (exec 3<>/dev/tcp/"$_h"/"$_p") 2>/dev/null; then
+    exec 3>&- 3<&-
+    info "管理库 TCP 可达：$_h:$_p"
+  else
+    warn "未检测到 python3 且非 bash 环境，跳过管理库 TCP 预检；请手动确认 $_h:$_p 可达后再继续。"
+  fi
+  # 账号鉴权（mysql 客户端存在才校验，失败仅告警不阻断）
+  if command -v mysql >/dev/null 2>&1; then
+    if MYSQL_PWD="$_pw" mysql -h "$_h" -P "$_p" -u "$_u" -e "SELECT 1" "$_db" >/dev/null 2>&1; then
+      info "管理库账号鉴权通过：$_u@$_h"
+    else
+      warn "管理库账号鉴权失败（$_u@$_h），但 TCP 已通；若后续容器反复重启请检查账号/口令/库名。"
+    fi
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 say "1/6 环境检查"
 command -v docker >/dev/null 2>&1 || { echo "错误：未安装 docker。" >&2; exit 1; }
@@ -125,6 +168,12 @@ ask "Web 管理员账号" "$DEF_WEB_USER"; WEB_USER=$REPLY
 #   - 或直接在 compose 的 environment 里填固定密码（生产建议）。
 # 详见 docker-compose-example.yml 的 WEB_PASS 注释。
 info "Web 密码(WEB_PASS)取自 docker-compose.yml：留空则首次启动自动生成并打印到日志，或填写固定密码。"
+
+# 管理库连通性预检（根治：错/不可达的 MGMT_MYSQL_HOST 会让管理器起不来、regen 全挂）
+if ! check_mgmt "$MGMT_HOST" "$MGMT_PORT" "$MGMT_USER" "$MGMT_PASS" "$MGMT_DB"; then
+  echo "管理库预检未通过，已中止安装。请修正 MGMT_MYSQL_HOST/PORT/USER/PASS/DB 后重跑 install.sh。" >&2
+  exit 1
+fi
 
 if [ -n "$VIP" ] && ping -c1 -W1 "$VIP" >/dev/null 2>&1; then
   warn "VIP $VIP 似乎已被占用（ping 通），请确认它未被其它主机使用！"
