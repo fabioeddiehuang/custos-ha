@@ -64,7 +64,8 @@ node_main() {
   flavor=""; data_base=""
   if [ -d mysql8.0/conf ]; then flavor=mysql; data_base=mysql8; fi
   if [ -d mariadb12.3.3/conf ]; then flavor=mariadb; data_base=mariadb12; fi
-  if [ -z "$flavor" ]; then
+  # prepare 允许在管理器目录（无节点包）执行，跳过风味强校验
+  if [ -z "$flavor" ] && [ "$sub" != "prepare" ]; then
     echo "错误：未在 $ndir 识别到节点包（缺少 mysql8.0/conf 或 mariadb12.3.3/conf）。" >&2
     exit 1
   fi
@@ -82,24 +83,109 @@ node_main() {
     cat <<EOF
 用法: $PROG node <命令> [--dir <节点包目录>]
   install                部署节点（docker: docker compose up -d；裸机: 运行 Install 脚本），并建 logs 软链、自装 custosctl
-  start                  启动（docker: up -d；裸机: systemctl start mariadb keepalived）
-  stop                   停止（docker: down；裸机: systemctl stop mariadb keepalived）
-  restart                重启（docker: down && up -d；裸机: systemctl restart）
-  restart-keepalived     重启 keepalived（docker: compose restart keepalived；裸机: systemctl restart keepalived）
+  prepare                节点包自检（校验必备文件 + 软链 logs + 下发 agent；管理器侧还会扫描 generated_nodes 并清理孤立单元，可加 --clean 删除孤立单元）
+  start                  启动（docker: up -d；裸机: systemctl start mariadb-ha + docker compose up -d keepalived/agent）
+  stop                   停止（docker: down；裸机: systemctl stop mariadb-ha + docker compose down）
+  restart                重启（docker: down && up -d；裸机: systemctl restart mariadb-ha + docker compose up -d keepalived/agent）
+  restart-keepalived     重启 keepalived（两种形态均为 docker compose restart keepalived）
   status                 容器/服务状态 + 日志软链信息
   backup [--target <dir>]  本地备份 → <dir>/<flavor>-<ts>.sql.gz（docker: compose exec；裸机: 本地客户端）
   restore <file>         本地恢复（docker: compose exec；裸机: 本地客户端重放）
   uninstall [-f]         卸载（docker: down[ + -f 删数据]；裸机: Uninstall 脚本[ + -f 删安装目录]）
 EOF
   }
+  # 计算日志目录基名：
+  #   容器形态 —— compose 挂载 /data/custos-ha/<base>:/var/lib/(mysql|mariadb) 的反推基名；
+  #   裸机 MariaDB —— my.cnf 的 datadir 基名（默认 mariadb，区别于容器形态的 mariadb12）。
+  _node_data_base() {
+    local b=""
+    b=$(grep -oE '/data/custos-ha/[A-Za-z0-9._-]+:/var/lib/(mysql|mariadb)' docker-compose.yaml 2>/dev/null | head -1 | cut -d: -f1 | xargs basename 2>/dev/null || true)
+    if [ -z "$b" ] && [ "$flavor" = "mariadb" ] && [ -f mariadb12.3.3/conf/my.cnf ]; then
+      b=$(grep -E '^[[:space:]]*datadir[[:space:]]*=' mariadb12.3.3/conf/my.cnf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d ' \t\r\n"'"'"'' | xargs basename 2>/dev/null || true)
+    fi
+    [ -n "$b" ] && { echo "$b"; return; }
+    case "$flavor" in
+      mariadb) echo "mariadb" ;;
+      mysql)   echo "mysql8" ;;
+      *)       echo "$data_base" ;;
+    esac
+  }
+  # 裸机 MariaDB 的 systemd 单元名（Install 脚本注册 mariadb-ha.service，状态文件可复核）
+  _mariadb_unit() {
+    local u="mariadb-ha.service" _u
+    for st in /etc/ha-mysql-node/install-state-*; do
+      [ -f "$st" ] || continue
+      _u=$(grep -E '^SYSTEMD_UNIT=' "$st" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d ' \t\r\n')
+      [ -n "$_u" ] && u=$_u && break
+    done
+    echo "$u"
+  }
   link_logs() {
-    local t="/data/custos-ha/logs/$data_base"
+    local t="/data/custos-ha/logs/$(_node_data_base)"
     mkdir -p "$t" 2>/dev/null || true
     if [ -L logs ]; then rm -f logs
     elif [ -d logs ]; then rmdir logs 2>/dev/null || mv -f logs "logs.$(date +%s).bak"
     fi
     ln -sfn "$t" logs
     echo "已建日志软链：logs -> $t"
+  }
+  # 准备单个节点包：校验必备文件 + 软链 logs +（管理器侧）下发 agent
+  # 返回 0=通过；非 0=存在缺失（供管理器侧汇总）
+  prepare_node_pkg() {
+    local p="$1" flv miss
+    ( cd "$p" || return 1
+      flv=""; [ -d mysql8.0/conf ] && flv=mysql; [ -d mariadb12.3.3/conf ] && flv=mariadb
+      flavor=$flv
+      if [ -z "$flv" ]; then
+        echo "  [FAIL] $p: 未识别节点包（缺 mysql8.0/conf 或 mariadb12.3.3/conf）"; return 1
+      fi
+      echo "  [pkg] $p 风味=$flv"
+      miss=""
+      if [ ! -f docker-compose.yaml ] && [ ! -f docker-compose.yml ]; then miss="$miss docker-compose.yaml"; fi
+      [ -d keepalived ] || miss="$miss keepalived/"
+      [ -d agent ] || miss="$miss agent/"
+      [ -f agent/node_agent.py ] || miss="$miss agent/node_agent.py"
+      if [ "$flv" = "mariadb" ]; then
+        [ -f mariadb12.3.3/conf/my.cnf ]             || miss="$miss mariadb12.3.3/conf/my.cnf"
+        [ -f mariadb12.3.3/conf/init_mariadb.sql ]  || miss="$miss mariadb12.3.3/conf/init_mariadb.sql"
+        [ -f mariadb12.3.3/conf/fix-node-creds.sql ]|| miss="$miss mariadb12.3.3/conf/fix-node-creds.sql"
+        [ -f mariadb12.3.3/scripts/Install-ha-mariadb-Node.sh ]   || miss="$miss mariadb12.3.3/scripts/Install-ha-mariadb-Node.sh"
+        [ -f mariadb12.3.3/scripts/Uninstall-mariadb-Node.sh ]    || miss="$miss mariadb12.3.3/scripts/Uninstall-mariadb-Node.sh"
+      else
+        [ -f mysql8.0/conf/init.sql ]           || miss="$miss mysql8.0/conf/init.sql"
+        [ -f mysql8.0/conf/ha-overrides.cnf ]   || miss="$miss mysql8.0/conf/ha-overrides.cnf"
+      fi
+      if [ -n "$miss" ]; then echo "  [WARN] $p 缺少必备文件:$miss"
+      else echo "  [OK] $p 必备文件齐全"; fi
+      # 软链 logs（目标随形态/数据目录基名自适配）
+      local t="/data/custos-ha/logs/$(_node_data_base)"
+      mkdir -p "$t" 2>/dev/null || true
+      if [ -L logs ]; then rm -f logs
+      elif [ -d logs ]; then rmdir logs 2>/dev/null || mv -f logs "logs.$(date +%s).bak"
+      fi
+      ln -sfn "$t" logs
+      echo "  [link] logs -> $t"
+      # 下发 agent（仅管理器侧：CUSTOS_HOME 可定位且本包缺 agent 时自动补齐）
+      if [ ! -f agent/node_agent.py ] && [ -n "${CUSTOS_HOME:-}" ] && [ -f "$CUSTOS_HOME/scripts/node_agent.py" ]; then
+        mkdir -p agent
+        cp -a "$CUSTOS_HOME/scripts/node_agent.py" agent/node_agent.py
+        echo "  [ship] 已从管理器下发 agent/node_agent.py"
+      elif [ ! -f agent/node_agent.py ]; then
+        echo "  [WARN] $p 缺 agent/node_agent.py（管理器侧可自动下发；节点侧请确认包完整）"
+      fi
+    ) || return 1
+  }
+  # 定位管理器项目目录（供 node prepare 管理器侧扫描 generated_nodes 使用）
+  _custos_home() {
+    [ -n "${CUSTOS_HOME:-}" ] && [ -f "$CUSTOS_HOME/docker-compose.yml" ] && { echo "$CUSTOS_HOME"; return; }
+    [ -f docker-compose.yml ] && { pwd; return; }
+    if [ -r "$CONF" ]; then . "$CONF" 2>/dev/null || true; fi
+    [ -n "${CUSTOS_HOME:-}" ] && [ -f "$CUSTOS_HOME/docker-compose.yml" ] && { echo "$CUSTOS_HOME"; return; }
+    local h
+    for h in /opt/Custos-HA /opt/custos /srv/Custos-HA /usr/local/Custos-HA "$HOME/Custos-HA"; do
+      [ -f "$h/docker-compose.yml" ] && { echo "$h"; return; }
+    done
+    echo ""
   }
   dump_bin() { [ "$flavor" = "mariadb" ] && echo mariadbdump || echo mysqldump; }
   cli_bin()  { [ "$flavor" = "mariadb" ] && echo mariadb || echo mysql; }
@@ -120,7 +206,10 @@ EOF
           echo "请确认在节点包根目录执行；若节点包是旧版，请用最新管理器重新生成（regen）后重试。" >&2
           exit 1
         fi
-        sh "$inst" || { echo "Install 脚本失败：$inst" >&2; exit 1; }
+        # 安装脚本是 bash（含 [[ ]] / set -E / printf '%q' 等），必须用 bash 调；
+        # 否则在 /bin/sh→dash 的系统（Ubuntu/Debian）下 bash 语法会直接报错退出。
+        inst_bin=$(command -v bash 2>/dev/null || echo sh)
+        "$inst_bin" "$inst" || { echo "Install 脚本失败：$inst" >&2; exit 1; }
       fi
       link_logs
       if [ "$(id -u)" = "0" ]; then
@@ -131,26 +220,72 @@ EOF
         echo "提示：非 root，未自装 custosctl；如需请 sudo custosctl node install"
       fi
       ;;
+    prepare)
+      # 节点侧：当前目录就是节点包 → 直接准备本包（校验 + 软链；节点侧无管理器源不补 agent）
+      if [ -d mysql8.0/conf ] || [ -d mariadb12.3.3/conf ]; then
+        echo "==> 节点侧准备：$ndir"
+        prepare_node_pkg "$ndir"; exit $?
+      fi
+      # 管理器侧：定位 CUSTOS_HOME 后扫描 generated_nodes（校验 + 软链 + 下发 agent + 清理孤立单元）
+      _ch=$(_custos_home)
+      if [ -n "$_ch" ] && [ -d "$_ch/generated_nodes" ]; then
+        CUSTOS_HOME="$_ch"
+        echo "==> 管理器侧准备：扫描 $_ch/generated_nodes"
+        rc=0
+        for ipd in "$_ch"/generated_nodes/*; do
+          [ -d "$ipd" ] || continue
+          if [ -d "$ipd/mysql8.0/conf" ] || [ -d "$ipd/mariadb12.3.3/conf" ]; then
+            prepare_node_pkg "$ipd" || rc=1
+          else
+            # 孤立单元：既非 mysql 也非 mariadb 合法包 → 疑似残留，不计入失败码
+            echo "  [ORPHAN?] $ipd 非合法节点包（缺 mysql8.0/conf 与 mariadb12.3.3/conf）"
+            if [ "$1" = "--clean" ]; then rm -rf "$ipd" && echo "  [clean] 已删除孤立单元 $ipd"; fi
+          fi
+        done
+        [ $rc -eq 0 ] && echo "==> 节点包自检全部通过" || echo "==> 节点包自检存在告警（见上）"
+        exit $rc
+      fi
+      echo "错误：node prepare 需在节点包目录内执行，或在管理器上（已配置 CUSTOS_HOME）执行。" >&2
+      exit 1
+      ;;
     start)
-      if [ "$is_docker" = 1 ]; then docker compose up -d
-      else systemctl start mariadb keepalived 2>/dev/null || systemctl start mariadb.service keepalived.service 2>/dev/null || true; fi
+      if [ "$is_docker" = 1 ]; then
+        docker compose up -d
+      else
+        # 裸机：MariaDB 由 systemd(mariadb-ha.service) 管理；keepalived + agent 跑在 docker 容器
+        systemctl start "$(_mariadb_unit)" 2>/dev/null || true
+        docker compose up -d keepalived custos-node-agent 2>/dev/null || true
+      fi
       ;;
     stop)
-      if [ "$is_docker" = 1 ]; then docker compose down
-      else systemctl stop mariadb keepalived 2>/dev/null || true; fi
+      if [ "$is_docker" = 1 ]; then
+        docker compose down
+      else
+        systemctl stop "$(_mariadb_unit)" 2>/dev/null || true
+        docker compose down 2>/dev/null || true
+      fi
       ;;
     restart)
-      if [ "$is_docker" = 1 ]; then docker compose down && docker compose up -d
-      else systemctl restart mariadb keepalived 2>/dev/null || true; fi
+      if [ "$is_docker" = 1 ]; then
+        docker compose down && docker compose up -d
+      else
+        systemctl restart "$(_mariadb_unit)" 2>/dev/null || true
+        docker compose up -d keepalived custos-node-agent 2>/dev/null || true
+      fi
       ;;
     restart-keepalived)
-      if [ "$is_docker" = 1 ]; then docker compose restart keepalived
-      else systemctl restart keepalived 2>/dev/null || systemctl restart keepalived.service 2>/dev/null || true; fi
+      # 两种形态 keepalived 均运行在 docker 容器（裸机形态也用 keepalived-only compose）
+      docker compose restart keepalived 2>/dev/null || true
       ;;
     status)
-      if [ "$is_docker" = 1 ]; then docker compose ps; else systemctl status mariadb keepalived --no-pager 2>/dev/null || true; fi
+      if [ "$is_docker" = 1 ]; then
+        docker compose ps
+      else
+        systemctl status "$(_mariadb_unit)" --no-pager 2>/dev/null || true
+        docker compose ps 2>/dev/null || true
+      fi
       echo "风味      : $flavor"
-      echo "日志软链  : ${ndir%/}/logs -> /data/custos-ha/logs/$data_base"
+      echo "日志软链  : ${ndir%/}/logs -> /data/custos-ha/logs/$(_node_data_base)"
       ;;
     backup)
       target="$ndir"; ts=$(date +%Y%m%d_%H%M%S)
@@ -190,7 +325,9 @@ EOF
         docker compose down
         if [ "$force" = 1 ]; then rm -rf "/data/custos-ha/$data_base"; echo "已删除数据目录 /data/custos-ha/$data_base"; fi
       else
-        sh "$flavor"12.3.3/scripts/Uninstall-mariadb-Node.sh "$@"
+        # 卸载脚本同样是 bash，用 bash 调（与 install 一致）
+        inst_bin=$(command -v bash 2>/dev/null || echo sh)
+        "$inst_bin" "$flavor"12.3.3/scripts/Uninstall-mariadb-Node.sh "$@"
       fi
       ;;
     *) node_usage ;;

@@ -282,6 +282,16 @@ if command -v curl >/dev/null 2>&1; then
   info "Web 探活：HTTP $code"
 fi
 
+# ---------------------------------------------------------------------------
+say "7/6 节点包自检（custosctl node prepare）"
+# 非阻断：仅报告各 generated_nodes 节点包的完整性 / 孤立刻，发现问题不中止安装。
+if command -v custosctl >/dev/null 2>&1; then
+  echo "以下为节点包自检（如有 [WARN]/[ORPHAN?] 可重新生成节点目录，或用 --clean 清理孤立单元）："
+  custosctl node prepare || true
+else
+  warn "未找到 custosctl，跳过节点包自检（可稍后手动执行 custosctl node prepare）"
+fi
+
 say "安装完成"
 info "访问地址：http://$MGR_IP:$WEB_PORT"
 info "管理员账号：$WEB_USER（密码见 docker-compose.yml 的 WEB_PASS：留空则首次启动自动生成并打印到日志，或填写固定密码）"

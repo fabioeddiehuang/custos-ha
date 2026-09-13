@@ -16,7 +16,7 @@ _custosctl_completions() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
   local top_cmds="deploy up rebuild start stop restart down ps tail logs shell status version rebuild-node install uninstall node help"
-  local node_cmds="install start stop restart restart-keepalived status backup restore uninstall"
+  local node_cmds="install prepare start stop restart restart-keepalived status backup restore uninstall"
 
   # 上一个词是目录型选项：补全目录
   case "$prev" in
@@ -49,6 +49,7 @@ _custosctl_completions() {
             backup)   COMPREPLY=( $(compgen -W "--target" -- "$cur") ) ;;
             restore)  COMPREPLY=( $(compgen -f -- "$cur") ) ;;
             uninstall) COMPREPLY=( $(compgen -W "-f" -- "$cur") ) ;;
+            prepare)  COMPREPLY=( $(compgen -W "--clean --dir" -- "$cur") ) ;;
             *)        COMPREPLY=() ;;
           esac
         fi
