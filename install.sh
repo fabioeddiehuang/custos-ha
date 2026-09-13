@@ -83,9 +83,9 @@ CUR_VER=$(grep -E '^VERSION=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '
 [ -n "$CUR_VER" ] || CUR_VER=v2.2.20
 
 COMPOSE_FILE=$CUSTOS_HOME/docker-compose.yml
-cur_val() {  # 从现有 compose 取某个键的值
+cur_val() {  # 从现有 compose 取某个键的值（先去尾随空白再剥引号，兼容重装场景）
   grep -E "^[[:space:]]*$1:" "$COMPOSE_FILE" 2>/dev/null | head -1 \
-    | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//' || true
+    | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//; s/^"//; s/"$//' || true
 }
 
 DEF_MGMT_HOST=$(cur_val MGMT_MYSQL_HOST); [ -n "$DEF_MGMT_HOST" ] || DEF_MGMT_HOST=127.0.0.1
@@ -137,11 +137,13 @@ if [ ! -f "$COMPOSE_FILE" ] && [ -f docker-compose-example.yml ]; then
   info "已由 docker-compose-example.yml 生成 docker-compose.yml"
 fi
 
-# 写回 compose（保留行尾注释）
+# 写回 compose（保留行尾注释；不追加多余空格，否则重装时 cur_val 解析会叠加引号导致 YAML 报错）
 set_yaml() {  # set_yaml KEY VALUE
   _k=$1; _v=$2
   if grep -Eq "^[[:space:]]*$_k:" "$COMPOSE_FILE"; then
-    sed -i -E "s|^([[:space:]]*$_k:)[[:space:]]*[^#]*|\1 \"$_v\" |" "$COMPOSE_FILE"
+    # 转义替换串中的 &（sed 中代表整段匹配），避免值含 & 被错误展开
+    _v_esc=$(printf '%s' "$_v" | sed 's/[&]/\\&/g')
+    sed -i -E "s|^([[:space:]]*$_k:[[:space:]]*)([^#]*[^[:space:]])([[:space:]]*#.*)?\$|\1\"$_v_esc\"\3|" "$COMPOSE_FILE"
   else
     warn "compose 中没有 $_k，已跳过（请手工确认）"
   fi

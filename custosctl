@@ -466,6 +466,10 @@ case "$cmd" in
     ;;
 
   install)
+    # 完整安装（生成 .env / docker-compose.yml、构建并启动）；缺失 install.sh 时退回仅安装 CLI 二进制
+    if [ -f "$CUSTOS_HOME/install.sh" ]; then
+      exec sh "$CUSTOS_HOME/install.sh" -C "$CUSTOS_HOME" "$@"
+    fi
     exec sh "$CUSTOS_HOME/scripts/install-custosctl.sh" "$@"
     ;;
 
