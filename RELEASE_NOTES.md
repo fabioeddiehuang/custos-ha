@@ -1,12 +1,91 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> 当前版本：**v2.2.20**（镜像标签 `custos-server:v2.2.20`，keepalived 镜像 `custos-node:v2.2.20`）
+> 当前版本：**v2.3.9**（镜像标签 `custos-server:v2.3.9`）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
 > 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
 
 ---
 
-## 〇、v2.2.20 半同步复制配置文件持久化 + 部署形态展示统一
+## 版本功能索引（按版本号看「增加了什么」）
+
+| 版本 | 类型 | 本期新增的主要功能 |
+|------|------|-------------------|
+| v2.1.0 | 功能 | 仪表盘主库 gauge / 实时活动 feed / 系统设置（轮询·内网IP）/ 告警「已自愈·未恢复」标记 / 节点自愈 SQL 查看下载 |
+| v2.2.0 | 更名 | 产品更名 Custos；仓库目录 `custos-ha`；镜像/容器 `custos-server` |
+| v2.2.11 | 功能 | 节点形态扩展到三种（新增 Docker MariaDB 12.3.x）；安装脚本缺陷修复；控制台布局修复 |
+| v2.2.13 | 改造 | 容器化 MariaDB 改为纯 compose 部署 |
+| v2.2.15 | 清理 | 容器化 MariaDB 不再含安装脚本（纯 compose） |
+| v2.2.16 | 修复 | 裸机包只适配裸机（移除容器回退脚本） |
+| v2.2.17 | 修复 | 错误日志面板兼容全部部署形态（表优先 + 文件兜底） |
+| v2.2.18 | 功能 | GTID 分叉感知 + 半同步复制基础（运行期 SET GLOBAL） |
+| v2.2.19 | 改进 | GTID 分叉感知改进（续传优先，避免误 RESET MASTER） |
+| v2.2.20 | 功能 | 半同步改配置文件持久化（重启不丢）；部署形态展示统一；版本号移入 `.env`；`install.sh` 一键安装；`custosctl` 命令行；复制卡死 / 1236 purge 自愈 |
+| v2.3.0 | 地基 | MariaDB 版本支持矩阵 + 版本感知；变更生效提示（重启/重建/执行SQL 四级）；半同步命名统一 |
+| v2.3.1 | 安全 | 凭证明文加密（`ENC1:` + Fernet，透明解密，启动自迁移） |
+| v2.3.2 | 改进 | 备份一致性快照（CONSISTENT SNAPSHOT 内读） |
+| v2.3.3 | 功能 | 维护模式（抑制切换/告警，放行关键字） |
+| v2.3.4 | 功能 | 备份分库 + 备份操作日志 |
+| v2.3.5 | 收官 | 2.3.x 收官：版本矩阵 / 凭证加密 / 备份一致性+位点 / 维护模式 / 备份分库 / 日志采集确认 |
+| v2.3.6 | 体验 | 备份恢复性能/进度/日志闭环；MariaDB 错误日志三级读取（agent 兜底）；日志筛选与集群卡片 UI |
+| v2.3.7 | 体验 | 待生效自动核验（`verify` 字段，落实后徽标自动消失） |
+| v2.3.8 | 防呆 | 待生效徽标真实性（ack 核验门禁）；凭证解密防覆盖；半同步 SHOW VARIABLES 复核；`/api/heal` 冷却去重；只读 403 提示 |
+| v2.3.9 | 重构 | 节点部署目录结构归整（配置/脚本/agent 分目录）；`custosctl node prepare` 自检；`.env` 去密（SECRET_KEY→`data/secret_key`，WEB_PASS/MGMT_MYSQL_PASS→compose，`.env` 纳入 git） |
+
+---
+
+## v2.3.x 详细变更
+
+### v2.3.0 · MariaDB 版本准绳与变更生效闭环
+- **MariaDB 版本支持矩阵**（`app/mariadb_matrix.py`）：主线 12.3.3、支持 11.4/11.8/12.x、兼容 10.6/10.11、<10.6 不支持；预检新增「版本准入」项。
+- **版本自动登记**：连库 `SELECT VERSION()` 回写 `nodes.mysql_version`（原常年空/过期）。
+- **变更生效提示（核心）**：regen 时 diff 新旧文件，产出动作清单分四级 `recreate`/`restart`/`exec`/`manual`，每项带可直接复制的命令与「为什么必须这么做」。
+- 节点列表「**配置待生效**」徽标 + 接口 `GET /api/nodes/{ip}/pending`、`POST /nodes/{ip}/ack_deploy`。
+- 授权串收敛为单一来源 + `SHOW PRIVILEGES` 能力探测（不再吞 1064/1227）；半同步插件名统一由 `mariadb_matrix` 提供（MariaDB 全系列 `master/slave`，勿照 MySQL 改）。
+
+### v2.3.1 · 凭证明文加密
+- 新增 `app/crypto.py`（Fernet，`ENC1:` 前缀）：落库即密文、读取透明解密；存量明文在 `init_schema()` 末尾自动迁移。
+- 仅 3 处写入显式 `encrypt()`（create/update_cluster、generate_node）；密钥优先级 `CRED_KEY` > `data/cred.key` > `SECRET_KEY` 派生。
+
+### v2.3.2 · 备份一致性
+- 备份读取统一在同一条 `START TRANSACTION WITH CONSISTENT SNAPSHOT` 内；`_dump_database` 复用 `data_conn`，不再按库自建连接。
+
+### v2.3.3 · 维护模式
+- 抑制 4 处（monitor 主库失联切换、延迟/压力切换、`_alert_on_transition`、`alerts._deliver`）；放行关键字：切换、数据冲突、备份失败、重建。
+
+### v2.3.4 · 备份分库 + 备份操作日志
+- 备份按库分别记录；`run_backup` / 恢复任务埋点写备份操作日志（`_log_event`/`read_backup_log` + `/api/backup/log`）。
+
+### v2.3.5 · 2.3.x 收官
+- 汇总：版本矩阵 / 凭证加密 / 备份一致性+位点 / 维护模式 / 备份分库 / 日志采集确认。版本号推进到 **v2.3.5**。
+
+### v2.3.6 · 备份恢复体验闭环 + MariaDB 日志可读
+- 恢复改为**后台任务** + 进度轮询（进度条/阶段/已用时长，刷新页面自动接管）；MySQL 恢复每 1000 条提交一次（修超长事务极慢）；备份操作日志端点 + 边界匹配 `id=N`。
+- 错误日志**三级读取**：`mysql.error_log` 表 → `LOAD_FILE` → **节点 agent `/logs`**（兜底必留，绕开 0660 权限/`secure_file_priv`）；时间戳按来源区分时区（MySQL=UTC→+08:00；MariaDB=本地）。
+- 日志筛选/集群卡片 UI 修复；审计页字段错配（`actor/action/target/detail`）修复。
+
+### v2.3.7 · 待生效自动核验
+- `deploy_actions` 每动作带 `verify` 字段（`db_uptime`/`proc:<svc>`/`db_alive`/`manual`）；`verify_node_pending` 自动核验落实后移除徽标；旧 JSON 无 `verify` 按 `manual` 保留。
+- 详见 [`doc/releases/v2.3.7.md`](./doc/releases/v2.3.7.md)。
+
+### v2.3.8 · 待生效徽标真实性 + 运维防呆
+- `ack_node_pending` 改**核验门禁**（未落实保留并回 `reason`，`force` 人工兜底）；`decrypt()` 失败**原样返回密文**（防凭证被空口令覆盖）；`list_nodes` 补 `pending_actions`/`pending_since` 列；`ensure_semisync_runtime` 改 `SHOW VARIABLES` 复核真 ON（修半同步假成功）；`/api/heal` 加 15s 冷却 + 按(集群,主机,端口)去重；只读账号 403 提示；首次部署 `verify` 改 `db_alive`。
+- 详见 [`doc/releases/v2.3.8.md`](./doc/releases/v2.3.8.md)。
+
+### v2.3.9 · 节点部署目录结构归整 + 无口令 `.env`
+
+- **节点包目录归整**：节点包配置/SQL 分 `mysql8.0/conf`、`mariadb12.3.3/conf`；脚本分 `<db>/scripts/`；agent 独立 `agent/` 子目录；日志统一软链到 `/data/custos-ha/logs/`；`custosctl node prepare` 自检 + 孤立单元清理；`deploy_actions` 执行命令改归整路径。
+- **`.env` 去密、可入库同步（安全增强）**：`SECRET_KEY`、`WEB_PASS`、`MGMT_MYSQL_PASS` 均不再写入 `.env`：
+  - `SECRET_KEY` → 首次启动持久化到 `data/secret_key`（权限 600，随 `data/` 备份、容器重建不丢；值不变则已有 `ENC1:` 凭据与登录态不受影响）；
+  - `WEB_PASS` / `MGMT_MYSQL_PASS` → 由 `docker-compose.yml` 的 `environment` 驱动（`WEB_PASS` 留空则首次启动随机生成并打印到日志）；
+  - `.env` 现仅含 `VERSION` + `COMPOSE_PROJECT_NAME` 等非密钥项，已纳入 git 跟踪（仓库不再忽略）。
+- **升级注意（重要）**：从 v2.3.8 及更早升级时，`install.sh` 重跑会自动把旧 `.env` 的 `SECRET_KEY` 迁移到 `data/secret_key`（仅当 `data/secret_key` 不存在），**请勿在旧 `SECRET_KEY` 未迁移前手动删掉它**；否则由它派生的凭据密钥会变化、旧 `ENC1:` 凭据需靠管理库 `secrets` 表自愈（见 v2.3.1）。建议升级步骤：拉取新代码 → `sh install.sh`（自动迁移）→ 重启管理器。
+- 详见 [`doc/releases/v2.3.9.md`](./doc/releases/v2.3.9.md)。
+
+---
+
+## 历史版本（v2.2.x 及更早）
+
+## v2.2.20 半同步复制配置文件持久化 + 部署形态展示统一
 
 - **半同步复制改为「配置文件持久化」方式**（v2.2.18/19 为运行期 `SET GLOBAL` 启用）：
   - 节点生成时，按数据库类型注入对应半同步片段到 `my.cnf` / `ha-overrides.cnf`：
@@ -110,7 +189,7 @@
   - 前端按 `rows` 渲染时间/级别/消息，并标注来源（表/文件）。
 - **生效**：重建管理器（`./scripts/deploy.sh`）；MySQL8 docker 节点需重新生成并部署以获取表错误日志配置。
 
-## 〇、v2.2.16 裸机包只适配裸机（移除容器回退脚本）
+## v2.2.16 裸机包只适配裸机（移除容器回退脚本）
 
 - **问题**：裸机（`mariadb`）节点生成目录曾一并交付 `Install-mariadb-docker-Node.sh`，供 glibc 过低装不上 tarball 时改跑容器。该脚本把**裸机完整 `my.cnf`**（仅剔除 `datadir`/`socket`/`pid_file`）喂给官方镜像容器，残留裸机专属参数 —— 典型如**缺失 `log_error`**（官方镜像默认写 stdout、`@@log_error` 为空，导致管理器「错误日志」面板恒为空）与 `innodb_buffer_pool_size=1G`，致使容器 MariaDB 与裸机主从不能正确适配；且部署机制分裂为「`docker run --network host` + keepalived-only compose」，与 `mariadb-docker` 的纯 compose 形成两条并存路径，必然再次漂移。
 - **另一后果**：节点库里 `node_type=mariadb` 而实际运行容器，导致 UI 徽标显示「MariaDB 裸机」、卸载脚本与数据目录指引与真实形态全部不符。
@@ -126,7 +205,7 @@
 
 ---
 
-## 〇之一、v2.2.13 容器化 MariaDB 部署方式改造（纯 compose）
+## v2.2.13 容器化 MariaDB 部署方式改造（纯 compose）
 
 > 部署方式重大变更：容器化 MariaDB 节点（`node_type=mariadb-docker`）从「安装脚本 + host 网络单独拉起容器」改为与容器化 MySQL 8.0 一致的**纯 compose** 部署；安装脚本仅保留给「裸机 + 容器混部」场景。
 
@@ -144,7 +223,7 @@
 
 ---
 
-## 〇、v2.2.0 项目更名（Custos）
+## v2.2.0 项目更名（Custos）
 
 - **产品正式更名为 Custos**（拉丁语「守护者」），tagline：**Never let your database down**。
 - 镜像 / 容器 / Dockerfile 同步更名：
@@ -157,7 +236,7 @@
 
 ---
 
-## 〇之二、v2.2.1 仓库目录改名（custos-ha）
+## v2.2.1 仓库目录改名（custos-ha）
 
 - **仓库根目录 `mysql-ha-manager/` → `custos-ha/`**，产品名、镜像名、容器名、目录名四者统一。
 - `NODES_HOST_BASE` 默认值 `custos/generated_nodes` → `custos-ha/generated_nodes`
@@ -172,7 +251,7 @@
 
 ---
 
-## 〇之三、v2.2.2 全站深色主题（对齐登录页）+ 首页全屏 + 空闲零写入
+## v2.2.2 全站深色主题（对齐登录页）+ 首页全屏 + 空闲零写入
 
 ### UI / 品牌
 
@@ -257,7 +336,7 @@
 
 ---
 
-## 〇之四、v2.2.11 节点形态扩展 + 安装/控制台缺陷修复
+## v2.2.11 节点形态扩展 + 安装/控制台缺陷修复
 
 ### 节点部署形态扩展（三种）
 

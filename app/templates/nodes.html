@@ -496,10 +496,38 @@
     }
     return h;
   }
-  function ackDeploy(ip){
-    fetch("/nodes/"+encodeURIComponent(ip)+"/ack_deploy",{method:"POST"})
+  // v2.3.8：不再「点一下徽标就没了」。若仍有动作经远程核验确认未生效，
+  // 如实列出原因并保留待办，同时提供「仍然清除」作为人工兜底。
+  function ackDeploy(ip, force){
+    var url = "/nodes/"+encodeURIComponent(ip)+"/ack_deploy"+(force?"?force=1":"");
+    fetch(url,{method:"POST"})
       .then(function(r){return r.json();})
-      .then(function(d){toast(d.msg||(d.ok?"已清除":"操作失败"), d.ok?"ok":"err"); if(d.ok)setTimeout(function(){location.reload();},800);})
+      .then(function(d){
+        if(d.ok && d.kept && d.kept.length){
+          var box = document.getElementById("regenBody");
+          if(box){
+            var rows = d.kept.map(function(k){
+              return '<li style="margin-bottom:6px"><b>'+esc(k.title||'')+'</b> —— '
+                     + esc(k.reason||'核验未通过')+'</li>';
+            }).join('');
+            box.innerHTML = '<div style="background:rgba(225,29,116,.12);border:1px solid #E11D74;'
+              + 'color:#fecdd3;border-radius:8px;padding:12px">'
+              + '⚠ 以下动作经远程核验确认<b>尚未在节点生效</b>，已为你保留（不再假装完成）：'
+              + '<ul style="margin:8px 0 0 18px">'+rows+'</ul>'
+              + '<div style="margin-top:10px;font-size:12px">已清除 '
+              + ((d.cleared||[]).length) + ' 项无需远程核验的动作。</div>'
+              + '<div style="margin-top:12px"><button class="btn btn-sm btn-primary" '
+              + 'onclick="ackDeploy(\''+ip+'\', true)">我确认已在节点生效，仍然清除</button></div>'
+              + '</div>';
+            document.getElementById("regenModal").classList.add("show");
+            refreshPendingBadges();
+            return;
+          }
+          toast(d.msg||"仍有动作未生效","err"); return;
+        }
+        toast(d.msg||d.detail||(d.ok?"已清除":"操作失败"), d.ok?"ok":"err");
+        if(d.ok)setTimeout(function(){location.reload();},800);
+      })
       .catch(function(e){toast("请求失败: "+e,"err");});
   }
   function showPending(ip){
@@ -552,7 +580,7 @@
       .then(function(d){
         btn.disabled=false;btn.textContent=old;
         var body=document.getElementById("regenBody");
-        if(!d.ok){body.innerHTML='<div class="banner err">⚠ <div>'+esc(d.msg||"生成失败")+'</div></div>';}
+        if(!d.ok){body.innerHTML='<div class="banner err">⚠ <div>'+esc(d.msg||d.detail||"生成失败")+'</div></div>';}
         else{
           var md5html='<ul class="md5-list">';
           (d.md5s||[]).forEach(function(x){md5html+='<li><span class="f">'+esc(x.file)+'</span><span class="m">'+esc(x.md5)+'</span></li>';});

@@ -31,6 +31,162 @@ if [ $# -gt 0 ]; then
   esac
 fi
 
+# ===========================================================================
+# 节点控制分支（custosctl node <cmd>）：控制【数据库节点】，与管理器互不干扰
+#   节点包结构（见节点部署改造）：docker-compose.yaml / keepalived/ /
+#     <db>/conf/ / <db>/scripts/ / agent/ / logs(软链)
+#   docker 节点：DB 在容器；裸机节点：DB 由 systemd(mariadb.service) 管理，
+#   包内 compose 仅含 keepalived + custos-node-agent 容器。
+# ===========================================================================
+node_main() {
+  local ndir sub data_base flavor is_docker db_svc dump_args sock_path target out ts f force tmp
+  ndir=$(pwd)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) ndir=$2; shift 2 || true ;;
+      *) break ;;
+    esac
+  done
+  sub=${1:-}; [ $# -gt 0 ] && shift || true
+
+  if [ ! -d "$ndir" ]; then
+    echo "错误：节点包目录不存在：$ndir" >&2; exit 1
+  fi
+  cd "$ndir" || exit 1
+
+  # 风味检测：mysql8.0/conf → mysql；mariadb12.3.3/conf → mariadb
+  flavor=""; data_base=""
+  if [ -d mysql8.0/conf ]; then flavor=mysql; data_base=mysql8; fi
+  if [ -d mariadb12.3.3/conf ]; then flavor=mariadb; data_base=mariadb12; fi
+  if [ -z "$flavor" ]; then
+    echo "错误：未在 $ndir 识别到节点包（缺少 mysql8.0/conf 或 mariadb12.3.3/conf）。" >&2
+    exit 1
+  fi
+  # 以 compose 中真实数据目录基名覆盖默认（兼容自定义数据目录）
+  dd=$(grep -oE '/data/custos-ha/[A-Za-z0-9._-]+:/var/lib/(mysql|mariadb)' docker-compose.yml 2>/dev/null | head -1 | cut -d: -f1 | xargs basename 2>/dev/null || true)
+  [ -n "$dd" ] && data_base=$dd
+  # docker 节点判定：compose 顶层含 mysql/mariadb 服务
+  is_docker=0
+  if grep -qE '^[[:space:]]*(mysql|mariadb):[[:space:]]*$' docker-compose.yml 2>/dev/null; then is_docker=1; fi
+  db_svc=$( [ "$flavor" = "mariadb" ] && echo mariadb || echo mysql )
+  dump_args="--single-transaction --routines --events --all-databases"
+  sock_path="/data/custos-ha/$data_base/mysql.sock"
+
+  node_usage() {
+    cat <<EOF
+用法: $PROG node <命令> [--dir <节点包目录>]
+  install                部署节点（docker: docker compose up -d；裸机: 运行 Install 脚本），并建 logs 软链、自装 custosctl
+  start                  启动（docker: up -d；裸机: systemctl start mariadb keepalived）
+  stop                   停止（docker: down；裸机: systemctl stop mariadb keepalived）
+  restart                重启（docker: down && up -d；裸机: systemctl restart）
+  restart-keepalived     重启 keepalived（docker: compose restart keepalived；裸机: systemctl restart keepalived）
+  status                 容器/服务状态 + 日志软链信息
+  backup [--target <dir>]  本地备份 → <dir>/<flavor>-<ts>.sql.gz（docker: compose exec；裸机: 本地客户端）
+  restore <file>         本地恢复（docker: compose exec；裸机: 本地客户端重放）
+  uninstall [-f]         卸载（docker: down[ + -f 删数据]；裸机: Uninstall 脚本[ + -f 删安装目录]）
+EOF
+  }
+  link_logs() {
+    local t="/data/custos-ha/logs/$data_base"
+    mkdir -p "$t" 2>/dev/null || true
+    if [ -L logs ]; then rm -f logs
+    elif [ -d logs ]; then rmdir logs 2>/dev/null || mv -f logs "logs.$(date +%s).bak"
+    fi
+    ln -sfn "$t" logs
+    echo "已建日志软链：logs -> $t"
+  }
+  dump_bin() { [ "$flavor" = "mariadb" ] && echo mariadbdump || echo mysqldump; }
+  cli_bin()  { [ "$flavor" = "mariadb" ] && echo mariadb || echo mysql; }
+
+  case "$sub" in
+    install)
+      if [ "$is_docker" = 1 ]; then
+        docker compose up -d || { echo "docker compose up -d 失败" >&2; exit 1; }
+      else
+        sh "$flavor"12.3.3/scripts/Install-ha-mariadb-Node.sh || { echo "Install 脚本失败" >&2; exit 1; }
+      fi
+      link_logs
+      if [ "$(id -u)" = "0" ]; then
+        install -m 0755 "$(command -v custosctl 2>/dev/null || echo "$0")" /usr/bin/custosctl 2>/dev/null \
+          || install -m 0755 "$0" /usr/bin/custosctl 2>/dev/null || true
+        echo "已自装 custosctl 到 /usr/bin/custosctl"
+      else
+        echo "提示：非 root，未自装 custosctl；如需请 sudo custosctl node install"
+      fi
+      ;;
+    start)
+      if [ "$is_docker" = 1 ]; then docker compose up -d
+      else systemctl start mariadb keepalived 2>/dev/null || systemctl start mariadb.service keepalived.service 2>/dev/null || true; fi
+      ;;
+    stop)
+      if [ "$is_docker" = 1 ]; then docker compose down
+      else systemctl stop mariadb keepalived 2>/dev/null || true; fi
+      ;;
+    restart)
+      if [ "$is_docker" = 1 ]; then docker compose down && docker compose up -d
+      else systemctl restart mariadb keepalived 2>/dev/null || true; fi
+      ;;
+    restart-keepalived)
+      if [ "$is_docker" = 1 ]; then docker compose restart keepalived
+      else systemctl restart keepalived 2>/dev/null || systemctl restart keepalived.service 2>/dev/null || true; fi
+      ;;
+    status)
+      if [ "$is_docker" = 1 ]; then docker compose ps; else systemctl status mariadb keepalived --no-pager 2>/dev/null || true; fi
+      echo "风味      : $flavor"
+      echo "日志软链  : ${ndir%/}/logs -> /data/custos-ha/logs/$data_base"
+      ;;
+    backup)
+      target="$ndir"; ts=$(date +%Y%m%d_%H%M%S)
+      while [ $# -gt 0 ]; do case "$1" in --target) target=$2; shift 2 || true ;; *) break ;; esac; done
+      mkdir -p "$target"
+      out="$target/$flavor-$ts.sql.gz"
+      echo "==> 备份到 $out"
+      if [ "$is_docker" = 1 ]; then
+        docker compose exec -T "$db_svc" "$(dump_bin)" $dump_args | gzip > "$out"
+      else
+        tmp=$(mktemp)
+        if "$(dump_bin)" --socket="$sock_path" $dump_args > "$tmp" 2>"$tmp.err"; then
+          gzip -c "$tmp" > "$out"
+        elif [ -x "/opt/$flavor/bin/$(dump_bin)" ] && "/opt/$flavor/bin/$(dump_bin)" --socket="$sock_path" $dump_args > "$tmp" 2>"$tmp.err"; then
+          gzip -c "$tmp" > "$out"
+        else
+          echo "裸机备份失败：$(cat "$tmp.err" 2>/dev/null)" >&2; rm -f "$tmp" "$tmp.err"; exit 1
+        fi
+        rm -f "$tmp" "$tmp.err"
+      fi
+      ls -lh "$out"
+      ;;
+    restore)
+      f=${1:-}
+      if [ -z "$f" ] || [ ! -f "$f" ]; then echo "用法：custosctl node restore <file.sql[.gz]>" >&2; exit 1; fi
+      echo "==> 从 $f 恢复"
+      if [ "$is_docker" = 1 ]; then
+        if [ "${f%.gz}" != "$f" ]; then gunzip -c "$f" | docker compose exec -T "$db_svc" "$(cli_bin)"; else cat "$f" | docker compose exec -T "$db_svc" "$(cli_bin)"; fi
+      else
+        if [ "${f%.gz}" != "$f" ]; then gunzip -c "$f" | "$(cli_bin)" --socket="$sock_path"; else cat "$f" | "$(cli_bin)" --socket="$sock_path"; fi
+      fi
+      ;;
+    uninstall)
+      force=0
+      for a in "$@"; do [ "$a" = "-f" ] && force=1; done
+      if [ "$is_docker" = 1 ]; then
+        docker compose down
+        if [ "$force" = 1 ]; then rm -rf "/data/custos-ha/$data_base"; echo "已删除数据目录 /data/custos-ha/$data_base"; fi
+      else
+        sh "$flavor"12.3.3/scripts/Uninstall-mariadb-Node.sh "$@"
+      fi
+      ;;
+    *) node_usage ;;
+  esac
+}
+
+# ---- 节点控制优先分发（不触发管理器目录发现）----
+if [ "${1:-}" = "node" ]; then
+  shift
+  node_main "$@"
+  exit $?
+fi
+
 # ---- 1. 定位项目目录 ----
 # 每个人安装路径都不同，故不猜固定路径，按「可靠性降序」多级发现：
 #   ① 命令行 -C / ② 环境变量 CUSTOS_HOME / ③ /etc/custos/custosctl.env（安装时写入）

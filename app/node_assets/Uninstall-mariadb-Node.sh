@@ -20,7 +20,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+NODE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"   # 节点包根（docker-compose.yaml 所在）
 
 FORCE_DEL_DIR=0
 ASSUME_YES=0
@@ -154,8 +154,8 @@ fi
 # ---------- 2) 停止 keepalived 客户端容器 ----------
 # 注意：仅 docker compose down 停止容器，【不删除】本目录的安装脚本/docker-compose.yaml，
 # 否则后续在同目录重装会因脚本/compose 已被删而 keepalived 起不来。
-if command -v docker >/dev/null 2>&1 && [[ -f docker-compose.yaml || -f docker-compose.yml ]]; then
-  ( cd "$SCRIPT_DIR" && docker compose down ) >/dev/null 2>&1 || warn "keepalived 容器停止失败，请手动 docker compose down"
+if command -v docker >/dev/null 2>&1 && [[ -f "$NODE_ROOT/docker-compose.yaml" || -f "$NODE_ROOT/docker-compose.yml" ]]; then
+  ( cd "$NODE_ROOT" && docker compose down ) >/dev/null 2>&1 || warn "keepalived 容器停止失败，请手动 docker compose down"
   log "已停止 keepalived 客户端容器（保留本目录安装脚本/compose，便于重装）"
 fi
 

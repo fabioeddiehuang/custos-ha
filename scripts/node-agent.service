@@ -6,7 +6,8 @@ After=network.target
 Type=simple
 # 把下面路径改为你存放 node_agent.py 的位置；建议在每台 MySQL 节点宿主机上各部署一份。
 WorkingDirectory=/opt/custos-ha/scripts
-ExecStart=/usr/bin/python3 /opt/custos-ha/scripts/node_agent.py --port 28889 --bind 0.0.0.0
+# 日志落盘到统一日志目录（安装脚本会按实际数据目录基名替换为正确路径，默认 mariadb）
+ExecStart=/usr/bin/python3 /opt/custos-ha/scripts/node_agent.py --port 28889 --bind 0.0.0.0 --log /data/custos-ha/logs/mariadb/node_agent.log
 # 可选：开启令牌校验（与管理器 NODE_AGENT_TOKEN 一致）
 #Environment=NODE_AGENT_TOKEN=your-shared-secret
 # 可选：额外汇报的挂载点
@@ -14,6 +15,9 @@ ExecStart=/usr/bin/python3 /opt/custos-ha/scripts/node_agent.py --port 28889 --b
 Restart=always
 RestartSec=3
 User=root
+# 同时把 stdout/stderr 追加到同一日志文件，便于 journalctl 之外直接查看
+StandardOutput=append:/data/custos-ha/logs/mariadb/node_agent.log
+StandardError=append:/data/custos-ha/logs/mariadb/node_agent.log
 
 [Install]
 WantedBy=multi-user.target

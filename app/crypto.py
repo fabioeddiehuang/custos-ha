@@ -147,9 +147,15 @@ def encrypt(plain):
 def decrypt(value):
     """解密；非密文（明文/空）原样返回，用于兼容迁移期与外部直连写入。
 
-    解密失败（密钥错误或密文损坏）时返回**空串**并记录告警：
-    返回密文会让上层拿着 `ENC1:...` 去连数据库，报错信息更难懂；
-    返回空串则表现为「密码不对」，配合日志里的明确告警可快速定位为密钥问题。
+    解密失败（密钥错误或密文损坏）时【原样返回密文】并记录告警。
+
+    为什么绝不能返回空串：空串会被上层当成合法明文，在下一次写库时经
+    ``encrypt("")`` 原样落库（encrypt 对空串/None 直接返回），从而把真实凭证
+    **永久覆盖为空口令**；更糟的是 generate_node 会把空口令渲染进
+    ``fix-node-creds.sql`` / ``ha_check.conf`` 下发到目标机，
+    表现为「修一次坏一次、越修越坏」且原始密码不可恢复。
+    返回密文则凭证不丢：故障表现为「密码不对」，配合日志与设置页的
+    ``crypto.last_error()`` 可立即定位为密钥问题，换回正确 SECRET_KEY 即自愈。
     """
     if value is None or value == "":
         return value
@@ -162,13 +168,14 @@ def decrypt(value):
     except (InvalidToken, ValueError, TypeError) as e:
         _last_error = "解密失败（密钥不匹配或密文损坏）：%s" % e
         _log.error("[crypto] %s —— 请确认 SECRET_KEY（或 CRED_KEY）是否与加密时一致；"
-                   "凭证密钥由 SECRET_KEY 派生，SECRET_KEY 变动需重新录入节点/集群凭证。",
+                   "凭证密钥由 SECRET_KEY 派生，SECRET_KEY 变动需重新录入节点/集群凭证。"
+                   "【已原样返回密文，凭证未被清空】",
                    _last_error)
-        return ""
+        return value
     except Exception as e:
         _last_error = "解密异常：%s" % e
-        _log.error("[crypto] %s", _last_error)
-        return ""
+        _log.error("[crypto] %s【已原样返回密文，凭证未被清空】", _last_error)
+        return value
 
 
 def last_error():

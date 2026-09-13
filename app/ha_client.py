@@ -2037,11 +2037,16 @@ def ensure_semisync_runtime(host, port, ha_user, ha_pass, root_user=None,
         if _on(_v("rpl_semi_sync_source_enabled", "rpl_semi_sync_master_enabled")) \
                 and _on(_v("rpl_semi_sync_replica_enabled", "rpl_semi_sync_slave_enabled")):
             return False, "already-on"
-        for var in ("rpl_semi_sync_source_enabled", "rpl_semi_sync_replica_enabled"):
+        # 两套命名都试：MySQL 8.0.26+ 用 source/replica，MariaDB（含 11.4 及以下）只有
+        # master/slave（source/replica 在 11.5+ 才是别名）。此前只 SET source/replica，
+        # 在 MariaDB 上必然失败却被 except: pass 吞掉 → 每轮都报「已开启半同步」的假成功。
+        failed = []
+        for var in ("rpl_semi_sync_source_enabled", "rpl_semi_sync_replica_enabled",
+                    "rpl_semi_sync_master_enabled", "rpl_semi_sync_slave_enabled"):
             try:
                 cur.execute("SET GLOBAL %s=1" % var)
-            except Exception:
-                pass
+            except Exception as e:
+                failed.append("%s(%s)" % (var, (str(e) or "").strip()[:60]))
         # 副本：改完开关需重启 IO 线程才会真正以半同步方式重连主库
         restarted = False
         try:
@@ -2060,6 +2065,24 @@ def ensure_semisync_runtime(host, port, ha_user, ha_pass, root_user=None,
             conn.commit()
         except Exception:
             pass
+
+        # 复核：只有变量真的变成 ON 才算成功。此前无论 SET 是否成功都 return True，
+        # 1227 权限不足/变量不存在被吞掉，导致 monitor 每 60s 记一次「自愈成功」，
+        # 自愈统计一片大好、半同步却从未真正开启。
+        try:
+            cur.execute("SHOW VARIABLES LIKE 'rpl_semi_sync%_enabled'")
+            now = {r[0]: r[1] for r in (cur.fetchall() or [])}
+        except Exception:
+            now = {}
+
+        def _now(new, old):
+            return now.get(new, now.get(old))
+
+        src_on = _on(_now("rpl_semi_sync_source_enabled", "rpl_semi_sync_master_enabled"))
+        rep_on = _on(_now("rpl_semi_sync_replica_enabled", "rpl_semi_sync_slave_enabled"))
+        if not (src_on and rep_on):
+            why = "；".join(failed) or "SET GLOBAL 未生效（多为 1227 权限不足，需 SUPER/SYSTEM_VARIABLES_ADMIN）"
+            return False, "半同步开启失败（复核仍未 ON）：%s" % why
         return True, "已开启半同步" + ("并重启复制 IO 线程" if restarted else "")
     except Exception as e:
         return False, "异常: %s" % e

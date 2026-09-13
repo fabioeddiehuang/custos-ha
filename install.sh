@@ -9,7 +9,7 @@
 # 做了什么
 #   1) 检查 docker / docker compose
 #   2) 交互式收集部署参数（管理库、管理器对外 IP、VIP、网卡、Web 账号端口…）
-#   3) 生成 .env（SECRET_KEY / WEB_PASS 自动生成强随机值，不再用 admin）
+#   3) 生成 .env（仅 VERSION / COMPOSE_PROJECT_NAME / WEB_USER 等非密钥项；SECRET_KEY、WEB_PASS、MGMT_MYSQL_PASS 均不写入 .env：口令类改由 docker-compose.yml 驱动）
 #   4) 把上述参数写回 docker-compose.yml（免手工编辑）
 #   5) root 时自动把 custosctl 安装到 /usr/bin
 #   6) 构建并启动，最后自检并打印访问地址与账号
@@ -120,16 +120,11 @@ ask "VRID（同网段多集群需不同）" "$DEF_VRID"; VRID=$REPLY
 ask "Web 端口" "$DEF_WEB_PORT"; WEB_PORT=$REPLY
 ask "Web 管理员账号" "$DEF_WEB_USER"; WEB_USER=$REPLY
 
-if [ "$ASSUME_YES" = "1" ]; then
-  WEB_PASS=$(rand_secret); SECRET_KEY=$(rand_secret)
-  info "Web 密码与 SECRET_KEY 已随机生成"
-else
-  printf '  Web 管理员密码（留空=随机生成，明文输入）: '
-  read -r WEB_PASS || true
-  printf '\n'
-  [ -n "$WEB_PASS" ] || { WEB_PASS=$(rand_secret); info "已生成随机 Web 密码"; }
-fi
-SECRET_KEY=$(rand_secret)
+# WEB_PASS 改由 docker-compose.yml 驱动，install.sh 不再生成/写入 .env：
+#   - compose 中 WEB_PASS 留空 → 首次启动随机生成并持久化到管理库、打印到日志；
+#   - 或直接在 compose 的 environment 里填固定密码（生产建议）。
+# 详见 docker-compose-example.yml 的 WEB_PASS 注释。
+info "Web 密码(WEB_PASS)取自 docker-compose.yml：留空则首次启动自动生成并打印到日志，或填写固定密码。"
 
 if [ -n "$VIP" ] && ping -c1 -W1 "$VIP" >/dev/null 2>&1; then
   warn "VIP $VIP 似乎已被占用（ping 通），请确认它未被其它主机使用！"
@@ -162,7 +157,6 @@ set_yaml VIP_PREFIX "$VIP_PREFIX"
 set_yaml VRID "$VRID"
 set_yaml WEB_PORT "$WEB_PORT"
 set_yaml WEB_USER "$WEB_USER"
-set_yaml WEB_PASS "$WEB_PASS"
 # 半同步复制默认开启（主库提交等待从库 ACK，压缩切换数据丢失窗口）
 set_yaml SEMI_SYNC "1"
 # VIP 可选：留空则不在 compose 写入，稍后可在后台「服务端配置」填写
@@ -179,24 +173,33 @@ else
   info "VIP 留空，未写入 compose；可稍后在后台「服务端配置」中填写"
 fi
 
+# SECRET_KEY 升级迁移：v2.3.8 及更早的 .env 含 SECRET_KEY。重跑 install.sh 会重新
+# 生成 .env（不再含 SECRET_KEY），为避免会话签名密钥丢失、进而由它派生的 ENC1: 凭据
+# 解不开，这里把旧 .env 的 SECRET_KEY 落到 data/secret_key（仅当该文件尚不存在，绝不覆盖）。
+# 全新部署（旧 .env 无 SECRET_KEY，或 data/secret_key 已存在）则跳过，由应用首次启动生成。
+OLD_SECRET_KEY=$(grep -E '^SECRET_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' \t\r\n') || true
+if [ -n "$OLD_SECRET_KEY" ] && [ ! -f data/secret_key ]; then
+  mkdir -p data
+  printf '%s' "$OLD_SECRET_KEY" > data/secret_key
+  chmod 600 data/secret_key
+  info "已将旧 .env 的 SECRET_KEY 迁移持久化到 data/secret_key（凭据密钥保持不变，升级无感）"
+fi
+
 umask 077
 cat > .env <<EOF
-# Custos 运行配置（由 install.sh 生成；含敏感值，请勿入库）
+# Custos 运行配置（由 install.sh 生成；SECRET_KEY、WEB_PASS、MGMT_MYSQL_PASS 均不写入本文件：SECRET_KEY 由 data/secret_key 持久化，WEB_PASS 与 MGMT_MYSQL_PASS 由 docker-compose.yml 驱动）
 VERSION=$CUR_VER
 COMPOSE_PROJECT_NAME=custos
-SECRET_KEY=$SECRET_KEY
 
 # 管理库（仅管理器自身存储，非集群节点）
 MGMT_MYSQL_HOST=$MGMT_HOST
 MGMT_MYSQL_PORT=$MGMT_PORT
 MGMT_MYSQL_USER=$MGMT_USER
-MGMT_MYSQL_PASS=$MGMT_PASS
 MGMT_MYSQL_DB=$MGMT_DB
 
 # Web / 网络
 WEB_PORT=$WEB_PORT
 WEB_USER=$WEB_USER
-WEB_PASS=$WEB_PASS
 MANAGER_PUBLIC_IP=$MGR_IP
 INTERFACE=$IFACE
 VIP=$VIP
@@ -230,6 +233,6 @@ fi
 
 say "安装完成"
 info "访问地址：http://$MGR_IP:$WEB_PORT"
-info "管理员  ：$WEB_USER / $WEB_PASS"
+info "管理员账号：$WEB_USER（密码见 docker-compose.yml 的 WEB_PASS：留空则首次启动自动生成并打印到日志，或填写固定密码）"
 info "后续常用：custosctl status | custosctl tail | custosctl rebuild | custosctl uninstall"
 info "提示：请确认管理库 $MGMT_HOST:$MGMT_PORT 已创建库 $MGMT_DB 且账号可写；否则容器会反复重启（custosctl tail 可见）。"

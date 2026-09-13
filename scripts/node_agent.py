@@ -22,6 +22,7 @@
 import argparse
 import glob
 import json
+import logging
 import os
 import socket
 import threading
@@ -439,17 +440,35 @@ def main():
                     help="逗号分隔的额外挂载点，如 /data,/backup")
     ap.add_argument("--root", default="/",
                     help="要统计磁盘占用的根挂载点。裸机默认 /；容器部署时配合 -v /:/host:ro 传 --root /host")
+    ap.add_argument("--log", default=os.environ.get("NODE_AGENT_LOG", ""),
+                    help="日志文件路径（如 /var/log/custos-ha/node_agent.log）；不指定则仅 stdout")
     args = ap.parse_args()
+
+    log = None
+    if args.log:
+        logging.basicConfig(
+            filename=args.log, level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s")
+        log = logging.getLogger("node_agent")
 
     collector = Collector(extra_disks=args.disks.split(",") if args.disks else [], root=args.root)
     handler = make_handler(collector, args.token.strip())
     srv = ThreadingHTTPServer((args.bind, args.port), handler)
-    print(f"[node_agent] listening on {args.bind}:{args.port}"
-          + (f" (token required)" if args.token else " (no auth)"), flush=True)
+    msg = ("[node_agent] listening on %s:%s" % (args.bind, args.port)) + \
+          (" (token required)" if args.token else " (no auth)")
+    if log is not None:
+        log.info(msg)
+    else:
+        print(msg, flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        pass
+        if log is not None:
+            log.info("stopped by KeyboardInterrupt")
+    except Exception:
+        if log is not None:
+            logging.exception("node_agent crashed")
+        raise
     finally:
         srv.server_close()
 

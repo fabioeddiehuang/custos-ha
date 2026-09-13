@@ -45,6 +45,16 @@ _vip_warn_ts = {}
 NODE_ASSETS = Path(__file__).parent / "node_assets" / "keepalived"
 NODE_SCRIPTS = Path(__file__).parent / "node_assets"
 
+# 节点包内数据库配置/脚本归整目录名（节点部署目录归整改造：cnf/sql 进 <db>/conf，脚本进 <db>/scripts）
+MYSQL_NODE_CONF_DIR = "mysql8.0"
+MARIADB_NODE_CONF_DIR = "mariadb12.3.3"
+AGENT_DIR = "agent"
+
+
+def _node_conf_dir(node_type):
+    """节点包内数据库配置目录名（mysql8.0 / mariadb12.3.3）。"""
+    return MARIADB_NODE_CONF_DIR if is_mariadb_node(node_type) else MYSQL_NODE_CONF_DIR
+
 # 容器化 MariaDB 节点（node_type='mariadb-docker'）使用的镜像。
 #
 # 选型原则：**统一使用 Debian 构建的官方镜像**，以同时兼容 Anolis(RHEL 系) 与 Ubuntu(Debian 系)。
@@ -89,7 +99,9 @@ KEEPALIVED_IMAGE_NAME = "custos-node"
 # Reads real host metrics: pid: host shares host PID ns for /proc; read-only mount / -> /host
 # with --root /host for real disk stats; network_mode: host lets manager reach <nodeIP>:28889.
 # node_agent.py is copied into the node unit dir (./node_agent.py) by generate_node/regenerate.
-AGENT_SERVICE = r"""
+def render_agent_service(log_dir_host):
+    """渲染 custos-node-agent sidecar service（日志落盘到统一日志目录，便于 <ip>/logs 软链接入）。"""
+    return f"""
   custos-node-agent:
     image: python:3-slim
     container_name: custos-node-agent
@@ -102,12 +114,15 @@ AGENT_SERVICE = r"""
       - 0.0.0.0
       - --root
       - /host
+      - --log
+      - /var/log/custos-ha/node_agent.log
     restart: always
     pid: host
     network_mode: host
     volumes:
       - /:/host:ro
-      - ./node_agent.py:/app/node_agent.py:ro
+      - ./agent/node_agent.py:/app/node_agent.py:ro
+      - {log_dir_host}:/var/log/custos-ha:z
 """
 
 def _valid_vip(vip):
@@ -182,6 +197,7 @@ def _render_keepalived_conf(local_ip, peers, vip, vip_prefix, interface, vrid, r
     return f"""global_defs {{
     router_id {router_id}
     enable_script_security
+    log_file /var/log/custos-ha/keepalived.log
 }}
 
 vrrp_script chk_mysql_master {{
@@ -255,7 +271,7 @@ services:
       - --read-only=ON
       # I/O 相关（避免沿用 mysql:8.0 镜像 128MB buffer pool / 200 io_capacity 的默认极小值，
       # 否则副本追日志、主库刷脏时会把磁盘 util 打满）。buffer pool 可按宿主机内存再调大。
-      - --innodb-buffer-pool-size=1G
+      - --innodb-buffer-pool-size=320M
       - --innodb-io-capacity=2000
       - --innodb-io-capacity-max=4000
       # 并行复制：加快从库回放，避免高写入/大事务下复制延迟持续累积（如单节点长期滞后）。
@@ -270,13 +286,13 @@ services:
       # :z 供 Anolis 等 SELinux=Enforcing 系统重打标签；未启用 SELinux 的 Ubuntu 会忽略该标记，
       # 故同一份 compose 同时兼容两类系统。
       - {MYSQL_DOCKER_DATA_DIR}:/var/lib/mysql:z
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./mysql8.0/conf/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       # 慢日志覆盖配置（slow_query_log=1 + log_output=TABLE），供 slow_log 采集 mysql.slow_log。
       # 必须挂载，否则节点慢查询不入库，/api/slow_log 永远空（节点默认 slow_query_log=OFF）。
-      - ./ha-overrides.cnf:/etc/mysql/conf.d/ha-overrides.cnf:ro
+      - ./mysql8.0/conf/ha-overrides.cnf:/etc/mysql/conf.d/ha-overrides.cnf:ro
       # 统一日志目录：error.log 等全部落到这里（宿主 logs/<基名> -> 容器 /var/log/custos-ha）。
       # 旧值 /var/lib/mysql-files 未挂到宿主，容器一销毁日志就没了，是排错时最难查的一类问题。
-      # 首次部署前需先在宿主建目录并 chown 给容器内 mysql(uid 999)：见同目录 prepare-logs.sh
+      # 首次部署前需先在宿主建目录并 chown 给容器内 mysql(uid 999)：见 <db>/scripts/prepare-logs.sh
       - {_log_dir_host(MYSQL_DOCKER_DATA_DIR)}:/var/log/custos-ha:z
     logging:
       # 容器 stdout 上限：防崩溃循环时 docker 日志刷爆磁盘（与 error.log 的 logrotate 互补）
@@ -331,7 +347,8 @@ services:
       - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro
       - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro
       - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro
-    """.replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME) + AGENT_SERVICE
+      - {_log_dir_host(MYSQL_DOCKER_DATA_DIR)}:/var/log/custos-ha:z
+    """.replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME) + render_agent_service(_log_dir_host(MYSQL_DOCKER_DATA_DIR))
 
 
 def _semisync_block():
@@ -427,26 +444,66 @@ _MEMORY_CNF_BLOCK = (
     "# performance_schema 纯 InnoDB 业务不需要，且开启后会随运行时间持续占用内存：显式关闭。\n"
     "performance_schema = OFF\n"
     "# MyISAM/Aria 固定大缓存瘦身（默认各 128M，对 InnoDB 业务基本无用）\n"
-    "key_buffer_size = 16M\n"
-    "aria_pagecache_buffer_size = 32M\n"
+    "key_buffer_size = 8M\n"
+    "aria_pagecache_buffer_size = 16M\n"
     "# InnoDB 其它缓冲\n"
-    "innodb_log_buffer_size = 16M\n"
-    "innodb_buffer_pool_instances = 4\n"
+    "innodb_log_buffer_size = 8M\n"
+    "innodb_buffer_pool_instances = 1\n"
     "# 表缓存 / 线程缓存 / 连接数（够用即可）\n"
-    "table_open_cache = 2000\n"
-    "table_definition_cache = 800\n"
-    "thread_cache_size = 16\n"
-    "max_connections = 200\n"
+    "table_open_cache = 500\n"
+    "table_definition_cache = 500\n"
+    "thread_cache_size = 8\n"
+    "max_connections = 100\n"
     "# 会话级缓冲（每连接，逐个封顶，防「连接数 × 缓冲」顶穿内存）\n"
-    "sort_buffer_size = 1M\n"
+    "sort_buffer_size = 512K\n"
     "join_buffer_size = 256K\n"
     "read_buffer_size = 128K\n"
     "read_rnd_buffer_size = 256K\n"
-    "tmp_table_size = 16M\n"
-    "max_heap_table_size = 16M\n"
+    "tmp_table_size = 8M\n"
+    "max_heap_table_size = 8M\n"
     "binlog_cache_size = 32K\n"
     "binlog_stmt_cache_size = 32K\n"
     "net_buffer_length = 16K\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# IO / CPU 调优块：**降低读写延迟但不增加内存**（与上面的内存封顶互补）
+# ---------------------------------------------------------------------------
+# 为什么重点调刷盘策略而不是一味加缓冲池：默认 innodb_flush_log_at_trx_commit=1
+# 且 sync_binlog=1 时，**每个事务提交都要 fsync 两次**（redo + binlog），
+# 这是写延迟与 IOPS 的头号瓶颈；放松它带来的延迟下降，远大于同等内存的缓冲池增量。
+_IO_TUNE_BLOCK_COMMON = (
+    "# ---- IO 调优（降延迟，不增内存）----\n"
+    "# 刷盘策略：默认 1 / 1 会让每次提交 fsync 两次。\n"
+    "#   innodb_flush_log_at_trx_commit=2 → 提交只写 OS 页缓存、每秒 fsync 一次；\n"
+    "#       进程崩溃【不丢数据】（OS 已持有），仅整机断电/内核崩溃最多丢约 1 秒。\n"
+    "#   sync_binlog=100 → 每 100 个事务才 fsync 一次 binlog，写 IOPS 降一个数量级。\n"
+    "#   本产品有半同步复制兜底：单机宕机切从库时数据不丢。\n"
+    "# ⚠ 若要求「单机断电也零丢失」，把这两项改回 1 / 1（代价：写延迟显著升高）。\n"
+    "innodb_flush_log_at_trx_commit = 2\n"
+    "sync_binlog = 100\n"
+    "# LRU 扫描深度：默认 1024~1536 会让 page cleaner 持续空转耗 CPU；缓冲池不大时\n"
+    "# 512 足够，可明显降低后台 CPU 占用。\n"
+    "innodb_lru_scan_depth = 512\n"
+    "# SSD 上关闭「邻接页合并刷」：减少随机写场景的无效 IO\n"
+    "innodb_flush_neighbors = 0\n"
+)
+
+# MySQL 8.0.30+ 用 innodb_redo_log_capacity 管重做日志（官方默认仅 100M），调大可显著
+# 减少「检查点刷脏风暴」造成的写延迟抖动。innodb_flush_method：官方镜像默认 fsync，
+# 会让数据在 OS 页缓存与 InnoDB 缓冲池【双份驻留】，O_DIRECT 绕过页缓存，
+# 降延迟同时省内存。
+_IO_TUNE_BLOCK_MYSQL = _IO_TUNE_BLOCK_COMMON + (
+    "innodb_redo_log_capacity = 256M\n"
+    "innodb_flush_method = O_DIRECT\n"
+)
+
+# MariaDB 用 innodb_log_file_size 表示重做日志大小（无 innodb_redo_log_capacity，
+# 写进去会 unknown variable 导致启动失败）。O_DIRECT 同上，避免双份缓存。
+_IO_TUNE_BLOCK_MARIADB = _IO_TUNE_BLOCK_COMMON + (
+    "innodb_log_file_size = 256M\n"
+    "innodb_flush_method = O_DIRECT\n"
 )
 
 
@@ -477,17 +534,15 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         "log_slave_updates = ON\n"
         "relay_log = relay-bin\n"
         "relay_log_recovery = ON\n"
-        "sync_binlog = 1\n"
-        "innodb_flush_log_at_trx_commit = 1\n"
         "binlog_format = ROW\n"
         "read_only = ON\n"
         "# 复制/性能（与 docker 节点保持一致，避免单节点复制延迟累积）\n"
-        "innodb_buffer_pool_size = 1G\n"
+        "innodb_buffer_pool_size = 320M\n"
         "innodb_io_capacity = 2000\n"
         "innodb_io_capacity_max = 4000\n"
         "slave_parallel_threads = 4\n"
         "slave_parallel_mode = optimistic\n"
-        + _MEMORY_CNF_BLOCK +
+        + _MEMORY_CNF_BLOCK + _IO_TUNE_BLOCK_MARIADB +
         "# 慢日志（供观测/排错）\n"
         "slow_query_log = 1\n"
         "long_query_time = 0.5\n"
@@ -551,19 +606,17 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
         "log_slave_updates = ON\n"
         "relay_log = relay-bin\n"
         "relay_log_recovery = ON\n"
-        "sync_binlog = 1\n"
-        "innodb_flush_log_at_trx_commit = 1\n"
         "binlog_format = ROW\n"
         "read_only = ON\n"
         "# 复制/性能（与裸机 MariaDB 节点保持一致）\n"
         "# 缓冲池默认 512M（而非官方/裸机模板的 1G）：小内存主机（如 2G）用 1G 极易 OOM。\n"
         "# 内存充足可调大：compose 场景改 MARIADB_INNODB_BUFFER_POOL_SIZE 环境变量即可覆盖。\n"
-        "innodb_buffer_pool_size = 512M\n"
+        "innodb_buffer_pool_size = 320M\n"
         "innodb_io_capacity = 2000\n"
         "innodb_io_capacity_max = 4000\n"
         "slave_parallel_threads = 4\n"
         "slave_parallel_mode = optimistic\n"
-        + _MEMORY_CNF_BLOCK +
+        + _MEMORY_CNF_BLOCK + _IO_TUNE_BLOCK_MARIADB +
         "# 慢日志（供观测/排错）\n"
         "slow_query_log = 1\n"
         "long_query_time = 0.5\n"
@@ -646,7 +699,7 @@ def render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, ap
     )
 
 
-def render_baremetal_compose(node_name, vip_port=None):
+def render_baremetal_compose(node_name, vip_port=None, data_dir=None):
     """裸机 MariaDB 节点（node_type=mariadb）的 keepalived-only compose（容器化 MariaDB 走 render_mariadb_compose），只跑 keepalived 客户端。
 
     - 裸机 MariaDB：mysqld 由宿主 systemd 提供；
@@ -679,12 +732,14 @@ def render_baremetal_compose(node_name, vip_port=None):
         "      - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro\n"
         "      - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro\n"
         "      - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro\n"
+        "      - {LOG_DIR_HOST_VOL}:/var/log/custos-ha:z\n"
     ).replace("{KEEPALIVED_IMAGE_NAME}", KEEPALIVED_IMAGE_NAME) \
-     .replace("{PKG_VERSION}", PKG_VERSION) + AGENT_SERVICE
+     .replace("{PKG_VERSION}", PKG_VERSION) \
+     .replace("{LOG_DIR_HOST_VOL}", _log_dir_host(data_dir or "/data/custos-ha/mariadb")) + render_agent_service(_log_dir_host(data_dir or "/data/custos-ha/mariadb"))
 
 
 def render_mariadb_compose(node_name, root_pass, port, server_id, vip_port=None,
-                           data_dir=None, image=None, buffer_pool="512M"):
+                           data_dir=None, image=None, buffer_pool="320M"):
     """容器化 MariaDB 节点的【纯 compose】部署文件（推荐方式）。
 
     与 render_baremetal_compose()（只跑 keepalived、MariaDB 由安装脚本另起）不同，
@@ -758,11 +813,11 @@ services:
       - {data_dir}:/var/lib/mysql:z
       # 配置双挂：Debian 构建读 /etc/mysql/conf.d，UBI 构建读 /etc/my.cnf.d，两条都挂
       # 可让任一镜像都生效；99- 前缀保证最后加载、覆盖镜像默认值。
-      - ./docker-my.cnf:/etc/my.cnf.d/99-ha.cnf:ro,z
-      - ./docker-my.cnf:/etc/mysql/conf.d/99-ha.cnf:ro,z
+      - ./mariadb12.3.3/conf/docker-my.cnf:/etc/my.cnf.d/99-ha.cnf:ro,z
+      - ./mariadb12.3.3/conf/docker-my.cnf:/etc/mysql/conf.d/99-ha.cnf:ro,z
       # 初始化 SQL：仅在数据目录为空的首次启动执行；已初始化节点改由 fix-node-creds.sql
       # 或管理器 ensure_ha_creds 自愈校正账号（不会重复执行导致报错）。
-      - ./init_mariadb.sql:/docker-entrypoint-initdb.d/init_mariadb.sql:ro,z
+      - ./mariadb12.3.3/conf/init_mariadb.sql:/docker-entrypoint-initdb.d/init_mariadb.sql:ro,z
       # 统一日志目录：error.log 等全部落到这里（宿主 logs/<基名> -> 容器 /var/log/custos-ha）
       - {_log_dir_host(data_dir)}:/var/log/custos-ha:z
     logging:
@@ -800,7 +855,39 @@ services:
       - ./keepalived/notify_master.sh:/etc/keepalived/notify_master.sh:ro
       - ./keepalived/notify_backup.sh:/etc/keepalived/notify_backup.sh:ro
       - ./keepalived/ha_check.conf:/etc/keepalived/ha_check.conf:ro
-""" + AGENT_SERVICE
+      - {_log_dir_host(data_dir or "/data/custos-ha/mariadb")}:/var/log/custos-ha:z
+""" + render_agent_service(_log_dir_host(data_dir or "/data/custos-ha/mariadb"))
+
+
+# ---------------------------------------------------------------------------
+# MySQL 8.0 专用内存封顶（**不可复用上面的 MariaDB 块**：MySQL 没有 aria_* 变量，
+# 写进去会报 unknown variable 导致容器启动失败/崩溃循环）
+# ---------------------------------------------------------------------------
+# 为什么必须显式关 performance_schema：MySQL 8 官方镜像默认开启，且会按
+# max_connections / table_open_cache 等参数**自动放大**，实测在 mysql:8.0.46 上
+# 占到 1.4~1.5G（超过 InnoDB 缓冲池本身），是容器内存第一大户。
+# 本产品不依赖它：慢日志走 mysql.slow_log、错误日志走 mysql.error_log 表。
+_MEMORY_CNF_BLOCK_MYSQL = (
+    "# ---- 内存封顶（MySQL 8.0 专用）----\n"
+    "performance_schema = OFF\n"
+    "innodb_buffer_pool_size = 320M\n"
+    "innodb_buffer_pool_instances = 1\n"
+    "innodb_log_buffer_size = 8M\n"
+    "key_buffer_size = 8M\n"
+    "table_open_cache = 500\n"
+    "table_definition_cache = 500\n"
+    "thread_cache_size = 8\n"
+    "max_connections = 100\n"
+    "sort_buffer_size = 512K\n"
+    "join_buffer_size = 256K\n"
+    "read_buffer_size = 128K\n"
+    "read_rnd_buffer_size = 256K\n"
+    "tmp_table_size = 8M\n"
+    "max_heap_table_size = 8M\n"
+    "binlog_cache_size = 32K\n"
+    "binlog_stmt_cache_size = 32K\n"
+    "net_buffer_length = 16K\n"
+)
 
 
 def render_docker_my_cnf(mysql_version=None, port=3306):
@@ -813,6 +900,7 @@ def render_docker_my_cnf(mysql_version=None, port=3306):
     cnf = (
         "[mysqld]\n"
         "bind-address = 0.0.0.0\n"
+        + _MEMORY_CNF_BLOCK_MYSQL + _IO_TUNE_BLOCK_MYSQL +
         f"port = {port}\n"
         "# 错误日志写入 mysql.error_log 表（log_sink_table 为 MySQL 8.0 内置组件，无需装插件），\n"
         "# 管理器「错误日志」面板直接 SELECT 该表，容器环境下不再依赖 LOAD_FILE / secure_file_priv。\n"
@@ -1001,7 +1089,7 @@ def render_fix_node_creds_sql(ha_user, ha_pass, repl_user, repl_pass, root_user,
         "-- ⚠ 无需手动执行：Install-ha-mariadb-Node.sh 在节点准备阶段【自动重放】本文件，\n"
         "--   用于校正 ha_monitor 权限被面板/重装回退、或 root@'<管理器IP>' 密码漂移。\n"
         "--   仅当自动重放失败（日志有提示）时，才需在本机手动跑：\n"
-        "--   mysql -uroot -p'<节点真实root密码>' < fix-node-creds.sql\n"
+        "--   mysql -uroot -p'<节点真实root密码>' < mariadb12.3.3/conf/fix-node-creds.sql\n"
         "SET SQL_LOG_BIN=0;\n"
         # 1) ha_monitor：同时校正 @'%' 与 @'<管理器IP>' 两种 host 的密码。
         #    关键：MySQL 会优先匹配「特定 host」账号，若节点上残留 ha_monitor@'<管理器IP>'
@@ -1078,7 +1166,7 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
         "-- MariaDB 节点账号/权限修复脚本（由管理器生成，已注入真实凭证）\n"
         "-- ⚠ 无需手动执行：Install-ha-mariadb-Node.sh 在节点准备阶段【自动重放】本文件。\n"
         "--   仅当自动重放失败（日志有提示）时，才需在本机手动跑：\n"
-        "--   mysql -uroot -p'<节点真实root密码>' < fix-node-creds.sql\n"
+        "--   mysql -uroot -p'<节点真实root密码>' < mariadb12.3.3/conf/fix-node-creds.sql\n"
         "SET SQL_LOG_BIN=0;\n"
         "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
         "ALTER USER '%s'@'%%' IDENTIFIED VIA mysql_native_password USING PASSWORD('%s');\n"
@@ -1128,6 +1216,7 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
 
 
 def _write(path: Path, text: str, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     os.chmod(path, mode)
 
@@ -1232,12 +1321,12 @@ def regenerate_cluster_compose(cluster_id):
             content = _render_compose(
                 node_name, r.get("root_pass") or "", int(r["port"]),
                 int(r.get("server_id") or 0), vip_port)
-            _write(kd.parent / "ha-overrides.cnf", render_docker_my_cnf(r.get("mysql_version"), int(r.get("port") or 3306)), mode=0o644)
+            _write(kd.parent / MYSQL_NODE_CONF_DIR / "conf" / "ha-overrides.cnf", render_docker_my_cnf(r.get("mysql_version"), int(r.get("port") or 3306)), mode=0o644)
         _write(p, content)
         # sync node agent script (OS metrics sidecar deployed with node compose)
         agent_src = Path(__file__).resolve().parent.parent / "scripts" / "node_agent.py"
         if agent_src.exists():
-            _write(kd.parent / "node_agent.py", agent_src.read_text(), mode=0o644)
+            _write(kd.parent / AGENT_DIR / "node_agent.py", agent_src.read_text(), mode=0o644)
 
 
 def _clean_generated_dir(d: Path):
@@ -1245,7 +1334,7 @@ def _clean_generated_dir(d: Path):
     if not d.exists():
         return
     for item in d.iterdir():
-        if item.name == "MySQL-data":
+        if item.name in ("MySQL-data", "logs"):
             continue
         if item.is_dir():
             shutil.rmtree(item)
@@ -1374,12 +1463,12 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
             add("manual", "首次部署：安装 MariaDB 并拉起 keepalived",
                 "裸机形态需先执行安装脚本（全量安装 MariaDB + 初始化账号），再拉起 "
                 "keepalived 与节点 agent；安装脚本会自动重放 fix-node-creds.sql。",
-                "cd %s && sudo bash Install-ha-mariadb-Node.sh "
-                "&& docker compose up -d keepalived custos-node-agent" % d, [])
+                "cd %s && sudo bash mariadb12.3.3/scripts/Install-ha-mariadb-Node.sh "
+                "&& docker compose up -d keepalived custos-node-agent" % d, [], "db_alive")
         else:
             add("manual", "首次部署：启动节点容器（数据库 + keepalived 合一）",
                 "把整个目录拷到目标机后执行一次即可；数据目录为空时会自动执行 init SQL 初始化账号。",
-                "cd %s && docker compose up -d" % d, [])
+                "cd %s && docker compose up -d" % d, [], "db_alive")
         return acts
 
     # 1) 数据库配置（my.cnf 类）：静态参数，必须重建/重启数据库
@@ -1430,7 +1519,7 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
         add("exec", "账号/权限修复脚本已更新：需在节点本机执行",
             "该文件含节点真实凭证，不经管理器下发，需登录节点用 root 执行"
             "（命令会交互式提示输入 root 密码）。",
-            "cd %s && mysql -uroot -p < fix-node-creds.sql" % d, fx)
+            "cd %s && mysql -uroot -p < %s" % (d, fx[0]), fx)
 
     # 6) 节点 Agent（OS 指标采集）
     af = hit("node_agent.py")
@@ -1445,7 +1534,7 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
         add("exec", "日志目录/logrotate 配置已更新：需在节点执行一次",
             "统一日志目录需预先创建并把属主改为容器内 mysql(uid 999)，否则 "
             "mariadbd/mysqld 写 error.log 会 Permission denied 启动失败。",
-            "cd %s && sudo bash prepare-logs.sh" % d, lf)
+            "cd %s && sudo bash %s" % (d, _node_conf_dir(node_type) / "conf" / "scripts" / "prepare-logs.sh"), lf)
 
     # 8) 安装/卸载脚本：仅在重装/卸载场景执行
     inf = hit("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh",
@@ -1485,9 +1574,57 @@ def node_pending_actions(ip):
     return data if isinstance(data, list) else []
 
 
-def ack_node_pending(ip):
-    """运维已在节点执行完动作后调用，清空「配置待生效」提示。"""
-    execute("UPDATE nodes SET pending_actions='' WHERE ip=%s", (ip,))
+def ack_node_pending(ip, force=False):
+    """运维确认已在节点执行完动作后调用，清除「配置待生效」提示。
+
+    v2.3.8 修正（此前是盲清，是「反复点修复却没效果」的直接根因）：
+      旧实现只有一句 ``UPDATE nodes SET pending_actions=''`` —— 不连节点、不核验、
+      不区分条目，点一下徽标就消失。运维据此以为配置已生效，实际节点上根本没变，
+      于是问题复现 → 再 regen → 再点，陷入死循环。UI 把「我知道了」呈现成了「已完成」。
+
+    现在的语义：
+      - manual 类（首次部署、执行 SQL 脚本等无法远程观测的一次性动作）→ 允许清除；
+      - db_uptime / proc:* 类 → **只有自动核验确认已落实才清除**；未落实的一律保留，
+        并回传 reason（为什么判定未生效），让运维看到真实原因而不是干瞪眼；
+      - force=True 是人工兜底：当核验方式确实不适用于该环境（例如数据库在 regen
+        之前就重启过、或节点压根没部署 custos-node-agent）时可强制清除，
+        避免待办因核验条件永不满足而永久悬挂。
+
+    返回 {"cleared": [标题...], "kept": [{"title","reason"}...], "forced": bool}。
+    """
+    try:
+        acts = node_pending_actions(ip) or []   # 内部已先自动核验，已落实的会被移除
+    except Exception:
+        acts = []
+    if not acts:
+        try:
+            execute("UPDATE nodes SET pending_actions='', pending_since=NULL WHERE ip=%s", (ip,))
+        except Exception:
+            pass
+        return {"cleared": [], "kept": [], "forced": bool(force)}
+
+    cleared, kept = [], []
+    for a in acts:
+        v = str((a or {}).get("verify") or "manual")
+        auto = (v == "db_uptime") or v.startswith("proc:")
+        if force or not auto:
+            cleared.append((a or {}).get("title") or "")
+        else:
+            kept.append(a)
+
+    if not kept:
+        try:
+            execute("UPDATE nodes SET pending_actions='', pending_since=NULL WHERE ip=%s", (ip,))
+        except Exception:
+            pass
+    else:
+        _save_pending(ip, kept)      # 只保留「确实还没生效」的
+    return {
+        "cleared": cleared,
+        "kept": [{"title": (a or {}).get("title") or "",
+                  "reason": (a or {}).get("reason") or "自动核验未通过"} for a in kept],
+        "forced": bool(force),
+    }
 
 
 def _node_creds(ip):
@@ -1583,7 +1720,7 @@ def verify_node_pending(ip):
 
     # 按需取证：只在确有对应类型待办时才连 DB / 拉 agent，避免无谓开销。
     db_up, agent = None, None
-    if any(a.get("verify") == "db_uptime" for a in acts):
+    if any(a.get("verify") in ("db_uptime", "db_alive") for a in acts):
         c = _node_creds(ip)
         if c:
             db_up = db_uptime(ip, c["port"], c["root_user"], c["root_pass"],
@@ -1604,6 +1741,24 @@ def verify_node_pending(ip):
                 logger.info("节点[%s] 待办已落实(数据库已重启, Uptime=%ss<%.0fs)：%s",
                             ip, db_up, elapsed, a.get("title"))
                 continue
+            # 未落实：写明原因，避免运维只看到一个徽标却不知道差在哪一步。
+            if db_up is None:
+                a["reason"] = ("连不上节点数据库、取不到 Uptime，无法确认是否已重启"
+                               "（多为 root 凭证/网络/端口问题）")
+            else:
+                a["reason"] = ("数据库自待办产生后未重启：当前 Uptime=%ss，待办已产生 %ss。"
+                               "请在该节点执行重建/重启命令后再看（生效后会自动消失）"
+                               % (db_up, elapsed))
+            remain.append(a)
+        elif v == "db_alive":
+            # 首次部署类动作：只要节点数据库能连上，就说明该节点已安装/拉起完成。
+            # （此前是 manual，永远等不到自动消除，导致「配置待生效」徽标长期挂死。）
+            if db_up is not None:
+                logger.info("节点[%s] 待办已落实(节点数据库已可连接, Uptime=%ss)：%s",
+                            ip, db_up, a.get("title"))
+                continue
+            a["reason"] = ("连不上该节点的数据库，尚未完成部署（或 root 凭证/端口/网络不通）；"
+                           "在节点执行安装/启动命令后会自动消失")
             remain.append(a)
         elif isinstance(v, str) and v.startswith("proc:"):
             svc = v.split(":", 1)[1]
@@ -1612,9 +1767,18 @@ def verify_node_pending(ip):
                 logger.info("节点[%s] 待办已落实(%s 已于待办后重启)：%s",
                             ip, svc, a.get("title"))
                 continue
+            if not isinstance(agent, dict) or agent.get("error") or agent is None:
+                a["reason"] = ("节点 custos-node-agent 不可达，读不到 %s 进程启动时间，无法自动核验；"
+                               "请在节点部署/重启 agent（老节点需 regen 后重启 custos-node-agent）" % svc)
+            elif started is None:
+                a["reason"] = "节点 agent 未上报 %s 的启动时间，无法自动核验" % svc
+            else:
+                a["reason"] = ("%s 自待办产生后未重启，请在节点执行重启命令；"
+                               "若管理器与该节点时钟不一致也会导致误判，可点「仍然清除」人工确认" % svc)
             remain.append(a)
         else:
             # manual / exec：节点侧一次性动作，保留待运维确认或后续人工处理。
+            a["reason"] = "该动作需在节点上手工执行，无法远程核验，需人工确认"
             remain.append(a)
 
     if len(remain) != len(acts):
@@ -1714,36 +1878,36 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     if is_mariadb_node(node_type):
         # MariaDB 两种形态（裸机 / 容器）共用：init_mariadb.sql + fix-node-creds.sql。
         # 差异仅在「配置文件」与「部署脚本」，故此处先写公共部分，再按形态分支。
-        _write(d / "init_mariadb.sql", render_mariadb_init_sql(
+        _write(d / MARIADB_NODE_CONF_DIR / "conf" / "init_mariadb.sql", render_mariadb_init_sql(
             ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass), mode=0o644)
         # 账号/权限修复脚本（MariaDB 语法，native 密码）
         fix_sql = render_fix_node_creds_sql_mariadb(
             ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port,
             manager_subnet)
-        _write(d / "fix-node-creds.sql", fix_sql, mode=0o644)
-        extra_files["init_mariadb_sql"] = f"{NODES_HOST_BASE}/{ip}/init_mariadb.sql"
+        _write(d / MARIADB_NODE_CONF_DIR / "conf" / "fix-node-creds.sql", fix_sql, mode=0o644)
+        extra_files["init_mariadb_sql"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/conf/init_mariadb.sql"
         # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
         # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
         if node_type == "mariadb-docker":
             # 容器化 MariaDB：纯 compose 部署（render_mariadb_compose 已含 mariadb + keepalived），
             # 故只交付配置片段（不含 datadir/socket）+ 卸载脚本，不再生成安装脚本
             # （部署入口即 docker compose up -d）；安装脚本仅作「裸机装不上 tarball」回退在裸机分支交付。
-            _write(d / "docker-my.cnf",
+            _write(d / MARIADB_NODE_CONF_DIR / "conf" / "docker-my.cnf",
                    render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=server_id),
                    mode=0o644)
-            extra_files["docker_my_cnf"] = f"{NODES_HOST_BASE}/{ip}/docker-my.cnf"
-            extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-docker-Node.sh"
+            extra_files["docker_my_cnf"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/conf/docker-my.cnf"
+            extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-docker-Node.sh"
             src = NODE_SCRIPTS / "Uninstall-mariadb-docker-Node.sh"
             if src.exists():
-                _write(d / "Uninstall-mariadb-docker-Node.sh", src.read_text(), mode=0o755)
+                _write(d / MARIADB_NODE_CONF_DIR / "scripts" / "Uninstall-mariadb-docker-Node.sh", src.read_text(), mode=0o755)
         else:
             # 裸机 MariaDB：完全独立安装（脱离宝塔），由 Install 脚本全量安装 tarball。
             # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
             my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=server_id)
-            _write(d / "my.cnf", my_cnf, mode=0o644)
-            extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/my.cnf"
-            extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/Install-ha-mariadb-Node.sh"
-            extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/Uninstall-mariadb-Node.sh"
+            _write(d / MARIADB_NODE_CONF_DIR / "conf" / "my.cnf", my_cnf, mode=0o644)
+            extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/conf/my.cnf"
+            extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/scripts/Install-ha-mariadb-Node.sh"
+            extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-Node.sh"
             # 裸机包【只适配裸机】：不再交付 Install-mariadb-docker-Node.sh 容器回退脚本。
             # 原因：该脚本把裸机完整 my.cnf（仅剔除 datadir/socket/pid_file）喂给官方镜像容器，
             # 残留裸机专属参数（缺失 log_error → 官方镜像默认写 stdout，管理器「错误日志」
@@ -1756,13 +1920,13 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh"):
                 src = NODE_SCRIPTS / sf
                 if src.exists():
-                    _write(d / sf, src.read_text(), mode=0o755)
+                    _write(d / MARIADB_NODE_CONF_DIR / "scripts" / sf, src.read_text(), mode=0o755)
     else:
         # init.sql 会被 MySQL 容器以非 root 的 mysql 用户读取执行，
         # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。
-        _write(d / "init.sql", init_sql, mode=0o644)
+        _write(d / MYSQL_NODE_CONF_DIR / "conf" / "init.sql", init_sql, mode=0o644)
         # 慢日志覆盖配置（挂载到容器 /etc/mysql/conf.d）
-        _write(d / "ha-overrides.cnf", render_docker_my_cnf(mysql_version, port), mode=0o644)
+        _write(d / MYSQL_NODE_CONF_DIR / "conf" / "ha-overrides.cnf", render_docker_my_cnf(mysql_version, port), mode=0o644)
 
     # 2) keepalived.conf
     keep_conf = _render_keepalived_conf(
@@ -1808,7 +1972,14 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     #      The rendered compose includes custos-node-agent service mounting ./node_agent.py.
     agent_src = Path(__file__).resolve().parent.parent / "scripts" / "node_agent.py"
     if agent_src.exists():
-        _write(d / "node_agent.py", agent_src.read_text(), mode=0o644)
+        _write(d / AGENT_DIR / "node_agent.py", agent_src.read_text(), mode=0o644)
+    svc_src = Path(__file__).resolve().parent.parent / "scripts" / "node-agent.service"
+    if svc_src.exists():
+        _write(d / AGENT_DIR / "node-agent.service", svc_src.read_text(), mode=0o644)
+    # 节点包自带 custosctl（供 `custosctl node install` 自装到 /usr/bin/custosctl）
+    ctl_src = Path(__file__).resolve().parent.parent / "custosctl"
+    if ctl_src.exists():
+        _write(d / "custosctl", ctl_src.read_text(), mode=0o755)
 
     # 5) docker-compose.yaml
     #    MariaDB 裸机（mariadb）：compose 只跑 keepalived 客户端（mysqld 由宿主 systemd 起）；
@@ -1828,10 +1999,11 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         "mariadb": "/data/mariadb",              # 裸机默认（与 render_mariadb_my_cnf 默认值一致）
         "mariadb-docker": MARIADB_DOCKER_DATA_DIR,
     }.get(node_type, MYSQL_DOCKER_DATA_DIR)
-    _write(d / "custos-ha-logrotate.conf", render_logrotate_conf(), mode=0o644)
-    _write(d / "prepare-logs.sh",
+    conf_dir = _node_conf_dir(node_type)
+    _write(d / conf_dir / "conf" / "custos-ha-logrotate.conf", render_logrotate_conf(), mode=0o644)
+    _write(d / conf_dir / "scripts" / "prepare-logs.sh",
            render_prepare_logs(node_type, _log_dir_host(_data_dir_for_log)), mode=0o755)
-    _write(d / "update-node.sh", render_update_node(), mode=0o755)
+    _write(d / conf_dir / "scripts" / "update-node.sh", render_update_node(), mode=0o755)
 
     # 6) 登记到 nodes 表 + hosts 表（供监控自动接入）
     #    compose_path 记录「宿主机路径」（便于 Web 展示与到目标主机执行），
@@ -1863,12 +2035,15 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     _changed = sorted(k for k in (set(_new_snap) | set(_old_snap))
                       if _new_snap.get(k) != _old_snap.get(k))
     _fp = _fingerprint(_new_snap)
-    _actions = deploy_actions(_changed, node_type, host_compose, fresh=not _old_snap)
     try:
         _prev = query("SELECT gen_fingerprint FROM nodes WHERE ip=%s", (ip,))
         _prev_fp = ((_prev[0] or {}).get("gen_fingerprint") or "") if _prev else ""
     except Exception:
         _prev_fp = ""
+    # fresh（首次部署）必须同时满足：生成目录为空 **且** 库中无历史指纹（此前从未生成过）。
+    # 否则一旦生成目录被清空/迁移后重新生成，已上线节点会被误报「首次部署」。
+    _actions = deploy_actions(_changed, node_type, host_compose,
+                              fresh=(not _old_snap) and (not _prev_fp))
     if _fp != _prev_fp:
         try:
             execute("UPDATE nodes SET gen_fingerprint=%s, pending_actions=%s, "
@@ -2042,13 +2217,14 @@ def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_r
             _write(kd / "ha_check.conf", ha_check)
             # 同步重生成 init 凭证 SQL（仅凭证相关），保证后续「重部署」后执行时使用的仍是当前密码。
             # MariaDB 节点（裸机/容器）写 init_mariadb.sql（MariaDB 语法）；docker 节点写 init.sql。
+            # 落盘到 <db>/conf/ 子目录（与 generate_node 一致；install 脚本与 compose 均从 conf/ 读取）。
             if is_mariadb_node(node_type):
                 init_sql = render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
-                _write(_safe_node_path(ip) / "init_mariadb.sql", init_sql, mode=0o644)
+                _write(_safe_node_path(ip) / MARIADB_NODE_CONF_DIR / "conf" / "init_mariadb.sql", init_sql, mode=0o644)
             else:
                 init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
                                             auth_plugin=_auth_plugin_for(mysql_version, node_type))
-                _write(_safe_node_path(ip) / "init.sql", init_sql, mode=0o644)
+                _write(_safe_node_path(ip) / MYSQL_NODE_CONF_DIR / "conf" / "init.sql", init_sql, mode=0o644)
             # 同步修复脚本（凭证变更/权限回退时，可在节点本机重放）
             # MariaDB 用 MariaDB 语法修复脚本（native 密码，无 MySQL8 专有特权）；其余用通用版。
             if is_mariadb_node(node_type):
@@ -2059,7 +2235,7 @@ def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_r
                 fix_sql = render_fix_node_creds_sql(
                     ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip,
                     manager_subnet, auth_plugin=_auth_plugin_for(mysql_version, node_type))
-            _write(_safe_node_path(ip) / "fix-node-creds.sql", fix_sql, mode=0o644)
+            _write(_safe_node_path(ip) / _node_conf_dir(node_type) / "conf" / "fix-node-creds.sql", fix_sql, mode=0o644)
             synced += 1
 
     # 复制账号改名/改密后，从库仍用旧 repl_user 连主库；主库 DROP 旧账号前必须先把
@@ -2096,7 +2272,7 @@ def list_nodes(cluster_id=None):
         if cluster_id:
             return query(
                 "SELECT n.ip, n.port, n.root_user, n.root_pass, n.server_id, n.compose_path, n.created_at, "
-                "n.node_type, n.mysql_version, "
+                "n.node_type, n.mysql_version, n.pending_actions, n.pending_since, "
                 "h.initial_role, h.role, h.status, n.cluster_id "
                 "FROM nodes n LEFT JOIN hosts h ON h.host = n.ip AND h.cluster_id=n.cluster_id "
                 "WHERE n.cluster_id=%s ORDER BY n.ip",

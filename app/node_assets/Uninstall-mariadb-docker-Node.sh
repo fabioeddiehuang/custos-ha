@@ -22,7 +22,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+NODE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"   # 节点包根（keepalived/ 与 docker-compose.yaml 所在）
+cd "$NODE_ROOT"
 
 FORCE_DEL_DATA=0
 ASSUME_YES=0

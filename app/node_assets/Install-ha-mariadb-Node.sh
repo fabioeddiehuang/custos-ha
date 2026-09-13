@@ -19,7 +19,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+# 节点包目录归整：本脚本位于 <节点>/mariadb12.3.3/scripts/，故：
+#   NODE_ROOT = <节点>/                  （keepalived/ 与 docker-compose.yaml 所在）
+#   CONF_DIR  = <节点>/mariadb12.3.3/conf/（服务端生成的 my.cnf / init_mariadb.sql 等）
+NODE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CONF_DIR="$SCRIPT_DIR/../conf"
+cd "$NODE_ROOT"
 
 # ---------- 可手动替换的下载链接（留空则只尝试用本地已存在的安装包） ----------
 MARIADB_DOWNLOAD_URL="${MARIADB_DOWNLOAD_URL:-https://mirrors.tuna.tsinghua.edu.cn/mariadb//mariadb-12.3.3/bintar-linux-systemd-x86_64/mariadb-12.3.3-linux-systemd-x86_64.tar.gz}"
@@ -162,7 +167,7 @@ if ! out="$("$INSTALL_DIR/bin/mariadbd" --version 2>&1)"; then
   echo "$out" | grep -iE 'not found|version .* not|GLIBC|GLIBCXX|XCRYPT|LIBSYSTEMD|CXXABI' | head -8 | sed 's/^/      /' || true
   die "该节点的 glibc/libstdc++ 低于 MariaDB 12.3.3(linux-systemd) 的要求（需 glibc≥2.28 等）。"\
 "此类老系统请改用 Docker 方式部署 MariaDB 12.3.3（容器自带运行时，不受宿主 glibc 限制）："\
-"在本节点目录用官方镜像 mariadb:12.3.3（host 网络，挂载 ./my.cnf 与 /data/mariadb），"\
+"在本节点目录用官方镜像 mariadb:12.3.3（host 网络，挂载 mariadb12.3.3/conf/my.cnf 与 /data/mariadb），"\
 "再按裸机流程执行 init_mariadb.sql 并拉起 keepalived 客户端即可。"\
 "或升级该节点系统 / glibc 后重试裸机安装。"
 fi
@@ -221,20 +226,22 @@ log "初始化统一日志目录：$LOG_DIR"
 mkdir -p "$LOG_DIR"
 chown -R mysql:mysql "$LOG_DIR"
 chmod 0755 "$LOG_DIR"
+# 节点包内 logs 软链（指向宿主真实日志目录，便于管理器/运维直接在包目录查看 error/keepalived/agent 日志）
+ln -sfn "$LOG_DIR" logs
 
 # logrotate：给 error.log 加大小上限（节点崩溃循环时几分钟就能刷爆磁盘）
-if [[ -f "$SCRIPT_DIR/custos-ha-logrotate.conf" ]]; then
+if [[ -f "$CONF_DIR/custos-ha-logrotate.conf" ]]; then
   if command -v logrotate >/dev/null 2>&1; then
-    install -m 0644 "$SCRIPT_DIR/custos-ha-logrotate.conf" /etc/logrotate.d/custos-ha
+    install -m 0644 "$CONF_DIR/custos-ha-logrotate.conf" /etc/logrotate.d/custos-ha
     log "已安装 logrotate：/etc/logrotate.d/custos-ha"
   else
     warn "未检测到 logrotate，跳过安装；请手动执行："
-    warn "  cp $SCRIPT_DIR/custos-ha-logrotate.conf /etc/logrotate.d/custos-ha"
+    warn "  cp $CONF_DIR/custos-ha-logrotate.conf /etc/logrotate.d/custos-ha"
   fi
 fi
 
 # ---------- 4) 落盘 my.cnf（服务端生成，确保配置一致性） ----------
-CNF_SRC="$SCRIPT_DIR/my.cnf"
+CNF_SRC="$CONF_DIR/my.cnf"
 if [[ ! -f "$CNF_SRC" ]]; then
   die "未找到服务端生成的 my.cnf（应在节点目录下：$CNF_SRC）。请重新在管理器生成节点目录。"
 fi
@@ -249,7 +256,7 @@ ROOT_PASS=""
 # 注意：这里不能用 `ROOT_PASS=$(grep ... | ...)` 裸写法——set -euo pipefail 下
 # grep 无匹配（文件存在但缺该键）会让赋值整条失败并**静默终止脚本**，
 # 表现为「打印到上一步就没有任何输出」。conf_get 已消除该风险。
-ROOT_PASS="$(conf_get "$SCRIPT_DIR/keepalived/ha_check.conf" LOCAL_ROOT_PASS || true)"
+ROOT_PASS="$(conf_get "$NODE_ROOT/keepalived/ha_check.conf" LOCAL_ROOT_PASS || true)"
 if [[ -z "$ROOT_PASS" ]]; then
   ROOT_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
   warn "未从 ha_check.conf 读到 root 密码，已生成随机密码：$ROOT_PASS（请到管理器节点配置同步）"
@@ -364,13 +371,13 @@ log "已创建 /usr/local/bin/mysql 等软链 + socket 软链（执行 mysql -ur
 # 注意：必须用本地 socket 连接（VIP 此刻可能尚未上浮/由 keepalived 接管），
 # 切勿用 -h127.0.0.1（会解析到 VIP 网卡），否则连不到本机 MariaDB。
 MYSQL=("$INSTALL_DIR/bin/mysql" -uroot -p"$ROOT_PASS" --socket="$DATA_DIR/mysql.sock")
-if [[ -f "$SCRIPT_DIR/init_mariadb.sql" ]]; then
+if [[ -f "$CONF_DIR/init_mariadb.sql" ]]; then
   log "执行 init_mariadb.sql（创建 ha_monitor/replication/app + ha_local）..."
-  "${MYSQL[@]}" < "$SCRIPT_DIR/init_mariadb.sql" || warn "init_mariadb.sql 执行有告警，请检查（以随后账号校验结果为准）"
+  "${MYSQL[@]}" < "$CONF_DIR/init_mariadb.sql" || warn "init_mariadb.sql 执行有告警，请检查（以随后账号校验结果为准）"
 fi
-if [[ -f "$SCRIPT_DIR/fix-node-creds.sql" ]]; then
+if [[ -f "$CONF_DIR/fix-node-creds.sql" ]]; then
   log "重放 fix-node-creds.sql（权限对齐，防面板/重装回退）..."
-  "${MYSQL[@]}" < "$SCRIPT_DIR/fix-node-creds.sql" || warn "fix-node-creds.sql 执行有告警，请检查（以随后账号校验结果为准）"
+  "${MYSQL[@]}" < "$CONF_DIR/fix-node-creds.sql" || warn "fix-node-creds.sql 执行有告警，请检查（以随后账号校验结果为准）"
 fi
 
 # ---------- 7.5) 初始化结果校验（关键：账号缺失必须判失败） ----------
@@ -380,8 +387,8 @@ fi
 # 故必须实查 mysql.user 校验账号是否真正建出来；不只看退出码，以免把无害告警误判为致命。
 verify_init_accounts() {
   local sqls=() u cnt
-  [[ -f "$SCRIPT_DIR/init_mariadb.sql" ]] && sqls+=("$SCRIPT_DIR/init_mariadb.sql")
-  [[ -f "$SCRIPT_DIR/fix-node-creds.sql" ]] && sqls+=("$SCRIPT_DIR/fix-node-creds.sql")
+  [[ -f "$CONF_DIR/init_mariadb.sql" ]] && sqls+=("$CONF_DIR/init_mariadb.sql")
+  [[ -f "$CONF_DIR/fix-node-creds.sql" ]] && sqls+=("$CONF_DIR/fix-node-creds.sql")
   ((${#sqls[@]})) || return 0
   local users
   users="$(grep -hoE "CREATE USER( IF NOT EXISTS)? '[^']+'" "${sqls[@]}" 2>/dev/null \
@@ -445,7 +452,7 @@ allow_port_vrrp
 # 表现为「VIP 能 ping 通，但业务账号连不上库」。仅 VIP 持有者会收到该流量，其余节点无副作用。
 setup_vip_port_forward() {
   local vip_port
-  vip_port="$(conf_get "$SCRIPT_DIR/keepalived/ha_check.conf" VIP_PORT || true)"
+  vip_port="$(conf_get "$NODE_ROOT/keepalived/ha_check.conf" VIP_PORT || true)"
   if [[ -z "$vip_port" ]]; then
     warn "ha_check.conf 未下发 VIP_PORT，跳过业务端口转发（如业务连 VIP 端口与 $PORT 不同，请重新生成节点目录）"
     return 0
@@ -473,12 +480,12 @@ setup_vip_port_forward() {
 setup_vip_port_forward
 
 # ---------- 9) 启动 keepalived 客户端（compose） ----------
-if [[ -f "$SCRIPT_DIR/docker-compose.yaml" || -f "$SCRIPT_DIR/docker-compose.yml" ]]; then
+if [[ -f "$NODE_ROOT/docker-compose.yaml" || -f "$NODE_ROOT/docker-compose.yml" ]]; then
   if command -v docker >/dev/null 2>&1; then
     log "启动 keepalived 客户端与节点 agent 容器..."
-    ( cd "$SCRIPT_DIR" && docker compose up -d keepalived custos-node-agent ) || warn "keepalived/agent 启动失败，请手动 docker compose up -d keepalived custos-node-agent"
+    ( cd "$NODE_ROOT" && docker compose up -d keepalived custos-node-agent ) || warn "keepalived/agent 启动失败，请手动 docker compose up -d keepalived custos-node-agent"
   else
-    warn "未安装 docker，跳过 keepalived/agent（请安装 docker 后手动 cd $SCRIPT_DIR && docker compose up -d keepalived custos-node-agent）"
+    warn "未安装 docker，跳过 keepalived/agent（请安装 docker 后手动 cd $NODE_ROOT && docker compose up -d keepalived custos-node-agent）"
   fi
 fi
 
@@ -507,7 +514,7 @@ echo "  • MariaDB 程序目录 : $INSTALL_DIR"
 echo "  • 数据目录         : $DATA_DIR"
 echo "  • 监听端口         : $PORT"
 echo "  • systemd 单元     : $SYSTEMD_UNIT（systemctl start/stop/status $SYSTEMD_UNIT）"
-echo "  • 卸载方式         : sudo bash Uninstall-mariadb-Node.sh"
+echo "  • 卸载方式         : sudo bash mariadb12.3.3/scripts/Uninstall-mariadb-Node.sh"
 echo
 echo
 if [[ "$MARIADB_OK" -eq 1 ]]; then

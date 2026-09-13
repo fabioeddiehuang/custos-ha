@@ -192,7 +192,12 @@ def auth_required(request: Request):
         raise HTTPException(status_code=307, headers={"Location": "/login"})
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         if get_user_role(user) == ROLE_VIEWER:
-            raise HTTPException(status_code=403, detail="只读账号无操作权限")
+            raise HTTPException(
+                status_code=403,
+                detail="当前登录账号为「只读」（viewer），无权执行写操作"
+                       "（重新生成配置 / 故障切换 / 备份恢复 / 修改设置 等）。"
+                       "请退出登录后，改用管理员账号重新登录再试。",
+            )
     return user
 
 
@@ -800,6 +805,37 @@ def api_rebuild_status(task: str = "", user=Depends(auth_required)):
     return _json_ok(rebuild.get_task(task))
 
 
+# 手动「修复复制」的点击冷却（秒）。monitor 自动巡检有 _heal_fail 退避，
+# 但手动点击此前完全没有限频：连点会反复 STOP/START SLAVE、CHANGE MASTER，
+# 并每次无脑新增一条 unresolved 告警 —— 「报错不断」的观感正来源于此。
+_HEAL_CLICK_COOLDOWN_SEC = 15
+_HEAL_CLICK_AT = {}
+
+
+def _dedup_heal_alert(cluster_id, host, port, msg):
+    """记录复制自愈失败告警：同一 (集群,主机,端口) 只保留一条 unresolved。
+
+    此前每次失败都 INSERT 一条新的 unresolved，点 10 次多 10 条，
+    告警列表被同一件事刷屏，运维无法判断到底有几个真问题。
+    """
+    try:
+        rows = query("SELECT id FROM alerts WHERE cluster_id=%s AND host=%s AND port=%s "
+                     "AND alert_type='selfheal' AND status='unresolved' ORDER BY id DESC LIMIT 1",
+                     (cluster_id, host, int(port)))
+    except Exception:
+        rows = []
+    if rows:
+        try:
+            execute("UPDATE alerts SET message=%s, created_at=NOW() WHERE id=%s",
+                    (msg, (rows[0] or {}).get("id")))
+            return
+        except Exception:
+            pass
+    execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) "
+            "VALUES(%s,%s,%s,'selfheal','unresolved',%s,NOW())",
+            (cluster_id, host, int(port), msg))
+
+
 @app.post("/api/heal")
 def api_heal(request: Request, user=Depends(auth_required),
              host: str = Form(...), port: int = Form(...), cluster_id: int = Form(...)):
@@ -813,6 +849,19 @@ def api_heal(request: Request, user=Depends(auth_required),
         p = int(port)
         audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
                         "heal", f"{host}:{p}", f"cluster={cluster_id}", cluster_id)
+
+        # 点击冷却：连点只会反复重启复制线程并刷告警，不会让修复更快
+        import time as _time
+        _ck = (int(cluster_id), str(host), int(p))
+        _gap = _time.time() - (_HEAL_CLICK_AT.get(_ck) or 0)
+        if 0 < _gap < _HEAL_CLICK_COOLDOWN_SEC:
+            return JSONResponse({
+                "ok": False,
+                "msg": "操作过于频繁：复制自愈需 %d 秒冷却（距上次点击仅 %.0f 秒）。"
+                       "连点会反复重启复制线程并刷告警，请稍候再试；"
+                       "后台自动巡检每 30 秒也会尝试一次。"
+                       % (_HEAL_CLICK_COOLDOWN_SEC, _gap)})
+        _HEAL_CLICK_AT[_ck] = _time.time()
 
         def live():
             return get_status(host, p, creds["ha_user"], creds["ha_pass"], ru, rp, timeout=10)
@@ -935,11 +984,9 @@ def api_heal(request: Request, user=Depends(auth_required),
         else:
             tail = "真实错误未知（建议检查 %s → %s 的网络连通、复制账号(%s)权限与 GTID 集合）" % (
                 host, cur_h, creds.get("repl_user"))
-        # 自愈失败：记录「未恢复」状态
+        # 自愈失败：记录「未恢复」状态（同一节点去重，避免连点刷屏）
         try:
-            execute("INSERT INTO alerts(cluster_id,host,port,alert_type,status,message,created_at) "
-                    "VALUES(%s,%s,%s,'selfheal','unresolved',%s,NOW())",
-                    (cluster_id, host, int(port), tail))
+            _dedup_heal_alert(cluster_id, host, int(port), tail)
         except Exception:
             pass
         return JSONResponse({"ok": False,
@@ -3125,12 +3172,30 @@ def api_node_pending(ip: str, user=Depends(auth_required)):
 
 
 @app.post("/nodes/{ip}/ack_deploy")
-def nodes_ack_deploy(ip: str, user=Depends(auth_required)):
-    """运维已在节点上执行完动作后点「已执行」，清空该节点的待生效提示。"""
+def nodes_ack_deploy(ip: str, force: bool = False, user=Depends(auth_required)):
+    """运维已在节点上执行完动作后点「已执行」。
+
+    v2.3.8：不再是「一键盲清」。只清除两类动作——无法远程核验的 manual 类、
+    以及自动核验已确认落实的；对 db_uptime / proc:* 这类可远程核验但**尚未落实**的
+    动作一律保留并回传原因，杜绝「点一下徽标没了、实际配置没生效、问题过会儿又回来」。
+    确需绕过核验（如数据库在 regen 前就重启过、节点无 agent）时用 ?force=1 人工兜底。
+    """
     try:
         from .node_gen import ack_node_pending
-        ack_node_pending(ip)
-        return JSONResponse({"ok": True, "msg": "已标记为已执行"})
+        r = ack_node_pending(ip, force=bool(force)) or {}
+        kept = r.get("kept") or []
+        if kept:
+            detail = "；".join(
+                "%s（%s）" % ((k or {}).get("title") or "", (k or {}).get("reason") or "")
+                for k in kept)
+            return JSONResponse({
+                "ok": True, "cleared": r.get("cleared") or [], "kept": kept,
+                "msg": "以下动作经远程核验确认【尚未生效】，已保留：%s。"
+                       "请在节点执行对应命令，生效后会自动消失；"
+                       "若你确认已生效只是核验不到，可用「仍然清除」。" % detail,
+            })
+        return JSONResponse({"ok": True, "cleared": r.get("cleared") or [], "kept": [],
+                             "msg": "已清除待生效提示"})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": f"标记失败：{type(e).__name__}: {e}"})
 
