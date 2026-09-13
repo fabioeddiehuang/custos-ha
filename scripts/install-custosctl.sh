@@ -48,6 +48,17 @@ if [ -f "$CUSTOS_HOME/scripts/custosctl-completion.bash" ]; then
   echo "    已安装 bash 补全：$BC_DIR/custosctl（新开终端或 source 它立即生效）"
 fi
 
+# 安装 zsh 原生补全（无需 bashcompinit：放入 site-functions，由 zsh compinit 自动加载，不改 ~/.zshrc）
+if [ -f "$CUSTOS_HOME/scripts/_custosctl" ]; then
+  for zd in /usr/local/share/zsh/site-functions /usr/share/zsh/site-functions; do
+    if [ -d "$zd" ]; then
+      install -m 0644 "$CUSTOS_HOME/scripts/_custosctl" "$zd/_custosctl"
+      echo "    已安装 zsh 补全：$zd/_custosctl（zsh 终端自动加载，无需改配置）"
+      break
+    fi
+  done
+fi
+
 echo "==> 已安装 $TARGET"
 echo "    项目目录：$CUSTOS_HOME（记录在 $CONF）"
 echo "    用法：custosctl help"

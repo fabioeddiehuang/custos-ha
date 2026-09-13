@@ -88,6 +88,8 @@ fi
 rm -f /usr/bin/custosctl
 rm -f /usr/share/bash-completion/completions/custosctl 2>/dev/null || true
 rm -f /etc/bash_completion.d/custosctl 2>/dev/null || true
+rm -f /usr/local/share/zsh/site-functions/_custosctl 2>/dev/null || true
+rm -f /usr/share/zsh/site-functions/_custosctl 2>/dev/null || true
 rm -rf /etc/custos
 
 echo "==> 卸载完成：容器与本项目镜像已移除，custosctl 已删除。"
