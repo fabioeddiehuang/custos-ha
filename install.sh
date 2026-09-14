@@ -142,6 +142,7 @@ DEF_VIP_PREFIX=$(cur_val VIP_PREFIX);    [ -n "$DEF_VIP_PREFIX" ] || DEF_VIP_PRE
 DEF_VRID=$(cur_val VRID);                [ -n "$DEF_VRID" ] || DEF_VRID=51
 DEF_WEB_PORT=$(cur_val WEB_PORT);        [ -n "$DEF_WEB_PORT" ] || DEF_WEB_PORT=28888
 DEF_WEB_USER=$(cur_val WEB_USER);        [ -n "$DEF_WEB_USER" ] || DEF_WEB_USER=admin
+DEF_WEB_PASS=$(cur_val WEB_PASS)
 DEF_VIP=$(grep -E '^[[:space:]]*VIP:' "$COMPOSE_FILE" 2>/dev/null | head -1 \
   | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//' || true)
 [ -n "$DEF_VIP" ] || DEF_VIP=""
@@ -162,12 +163,13 @@ ask "VIP 掩码位" "$DEF_VIP_PREFIX"; VIP_PREFIX=$REPLY
 ask "VRID（同网段多集群需不同）" "$DEF_VRID"; VRID=$REPLY
 ask "Web 端口" "$DEF_WEB_PORT"; WEB_PORT=$REPLY
 ask "Web 管理员账号" "$DEF_WEB_USER"; WEB_USER=$REPLY
+ask "Web 管理员密码(WEB_PASS，留空=首次启动随机生成并打印日志)" "${DEF_WEB_PASS:-}"; WEB_PASS=$REPLY
 
 # WEB_PASS 改由 docker-compose.yml 驱动，install.sh 不再生成/写入 .env：
 #   - compose 中 WEB_PASS 留空 → 首次启动随机生成并持久化到管理库、打印到日志；
 #   - 或直接在 compose 的 environment 里填固定密码（生产建议）。
 # 详见 docker-compose-example.yml 的 WEB_PASS 注释。
-info "Web 密码(WEB_PASS)取自 docker-compose.yml：留空则首次启动自动生成并打印到日志，或填写固定密码。"
+info "Web 密码(WEB_PASS)：上一步可直接输入固定口令（生产建议）；留空则首次启动自动生成并打印到日志。"
 
 # 管理库连通性预检（根治：错/不可达的 MGMT_MYSQL_HOST 会让管理器起不来、regen 全挂）
 if ! check_mgmt "$MGMT_HOST" "$MGMT_PORT" "$MGMT_USER" "$MGMT_PASS" "$MGMT_DB"; then
@@ -208,6 +210,7 @@ set_yaml VIP_PREFIX "$VIP_PREFIX"
 set_yaml VRID "$VRID"
 set_yaml WEB_PORT "$WEB_PORT"
 set_yaml WEB_USER "$WEB_USER"
+set_yaml WEB_PASS "$WEB_PASS"
 # 半同步复制默认开启（主库提交等待从库 ACK，压缩切换数据丢失窗口）
 set_yaml SEMI_SYNC "1"
 # VIP 可选：留空则不在 compose 写入，稍后可在后台「服务端配置」填写

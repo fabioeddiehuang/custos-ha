@@ -349,21 +349,39 @@ fi
 # 每个人安装路径都不同，故不猜固定路径，按「可靠性降序」多级发现：
 #   ① 命令行 -C / ② 环境变量 CUSTOS_HOME / ③ /etc/custos/custosctl.env（安装时写入）
 #   ④ 从运行中的容器反查（compose 写入的 working_dir 标签，最贴合实际部署）
-#   ⑤ 常见安装路径探测 / ⑥ 当前目录及其父级
+#   ⑤ 常见安装路径探测 / ⑥ 当前目录及其父级 / ⑦ custosctl 自身所在目录
 CUSTOS_HOME_ENV="${CUSTOS_HOME:-}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || SCRIPT_DIR=""
+# 项目目录的有效标记：运行期需 docker-compose.yml；但首次安装时 compose 尚未生成，
+# 仅凭 install.sh / custosctl / env.example 即可判定（install 的目的正是生成 compose）。
+# 否则会落到陈旧目录（如 /etc 记录的旧 CUSTOS_HOME）而报「找不到 .env / env.example」。
+_proj_ok() {
+  [ -f "$1/docker-compose.yml" ] || [ -f "$1/install.sh" ] \
+    || [ -f "$1/custosctl" ] || [ -f "$1/env.example" ]
+}
 [ -r "$CONF" ] && . "$CONF" || true
 # 关键：/etc 记录的路径**绝不能**覆盖「本次执行的 custosctl 自身所在目录」或 -C 显式指定。
 # 否则在项目目录里执行 ./custosctl，却跑到 /etc 记录的历史目录去操作，典型症状就是
 # 「明明当前目录有 .env，却报 找不到 .env，也没有 env.example 模板」——因为检查的是
-# 另一个目录。显式执行某份 custosctl 即代表要操作它所在的项目，意图优先级最高。
+# 另一个目录。显式执行某份 custosctl 即代表要操作它所在的项目，意图优先级最高（仅次 -C）。
 if [ -n "$CUSTOS_HOME_ENV" ]; then
   CUSTOS_HOME=$CUSTOS_HOME_ENV
   [ -n "$HOME_SRC" ] || HOME_SRC="环境变量 CUSTOS_HOME"
-else
-  if [ -n "${CUSTOS_HOME:-}" ] && [ -z "$HOME_SRC" ]; then HOME_SRC="$CONF"; fi
+elif [ -n "${CUSTOS_HOME:-}" ] && [ -z "$HOME_SRC" ]; then
+  HOME_SRC="$CONF"
 fi
 
-if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
+# ⑦ custosctl 自身所在目录（最高优先级，仅次于 -C）：无论 compose 是否已生成。
+# 仅在 -C 未显式指定、且当前已定位目录无效（如 /etc 旧路径）时启用，避免误覆盖用户意图。
+# 注意：判定用「有 install.sh / docker-compose.yml / env.example」，不把孤立的 custosctl
+# 当成项目目录（否则装入 /usr/bin 时 SCRIPT_DIR=/usr/bin 会被误判）。
+if [ -z "$CUSTOS_HOME_ENV" ] && { [ -z "${CUSTOS_HOME:-}" ] || ! _proj_ok "$CUSTOS_HOME"; } \
+   && [ -n "$SCRIPT_DIR" ] \
+   && { [ -f "$SCRIPT_DIR/install.sh" ] || [ -f "$SCRIPT_DIR/docker-compose.yml" ] || [ -f "$SCRIPT_DIR/env.example" ]; }; then
+  CUSTOS_HOME=$SCRIPT_DIR; HOME_SRC="custosctl 所在目录"
+fi
+
+if [ -z "${CUSTOS_HOME:-}" ] || ! _proj_ok "$CUSTOS_HOME"; then
   for _c in $SVC $(docker ps --format '{{.Names}}' 2>/dev/null || true); do
     _d=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$_c" 2>/dev/null || true)
     if [ -n "$_d" ] && [ -f "$_d/docker-compose.yml" ] && [ -f "$_d/custosctl" ]; then
@@ -372,17 +390,17 @@ if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
   done
 fi
 
-if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
+if [ -z "${CUSTOS_HOME:-}" ] || ! _proj_ok "$CUSTOS_HOME"; then
   for d in /opt/Custos-HA /opt/custos /srv/Custos-HA /usr/local/Custos-HA "$HOME/Custos-HA"; do
-    if [ -f "$d/docker-compose.yml" ]; then CUSTOS_HOME=$d; HOME_SRC="常见路径探测"; break; fi
+    if _proj_ok "$d"; then CUSTOS_HOME=$d; HOME_SRC="常见路径探测"; break; fi
   done
 fi
 
-if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
+if [ -z "${CUSTOS_HOME:-}" ] || ! _proj_ok "$CUSTOS_HOME"; then
   _p=$(pwd)
   _i=0
   while [ $_i -lt 8 ]; do
-    if [ -f "$_p/docker-compose.yml" ]; then
+    if _proj_ok "$_p"; then
       CUSTOS_HOME=$_p; HOME_SRC="当前目录/父级"; break
     fi
     [ "$_p" = "/" ] && break
@@ -390,8 +408,8 @@ if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
   done
 fi
 
-if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
-  echo "错误：未能定位 Custos 项目目录（需含 docker-compose.yml 与 custosctl）。" >&2
+if [ -z "${CUSTOS_HOME:-}" ] || ! _proj_ok "$CUSTOS_HOME"; then
+  echo "错误：未能定位 Custos 项目目录（需含 docker-compose.yml 与 custosctl，或 install.sh / env.example）。" >&2
   echo "任选一种方式即可：" >&2
   echo "  1) custosctl -C <项目目录> status" >&2
   echo "  2) cd <项目目录> && custosctl status" >&2
