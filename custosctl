@@ -352,8 +352,15 @@ fi
 #   ⑤ 常见安装路径探测 / ⑥ 当前目录及其父级
 CUSTOS_HOME_ENV="${CUSTOS_HOME:-}"
 [ -r "$CONF" ] && . "$CONF" || true
-if [ -n "${CUSTOS_HOME:-}" ] && [ -z "$HOME_SRC" ]; then
-  if [ -n "${CUSTOS_HOME_ENV:-}" ]; then HOME_SRC="环境变量 CUSTOS_HOME"; else HOME_SRC="$CONF"; fi
+# 关键：/etc 记录的路径**绝不能**覆盖「本次执行的 custosctl 自身所在目录」或 -C 显式指定。
+# 否则在项目目录里执行 ./custosctl，却跑到 /etc 记录的历史目录去操作，典型症状就是
+# 「明明当前目录有 .env，却报 找不到 .env，也没有 env.example 模板」——因为检查的是
+# 另一个目录。显式执行某份 custosctl 即代表要操作它所在的项目，意图优先级最高。
+if [ -n "$CUSTOS_HOME_ENV" ]; then
+  CUSTOS_HOME=$CUSTOS_HOME_ENV
+  [ -n "$HOME_SRC" ] || HOME_SRC="环境变量 CUSTOS_HOME"
+else
+  if [ -n "${CUSTOS_HOME:-}" ] && [ -z "$HOME_SRC" ]; then HOME_SRC="$CONF"; fi
 fi
 
 if [ -z "${CUSTOS_HOME:-}" ] || [ ! -f "$CUSTOS_HOME/docker-compose.yml" ]; then
@@ -402,6 +409,8 @@ if [ ! -f "$ENV_FILE" ]; then
     echo "提示：未找到 .env，已由 env.example 生成，请按需修改后再部署。" >&2
   else
     echo "错误：找不到 $ENV_FILE，也没有 env.example 模板。" >&2
+    echo "  已定位的项目目录：$CUSTOS_HOME（来源：${HOME_SRC:-未知}）" >&2
+    echo "  若与实际目录不符，请显式指定：custosctl -C <项目目录> install" >&2
     exit 1
   fi
 fi

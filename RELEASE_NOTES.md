@@ -93,6 +93,7 @@
 - **修复**：`custosctl node install` 不支持容器版 MySQL / MariaDB —— 节点包 compose 名为 `docker-compose.yaml` 而检测读 `docker-compose.yml`，导致容器节点被误判为裸机而找不到安装脚本。新增 `_cf()` 统一解析 compose 文件名。
 - **卸载保底：密钥保险库（`/var/lib/custos`）**：`scripts/uninstall.sh` 无论是否 `-f`，都会先把 `data/cred.key` / `data/secret_key` 镜像到**项目目录之外**的 `/var/lib/custos/`（该目录卸载不删除）；`install.sh` 重装时若 `data/` 下缺失会自动取回，应用启动时 `crypto.bootstrap()` 也会从保险库回补，并把它纳入解密钥匙串。效果：**即便整个项目目录被删除后重装，存量凭证仍能解开**；只有删除 `/var/lib/custos` 才会真正失效。
 - **启动自检（主动告警）**：`init_db` 启动时执行 `startup_credential_check()`，若存在解不开的凭证，立即在启动日志打印明细并写入告警中心（`alert_type=cred_key`，按集群聚合、24h 内同内容不重复）。这类故障原本**完全静默** —— 要等复制把密文当口令报 1470 才暴露，现象是「源库不可达」，与密钥毫无关联，排查成本极高。
+- **凭证加密 Web 开关 + 一键回填 + 批量重置复制口令**：设置页「凭证加密」可在线切换开关、重置密钥，并新增「从节点包回填明文」「批量重置复制口令」两个一键按钮。
 - 详见 [`doc/releases/v2.3.10.md`](./doc/releases/v2.3.10.md)。
 
 ---

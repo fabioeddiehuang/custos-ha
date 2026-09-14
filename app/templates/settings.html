@@ -76,6 +76,8 @@
     <button class="btn btn-sm" id="credDisable">关闭加密（保底）</button>
     <button class="btn btn-primary btn-sm" id="credEnable">开启加密</button>
     <button class="btn btn-sm" id="credReset" style="border-color:#fb7185;color:#fb7185">重置密钥</button>
+    <button class="btn btn-sm" id="credRecover" style="border-color:#34d399;color:#34d399">从节点包回填明文</button>
+    <button class="btn btn-sm" id="credResetRepl" style="border-color:#f59e0b;color:#f59e0b">批量重置复制口令</button>
   </div>
   <div id="credMsg" style="margin-top:8px;font-size:13px"></div>
 </div>
@@ -409,6 +411,40 @@
     var b=document.getElementById('credDisable'); if(b)b.onclick=function(){credAction('disable');};
     b=document.getElementById('credEnable');      if(b)b.onclick=function(){credAction('enable');};
     b=document.getElementById('credReset');       if(b)b.onclick=function(){credAction('reset_key');};
+    b=document.getElementById('credRecover');     if(b)b.onclick=function(){
+      if(!confirm('从节点生成包（generated_nodes/）取回明文口令并回填？\n\n'
+        +'· 适用于：重装/重建管理器后，管理库密文解不开、复制中断。\n'
+        +'· 节点包含节点 MySQL 当前实际使用的明文口令，回填后复制即可恢复，无需旧密钥。\n'
+        +'· 若节点包已被卸载/清理，则无法回填，需手动到「集群设置/节点」重录。'))return;
+      var fd=new FormData();
+      fetch('/api/cred_recover',{method:'POST',body:fd,credentials:'same-origin'})
+        .then(function(r){return r.json();})
+        .then(function(d){
+          var extra=d.applied&&d.applied.length?('\n· '+d.applied.join('\n· ')):'';
+          var skip=d.skipped&&d.skipped.length?('\n跳过：\n· '+d.skipped.join('\n· ')):'';
+          credMsg((d.msg||(d.ok?'已完成':'操作失败'))+extra+skip, !d.ok);
+          loadCredStatus();
+        })
+        .catch(function(e){credMsg('操作失败: '+e,true);});
+    };
+    b=document.getElementById('credResetRepl'); if(b)b.onclick=function(){
+      if(!confirm('批量重置复制口令？\n\n'
+        +'· 生成新的复制口令并写回管理库，在每个节点上重置 replication 账号密码，\n'
+        +'  对从库以新口令重新挂载复制（GTID 自动定位，不会丢数据）。\n'
+        +'· 需要 manager 能用 ha/root 连上节点（口令须可用）；若 root 也解不开，\n'
+        +'  请改用「从节点包回填明文」或手动重置。\n'
+        +'· 该操作会短暂重启从库复制线程。'))return;
+      var fd=new FormData();
+      fetch('/api/cred_reset_repl',{method:'POST',body:fd,credentials:'same-origin'})
+        .then(function(r){return r.json();})
+        .then(function(d){
+          var extra=d.applied&&d.applied.length?('\n· '+d.applied.join('\n· ')):'';
+          var skip=d.skipped&&d.skipped.length?('\n跳过：\n· '+d.skipped.join('\n· ')):'';
+          credMsg((d.msg||(d.ok?'已完成':'操作失败'))+extra+skip, !d.ok);
+          loadCredStatus();
+        })
+        .catch(function(e){credMsg('操作失败: '+e,true);});
+    };
   })();
 
   // 动态填充「本机实际存在」的容器，避免点到本机没有的容器

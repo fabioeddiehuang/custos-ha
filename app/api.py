@@ -1862,6 +1862,46 @@ def api_cred_encryption(action: str = Form(...), user=Depends(auth_required)):
                   if h.get("broken") else "")})
 
 
+@app.post("/api/cred_recover")
+def api_cred_recover(user=Depends(auth_required)):
+    """从节点生成包取回明文口令并回填（依赖文件，不连节点 DB）。
+
+    重装/重建管理器导致管理库凭证密文解不开、复制中断时的「一键恢复」：节点包里含
+    节点 MySQL 当前实际使用的明文口令，回填后即可让复制恢复，无需旧密钥、无需重设节点。
+    """
+    from .db import recover_creds_from_node_packages
+    try:
+        return JSONResponse(recover_creds_from_node_packages())
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"从节点包回填失败: {e}"},
+                            status_code=500)
+
+
+@app.post("/api/cred_reset_repl")
+def api_cred_reset_repl(user=Depends(auth_required)):
+    """批量重置复制口令：生成新 repl_pass 落库，并在每个节点重置复制账号密码、对从库以新口令重挂。
+
+    ⚠ 依赖 manager 能连上节点（ha/root 口令须可用）；root 也解不开时请改用「从节点包回填明文」。
+    """
+    from .db import reset_repl_password
+    from . import clusters as _clusters
+    try:
+        applied, skipped = [], []
+        any_ok = False
+        for c in _clusters.list_clusters():
+            r = reset_repl_password(c["id"])
+            any_ok = any_ok or r["ok"]
+            applied.extend(r["applied"])
+            skipped.extend(r["skipped"])
+        msg = "已批量重置复制口令：%d 项成功" % len(applied)
+        if skipped:
+            msg += "，%d 项跳过" % len(skipped)
+        return JSONResponse({"ok": any_ok, "msg": msg, "applied": applied, "skipped": skipped})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"批量重置复制口令失败: {e}"},
+                            status_code=500)
+
+
 @app.post("/api/setting_set")
 def api_setting_set(key: str = Form(...), value: str = Form(...),
                     user=Depends(auth_required)):
