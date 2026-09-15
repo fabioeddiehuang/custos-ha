@@ -118,25 +118,55 @@ def _heal_fail(key):
 _DATA_CONFLICT_ALERT_AT = {}
 _DATA_CONFLICT_ALERT_INTERVAL = 3600
 
+# 复制数据冲突的「连续复现」计数：需连续多周期都判定为数据冲突才升级告警。
+# 原因：单次 1032/1062 常是良性瞬态（如主库合法删行、从库尚未追上），
+# 直接按「需重建」告警会过度反应；配合自愈退避（_heal_fail 递增退避），
+# 连续 N 次复现意味着冲突已持续数十分钟，此时才升级为「需重建」的可操作告警。
+_DATA_CONFLICT_STREAK = {}
+_DATA_CONFLICT_STREAK_NEED = 3
+
+# 已落过「需重建」记录的节点：record_alert 是纯 INSERT、不去重，
+# 若每次限频到期都写一条，冲突持续时会在 alerts 表堆出大量重复的 unresolved 记录。
+# 故同一节点只落库一次，复制恢复后清除，使其后再次发生时能重新记录。
+_DATA_CONFLICT_LOGGED = set()
+
 
 def _alert_data_conflict(key, host, port, cluster_name, cid, msg):
-    """复制「数据冲突」告警（限频）。
+    """复制「数据冲突」告警（需连续多周期复现 + 限频）。
 
     1062/1032/1146 意味着主从数据已经不一致，自动跳过会静默放大分歧；
     默认已拒绝自愈，但必须让运维知晓——否则节点长期挂着不动，
     直到某次切主才暴露数据丢失。
+
+    ⚠ 本函数**只告警并给出重建入口，绝不自动执行重建**：重建会用主库数据覆盖该节点，
+    属不可逆的破坏性操作；且 1032 的语义（主库要改/删的行在从库不存在）无法自动判定
+    「谁的数据是对的」——盲目以主库为准可能销毁仅存于从库的有效数据。
+    重建必须由运维在界面确认后执行（一键入口），故此处仅做检测与引导。
     """
+    # 连续复现计数：单次瞬态冲突不升级为「需重建」
+    n = _DATA_CONFLICT_STREAK.get(key, 0) + 1
+    _DATA_CONFLICT_STREAK[key] = n
+    if n < _DATA_CONFLICT_STREAK_NEED:
+        return
     now = time.monotonic()
     if now < _DATA_CONFLICT_ALERT_AT.get(key, 0.0):
         return
     _DATA_CONFLICT_ALERT_AT[key] = now + _DATA_CONFLICT_ALERT_INTERVAL
     _sh_stat("data_conflict")
     try:
-        send_alert("复制数据冲突(需人工处理)",
-                   f"【{cluster_name}】节点 {host}:{port} 复制中断于数据冲突，已拒绝自动跳过：{msg}。"
-                   f"该节点数据与主库已不一致，建议核对差异或从主库重建此节点。"
-                   f"切勿长期忽略，否则切主后会暴露数据丢失。",
-                   cluster_id=cid)
+        send_alert("复制数据冲突(需重建从库)",
+                   f"【{cluster_name}】节点 {host}:{port} 复制持续中断于数据冲突"
+                   f"（已连续 {n} 个周期复现），已拒绝自动跳过：{msg}。\n"
+                   f"该节点数据与主库已不一致：跳过会使分歧永久化，切主后将暴露数据丢失。\n"
+                   f"处理：在「仪表盘 / 集群管理」对该节点点击【重建】，用主库数据重做该从库。\n"
+                   f"⚠ 重建会用主库数据覆盖本节点，属破坏性操作，请确认后再执行。",
+                   cluster_id=cid, force=True)
+        # 仅落库一次（record_alert 为纯 INSERT，不去重）
+        if key not in _DATA_CONFLICT_LOGGED:
+            _DATA_CONFLICT_LOGGED.add(key)
+            record_alert(cid, host, port, "need_rebuild",
+                         f"复制数据冲突（连续 {n} 个周期复现）：{msg}。需重建该从库。",
+                         status="unresolved")
     except Exception:
         pass
 
@@ -884,6 +914,9 @@ def _act_once():
             # 复制已恢复正常：解除「需重建」标记，使其后再次发生时能重新告警
             if not is_master and st.get("slave_io") == "Yes" and st.get("slave_sql") == "Yes":
                 _PURGE_LOGGED.discard((cid, h_host, h_port))
+                # 数据冲突连续计数一并清零：否则下次偶发冲突会带着旧计数直接触发「需重建」
+                _DATA_CONFLICT_STREAK.pop(key, None)
+                _DATA_CONFLICT_LOGGED.discard(key)
             # 当前主库但若仍挂着复制通道（SHOW REPLICA STATUS 有输出）：这是提升为主时
             # RESET SLAVE ALL 未清干净、或被 ensure_topology 误 repoint 的残留。它会让主库
             # 仍尝试拉旧源 binlog 而报 1236（"master 却 IO 错误"的矛盾现象）。

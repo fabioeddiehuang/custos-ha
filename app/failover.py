@@ -6,6 +6,7 @@ from .ha_client import (set_read_only, promote_to_master, make_slave_of,
                         set_local_master_flag, is_stale_master, get_status,
                         heal_replication, heal_io_gtid_gap, get_gtid_executed,
                         parse_gtid_set, fix_node_mysql_params, ensure_ha_creds,
+                        ensure_connect_creds,
                         heal_anonymous_gtid_io, is_read_only)
 import time
 import threading
@@ -553,11 +554,22 @@ def _selfheal_cluster(cluster_id):
     for h in hosts:
         ip, port = h["host"], int(h["port"])
         ru, rp = node_root(ip, cluster_id)
-        # 只读副本：账号(ha_monitor/replication/root)与全局参数(gtid_mode/server_id)均来自
-        # 主库经复制同步，管理器不应在副本上直接执行改账号/改全局参数的 DDL——会与其复制来的
-        # 同名语句争用元数据锁并漂权限(表现为 1045/1227 告警)。副本账号由主库 ensure_ha_creds
-        # 周期性 binlog 出去自动纠正；server_id 已在节点初始化时设为唯一值。故直接跳过。
+        # 只读副本：replication/app 账号与全局参数(gtid_mode/server_id)来自主库经复制同步，
+        # 管理器不应在副本上跑全量 ensure_ha_creds（会与其复制来的同名 DCL 争用元数据锁/漂权限）。
+        # 但 ha_monitor/root 是管理器【直连本节点】所需的登录凭证，必须逐节点校正——
+        # 否则副本重装后 init SQL 写入的 ha_monitor/root 与库存不一致时，管理器连不上副本 ->
+        # 副本永远 "down" -> 不被重指向、不自动加入集群（这正是「重装节点难自动加入」的根因之一）。
+        # 故副本仅跑 ensure_connect_creds（只校正 ha_monitor/root，且全程 sql_log_bin=0 不回灌主库）。
         if is_read_only(ip, port, creds["ha_user"], creds["ha_pass"], ru, rp):
+            _ts = _SELFHEAL_CRED_TS.get(cluster_id)
+            if _ts is None or (time.time() - _ts) >= CRED_SELFHEAL_INTERVAL:
+                cok, cmsg = ensure_connect_creds(
+                    ip, port, creds["ha_user"], creds["ha_pass"], ru, rp,
+                    manager_ip=get_manager_public_ip(),
+                    manager_subnet=get_manager_docker_subnet_wildcard())
+                did_cred = True
+                if not cok:
+                    print(f"[selfheal] {ip}:{port}(副本) 连接凭证校正失败: {cmsg}")
             continue
         # 参数自愈限频（见 PARAM_SELFHEAL_INTERVAL 注释）
         _pk = (cluster_id, ip, port)

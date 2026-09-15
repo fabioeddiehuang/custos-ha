@@ -2039,9 +2039,87 @@ def ensure_semisync_runtime(host, port, ha_user, ha_pass, root_user=None,
             flavour = detect_flavour(cur)
         except Exception:
             return False, "无法判定数据库类型"
-        if flavour != F_MYSQL8:
-            # MariaDB 半同步由 node_gen 注入的 my.cnf 决定，不走运行期 SET GLOBAL
-            return False, "非 MySQL8(%s)，跳过" % flavour
+        if flavour == F_MARIADB:
+            # 幂等：已开启则直接返回，不产生写操作、也【不刷自愈日志】。
+            # monitor 仅在 changed=True 时打印自愈信息；若每周期都返回 True，
+            # 每个 MariaDB 节点每个间隔都会刷一行「半同步自愈」（MySQL 分支用 already-on 规避）。
+            def _on_m(x):
+                return str(x or "").strip().upper() in ("ON", "1")
+
+            try:
+                cur.execute("SHOW VARIABLES LIKE 'rpl_semi_sync%_enabled'")
+                _pre = {r[0]: r[1] for r in (cur.fetchall() or [])}
+            except Exception:
+                _pre = {}
+            if _on_m(_pre.get("rpl_semi_sync_master_enabled")) \
+                    and _on_m(_pre.get("rpl_semi_sync_slave_enabled")):
+                return False, "already-on"
+            # MariaDB 半同步：插件内置，通常由 node_gen 注入的 my.cnf（plugin_load_add +
+            # rpl_semi_sync_*_enabled=1）随启动启用。但若节点生成时未注入该块（早于该修复，
+            # 或 SEMI_SYNC 后开未 regen），插件可能未加载、变量恒为 OFF —— 这里运行时补启用，
+            # 使「半同步配了却一直 OFF」对 my.cnf 缺块也 resilient，无需重装节点。
+            def _mset(var):
+                try:
+                    cur.execute("SET GLOBAL %s=1" % var)
+                    return True, ""
+                except Exception as e:
+                    return False, str(e)
+
+            m_ok, m_err = _mset("rpl_semi_sync_master_enabled")
+            s_ok, s_err = _mset("rpl_semi_sync_slave_enabled")
+
+            def _semi_unk(s):
+                return "unknown system variable" in s.lower() or "does not exist" in s.lower()
+
+            if (not m_ok or not s_ok) and _semi_unk(m_err + " " + s_err):
+                # 插件未加载：运行时 INSTALL PLUGIN（MariaDB 半同步 .so 内置）
+                for _sn, _pn in (("semisync_master.so", "rpl_semi_sync_master"),
+                                 ("semisync_slave.so", "rpl_semi_sync_slave")):
+                    try:
+                        cur.execute("INSTALL PLUGIN %s SONAME '%s'" % (_pn, _sn))
+                    except Exception as e:
+                        if "already loaded" not in str(e).lower():
+                            print("[semi] MariaDB 加载插件 %s 失败: %s" % (_pn, e))
+                m_ok, m_err = _mset("rpl_semi_sync_master_enabled")
+                s_ok, s_err = _mset("rpl_semi_sync_slave_enabled")
+            # 最佳努力：对齐 AFTER_SYNC 等待点 + 超时（与 my.cnf 意图一致）
+            try:
+                cur.execute("SET GLOBAL rpl_semi_sync_master_wait_point='AFTER_SYNC'")
+            except Exception:
+                pass
+            try:
+                cur.execute("SET GLOBAL rpl_semi_sync_master_timeout=10000")
+            except Exception:
+                pass
+            restarted = False
+            try:
+                cur.execute("SHOW SLAVE STATUS")
+                _row = cur.fetchone()
+                if _row:
+                    _cols = [d[0] for d in cur.description]
+                    _d = dict(zip(_cols, _row))
+                    if _d.get("Slave_IO_Running") == "Yes":
+                        cur.execute("STOP SLAVE")
+                        cur.execute("START SLAVE")
+                        restarted = True
+            except Exception:
+                pass
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                cur.execute("SHOW VARIABLES LIKE 'rpl_semi_sync%_enabled'")
+                _now = {r[0]: r[1] for r in (cur.fetchall() or [])}
+            except Exception:
+                _now = {}
+            _m_on = str(_now.get("rpl_semi_sync_master_enabled", "")).strip().upper() in ("ON", "1")
+            _s_on = str(_now.get("rpl_semi_sync_slave_enabled", "")).strip().upper() in ("ON", "1")
+            if not (_m_on and _s_on):
+                _why = (m_err + " " + s_err).strip() or "SET GLOBAL 未生效"
+                return False, "MariaDB 半同步开启失败（复核未 ON）：%s" % _why
+            return True, "MariaDB 已启用半同步" + ("并重启复制 IO 线程" if restarted else "")
+        # 以下为 MySQL 8 原逻辑
         cur.execute("SHOW GLOBAL VARIABLES LIKE 'rpl_semi_sync%_enabled'")
         vals = dict(cur.fetchall())
 
@@ -2101,6 +2179,91 @@ def ensure_semisync_runtime(host, port, ha_user, ha_pass, root_user=None,
             why = "；".join(failed) or "SET GLOBAL 未生效（多为 1227 权限不足，需 SUPER/SYSTEM_VARIABLES_ADMIN）"
             return False, "半同步开启失败（复核仍未 ON）：%s" % why
         return True, "已开启半同步" + ("并重启复制 IO 线程" if restarted else "")
+    except Exception as e:
+        return False, "异常: %s" % e
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def ensure_connect_creds(host, port, ha_user, ha_pass, root_user, root_pass,
+                         manager_ip=None, manager_subnet=None, timeout=5):
+    """仅校正【本节点】的 ha_monitor 与 root 登录凭证，使管理器能连上该节点。
+
+    与 ensure_ha_creds 的区别：
+      - 只处理 ha_monitor@'%'（+ @manager_ip）与 root@<各 host>，不动 replication/app 账号
+        （replication 账号是主库权威、由主库经复制下发；app 同），故对副本完全安全；
+      - 全程在 SET SESSION sql_log_bin=0 下执行，**不写 binlog、不回灌主库**，
+        可在副本上直连校正，杜绝账号 DCL 经复制放大 / 元数据锁争用。
+
+    解决：副本重装后 init SQL 写入的 ha_monitor/root 与管理器库存不一致（节点包生成后
+    改过口令 / 重加密等），导致管理器连不上副本 -> 副本永远 "down" -> 不被重指向、
+    不自动加入集群。优先用 root 连接（具 SUPER 可先关 binlog），不通再回退 ha_monitor。
+    返回 (ok, msg)。
+    """
+    conn = None
+    used = None
+    for (cu, cp, tag) in ((root_user, root_pass, "root"), (ha_user, ha_pass, "ha_monitor")):
+        if not cu:
+            continue
+        try:
+            conn = connect(host, port, cu, cp, timeout=timeout)
+            used = tag
+            break
+        except Exception:
+            pass
+    if conn is None:
+        return False, "不可达（root/ha_monitor 均失败）"
+    try:
+        cur = conn.cursor()
+        try:
+            _flavour = detect_flavour(cur)
+        except Exception:
+            _flavour = F_MYSQL8
+        version_str = ""
+        try:
+            cur.execute("SELECT VERSION()")
+            _vr = cur.fetchone()
+            version_str = (_vr[0] if _vr else "") or ""
+        except Exception:
+            pass
+        try:
+            from .db import get_setting
+            _prefer = (get_setting("AUTH_PLUGIN") or "auto")
+        except Exception:
+            _prefer = "auto"
+        _auth = default_auth_plugin(version_str, None, _prefer)
+        if _flavour == F_MARIADB:
+            idn = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
+            idn_root = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
+        else:
+            idn = "IDENTIFIED WITH " + _auth + " BY %s"
+            idn_root = "IDENTIFIED WITH " + _auth + " BY %s"
+        # 关 binlog：本节点本地校正，不复制到主库（避免 DCL 回灌 / 放大）
+        try:
+            cur.execute("SET SESSION sql_log_bin=0")
+        except Exception:
+            pass
+        for _h in ("%", manager_ip):
+            if not _h:
+                continue
+            _ensure_account(cur, ha_user, _h, ha_pass, idn, None,
+                           conn_host=host, conn_port=port, plugin=_auth)
+        root_targets = []
+        if manager_ip:
+            root_targets.append(manager_ip)
+        root_targets.append("127.0.0.1")
+        if manager_subnet:
+            root_targets.append(manager_subnet)
+        root_targets.append("%")
+        for rh in root_targets:
+            _g = ("GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' WITH GRANT OPTION"
+                  % (_esc_sql(root_user), rh))
+            _ensure_account(cur, root_user, rh, root_pass, idn_root, _g,
+                           conn_host=host, conn_port=port, plugin=_auth)
+        return True, ("已校正本节点连接凭证(ha_monitor/root，binlog 安全，以 %s 连接)" % used)
     except Exception as e:
         return False, "异常: %s" % e
     finally:

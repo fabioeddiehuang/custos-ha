@@ -107,7 +107,12 @@ services:
       VRID: "51"
       # SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / ALERT_EMAIL
     ports:
-      - "28888:28888"
+      # 端口映射必须跟随 WEB_PORT：此前写死 "28888:28888"，而应用监听的是 WEB_PORT
+      # （config.WEB_PORT = env("WEB_PORT", 28888)）。安装时一旦改了端口（如 8080），
+      # 容器内监听 8080、映射却是 28888:28888 → 宿主 28888 转不到应用、8080 又未映射，
+      # 结果 Web 完全打不开，且安装脚本还按 WEB_PORT 打印了错误的访问地址。
+      # ${WEB_PORT:-28888} 由 .env 的 WEB_PORT 注入（install.sh 会写入），缺省回落 28888。
+      - "${WEB_PORT:-28888}:${WEB_PORT:-28888}"
     volumes:
       # 持久化「添加节点」生成的部署文件，便于到目标主机 docker compose up。
       # 统一收敛到项目根下的 ./generated_nodes（每个 <ip> 为自包含部署单元，可直接拷到 /home/docker/<ip>/）。

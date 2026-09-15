@@ -127,8 +127,13 @@ CUR_VER=$(grep -E '^VERSION=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '
 
 COMPOSE_FILE=$CUSTOS_HOME/docker-compose.yml
 cur_val() {  # 从现有 compose 取某个键的值（先去尾随空白再剥引号，兼容重装场景）
+  # 关键：值可能含 '#'（如口令 P@ss#123）。旧实现直接 s/[[:space:]]*#.*$// 会把
+  # '#123"' 当成注释起点而【静默截断口令】，且 set_yaml 回写时会拼出畸形行
+  # （compose 起不来）。故优先按「引号包裹的整体」提取；无引号才退回旧的去注释逻辑。
+  # sed 的 t：若引号提取成功则跳到末尾，不再执行后面的去注释（避免误截）。
   grep -E "^[[:space:]]*$1:" "$COMPOSE_FILE" 2>/dev/null | head -1 \
-    | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//; s/^"//; s/"$//' || true
+    | sed -E 's/^[^:]*:[[:space:]]*//' \
+    | sed -E 's/^"([^"]*)".*$/\1/; t; s/[[:space:]]*#.*$//; s/[[:space:]]*$//; s/^"//; s/"$//' || true
 }
 
 DEF_MGMT_HOST=$(cur_val MGMT_MYSQL_HOST); [ -n "$DEF_MGMT_HOST" ] || DEF_MGMT_HOST=127.0.0.1
@@ -152,6 +157,18 @@ info "版本 $CUR_VER；将使用现有值作为默认（直接回车即采用�
 # ---------------------------------------------------------------------------
 say "3/6 部署参数"
 ask "管理库地址 MGMT_MYSQL_HOST" "$DEF_MGMT_HOST"; MGMT_HOST=$REPLY
+# 容器的 127.0.0.1 是【容器自己】（里面没有 MySQL），填它必然导致容器连不上管理库而反复重启。
+# 这是首次安装最易踩的坑：宿主上若正好跑着 MySQL，下方的 TCP 预检还会「通过」，
+# 误导用户以为配置正确，装完才发现容器起不来。故在此直接拦截，而不是等到启动失败。
+case "$MGMT_HOST" in
+  127.0.0.1|localhost|::1|0.0.0.0)
+    echo "错误：MGMT_MYSQL_HOST 不能填 $MGMT_HOST。" >&2
+    echo "      管理器运行在容器内，容器的 $MGMT_HOST 指向容器自身（其中没有 MySQL），" >&2
+    echo "      会导致容器连不上管理库而反复重启（custosctl tail 可见）。" >&2
+    echo "      请填管理库所在主机的【真实内网 IP】；若启用 compose 内置 mgmt-mysql 服务则填 mgmt-mysql。" >&2
+    exit 1
+    ;;
+esac
 ask "管理库端口" "$DEF_MGMT_PORT"; MGMT_PORT=$REPLY
 ask "管理库账号" "$DEF_MGMT_USER"; MGMT_USER=$REPLY
 ask "管理库密码" "${DEF_MGMT_PASS:-}"; MGMT_PASS=$REPLY
@@ -164,6 +181,15 @@ ask "VRID（同网段多集群需不同）" "$DEF_VRID"; VRID=$REPLY
 ask "Web 端口" "$DEF_WEB_PORT"; WEB_PORT=$REPLY
 ask "Web 管理员账号" "$DEF_WEB_USER"; WEB_USER=$REPLY
 ask "Web 管理员密码(WEB_PASS，留空=首次启动随机生成并打印日志)" "${DEF_WEB_PASS:-}"; WEB_PASS=$REPLY
+# Web 密码含双引号/反斜杠时，写进 compose 的双引号标量会破坏 YAML（compose 起不来）。
+# 此时退回留空：首次启动随机生成并打印到日志，之后可在 Web「修改密码」里改，不阻塞安装。
+case "$WEB_PASS" in
+  *'"'*|*'\'*)
+    warn "Web 密码含双引号或反斜杠，无法安全写入 docker-compose.yml（会破坏 YAML）。已改为留空："
+    warn "首次启动将随机生成密码并打印到日志（custosctl tail 可见），之后可在 Web「修改密码」中修改。"
+    WEB_PASS=""
+    ;;
+esac
 
 # WEB_PASS 改由 docker-compose.yml 驱动，install.sh 不再生成/写入 .env：
 #   - compose 中 WEB_PASS 留空 → 首次启动随机生成并持久化到管理库、打印到日志；
@@ -192,9 +218,41 @@ fi
 set_yaml() {  # set_yaml KEY VALUE
   _k=$1; _v=$2
   if grep -Eq "^[[:space:]]*$_k:" "$COMPOSE_FILE"; then
-    # 转义替换串中的 &（sed 中代表整段匹配），避免值含 & 被错误展开
-    _v_esc=$(printf '%s' "$_v" | sed 's/[&]/\\&/g')
-    sed -i -E "s|^([[:space:]]*$_k:[[:space:]]*)([^#]*[^[:space:]])([[:space:]]*#.*)?\$|\1\"$_v_esc\"\3|" "$COMPOSE_FILE"
+    # 用 awk 按【数据】改写，而不是 sed 正则替换：
+    #  - sed 替换串中 & 代表整段匹配、\ 是转义符，值含它们会被错误展开；
+    #  - sed 无法表达「引号内的 # 不是注释」，遇含 '#' 的口令会截断并拼出畸形行
+    #    （compose 直接起不来）。awk 按字符处理，安全。
+    #  - 注释只在「空白+#」处切分，故值内的 '#'（如 P@ss#123）不会被当注释。
+    # 经 ENVIRON 传值（而非 -v），避免 awk 把值里的反斜杠当转义序列处理。
+    _sy_tmp="${COMPOSE_FILE}.sy.$$"
+    if SY_KEY="$_k" SY_VAL="$_v" awk '
+      {
+        if (!done && $0 ~ "^[ \t]*" ENVIRON["SY_KEY"] "[ \t]*:") {
+          line = $0
+          if (match(line, /^[ \t]*[^:]*:[ \t]*/)) {
+            prefix = substr(line, 1, RLENGTH); rest = substr(line, RLENGTH + 1)
+          } else { prefix = line; rest = "" }
+          comment = ""
+          if (substr(rest, 1, 1) == "\"") {
+            # 引号包裹：注释从【闭合引号】之后开始，值内的「空格+#」不算注释
+            # （否则口令 "a #b" 会被误切成 值a + 注释#b"，写出畸形行）
+            q = index(substr(rest, 2), "\"")
+            if (q > 0) { comment = substr(rest, q + 2) }
+          } else {
+            n = index(rest, " #")
+            if (n > 0) { comment = substr(rest, n) }
+          }
+          print prefix "\"" ENVIRON["SY_VAL"] "\"" comment
+          done = 1
+          next
+        }
+        print
+      }
+    ' "$COMPOSE_FILE" > "$_sy_tmp"; then
+      cat "$_sy_tmp" > "$COMPOSE_FILE" && rm -f "$_sy_tmp"
+    else
+      rm -f "$_sy_tmp"; warn "写入 $_k 失败"
+    fi
   else
     warn "compose 中没有 $_k，已跳过（请手工确认）"
   fi
@@ -318,6 +376,12 @@ fi
 
 say "安装完成"
 info "访问地址：http://$MGR_IP:$WEB_PORT"
-info "管理员账号：$WEB_USER（密码见 docker-compose.yml 的 WEB_PASS：留空则首次启动自动生成并打印到日志，或填写固定密码）"
+if [ -n "$WEB_PASS" ]; then
+  info "管理员账号：$WEB_USER（密码：本次安装设置的固定口令）"
+else
+  info "管理员账号：$WEB_USER（未设固定口令，已由首次启动随机生成并打印到容器日志）"
+  info "  获取初始密码：custosctl tail | grep 初始管理员密码"
+  info "  或于 compose 的 WEB_PASS 填入固定口令后重启：custosctl restart"
+fi
 info "后续常用：custosctl status | custosctl tail | custosctl rebuild | custosctl uninstall"
 info "提示：请确认管理库 $MGMT_HOST:$MGMT_PORT 已创建库 $MGMT_DB 且账号可写；否则容器会反复重启（custosctl tail 可见）。"
