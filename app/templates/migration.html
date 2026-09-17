@@ -84,23 +84,31 @@
   <div class="field"><label>目标节点地址（已安装 MariaDB 12.3.3）</label><input id="tgtHost" placeholder="如 10.0.0.21"></div>
   <div class="field"><label>目标端口</label><input id="tgtPort" value="3306"></div>
   <div class="field"><label>目标 root 密码</label><input id="tgtRoot" type="password"></div>
-  <div class="field"><label>目标版本（SELECT VERSION() 原文）</label><input id="tgtVer" placeholder="如 12.3.3-MariaDB"></div>
   <div class="field"><label>目标节点形态</label>
     <select id="tgtType">
-      <option value="mariadb-docker" selected>容器化 MariaDB（mariadb-docker）</option>
+      <option value="" disabled selected>请选择节点形态</option>
+      <option value="mariadb-docker">容器化 MariaDB（mariadb-docker）</option>
       <option value="mariadb">裸机 MariaDB（mariadb）</option>
     </select>
   </div>
-  <div class="field"><label>目标数据目录（可选，物理通道 B 用；留空按形态默认）</label>
-    <input id="tgtData" placeholder="如 /data/custos-ha/mariadb12（容器）或 /data/mariadb（裸机）">
-  </div>
-  <div style="margin-top:10px;font-size:12px;color:var(--muted)">以下两项为「物理通道 B」源端路径（非标安装必填）：每个人的 my.cnf / 数据目录位置不同，必须显式指定，否则 mariabackup 找不到。</div>
-  <div class="field"><label>源端 my.cnf 路径（可选，物理通道 B 用）</label>
-    <input id="srcCnf" placeholder="如 /etc/mysql/my.cnf 或 /data/mariadb/my.cnf">
-  </div>
-  <div class="field"><label>源端数据目录（可选，物理通道 B 用）</label>
-    <input id="srcData" placeholder="如 /var/lib/mysql 或 /data/mariadb/data">
-  </div>
+  <!-- 以下为「物理通道 B」专属字段，逻辑通道 A 时隐藏（DESIGN-002/003） -->
+  <div id="bOnly" style="display:none">
+    <div class="field"><label>目标版本（SELECT VERSION() 原文）</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input id="tgtVer" placeholder="如 12.3.3-MariaDB" style="flex:1">
+        <button class="btn" type="button" onclick="probeTarget()">探测目标版本</button>
+      </div>
+    </div>
+    <div class="field"><label>目标数据目录（可选，物理通道 B 用；留空按形态默认）</label>
+      <input id="tgtData" placeholder="如 /data/custos-ha/mariadb12（容器）或 /data/mariadb（裸机）">
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--muted)">以下两项为「物理通道 B」源端路径（非标安装必填）：每个人的 my.cnf / 数据目录位置不同，必须显式指定，否则 mariabackup 找不到。</div>
+    <div class="field"><label>源端 my.cnf 路径（可选，物理通道 B 用）</label>
+      <input id="srcCnf" placeholder="如 /etc/mysql/my.cnf 或 /data/mariadb/my.cnf">
+    </div>
+    <div class="field"><label>源端数据目录（可选，物理通道 B 用）</label>
+      <input id="srcData" placeholder="如 /var/lib/mysql 或 /data/mariadb/data">
+    </div>
   </div>
 
   <div style="margin-top:12px;font-size:13px;color:var(--text);font-weight:600">迁移通道（系统已按数据量推荐，可覆盖）</div>
@@ -117,6 +125,7 @@
   <div class="kv" id="recInfo" style="margin-top:8px"></div>
 
   <div class="field" style="margin-top:12px"><label>迁移任务名称</label><input id="taskName" value="MariaDB 迁移"></div>
+  <button class="btn" onclick="setStep(1)">← 上一步</button>
   <button class="btn primary" onclick="createTask()">✓ 创建迁移任务并继续</button>
 </div>
 
@@ -127,6 +136,12 @@
     <div id="preBox" style="margin-top:8px;display:none"></div>
   </div>
   <div id="execList"></div>
+  <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+    <button class="btn primary" onclick="runAll()">▶ 全部执行（种子→桥接→校验）</button>
+    <button class="btn" onclick="showHistory()">📜 查看历史迁移任务</button>
+    <button class="btn" onclick="setStep(2)">← 上一步：改目标</button>
+    <button class="btn primary" id="nextStageBtn" style="display:none" onclick="gotoStep4()">进入下一阶段：停桥切换 →</button>
+  </div>
   <div id="progWrap" style="margin-top:12px;display:none">
     <div style="display:flex;justify-content:space-between;align-items:baseline;font-size:13px;margin-bottom:6px">
       <span id="progStage" style="color:var(--text);font-weight:600">准备中…</span>
@@ -142,13 +157,18 @@
 <div class="card" id="step4" style="display:none">
   <h3>④ 停桥切换（cutover，需人工确认）</h3>
   <p class="bk-note">此操作不可逆转：将停止目标对源的复制、清除桥接通道，并把目标节点登记进 Custos（monitor 自动提升新主）。请在确认数据已追平、并已准备手动切换 VIP 后执行。</p>
+  <button class="btn" onclick="setStep(3)">← 上一步：返回校验</button>
   <button class="btn primary" onclick="showCutover()">⚠ 执行停桥切换</button>
   <div class="logbox" id="cutLog" style="margin-top:10px"></div>
 </div>
 
 <div class="card" id="step5" style="display:none">
   <h3>⑤ 收尾回收</h3>
-  <p class="bk-note">回收源端桥接复制账号（最小权限，可收回），并将老主置为只读暖备（保留期后下线）。</p>
+  <p class="bk-note">本步仅作用于<b>源库（老主）</b>，<b>绝不改动目标集群（新主 203）</b>。将执行：<br>
+    ① 源库执行 <code>DROP USER IF EXISTS 'replication'@'%'</code> —— 回收桥接专用的源端复制账号；<br>
+    ② 源库执行 <code>SET GLOBAL read_only=ON</code> —— 将老主置为只读暖备（保留期后下线）。<br>
+    目标集群的新主 203 及其从节点（如 213/33）不受影响，仍由 Custos 正常托管。</p>
+  <button class="btn" onclick="setStep(4)">← 上一步：返回切换</button>
   <button class="btn" onclick="runCleanup()">回收源端账号 / 老主只读</button>
   <div class="logbox" id="cleanLog" style="margin-top:10px"></div>
   <div id="doneBox" style="margin-top:12px;display:none" class="banner ok">✓ 迁移完成。请在外部手动切换 VIP，老主已置只读暖备。</div>
@@ -159,13 +179,22 @@
   <div class="modal">
     <h3>确认执行停桥切换？</h3>
     <p>1. 目标停止从源复制（STOP REPLICA）并清除桥接通道。</p>
-    <p>2. 目标节点登记进 Custos，monitor 将自动提升新主、接管 HA。</p>
+    <p>2. 目标节点登记进 Custos（<b>沿用既有集群，新主 203 不会被移出集群</b>），monitor 自动提升新主、接管 HA。</p>
     <p>3. <b>VIP 需你在外部手动切换</b>（Custos 不自动接管本场景 VIP）。</p>
-    <p>4. 操作前请确认校验步骤已通过、复制已追平。</p>
+    <p>4. 操作前请确认校验步骤已通过、复制已追平（SHOW REPLICA STATUS 的 Seconds_Behind_Master≈0）。</p>
     <div class="acts">
       <button class="btn" onclick="hideCutover()">取消</button>
-      <button class="btn danger" onclick="runCutover()">确认切换</button>
+      <button class="btn danger" id="cutConfirmBtn" onclick="runCutover()">确认切换</button>
     </div>
+  </div>
+</div>
+
+<!-- 历史迁移任务弹窗 -->
+<div class="modal-mask" id="histMask">
+  <div class="modal">
+    <h3>历史迁移任务</h3>
+    <div id="histList" class="logbox" style="max-height:50vh"></div>
+    <div class="acts"><button class="btn" onclick="hideHistory()">关闭</button></div>
   </div>
 </div>
 
@@ -215,6 +244,7 @@ function goStep2(){
 function selChan(c){
   STATE.channel = c;
   document.querySelectorAll('.chan').forEach(el=>el.classList.toggle('sel', el.dataset.chan===c));
+  const bOnly = $("bOnly"); if(bOnly) bOnly.style.display = (c==='physical') ? 'block' : 'none';
 }
 
 async function createTask(){
@@ -239,6 +269,7 @@ async function createTask(){
     tgt_flavor:"mariadb",
     size_mb:(STATE.probe&&STATE.probe.size_mb)||0, databases
   };
+  if(!$("tgtType").value){ alert("请选择目标节点形态（容器化 / 裸机 MariaDB）"); return; }
   const b = await postJSON("/api/migration/create", body);
   if(!b.ok){ alert("创建失败: "+b.error); return; }
   STATE.taskId = b.id;
@@ -333,37 +364,71 @@ async function runPrecheck(){
     + capLine + trialErr;
 }
 
-async function runStep(step){
-  const stEl = $("st_"+step);
-  if(stEl){ stEl.className = "st wait"; stEl.textContent = "执行中…"; }
-  const b = await postJSON("/api/migration/"+STATE.taskId+"/step", {step});
-  if(!b.ok){
-    if(stEl){ stEl.className = "st err"; stEl.textContent = "失败"; }
-    alert(step + " 启动失败: " + b.error); markStepErr(3); return;
-  }
-  startPolling(step, (rec, j)=>{
-    if(rec.status === "done"){
-      if(stEl){ stEl.className = "st ok"; stEl.textContent = "完成"; }
-      if(step === "seed"){
-        const r = rec.result || {};
-        appendLog("\n[种子 ✓] 工具=" + r.dump_tool + "，库=" +
-                  JSON.stringify(r.databases||[]) +
-                  (r.bytes ? ("，传输 " + (r.bytes/1048576).toFixed(1) + " MB") : ""));
-      }else{
-        appendLog("\n[" + step + " ✓] " + JSON.stringify(rec.result||{}));
+function runStep(step){
+  return new Promise((resolve)=>{
+    const stEl = $("st_"+step);
+    if(stEl){ stEl.className = "st wait"; stEl.textContent = "执行中…"; }
+    postJSON("/api/migration/"+STATE.taskId+"/step", {step}).then(b=>{
+      if(!b.ok){
+        if(stEl){ stEl.className = "st err"; stEl.textContent = "失败"; }
+        alert(step + " 启动失败: " + b.error); markStepErr(3); resolve(false); return;
       }
-      if(step === "verify"){ markStepDone(3); setStep(4); }
-    }else{
-      if(stEl){ stEl.className = "st err"; stEl.textContent = "失败"; }
-      markStepErr(3);
-      setProg(j.progress||0, "失败：" + (rec.error||"未知错误"));
-      alert(step + " 失败: " + (rec.error||"未知错误，详见日志"));
-    }
+      startPolling(step, (rec, j)=>{
+        if(rec.status === "done"){
+          if(stEl){ stEl.className = "st ok"; stEl.textContent = "完成"; }
+          if(step === "seed"){
+            const r = rec.result || {};
+            appendLog("\n[种子 ✓] 工具=" + r.dump_tool + "，库=" +
+                      JSON.stringify(r.databases||[]) +
+                      (r.bytes ? ("，传输 " + (r.bytes/1048576).toFixed(1) + " MB") : ""));
+          }else if(step === "bridge"){
+            appendLog("\n[桥接 ✓] " + ((rec.result||{}).note||""));
+          }else{
+            appendLog("\n[" + step + " ✓] " + JSON.stringify(rec.result||{}));
+          }
+          // 校验通过：不再自动跳第四步，改为显式“进入下一阶段”按钮（UX-004）
+          if(step === "verify"){ markStepDone(3); $("nextStageBtn").style.display = "block"; }
+          resolve(true);
+        }else{
+          if(stEl){ stEl.className = "st err"; stEl.textContent = "失败"; }
+          markStepErr(3);
+          setProg(j.progress||0, "失败：" + (rec.error||"未知错误"));
+          alert(step + " 失败: " + (rec.error||"未知错误，详见日志"));
+          resolve(false);
+        }
+      });
+    });
   });
 }
 
-function showCutover(){ $("cutMask").classList.add("show"); }
-function hideCutover(){ $("cutMask").classList.remove("show"); }
+// 一键顺序执行：种子 → 桥接 → 校验（UX-003）
+async function runAll(){
+  $("nextStageBtn").style.display = "none";
+  for(const s of ["seed","bridge","verify"]){
+    const ok = await runStep(s);
+    if(!ok){ alert(s + " 失败，已中止全部执行"); return; }
+  }
+}
+function gotoStep4(){ setStep(4); }
+
+let _cutTimer = null;
+function showCutover(){
+  const btn = $("cutConfirmBtn");
+  btn.disabled = true; btn.textContent = "确认切换（3）";
+  let n = 3;
+  if(_cutTimer) clearInterval(_cutTimer);
+  _cutTimer = setInterval(()=>{
+    n--;
+    if(n <= 0){ clearInterval(_cutTimer); _cutTimer = null; btn.disabled = false; btn.textContent = "确认切换"; }
+    else { btn.textContent = "确认切换（"+n+"）"; }
+  }, 1000);
+  $("cutMask").classList.add("show");
+}
+function hideCutover(){
+  if(_cutTimer){ clearInterval(_cutTimer); _cutTimer = null; }
+  const btn = $("cutConfirmBtn"); if(btn){ btn.disabled = false; btn.textContent = "确认切换"; }
+  $("cutMask").classList.remove("show");
+}
 async function runCutover(){
   hideCutover();
   const b = await postJSON("/api/migration/"+STATE.taskId+"/step", {step:"cutover"});
@@ -386,6 +451,31 @@ async function runCleanup(){
     if(rec.status === "done"){ markStepDone(5); $("doneBox").style.display = "block"; }
   });
 }
+
+// 探测目标版本并自动填充（DESIGN-003）
+async function probeTarget(){
+  const host = $("tgtHost").value.trim();
+  if(!host){ alert("请先填写目标节点地址与 root 密码"); return; }
+  const b = await postJSON("/api/migration/probe_target",
+    {tgt_host:host, tgt_port:+$("tgtPort").value||3306, tgt_root_pass:$("tgtRoot").value});
+  if(!b.ok){ alert("探测失败: "+b.error); return; }
+  if($("tgtVer")) $("tgtVer").value = b.version || "";
+  alert("目标版本: " + (b.version || "未知"));
+}
+
+// 查看历史迁移任务列表（UX-003）
+async function showHistory(){
+  try{
+    const r = await fetch("/api/migration/list", {headers:{"Accept":"application/json"}});
+    const b = await r.json();
+    const list = (b && b.ok && b.tasks) ? b.tasks : [];
+    $("histList").textContent = list.length
+      ? list.map(t=>"#"+t.id+"  "+t.name+"  ["+t.status+"]  "+t.created_at).join("\n")
+      : "（暂无迁移任务）";
+  }catch(e){ $("histList").textContent = "加载失败: "+e; }
+  $("histMask").classList.add("show");
+}
+function hideHistory(){ $("histMask").classList.remove("show"); }
 
 setStep(1);
 </script>

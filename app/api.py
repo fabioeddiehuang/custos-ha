@@ -2774,10 +2774,33 @@ async def api_migration_recommend(request: Request, user=Depends(auth_required))
     return _json_ok(_migration.recommend_channel(probe, b.get("channel_pref") or None))
 
 
+@app.post("/api/migration/probe_target")
+async def api_migration_probe_target(request: Request, user=Depends(auth_required)):
+    """探测目标 MariaDB 版本（SELECT VERSION()），用于自动填充目标版本（DESIGN-003）。"""
+    b = await _json_body(request)
+    try:
+        conn = connect(b.get("tgt_host", ""), int(b.get("tgt_port", 3306)),
+                       "root", b.get("tgt_root_pass", ""), timeout=8)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT VERSION()")
+            ver = cur.fetchone()[0]
+        finally:
+            conn.close()
+        return _json_ok({"ok": True, "version": ver})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
 @app.post("/api/migration/create")
 async def api_migration_create(request: Request, user=Depends(auth_required)):
     b = await _json_body(request)
     try:
+        # BUG-003：节点形态必须显式选择，禁止静默回退为容器默认值
+        node_type = b.get("node_type") or ""
+        if node_type not in ("mariadb", "mariadb-docker", "docker"):
+            return _json_ok({"ok": False,
+                             "error": "请选择有效的目标节点形态（容器化 MariaDB / 裸机 MariaDB）"})
         databases = b.get("databases") or []
         if isinstance(databases, str):
             databases = [d.strip() for d in databases.split(",") if d.strip()]
@@ -2793,7 +2816,7 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
             "tgt_port": int(b.get("tgt_port", 3306)),
             "tgt_root_pass": b.get("tgt_root_pass", ""),
             "tgt_version": b.get("tgt_version", ""),
-            "node_type": b.get("node_type", "mariadb-docker"),
+            "node_type": node_type,
             "databases": databases,
             "repl_user": repl_user,
             "repl_pass": repl_pass,

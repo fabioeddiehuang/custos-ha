@@ -325,15 +325,32 @@ def capabilities(src_flavor, src_major, tgt_flavor, tgt_major=None):
 # 步骤实现
 # ---------------------------------------------------------------------------
 def _ensure_source_repl_account(task):
-    """在【源】MariaDB 上创建最小权限复制账号（迁移完 cleanup 可回收）。"""
+    """在【源】MariaDB 上创建最小权限复制账号（迁移完 cleanup 可回收）。
+
+    降级策略：若源连接账号无 CREATE USER 权限（桥接会报 1227），则不再建专用账号，
+    改为**直接用源连接账号本身**作为复制账号（前提是源账号允许从目标主机连入，
+    通常 @'%' 即可）。返回 used_src_creds 供 bridge 选择 CHANGE MASTER 的账号。
+    """
     cfg = task["config"]
     conn = connect(cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"], timeout=8)
     try:
         cur = conn.cursor()
         u, p = cfg["repl_user"], cfg["repl_pass"]
-        cur.execute(f"CREATE USER IF NOT EXISTS '{u}'@'%' IDENTIFIED BY '{p}'")
-        cur.execute(f"GRANT REPLICATION SLAVE ON *.* TO '{u}'@'%'")
-        cur.execute("FLUSH PRIVILEGES")
+        try:
+            cur.execute(f"CREATE USER IF NOT EXISTS '{u}'@'%' IDENTIFIED BY '{p}'")
+            cur.execute(f"GRANT REPLICATION SLAVE ON *.* TO '{u}'@'%'")
+            cur.execute("FLUSH PRIVILEGES")
+            return {"used_src_creds": False}
+        except Exception as e:
+            err = str(e)
+            # 1227 Access denied / 缺少 CREATE USER：源账号无权建账号 → 降级复用源账号本身
+            if "1227" in err or "Access denied" in err or "CREATE USER" in err:
+                cur.execute("SELECT CURRENT_USER()")
+                who = cur.fetchone()[0]
+                return {"used_src_creds": True,
+                        "note": (f"源连接账号 {who} 无 CREATE USER 权限，已改用源账号本身作为复制账号；"
+                                 f"请确保该账号允许从目标 {cfg['tgt_host']} 连入（如改为 @'%'）")}
+            raise RuntimeError(f"在源库创建复制账号失败: {err}")
     finally:
         conn.close()
 
@@ -503,6 +520,28 @@ def precheck(task_id):
     src = connect(cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"], timeout=8)
     tgt = connect(cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"], timeout=8)
     try:
+        # ① 源账号建复制账号权限预检（桥接会在源建 repl@'%'，需 CREATE USER + GRANT OPTION）
+        try:
+            cur = src.cursor()
+            cur.execute("SELECT CURRENT_USER()")
+            who = cur.fetchone()[0]
+            cur.execute("SHOW GRANTS FOR CURRENT_USER()")
+            grants = "\n".join(r[0] for r in cur.fetchall())
+            can_create = (("CREATE USER" in grants)
+                          or ("GRANT OPTION" in grants and "*.*" in grants)
+                          or ("ALL PRIVILEGES" in grants and "*.*" in grants))
+            if not can_create:
+                findings.append({
+                    "level": "blocker", "kind": "src_create_user",
+                    "detail": (f"源连接账号 {who} 缺少 CREATE USER 权限，桥接步骤无法在源库创建复制账号"
+                               f"（将报 1227）。请在源库执行："
+                               f"GRANT CREATE USER, REPLICATION SLAVE, REPLICATION CLIENT ON *.* "
+                               f"TO CURRENT_USER() WITH GRANT OPTION; FLUSH PRIVILEGES;"),
+                    "sample": [],
+                })
+        except Exception:
+            # 无法判定（旧版本/权限受限）不阻断，留给桥接步骤实测
+            pass
         tgt_coll = {r[0] for r in _q(tgt, "SHOW COLLATION")}
         tgt_eng = {(r[0] or "").upper() for r in _q(tgt, "SHOW ENGINES")
                    if (str(r[1] or "")).upper() in ("YES", "DEFAULT")}
@@ -731,7 +770,10 @@ def seed_physical(task):
 def bridge(task):
     """在目标建立指向源的 MariaDB GTID 复制桥接（持续追平）。"""
     cfg = task["config"]
-    _ensure_source_repl_account(task)  # 源端复制账号（最小权限）
+    acct = _ensure_source_repl_account(task)  # 源端复制账号（最小权限，必要时降级复用源账号）
+    use_src = bool(acct.get("used_src_creds"))
+    m_user = cfg["src_user"] if use_src else cfg["repl_user"]
+    m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
     tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
     conn = connect(*tgt, timeout=8)
     try:
@@ -750,10 +792,16 @@ def bridge(task):
         cur.execute(
             "CHANGE MASTER TO MASTER_HOST=%s, MASTER_PORT=%s, "
             "MASTER_USER=%s, MASTER_PASSWORD=%s, MASTER_USE_GTID=slave_pos",
-            (cfg["src_host"], int(cfg["src_port"]), cfg["repl_user"], cfg["repl_pass"]),
+            (cfg["src_host"], int(cfg["src_port"]), m_user, m_pass),
         )
         cur.execute("START REPLICA")
-        return {"ok": True, "note": "桥接已建立，目标正在从源追平（MariaDB GTID）"}
+        # 进度上报：让前端桥接阶段不再“卡住”（BUG-004）
+        _tick(task, 60, stage="复制桥接已启动，目标正在从源追平（MariaDB GTID）")
+        note = "桥接已建立，目标正在从源追平（MariaDB GTID）"
+        if use_src:
+            note += "（使用源账号本身作为复制账号）"
+        _tick(task, 100, stage="桥接完成（持续追平中，可随时做一致性校验）")
+        return {"ok": True, "note": note, "used_src_creds": use_src}
     finally:
         conn.close()
 
@@ -845,9 +893,16 @@ def _register_target_node(cluster_id, host, port, root_pass, node_type, mysql_ve
 
 
 def cutover(task):
-    """停桥（STOP REPLICA + RESET REPLICA ALL）→ 凭证对齐 → 登记进 Custos（monitor 接管提升）。"""
+    """停桥（STOP REPLICA + RESET REPLICA ALL）→ 凭证对齐 → 登记进 Custos（monitor 接管提升）。
+
+    集群归属策略（修复 BUG-001/002）：若目标节点（203）已在某 Custos 集群中，
+    则【沿用】该集群，绝不再新建只含 203 的单节点集群把节点从原集群拽出；
+    仅当目标尚未登记时才新建集群。同集群的其余节点（如 213/33）归属不受影响。
+    """
     cfg = task["config"]
-    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
+    tgt_host = cfg["tgt_host"]
+    tgt_port = int(cfg["tgt_port"])
+    tgt = (tgt_host, tgt_port, "root", cfg["tgt_root_pass"])
     conn = connect(*tgt, timeout=8)
     try:
         cur = conn.cursor()
@@ -855,23 +910,32 @@ def cutover(task):
         cur.execute("RESET REPLICA ALL")  # MariaDB：清除桥接通道，避免 monitor 误判
     finally:
         conn.close()
-    # 此刻才建集群：create_cluster 生成 Custos 托管的 ha/repl/app 口令
-    cluster_id = create_cluster(
-        name=task["name"],
-        node_type=cfg.get("node_type", "mariadb-docker"),
-        mysql_version=cfg.get("tgt_version") or None,
-    )
+    node_type = cfg.get("node_type", "mariadb-docker")
+    mysql_version = cfg.get("tgt_version") or None
+    # 复用已有集群：避免把目标节点从原集群拽出（BUG-001）
+    existing = query("SELECT cluster_id FROM nodes WHERE ip=%s AND port=%s",
+                    (tgt_host, tgt_port))
+    reused = bool(existing and existing[0].get("cluster_id"))
+    if reused:
+        cluster_id = existing[0]["cluster_id"]
+    else:
+        # 此刻才建集群：create_cluster 生成 Custos 托管的 ha/repl/app 口令
+        cluster_id = create_cluster(name=task["name"], node_type=node_type,
+                                   mysql_version=mysql_version)
     # 关键：把目标节点账号刷成 Custos 托管口令（并补齐 ha_local 库），
     # 否则 monitor 接管后因账号口令不匹配而连不上节点。
     _align_target_creds(cluster_id, cfg)
-    # 登记节点 + 主机（此刻才让 ensure_topology 提升新主、挂第二节点）
-    _register_target_node(
-        cluster_id, cfg["tgt_host"], int(cfg["tgt_port"]),
-        cfg["tgt_root_pass"], cfg.get("node_type", "mariadb-docker"),
-        cfg.get("tgt_version") or None,
-    )
-    return {"ok": True, "cluster_id": cluster_id,
-            "note": "已停桥、对齐凭证并登记进 Custos，monitor 将自动提升新主；请在外部手动切换 VIP"}
+    # 登记节点 + 主机（此刻才让 ensure_topology 提升新主、挂第二节点）。
+    # 若目标已在某集群，这里只是原地更新 203 一条记录，不改其它节点（213/33 等）归属。
+    _register_target_node(cluster_id, tgt_host, tgt_port, cfg["tgt_root_pass"],
+                         node_type, mysql_version)
+    if reused:
+        note = ("已停桥、对齐凭证并登记进 Custos（沿用既有集群，新主不会被移出）；"
+                "请在外部手动切换 VIP")
+    else:
+        note = ("已停桥、对齐凭证并登记进 Custos，monitor 将自动提升新主；"
+                "请在外部手动切换 VIP")
+    return {"ok": True, "cluster_id": cluster_id, "reused_cluster": reused, "note": note}
 
 
 def _align_target_creds(cluster_id, cfg):
