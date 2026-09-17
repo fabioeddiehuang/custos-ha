@@ -158,7 +158,12 @@
   <h3>④ 停桥切换（cutover，需人工确认）</h3>
   <p class="bk-note">此操作不可逆转：将停止目标对源的复制、清除桥接通道，并把目标节点登记进 Custos（monitor 自动提升新主）。请在确认数据已追平、并已准备手动切换 VIP 后执行。</p>
   <button class="btn" onclick="setStep(3)">← 上一步：返回校验</button>
-  <button class="btn primary" onclick="showCutover()">⚠ 执行停桥切换</button>
+  <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;align-items:center">
+    <button class="btn" onclick="runLagCheck()">🔍 追平检测（切换前必做）</button>
+    <span class="st wait" id="lagState">未检测</span>
+  </div>
+  <div id="lagBox" class="logbox" style="margin-top:8px;display:none"></div>
+  <button class="btn primary" id="cutBtn" disabled onclick="showCutover()">⚠ 执行停桥切换（需先追平）</button>
   <div class="logbox" id="cutLog" style="margin-top:10px"></div>
 </div>
 
@@ -170,6 +175,7 @@
     目标集群的新主 203 及其从节点（如 213/33）不受影响，仍由 Custos 正常托管。</p>
   <button class="btn" onclick="setStep(4)">← 上一步：返回切换</button>
   <button class="btn" onclick="runCleanup()">回收源端账号 / 老主只读</button>
+  <button class="btn primary" onclick="skipCleanup()">✓ 直接完成（不改动源库）</button>
   <div class="logbox" id="cleanLog" style="margin-top:10px"></div>
   <div id="doneBox" style="margin-top:12px;display:none" class="banner ok">✓ 迁移完成。请在外部手动切换 VIP，老主已置只读暖备。</div>
 </div>
@@ -200,7 +206,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let STATE = { probe:null, channel:"logical", taskId:null, dbs:[] };
+let STATE = { probe:null, channel:"logical", taskId:null, dbs:[], lagOk:false };
 
 function setStep(n){
   for (let i=1;i<=5;i++){
@@ -409,10 +415,69 @@ async function runAll(){
     if(!ok){ alert(s + " 失败，已中止全部执行"); return; }
   }
 }
-function gotoStep4(){ setStep(4); }
+function gotoStep4(){
+  // 每次进入第四步都重置追平门禁：必须重新检测通过才允许切换
+  STATE.lagOk = false;
+  const cb = $("cutBtn"); if(cb){ cb.disabled = true; }
+  const ls = $("lagState"); if(ls){ ls.className = "st wait"; ls.textContent = "未检测"; }
+  $("lagBox").style.display = "none";
+  setStep(4);
+}
+
+/* 停桥前追平检测：只读（SHOW REPLICA STATUS），未追平【禁止】切换。
+   切换即切断 177→203 桥接，任何残留延迟都会变成永久丢失，故门禁放在前端强校验。 */
+async function runLagCheck(){
+  $("lagState").className = "st wait"; $("lagState").textContent = "检测中…";
+  $("lagBox").style.display = "block"; $("lagBox").textContent = "正在读取目标复制状态…";
+  const b = await postJSON("/api/migration/"+STATE.taskId+"/lag", {});
+  if(!b.ok){
+    $("lagState").className = "st err"; $("lagState").textContent = "检测失败";
+    $("lagBox").textContent = "检测失败: " + b.error;
+    STATE.lagOk = false; $("cutBtn").disabled = true; return;
+  }
+  const sb = (b.seconds_behind === null || b.seconds_behind === undefined) ? "未知" : b.seconds_behind;
+  $("lagBox").textContent = [
+    "IO  线程 : " + (b.io_running || "-"),
+    "SQL 线程 : " + (b.sql_running || "-"),
+    "延迟(Seconds_Behind_Master) : " + sb + " 秒",
+    "复制错误 : " + (b.last_error || "无"),
+    "────────────",
+    (b.caught_up ? "✅ 已追平，可以切换。" : "❌ 未追平：" + (b.reason||""))
+  ].join("\n");
+  STATE.lagOk = !!b.caught_up;
+  if(b.caught_up){
+    $("lagState").className = "st ok"; $("lagState").textContent = "已追平";
+    $("cutBtn").disabled = false; $("cutBtn").textContent = "⚠ 执行停桥切换";
+  }else{
+    $("lagState").className = "st err"; $("lagState").textContent = "未追平";
+    $("cutBtn").disabled = true;
+    alert("尚未追平：" + (b.reason||"") + "\n\n请等待目标追平后再检测，确认追平后才允许停桥切换。");
+  }
+}
+
+/* 跳过收尾直接完成：不回收源端账号、不置老主只读，源库 177 保持原状。 */
+async function skipCleanup(){
+  if(!confirm("确认「直接完成」？\n\n将【不会】执行：\n" +
+              "  ① 源库 DROP 桥接复制账号\n" +
+              "  ② 源库 SET GLOBAL read_only=ON（老主只读）\n\n" +
+              "源端服务器保持原状、不作任何改动，迁移到此结束。")) return;
+  const b = await postJSON("/api/migration/"+STATE.taskId+"/skip_cleanup", {});
+  if(!b.ok){ alert("跳过失败: "+b.error); return; }
+  $("cleanLog").textContent = "[跳过收尾] " + (b.note||"");
+  markStepDone(5); markStepDone(4);
+  $("doneBox").style.display = "block";
+  $("doneBox").textContent =
+    "✓ 迁移完成（已跳过收尾回收，源库未做任何改动）。请在外部手动切换 VIP。";
+}
 
 let _cutTimer = null;
 function showCutover(){
+  // 二次守卫：即使有人绕过按钮 disabled 也不允许未追平就切换
+  if(!STATE.lagOk){
+    alert("请先点击「追平检测」并确认已追平，才能执行停桥切换。\n" +
+          "（切换会切断 177→203 桥接，未追平的残留延迟会造成永久数据丢失）");
+    return;
+  }
   const btn = $("cutConfirmBtn");
   btn.disabled = true; btn.textContent = "确认切换（3）";
   let n = 3;

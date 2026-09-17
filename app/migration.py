@@ -857,16 +857,21 @@ def _replica_status(tgt):
         row = cur.fetchone()
         if not row:
             return {"running": False, "note": "无复制通道（尚未建立桥接或已停桥）"}
-        # 列名兼容：MariaDB 10.5+ 用 Replica_*，旧别名 Slave_*
-        def _col(prefix):
-            for k in (f"{prefix}_IO_Running", f"{prefix}_SQL_Running"):
+        # 列名兼容：MariaDB 10.5+ 用 Replica_*，旧别名 Slave_*。
+        # ⚠ 此前 io_running / sql_running 都调用同一个 _col("Replica")，而 _col 遍历
+        #   (*_IO_Running, *_SQL_Running) 时第一个命中的恒为 IO ⇒ 两个字段实际都取到
+        #   IO 线程状态，**SQL 线程状态从未被正确读取**（一致性校验展示失真，
+        #   且停桥前追平检测会误判为已追平）。已改为按后缀精确取值。
+        def _pick(suffix):
+            for p in ("Replica", "Slave"):
+                k = f"{p}_{suffix}"
                 if k in row:
                     return row[k]
             return None
         return {
-            "io_running": _col("Replica") or _col("Slave"),
-            "sql_running": _col("Replica") or _col("Slave"),
-            "seconds_behind": row.get("Seconds_Behind_Master"),
+            "io_running": _pick("IO_Running"),
+            "sql_running": _pick("SQL_Running"),
+            "seconds_behind": row.get("Seconds_Behind_Master", row.get("Seconds_Behind_Source")),
             "last_error": row.get("Last_SQL_Error") or row.get("Last_Error"),
         }
     finally:
@@ -981,6 +986,74 @@ def cleanup(task):
     finally:
         conn.close()
     return {"ok": True, "note": "已回收源端复制账号，老主已置只读暖备（保留期后下线）"}
+
+
+# ---------------------------------------------------------------------------
+# 停桥前追平检测 + 跳过收尾
+# ---------------------------------------------------------------------------
+# 追平阈值（秒）：停桥意味着切断 177→203 的桥接，任何残留延迟都会变成永久数据丢失，
+# 故取 0 —— 必须 Seconds_Behind_Master 收敛到 0 才允许切换。
+LAG_CAUGHT_UP_SEC = 0
+
+
+def check_lag(task):
+    """停桥切换前的「追平检测」：确认目标已从源追平，避免带差切换导致数据丢失。
+
+    纯只读，不改动任何节点。返回 caught_up 供前端放行「执行停桥切换」按钮。
+    """
+    cfg = task["config"]
+    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
+    try:
+        repl = _replica_status(tgt)
+    except Exception as e:
+        return {"ok": False, "caught_up": False, "error": f"{type(e).__name__}: {e}"}
+    if repl.get("note"):
+        # 目标上没有复制通道：要么尚未建立桥接，要么已经停过桥
+        return {"ok": True, "caught_up": False, "io_running": None, "sql_running": None,
+                "seconds_behind": None, "last_error": None,
+                "reason": repl["note"], "replica": repl}
+    io_ok = str(repl.get("io_running") or "").lower() == "yes"
+    sql_ok = str(repl.get("sql_running") or "").lower() == "yes"
+    sb = repl.get("seconds_behind")
+    last_err = repl.get("last_error")
+    if not sql_ok:
+        reason = "SQL 线程未运行（复制未工作）"
+    elif not io_ok:
+        reason = "IO 线程未运行（未从源拉取 binlog）"
+    elif last_err:
+        reason = "存在复制错误：" + str(last_err)[:300]
+    elif sb is None:
+        reason = "无法获取延迟（Seconds_Behind_Master 为空，复制可能未运行）"
+    else:
+        try:
+            lag = int(sb)
+        except Exception:
+            lag = 0
+        reason = "" if lag <= LAG_CAUGHT_UP_SEC else \
+            "尚未追平，仍有 %d 秒延迟（阈值 %ds）" % (lag, LAG_CAUGHT_UP_SEC)
+    return {"ok": True, "caught_up": not reason, "io_running": repl.get("io_running"),
+            "sql_running": repl.get("sql_running"), "seconds_behind": sb,
+            "last_error": last_err,
+            "reason": reason or "已追平（Seconds_Behind_Master=%s）" % sb, "replica": repl}
+
+
+def skip_cleanup(task_id):
+    """跳过「收尾回收」直接完成迁移——**完全不改动源库（老主）**。
+
+    场景：用户无权 / 不愿在老主上做手脚时（不回收源端账号、不置 read_only），
+    迁移到此为止：把 cleanup 标记为 skipped 并收尾，使任务进入完成态。
+    """
+    task = get_task(task_id)
+    if not task:
+        return {"ok": False, "error": "任务不存在"}
+    steps = dict(task.get("steps") or {})
+    note = "已跳过收尾回收：未回收源端账号、未置老主只读，源库保持原状。"
+    steps["cleanup"] = {"status": "done", "at": _now(), "skipped": True,
+                        "result": {"note": note, "skipped": True}}
+    execute("UPDATE migration_tasks SET status='done',steps=%s,progress=100,"
+            "stage='迁移完成（已跳过收尾回收）',updated_at=NOW() WHERE id=%s",
+            (json.dumps(steps, ensure_ascii=False), task_id))
+    return {"ok": True, "skipped": True, "note": note}
 
 
 # ---------------------------------------------------------------------------
