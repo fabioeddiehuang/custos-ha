@@ -163,6 +163,15 @@
     <span class="st wait" id="lagState">未检测</span>
   </div>
   <div id="lagBox" class="logbox" style="margin-top:8px;display:none"></div>
+  <div id="fixBridgeWrap" style="display:none;margin-top:8px">
+    <button class="btn" onclick="backToBridge()">← 返回第三步，重跑「建立桥接」</button>
+  </div>
+  <label style="display:flex;gap:8px;align-items:flex-start;margin-top:10px;font-size:13px;line-height:1.5">
+    <input type="checkbox" id="noLagChk" onchange="toggleNoLag()" style="margin-top:3px">
+    <span>源库已停写、无需追平（跳过追平检测，直接解锁切换）<br>
+      <span style="color:var(--muted)">仅当老主 177 已停止写入时才勾选；源库仍在写入却跳过，增量数据将永久丢失。</span>
+    </span>
+  </label>
   <button class="btn primary" id="cutBtn" disabled onclick="showCutover()">⚠ 执行停桥切换（需先追平）</button>
   <div class="logbox" id="cutLog" style="margin-top:10px"></div>
 </div>
@@ -420,8 +429,37 @@ function gotoStep4(){
   STATE.lagOk = false;
   const cb = $("cutBtn"); if(cb){ cb.disabled = true; }
   const ls = $("lagState"); if(ls){ ls.className = "st wait"; ls.textContent = "未检测"; }
+  const chk = $("noLagChk"); if(chk){ chk.checked = false; }
+  $("fixBridgeWrap").style.display = "none";
   $("lagBox").style.display = "none";
   setStep(4);
+}
+
+// 检测失败且「未停桥」时，引导回第三步重跑「建立桥接」（该步骤支持重复执行）
+function backToBridge(){
+  alert("请点击「建立桥接」那一行的【执行】按钮重跑。\n" +
+        "桥接支持重复执行；成功后目标会重建 177→203 复制通道，\n" +
+        "回到本步再点「追平检测」即可。");
+  setStep(3);
+}
+
+// 「源库已停写」跳过追平：显式勾选 + 危险确认后才解锁切换
+function toggleNoLag(){
+  const chk = $("noLagChk");
+  if(chk.checked){
+    if(!confirm("⚠ 危险操作确认\n\n" +
+        "勾选表示你确认：源库（老主 177）已经停止写入、不会再产生新数据。\n\n" +
+        "如果源库仍在写入就跳过追平检测，\n" +
+        "这部分增量数据将【永久丢失、无法找回】。\n\n" +
+        "确认源库确实已停写？")){ chk.checked = false; return; }
+    STATE.lagOk = true;
+    $("cutBtn").disabled = false;
+    $("lagState").className = "st wait"; $("lagState").textContent = "已跳过追平检测";
+  }else{
+    STATE.lagOk = false;
+    $("cutBtn").disabled = true;
+    $("lagState").className = "st wait"; $("lagState").textContent = "未检测";
+  }
 }
 
 /* 停桥前追平检测：只读（SHOW REPLICA STATUS），未追平【禁止】切换。
@@ -442,16 +480,22 @@ async function runLagCheck(){
     "延迟(Seconds_Behind_Master) : " + sb + " 秒",
     "复制错误 : " + (b.last_error || "无"),
     "────────────",
-    (b.caught_up ? "✅ 已追平，可以切换。" : "❌ 未追平：" + (b.reason||""))
-  ].join("\n");
+    (b.caught_up ? "✅ 已追平，可以切换。" : "❌ 未追平：" + (b.reason||"")),
+    b.hint ? ("→ 处理建议：" + b.hint) : ""
+  ].filter(Boolean).join("\n");
   STATE.lagOk = !!b.caught_up;
+  $("fixBridgeWrap").style.display = (!b.caught_up && b.need_bridge) ? "block" : "none";
   if(b.caught_up){
     $("lagState").className = "st ok"; $("lagState").textContent = "已追平";
     $("cutBtn").disabled = false; $("cutBtn").textContent = "⚠ 执行停桥切换";
   }else{
     $("lagState").className = "st err"; $("lagState").textContent = "未追平";
     $("cutBtn").disabled = true;
-    alert("尚未追平：" + (b.reason||"") + "\n\n请等待目标追平后再检测，确认追平后才允许停桥切换。");
+    if(b.need_bridge){
+      alert("尚未追平：" + (b.reason||"") + "\n\n" + (b.hint||""));
+    }else{
+      alert("尚未追平：" + (b.reason||"") + "\n\n请等待目标追平后再检测，确认追平后才允许停桥切换。");
+    }
   }
 }
 

@@ -788,6 +788,14 @@ def bridge(task):
             cur.execute("SET GLOBAL log_replica_updates=ON")
         except Exception:
             pass
+        # 幂等：本步骤允许重复执行（第三步可重跑「建立桥接」）。
+        # 若目标上已有 replica 线程在运行，CHANGE MASTER TO 会被拒绝
+        # （MariaDB 要求先停止 replica 线程），故先 STOP REPLICA 再重建通道。
+        # 无复制通道时 STOP REPLICA 也会报 “not configured”，忽略即可。
+        try:
+            cur.execute("STOP REPLICA")
+        except Exception:
+            pass
         # MariaDB GTID 桥接：MASTER_USE_GTID=slave_pos
         cur.execute(
             "CHANGE MASTER TO MASTER_HOST=%s, MASTER_PORT=%s, "
@@ -1008,10 +1016,33 @@ def check_lag(task):
     except Exception as e:
         return {"ok": False, "caught_up": False, "error": f"{type(e).__name__}: {e}"}
     if repl.get("note"):
-        # 目标上没有复制通道：要么尚未建立桥接，要么已经停过桥
+        # 目标上没有复制通道。仅回一句“不存在”会让人不知道下一步做什么，
+        # 故用任务步骤状态区分三种情况，分别给出可操作指引。
+        steps = task.get("steps") or {}
+        bridge_done = (steps.get("bridge") or {}).get("status") == "done"
+        cutover_done = (steps.get("cutover") or {}).get("status") == "done"
+        if cutover_done:
+            why = "已停桥"
+            hint = ("本任务已执行过停桥切换（STOP REPLICA + RESET REPLICA ALL 会清除复制通道），"
+                    "此时再检测追平没有意义。若需重新迁移，请新建迁移任务。")
+        elif not bridge_done:
+            why = "未建立桥接"
+            hint = ("需要重做【第三步 → 「建立桥接」】这一步："
+                    "回到第三步，点击「建立桥接」那一行的【执行】按钮（支持重复执行），"
+                    "成功后目标才会建立 177→203 的复制通道，再回来点「追平检测」。"
+                    "若你的源库已停写、不需要追平增量，可勾选下方「源库已停写」跳过本检测。")
+        else:
+            why = "复制通道已清除"
+            hint = ("需要重做【第三步 → 「建立桥接」】这一步（桥接执行过，但目标上的复制通道现在不存在）。"
+                    "回到第三步重跑「建立桥接」即可重建通道。"
+                    "若目标已被登记进 Custos 集群，monitor 的 ensure_topology 会持续清掉该通道，"
+                    "此时应新建迁移任务，而不是重跑桥接。")
         return {"ok": True, "caught_up": False, "io_running": None, "sql_running": None,
                 "seconds_behind": None, "last_error": None,
-                "reason": repl["note"], "replica": repl}
+                "reason": "%s：目标上没有复制通道" % why, "why": why, "hint": hint,
+                "bridge_done": bridge_done, "cutover_done": cutover_done,
+                "need_bridge": (not cutover_done),  # 未停桥时，重跑桥接即可恢复通道
+                "replica": repl}
     io_ok = str(repl.get("io_running") or "").lower() == "yes"
     sql_ok = str(repl.get("sql_running") or "").lower() == "yes"
     sb = repl.get("seconds_behind")
