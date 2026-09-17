@@ -195,6 +195,10 @@ done
 rm -f /tmp/mysql.sock /var/run/mysqld/mysqld.sock
 log "已清理客户端/socket 软链"
 
+# ---------- 5.5) 删除 logrotate 配置（节点宿主级，安装时由 Install 脚本写入 /etc/logrotate.d/custos-ha） ----------
+rm -f /etc/logrotate.d/custos-ha
+log "已删除 logrotate 配置 /etc/logrotate.d/custos-ha"
+
 # ---------- 6) 删除数据目录（所有新增数据） ----------
 if [[ -d "$DATA_DIR" ]]; then
   rm -rf "$DATA_DIR"

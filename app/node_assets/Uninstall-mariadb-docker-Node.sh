@@ -265,6 +265,10 @@ fi
 rm -f "$STATE"
 rmdir "$STATE_DIR" >/dev/null 2>&1 || true
 
+# ---------- 6) 删除 logrotate 配置（节点宿主级；容器形态通常由运维手动 cp 到 /etc/logrotate.d/custos-ha，这里一并清理） ----------
+rm -f /etc/logrotate.d/custos-ha
+log "已删除 logrotate 配置 /etc/logrotate.d/custos-ha"
+
 echo
 log "==== 容器化 MariaDB 节点卸载完成 ===="
 echo "提醒：请到管理器 Web 界面删除该节点（避免后台继续探测/选主）。"
