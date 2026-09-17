@@ -1,6 +1,6 @@
 # Custos
 
-> 当前版本：**v2.3.10**（凭证加密默认关闭 + 复制自愈保底）
+> 当前版本：**v2.4.0**（数据迁移向导：MariaDB↔MariaDB + MySQL 5.7→MariaDB）
 > 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)；**v2.3 起**每个版本的独立规划见 [`doc/releases/`](./doc/releases/)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
 
@@ -26,12 +26,16 @@
 
 ```bash
 git clone <仓库地址> custos-ha && cd custos-ha
-sudo sh scripts/setup.sh         # 交互收集管理库/VIP/网卡/Web 账号，自动生成 .env（SECRET_KEY/WEB_PASS 随机）、写回 compose、装 custosctl
-# 或 sudo sh scripts/setup.sh -y  （非交互，全默认 + 随机口令）
+sudo sh install.sh               # 交互收集管理库/VIP/网卡/Web 账号，自动生成 .env（SECRET_KEY/WEB_PASS 随机）、写回 compose、装 custosctl
+# 或 sudo sh install.sh -y        （非交互，全默认 + 随机口令）
+# 或 sudo sh install.sh --with-db （零外部依赖：内置 mgmt-mysql 一键起管理端，演示/小规模推荐；管理库地址自动填 mgmt-mysql、端口固化 3306）
 ```
 
-启动后访问 `http://<管理端IP>:28888`（账号密码为 setup.sh 生成，见其输出）。
+启动后访问 `http://<管理端IP>:28888`（账号密码为 install.sh 生成，见其输出）。
 
+> **命令入口区分（重要，新手最容易混）**：本工具有「两套命令」，切勿混用——
+> - **管理端命令**（在管理端机器、仓库根目录 `custos-ha/` 执行）：`install.sh`（安装）、`custosctl`（重建/重启/卸载管理器）、`./scripts/deploy.sh`（部署）。
+> - **节点命令**（在每台节点机器、由 Web 控制台「一键生成节点部署文件」产出的节点目录内执行）：`Install-*.sh`（安装节点）、`Uninstall-*.sh`（卸载）、`docker compose up -d`（拉起节点容器）。
 > 已有部署想重建/重启管理器：`custosctl rebuild`（= 重建管理器镜像）或 `custosctl restart`。
 > 改 `./app` 源码后必须 `--build` 重建镜像才生效：`custosctl rebuild` 或 `./scripts/deploy.sh up -d --build`。
 
@@ -48,7 +52,7 @@ cp env.example .env            # 改 MGMT_MYSQL_* / WEB_PASS / SECRET_KEY / VIP 
 
 | 变量 | 说明 | 默认 |
 |------|------|------|
-| `MGMT_MYSQL_HOST` | 管理库可达 IP（**务必填外部库真实 IP，不要写 auto / 127.0.0.1**） | `192.0.2.88` |
+| `MGMT_MYSQL_HOST` | 管理库可达 IP（**务必填外部库真实 IP，不要写 auto / 127.0.0.1**；用 `install.sh --with-db` 时自动填 `mgmt-mysql` 服务名） | `192.0.2.88` |
 | `MGMT_MYSQL_PORT` / `USER` / `PASS` / `DB` | 管理库连接 | `3306` / `ha` / `ha` / `ha` |
 | `WEB_PORT` | Web 端口 | `28888` |
 | `WEB_USER` / `WEB_PASS` | Web 登录（默认 `admin`/`admin`，生产务必修改） | `admin` / `admin` |

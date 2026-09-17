@@ -1333,10 +1333,15 @@ def make_slave_of(host, port, user, password, master_host, master_port,
 
     重指向前先 RESET SLAVE ALL 清掉残留复制通道，再以 MASTER_AUTO_POSITION=1
     重新挂载到新主库。GTID 自动定位会跳过本节点「已经执行过」的事务，
-    因此【严禁 RESET MASTER】：一旦清空本机 GTID 执行集合，新主库会把它
+    因此    【严禁 RESET MASTER】：一旦清空本机 GTID 执行集合，新主库会把它
     曾发过的同名事务（如 CREATE DATABASE）当作新事务重放，从而触发
     「database exists / duplicate entry」等 1007/1062 错误，导致
     Slave_SQL_Running=No。依赖 GTID 自动定位即可干净重入，无需 RESET MASTER。
+
+    唯一例外：若本节点「曾为主库」（其 gtid_binlog_pos 非空，含自有 GTID 身份），
+    重指向其他主库时该自有 GTID 与新主库同 domain-server 序列在 gtid_strict_mode
+    下必然冲突（out-of-order）。此情形必须 RESET MASTER 清空自有 binlog，
+    再按已应用集/主库位点重设 gtid_slave_pos——否则干净从库无法建立（见下方 _own_gt 分支）。
 
     返回 (ok, msg)。
     """
@@ -1374,26 +1379,62 @@ def make_slave_of(host, port, user, password, master_host, master_port,
         # 节点便一直自认主、VIP 不释放，而管理器已选了别的主，于是把它当从库压成只读。
         # 分裂时保持其可写并告警，远好于静默压只读导致业务整体不可写。
         _self_m, _rec = _local_state_self_master(cur, host, port)
-        if _self_m and not _addr_eq("%s:%s" % (master_host, int(master_port)), host, port):
-            # 仅在节点【当前可写】时才拦截：把可写的 VIP 持有者压成只读，业务才会 1290。
-            # 若它已被 fencing 置为只读（read_only=1），改造为从库不会让情况更糟，
-            # 反而能让它重新入集群并恢复复制，故放行。
+        _target = "%s:%s" % (master_host, int(master_port))
+        if _self_m and not _addr_eq(_target, host, port):
+            # ---- 先自愈，再决定是否拦截（F16，2026-09-16）----
+            # 本节点的 ha_local.state **只有管理器会写**。既然管理器此刻已认定当前主是
+            # _target（另一节点），那么本机这份「我是主」的记录就是**过期错误数据**。
+            # 旧实现只做「拒绝降级」，形成死锁：
+            #   状态推送失败 → 本机记录过期 → 守卫拒绝降级 → 记录永远得不到纠正；
+            # 后果有两层，且互相放大：
+            #   ① 回归的旧主既不重入集群、又保留自己的 binlog 继续接受写入 → 静默分叉；
+            #   ② 真主（_target）在 keepalived 那侧也可能因同类过期记录而拒绝持有 VIP
+            #      → 两节点同时放弃 → VIP 全网消失（实测现象）。
+            # 故此处就地把本机 current_master 纠正为 _target，再复读确认；纠正成功即放行。
             try:
                 cur.execute("SELECT @@GLOBAL.read_only")
                 _ro = cur.fetchone()
-                _writable = (_ro is None) or int(_ro[0]) == 0
+                _v = "" if _ro is None else str(_ro[0]).strip().upper()
+                _writable = _v in ("0", "OFF", "")
             except Exception:
                 _writable = True
             if not _writable:
+                # 已被 fencing 置为只读（read_only=ON）：改造为从库不会让情况更糟，
+                # 反而能让它重新入集群并恢复复制，故放行（保持原语义）。
                 print(f"[vip-guard] {host}:{port} 自认主(ha_local={_rec!r})但已为只读，"
-                      f"放行重挂载为 {master_host}:{master_port} 的从库以恢复复制。")
+                      f"放行重挂载为 {_target} 的从库以恢复复制。")
                 _self_m = False
-        if _self_m and not _addr_eq("%s:%s" % (master_host, int(master_port)), host, port):
+            else:
+                _fixed = False
+                _ferr = ""
+                try:
+                    # 与会话内其它写入保持一致：ha_local 是节点本地状态表，绝不进 binlog，
+                    # 否则该写入会被复制到从库、并可能在从库上报 1062 卡死复制线程。
+                    cur.execute("SET SESSION sql_log_bin=0")
+                    cur.execute(
+                        "REPLACE INTO ha_local.state (k, v) VALUES ('current_master', %s)",
+                        (_target,))
+                    _fixed = True
+                except Exception as _e_fix:
+                    _ferr = "%s: %s" % (type(_e_fix).__name__, _e_fix)
+                finally:
+                    try:
+                        cur.execute("SET SESSION sql_log_bin=1")
+                    except Exception:
+                        pass
+                if _fixed:
+                    print(f"[vip-guard] {host}:{port} 本地 current_master 已由 {_rec!r} "
+                          f"就地纠正为 {_target}（自愈），继续挂载为从库。")
+                    _self_m = False
+                else:
+                    print(f"[vip-guard] {host}:{port} 就地纠正本地 current_master 失败：{_ferr}")
+        if _self_m and not _addr_eq(_target, host, port):
             msg = (f"[vip-guard] 拒绝把 {host}:{port} 改造为从库：其本机 ha_local.state 仍记录 "
                    f"current_master={_rec!r}（keepalived 据此把 VIP 绑在该节点），与本次要挂载的"
-                   f"主库 {master_host}:{master_port} 不一致。已跳过本次重指向并保留其可写状态，"
-                   f"避免业务经 VIP 写入报 1290。请检查该节点 ha_local.state 写入是否失败"
-                   f"（常见：ha_monitor 缺 BINLOG ADMIN / ha_local 库权限）。")
+                   f"主库 {_target} 不一致，且就地纠正该记录也未成功。已跳过本次重指向并保留其"
+                   f"可写状态，避免业务经 VIP 写入报 1290。请检查该节点 ha_local 库与 "
+                   f"ha_monitor 账号权限（需 BINLOG ADMIN 及 ha_local 库的 "
+                   f"SELECT/INSERT/UPDATE/CREATE），以及到该节点的网络连通性。")
             print(msg)
             try:
                 from .alerts import send_alert   # 局部导入，避免模块级循环依赖
@@ -1446,11 +1487,34 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                     if _slave_gt:
                         cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
                         _pos_ok = bool((cur.fetchone() or [0])[0])
-                    _bin_ok = False
+                    # 从库「自有 binlog GTID」(gtid_binlog_pos) 非空 = 它曾为源（曾是主库）。
+                    # 重指向其他主库时，其自有 GTID 与该主库同 domain-server 序列在
+                    # gtid_strict_mode 下必然冲突（out-of-order）；而 GTID_SUBSET(自有,主库)
+                    # 常判为「子集」会漏掉此场景（同序列、不同源）。故「曾为源」即清空自有
+                    # binlog，再按已应用集/主库位点重设 gtid_slave_pos，彻底解除乱序冲突。
                     if _own_gt:
-                        cur.execute("SELECT GTID_SUBSET(%s, %s)", (_own_gt, _master_gt))
-                        _bin_ok = bool((cur.fetchone() or [0])[0])
-                    if not (_pos_ok and _bin_ok):
+                        print("[gtid] %s:%s 曾为源(自有binlog GTID=%s)，RESET MASTER 解除乱序冲突" % (host, port, _own_gt))
+                        try:
+                            cur.execute(stop_replication_sql(flavour))
+                            cur.execute(reset_replica_sql(flavour))
+                            cur.execute("RESET MASTER")
+                            if _slave_gt and _master_gt:
+                                cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
+                                if bool((cur.fetchone() or [0])[0]):
+                                    # 已应用集为主库子集：保留以免从头重放报 1062
+                                    cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
+                                else:
+                                    # 已应用集也分叉：对齐到主库当前位置，跳过重放避免 1236
+                                    cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
+                                    print("[gtid] %s:%s 已应用集分叉，gtid_slave_pos 已对齐主库当前 %s" % (host, port, _master_gt))
+                            elif _slave_gt:
+                                cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
+                            elif _master_gt:
+                                cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
+                        except Exception as e2:
+                            print("[gtid] 分叉重建失败(可忽略，继续常规重链): %s" % e2)
+                    elif not _pos_ok:
+                        # 纯净从库（无自有 binlog GTID）：仅已应用集非主库子集才对齐（原有逻辑）
                         print("[gtid] %s:%s 本地 GTID 非主库子集(分叉)，RESET MASTER 解除冲突后重链" % (host, port))
                         try:
                             cur.execute(stop_replication_sql(flavour))
@@ -1716,10 +1780,25 @@ def set_local_master_flag(host, port, user, password, master_str, root_user="roo
 
     由管理端在切换主库时调用，供 keepalived 检查脚本本地读取判定 VIP 归属。
     完全本地、不依赖节点回连管理库，彻底规避管理库不可达导致 VIP 不漂移。
+    返回 bool；需要失败原因时改用 set_local_master_flag_ex()。
+    """
+    return set_local_master_flag_ex(host, port, user, password, master_str,
+                                    root_user, root_pass)[0]
+
+
+def set_local_master_flag_ex(host, port, user, password, master_str,
+                             root_user="root", root_pass=""):
+    """同 set_local_master_flag，但返回 (ok, err)，err 为人类可读的失败原因。
+
+    **这个诊断能力是刻意加的**：本函数是 ha_local.state 的唯一写入点，而 keepalived
+    完全依赖这份本地记录判定 VIP 归属。早期实现把所有异常压成 `return False`，
+    使「节点本地状态长期停留在幽灵主库 IP」这类致命故障在管理端完全无声——
+    实测后果是故障切换后 VIP 在两个节点上被同时放弃（VIP 凭空消失）。
+    任何失败都必须能说清是「连不上 / 无 BINLOG ADMIN / 建表被拒 / 写入被拒 / 表不存在」。
     """
     conn = connect_robust(host, port, user, password, root_user, root_pass)
     if conn is None:
-        return False
+        return False, "无法连接节点(ha_monitor/root 均失败)"
     try:
         cur = conn.cursor()
         # MariaDB 10.5+：SET SESSION sql_log_bin 需要 BINLOG ADMIN，仅 SUPER 不够。
@@ -1729,21 +1808,23 @@ def set_local_master_flag(host, port, user, password, master_str, root_user="roo
         try:
             cur.execute("SET SESSION sql_log_bin=0")
             cur.execute("SET SESSION sql_log_bin=1")
-        except Exception:
+        except Exception as e_binlog:
             try:
                 conn.close()
             except Exception:
                 pass
             if not root_user or not root_pass:
-                return False
+                return False, ("ha_monitor 无 BINLOG ADMIN（%s），且未提供节点 root 口令，"
+                               "无法关闭会话 binlog 写入 ha_local.state" % e_binlog)
             conn2 = None
             try:
                 conn2 = pymysql.connect(host=host, port=int(port), user=root_user,
                                         password=root_pass, connect_timeout=4, autocommit=True)
-            except Exception:
-                return False
+            except Exception as e_root:
+                return False, ("ha_monitor 无 BINLOG ADMIN（%s），root 回退连接亦失败：%s"
+                               % (e_binlog, e_root))
             if conn2 is None:
-                return False
+                return False, "ha_monitor 无 BINLOG ADMIN，root 回退连接返回空"
             conn = conn2
             cur = conn.cursor()
         # ha_local 是节点本地状态表（keepalived 检查脚本读本机 current_master 用），
@@ -1772,16 +1853,19 @@ def set_local_master_flag(host, port, user, password, master_str, root_user="roo
             cur.execute("SELECT v FROM ha_local.state WHERE k='current_master'")
             row = cur.fetchone()
             if row and row[0] == master_str:
-                return True
+                return True, None
             cur.execute(
                 "REPLACE INTO ha_local.state (k, v) VALUES ('current_master', %s)",
                 (master_str,),
             )
         finally:
-            cur.execute("SET SESSION sql_log_bin=1")
-        return True
-    except Exception:
-        return False
+            try:
+                cur.execute("SET SESSION sql_log_bin=1")
+            except Exception:
+                pass
+        return True, None
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
     finally:
         try:
             conn.close()
@@ -2342,6 +2426,12 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             # （PASSWORD() 函数对明文再哈希，与 init_mariadb.sql 一致，已验证可用）。
             idn = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
             idn_root = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
+            # F13（2026-09-16 真机）：MariaDB 分支此前**漏定义 idn_repl**，而下方 accts 循环
+            # 在 u==repl_user 时引用它 → NameError → ensure_ha_creds 对**所有 MariaDB 节点**
+            # 恒失败（返回 False），凭证漂移自愈整条链路静默失效（表现为日志恒
+            # "凭证巡检完成：0 个节点已对齐"、漂移永远自愈不了）。MariaDB 复制账号同样用
+            # native 插件 + USING PASSWORD 语法，直接复用 idn 即可。
+            idn_repl = idn
             # 注：MariaDB 10.5+（含 11/12.x）提供 REPLICATION SLAVE ADMIN / SLAVE MONITOR 特权：
             #  - 12.x 执行 CHANGE MASTER TO / START SLAVE 必须有 REPLICATION SLAVE ADMIN（仅 REPLICATION SLAVE 不够，报 1227）；
             #  - 12.x 执行 SHOW REPLICA STATUS / 读取复制状态必须有 SLAVE MONITOR（监控探活读复制状态用），否则报 1227；
@@ -2452,6 +2542,35 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                         cur.execute("GRANT %s ON *.* TO '%s'@'%s'" % (extra, _esc_sql(ha_user), _h))
                 except Exception:
                     pass
+        # ---- F11：消除「精确 host 影子账号」造成的能力落差（2026-09-16 真机）----
+        # 现象：节点上残留 ha_monitor@'<管理器IP>'（历史 fix 脚本交叉污染 / 旧版本遗留），
+        #   MariaDB / MySQL 按 host **精确度优先**匹配 —— 管理器从管理器主机 IP 连入时
+        #   命中该「影子账号」。若它只有 USAGE（或缺少 REPLICATION SLAVE ADMIN /
+        #   SLAVE MONITOR），则表现为「连得上、却没权限」：CHANGE REPLICATION SOURCE
+        #   报 1227、读复制状态报 1227 → 复制永久起不来、故障切换中止，而错误信息
+        #   完全看不出是精确 host 账号在作祟（这正是 177/33 实测中「复制无法自愈」的根因）。
+        # 修复：对 ha_monitor **每一个已存在的 host 变体**（并集 管理器IP ∪ '%'）执行全集
+        #   授权，彻底抹平影子账号的能力落差。幂等：已具备全集者跳过，不写 binlog。
+        #   刻意只补 ha_monitor：repl/app 不参与管理器连入，无需 per-host 变体。
+        try:
+            cur.execute("SELECT DISTINCT Host FROM mysql.user WHERE User=%s", (ha_user,))
+            _ha_hosts = [r[0] for r in (cur.fetchall() or [])]
+        except Exception:
+            _ha_hosts = []
+        _target_privs = _parse_grant_privs(ha_grant)
+        _shadow_hosts = set([h for h in _ha_hosts if h] + ["%"]
+                            + ([manager_ip] if manager_ip else []))
+        for _h in _shadow_hosts:
+            try:
+                if _target_privs and _target_privs.issubset(_granted_privs(cur, ha_user, _h)):
+                    continue
+                _g = (ha_grant if _h == "%"
+                      else ha_grant.replace("@'%'", "@'%s'" % _h))
+                cur.execute(_g)
+                print("[ha-shadow] 已为 ha_monitor@%s 补齐全集特权（消除精确 host 影子账号）"
+                      % _h, flush=True)
+            except Exception as _e:
+                print("[ha-shadow] 修复 ha_monitor@%s 权限失败(可忽略): %s" % (_h, _e))
         # 账号改名：删除节点上残留的旧账号（旧账号可能以多个 host 存在）。
         # 必须在 sql_log_bin=0 作用域内执行，避免 DROP USER 经复制下放到从库。
         def _drop_old(cur, old_user, new_user):
@@ -2532,4 +2651,90 @@ def ensure_ha_creds(host, port, root_user, root_pass,
     except Exception:
         pass
     return True, "ok (via %s)" % used
-      
+
+
+def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root_pass="",
+                            manager_ip=""):
+    """修复 ha_monitor「精确 host 影子账号」的权限落差（F11，**可安全用于只读副本**）。
+
+    背景（2026-09-16 真机 177/33）：节点上可能残留 ha_monitor@'<管理器IP>' 等
+    「精确 host」账号（历史 fix 脚本交叉污染 / 旧版本遗留 / ACCOUNT_HOST_MODE 切换）。
+    MySQL / MariaDB 按 host **精确度优先**匹配 —— 管理器从管理器主机 IP 连入时命中该
+    影子账号。若它只有 USAGE，则表现为「连得上、却没权限」：CHANGE REPLICATION SOURCE、
+    SHOW REPLICA STATUS、写 ha_local 一律报 1227 → **复制永久无法自愈、故障切换中止**，
+    而错误信息完全看不出是精确 host 账号在作祟。实测 33 号节点的复制正是被此卡死。
+
+    与 ensure_ha_creds 的关键区别：本函数**只做 GRANT**（不 CREATE / ALTER USER、不改
+    密码），因此可在**只读副本**上安全执行。副本上严禁 CREATE/ALTER USER（会与复制
+    线程争用 mysql.* 元数据锁，导致 'Waiting for dependent transaction to commit'、
+    复制卡死），但「为既有账号补齐授权」是低风险且**必要**的：否则该副本永远无法被
+    管理器管理。GRANT 全程 ``SET SESSION sql_log_bin=0``，不复制下去、不污染主库。
+
+    连接：优先 ha_monitor；若它自身即无权影子账号（连也白连），回退 root
+    （root@'<管理器IP>' / root@'%' 恒为 ALL PRIVILEGES）。幂等：账号已具全集时不写库。
+
+    返回 (repaired_count, msg)。
+    """
+    conn = None
+    try:
+        # GRANT 需要 **GRANT OPTION**，而 ha_monitor 刻意不带该权限（最小权限原则）。
+        # 故本修复**优先用 root**（节点上 root@'<管理器IP>' / root@'%' 均为
+        # ALL PRIVILEGES WITH GRANT OPTION）；root 不可达时才退回 ha_monitor
+        # （仅当它自身已带 GRANT OPTION 时才有意义，否则会 1044/1045 —— 不影响其它逻辑）。
+        if root_pass:
+            try:
+                conn = connect(host, int(port), root_user, root_pass, timeout=5)
+            except Exception:
+                conn = None
+        if conn is None:
+            conn = connect(host, int(port), ha_user, ha_pass, timeout=5)
+        if conn is None:
+            return 0, "无法连接节点(root/ha_monitor 均失败)"
+        cur = conn.cursor()
+        flavour = detect_flavour(cur)
+        if flavour == F_MARIADB:
+            target = mariadb_matrix.ha_privs(mariadb_matrix.server_privileges(cur))
+        else:
+            target = ("REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
+                      "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE, EXECUTE")
+        target_set = {p.strip().upper() for p in target.split(",") if p.strip()}
+        try:
+            cur.execute("SELECT DISTINCT Host FROM mysql.user WHERE User=%s", (ha_user,))
+            _hosts = [r[0] for r in (cur.fetchall() or [])]
+        except Exception:
+            _hosts = []
+        cand = set([h for h in _hosts if h] + ["%"]
+                   + ([manager_ip] if manager_ip else []))
+        _binlog_off = False
+        try:
+            cur.execute("SET SESSION sql_log_bin=0")
+            _binlog_off = True
+        except Exception:
+            pass
+        repaired = 0
+        for h in cand:
+            try:
+                if target_set and target_set.issubset(_granted_privs(cur, ha_user, h)):
+                    continue
+                cur.execute("GRANT %s ON *.* TO '%s'@'%s'"
+                            % (target, _esc_sql(ha_user), h))
+                repaired += 1
+                print("[ha-shadow] %s:%s 的 ha_monitor@%s 已补齐全集特权"
+                      % (host, port, h), flush=True)
+            except Exception as e:
+                print("[ha-shadow] %s:%s ha_monitor@%s 授权失败(可忽略): %s"
+                      % (host, port, h, e))
+        if _binlog_off:
+            try:
+                cur.execute("SET SESSION sql_log_bin=1")
+            except Exception:
+                pass
+        return repaired, ("已修复 %d 个影子账号" % repaired if repaired else "无需修复")
+    except Exception as e:
+        return 0, "异常: %s" % e
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass

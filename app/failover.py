@@ -3,7 +3,7 @@ from .db import query, execute, get_setting
 from .config import get_manager_public_ip, get_manager_docker_subnet_wildcard, FAILOVER_COOLDOWN_SEC
 from .state import get_current_master, set_current_master
 from .ha_client import (set_read_only, promote_to_master, make_slave_of,
-                        set_local_master_flag, is_stale_master, get_status,
+                        set_local_master_flag_ex, is_stale_master, get_status,
                         heal_replication, heal_io_gtid_gap, get_gtid_executed,
                         parse_gtid_set, fix_node_mysql_params, ensure_ha_creds,
                         ensure_connect_creds,
@@ -39,8 +39,23 @@ TOPO_REPAIR_INTERVAL = 60
 _TOPO_AT = {}
 # 推送 current_master 到各节点本地 ha_local.state 的兜底间隔（秒）：
 # 值未变化时不推送；但节点重启可能丢失本地状态，故最长 PUSH_MAX_INTERVAL 强制推一次。
+#
+# 【按节点记账，而非按集群】——这是「故障切换后 VIP 全网消失」的根因修复（2026-09-16）。
+# 旧实现只维护一个集群级时间戳：只要某轮推送开始过，就先记下「本集群已推」，
+# 随后每个节点的写入异常都被 `except: pass` 静默吞掉。于是某节点一旦写失败
+# （典型：ha_monitor 影子账号缺权限、网络抖动），
+#   ① 该节点在最长 PUSH_MAX_INTERVAL 秒内**不会再被重试**；
+#   ② 失败持续时，它本地 current_master 会长期停留在旧值甚至幽灵值；
+#   ③ keepalived 检查脚本第 3 关据此判定「本机非主库」→ **真主拒绝持有 VIP**，
+#      而 vip-guard 又读到该节点「自认主」→ 拒绝把回归的旧主降级为从库（静默分叉）。
+# 两者叠加即 VIP 在两节点上同时被放弃 → VIP 凭空消失。
+# 改为 (cluster_id, host, port) 粒度记账：只有**真正写成功**的节点才被记时间戳，
+# 失败的节点下一个监控周期（~2s）立即重试，并可被诊断日志/告警暴露。
 PUSH_MAX_INTERVAL = 300
 _LAST_PUSH = {}
+# 推送失败告警冷却（同样按节点集合记账，避免本地状态过期问题被静默）
+_PUSH_WARN_INTERVAL = 300
+_PUSH_WARN_AT = {}
 
 # 故障切换全局互斥锁：自动（monitor 在 _RUN_ONCE_LOCK 保护区内调用 do_failover）与手动（API）
 # 切换统一串行，避免并发切换造成 split-brain / 双主。
@@ -128,34 +143,88 @@ def list_hosts(cluster_id=None):
     )
 
 
-def push_current_master_to_nodes(cluster_id, master_str):
+def push_current_master_to_nodes(cluster_id, master_str, force=False):
     """把当前主库标识写入集群内每个节点的本地 MySQL（ha_local.state）。
 
     供 keepalived 检查脚本本地读取判定 VIP 归属；完全本地，无需节点回连管理库。
-    单节点失败不影响整体（下个监控周期会重试）。
+
+    返回成功（含「已是最新、无需写」）的节点数，仅用于诊断，调用方无需依赖。
 
     【空闲零写入】旧实现每个监控周期（~2s）都无条件写一遍集群内**所有节点**的
     ha_local.state —— 稳态下就是每 2 秒对每个节点做一次真实行更新，是「没有业务
-    数据交互却在持续写盘」最直接的来源。改为：值未变化则不写；仅当主库变更、
-    或距上次推送超过 PUSH_MAX_INTERVAL（兜底，防止节点重启丢失本地状态）才写。
+    数据交互却在持续写盘」最直接的来源。改为：值未变化则不写（幂等，内部先 SELECT
+    比对）；非当前主库额外用 PUSH_MAX_INTERVAL 缓存把「核验」降频为纯 I/O 优化。
+
+    【当前主库例外：每周期都核验】见下方 is_cur_master 处注释（F16-b）——
+    当前主库是 VIP 落点，其本地状态过期会让真主主动放弃 VIP，不能等缓存兜底。
+
+    【失败必须重试，且必须可见】见 _LAST_PUSH 上方注释（F16 根因）。
+    关键两点：① 记账粒度到节点，只有写成功的节点才登记时间戳；
+    ② 失败不再 `except: pass` 静默吞掉，而是落日志+告警（带冷却），
+    因为「节点本地状态过期」正是 keepalived 误判 VIP 归属、旧主无法回归的第一现场。
+
+    force=True：忽略缓存强制重推（切换/手动切换后使用，确保新主立刻落地）。
     """
-    prev = _LAST_PUSH.get(cluster_id)
-    now = time.monotonic()
-    if prev and prev[0] == master_str and (now - prev[1]) < PUSH_MAX_INTERVAL:
-        return
-    _LAST_PUSH[cluster_id] = (master_str, now)
     creds = load_creds(cluster_id)
     try:
         rows = query("SELECT host, port FROM hosts WHERE cluster_id=%s", (cluster_id,))
     except Exception:
-        return
+        return 0
+    if not rows:
+        return 0
+    # 当前主库排最前：VIP 绑在它身上，它的本地状态决定 VIP 何时能落位，最需及时。
+    rows = sorted(rows, key=lambda r: 0 if ("%s:%s" % (r["host"], int(r["port"]))) == master_str else 1)
+    now = time.monotonic()
+    ok_n = 0
+    failed = []
     for r in rows:
+        host, port = r["host"], int(r["port"])
+        key = (cluster_id, host, port)
+        is_cur_master = ("%s:%s" % (host, port)) == master_str
+        # 【当前主库不进缓存，每周期核验】（F16-b，2026-09-16）
+        # PUSH_MAX_INTERVAL 缓存本质是「信任」而非「核验」：一旦某节点被记为推送成功，
+        # 管理器在 5 分钟内不再看它。对**非主库**这只是 I/O 优化（它本地状态过期不影响
+        # 任何东西，且真切换时 do_failover 会 force 重推）。但对**当前主库**是可用性缺陷：
+        # 它是 VIP 的落点，本地 current_master 一旦过期/被外部改动，keepalived 检查脚本
+        # 第 3 关就会判「本机非主库」→ **真主主动放弃 VIP → VIP 凭空消失**，而且要等满
+        # 兜底间隔才自愈。实测（哨兵实验）：向节点注入错误值后 90s 内完全无人纠正。
+        # 故当前主库每周期调用一次幂等写入：值正确时内部 SELECT 相等即返回（零写盘），
+        # 只有真的不一致才会 REPLACE。代价仅一次连接+一次 SELECT，换 VIP 秒级自愈。
+        prev = _LAST_PUSH.get(key)
+        if (not force) and (not is_cur_master) and prev and prev[0] == master_str \
+                and (now - prev[1]) < PUSH_MAX_INTERVAL:
+            ok_n += 1
+            continue
+        ok = False
+        err = ""
         try:
-            ru, rp = node_root(r["host"], cluster_id)
-            set_local_master_flag(r["host"], int(r["port"]), creds["ha_user"],
-                                  creds["ha_pass"], master_str, ru, rp)
-        except Exception:
-            pass
+            ru, rp = node_root(host, cluster_id)
+            ok, err = set_local_master_flag_ex(host, port, creds["ha_user"], creds["ha_pass"],
+                                               master_str, ru, rp)
+        except Exception as e:
+            err = "%s: %s" % (type(e).__name__, e)
+        if ok:
+            _LAST_PUSH[key] = (master_str, now)
+            ok_n += 1
+        else:
+            failed.append((host, port, err))
+    if failed:
+        # 冷却：同一「集群+主库+失败集合」最多 5 分钟提示一次，避免刷屏。
+        _kd = (cluster_id, master_str, tuple(sorted((h, p) for h, p, _ in failed)))
+        if now - _PUSH_WARN_AT.get(_kd, 0.0) >= _PUSH_WARN_INTERVAL:
+            _PUSH_WARN_AT[_kd] = now
+            detail = "；".join("%s:%s (%s)" % (h, p, e) for h, p, e in failed)
+            msg = ("[ha_local] 当前主库标识 %s 推送失败 %d 个节点：%s "
+                   "这些节点本地 ha_local.state 已过期，keepalived 会据此误判 VIP 归属"
+                   "（真主可能拒绝持 VIP、回归的旧主可能拒绝降级为从库→静默分叉）。"
+                   "请检查节点 ha_monitor 账号权限（需 BINLOG ADMIN 及 ha_local 库权限）"
+                   "与到节点的网络连通性。" % (master_str, len(failed), detail))
+            print(msg)
+            try:
+                send_alert("节点本地状态推送失败", msg, cluster_id=cluster_id)
+            except Exception:
+                pass
+    return ok_n
 
 
 def _repoint_slave(cluster_id, h, target_host, target_port, creds):
@@ -281,7 +350,12 @@ def reset_topo_throttle(cluster_id):
     for k in [k for k in _TOPO_AT
               if k[0] in ("repoint", "promote") and k[1] == cluster_id]:
         _TOPO_AT.pop(k, None)
-    _LAST_PUSH.pop(cluster_id, None)
+    # _LAST_PUSH / _PUSH_WARN_AT 均为 (cluster_id, host, port) 粒度：按集群整体清除，
+    # 保证切换后新主能立刻写进每个节点的本地状态（含此前推送失败的节点）。
+    for k in [k for k in _LAST_PUSH if k[0] == cluster_id]:
+        _LAST_PUSH.pop(k, None)
+    for k in [k for k in _PUSH_WARN_AT if k[0] == cluster_id]:
+        _PUSH_WARN_AT.pop(k, None)
 
 
 # 交叉验证用的「连不上主库」判定（与 monitor._repl_err_is_connectivity 同义；
@@ -426,7 +500,9 @@ def do_failover(cluster_id, reason="auto"):
     #    先解除限频+清推送缓存，确保新主立刻到达各节点（否则 VIP 漂移会被推迟）
     reset_topo_throttle(cluster_id)
     set_current_master(cluster_id, new_h, new_p)
-    push_current_master_to_nodes(cluster_id, f"{new_h}:{new_p}")
+    # force=True：切换后新主必须**立刻**落地到每个节点的本地状态，否则 keepalived
+    # 会拿旧值判定 VIP 归属（新主拒绝持 VIP、旧主拒绝降级），VIP 漂移被卡住。
+    push_current_master_to_nodes(cluster_id, f"{new_h}:{new_p}", force=True)
 
     # 4) 其余存活节点重指向新主（并重试自愈复制冲突）
     for h in hosts:
@@ -490,7 +566,7 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
                    cluster_id=cluster_id)
         return False
     set_current_master(cluster_id, target_host, target_port)
-    push_current_master_to_nodes(cluster_id, f"{target_host}:{target_port}")
+    push_current_master_to_nodes(cluster_id, f"{target_host}:{target_port}", force=True)
     # 3) 其余存活节点重指向新主（并重试自愈复制冲突）
     for h in list_hosts(cluster_id):
         if (h["host"], int(h["port"])) == (target_host, target_port):

@@ -12,6 +12,15 @@ RUN pip install --no-cache-dir \
     --timeout 120 --retries 10 \
     -r requirements.txt
 
+# 数据迁移必须的数据库客户端：没有它们，迁移向导的逻辑通道与物理通道都无法运行。
+# ⚠ 注意：脱离了客户端，/migration 页面能打开但一点即错，务必保留此层。
+# MariaDB 源使用 mariadb-dump / mariadb；MySQL 源按官方建议应使用 MySQL 自带 mysqldump
+# （Debian 仓库的 mysql-client 只是指向 mariadb-client 的过渡包），
+# 如需严格使用官方 mysqldump，可在宿主机安装后挂载进容器 PATH。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        mariadb-client \
+    && rm -rf /var/lib/apt/lists/*
+
 # 依赖装完后再引入随版本变化的元数据：LABEL 内含 ${VERSION}，
 # 若放在 pip 之前，每次升版都会使该层及其后所有层缓存失效 → 依赖被反复重装。
 ARG VERSION

@@ -20,6 +20,7 @@ services:
   # 的 environment 里填好 MGMT_MYSQL_* 即可，无需启动本服务。
   # 若想让管理器自带一个管理库做演示，取消下面整段注释，并取消
   # custos 的 depends_on 注释即可（数据落在项目根下的 ./data/mysql-data）。
+  # 更省事：sudo sh install.sh --with-db 会自动完成上述「取消注释 + 写入口令 + 同网 + depends_on 健康条件」。
   # ------------------------------------------------------------
   # mgmt-mysql:
   #   image: mysql:8.0
@@ -31,7 +32,7 @@ services:
   #   volumes:
   #     - ./data/mysql-data:/var/lib/mysql
   #   healthcheck:
-  #     test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pchange_me"]
+  #     test: ["CMD-SHELL", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
   #     interval: 10s
   #     timeout: 5s
   #     retries: 5

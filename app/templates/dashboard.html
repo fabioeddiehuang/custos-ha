@@ -131,6 +131,9 @@
               {% if h.upstream %}<div class="repl-link">← {{ h.upstream }}</div>{% endif %}
             {% elif h.repl_state == 'orphan' %}
               <span class="pill warn">● 脱管异常</span>
+            {% elif h.repl_state == 'repl_fork' %}
+              <span class="pill down" title="复制线程正常但上游并非当前主库：正从幽灵/旧主拉数据，存在静默数据分叉，管理器将自动重指">● 数据分叉</span>
+              {% if h.upstream %}<div class="repl-link">← {{ h.upstream }}(非当前主)</div>{% endif %}
             {% elif h.repl_state == 'offline' %}
               <span class="pill down">● 离线</span>
             {% else %}
@@ -373,6 +376,8 @@
             return '<span class="pill down" title="主库 binlog 已清理，复制无法自愈，需重建该从库">● 需重建</span>' + (up ? '<div class="repl-link">← ' + esc(up) + '</div>' : '');
           } else if (s === 'orphan') {
             return '<span class="pill warn">● 脱管异常</span>';
+          } else if (s === 'repl_fork') {
+            return '<span class="pill down" title="复制线程正常但上游并非当前主库：正从幽灵/旧主拉数据，存在静默数据分叉，管理器将自动重指">● 数据分叉</span>' + (up ? '<div class="repl-link">← ' + esc(up) + '(非当前主)</div>' : '');
           } else if (s === 'offline') {
             return '<span class="pill down">● 离线</span>';
           }

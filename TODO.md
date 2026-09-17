@@ -61,6 +61,11 @@
 - [ ] **1.3 MySQL 侧冻结策略与回归清单** `P0`
   - `mysql_compat` 是共享分派层，改 MariaDB 分支**极易误伤 MySQL 路径**
   - 规则：MySQL 侧只修 bug；每次 MariaDB 改动跑一遍 MySQL 回归（建节点 → 复制 → 切换 → 备份恢复）
+  - ✅ **代码级双路径回归已就位**：`tests/test_mysql_compat.py` 对 `mysql_compat` 的复制 SQL 生成 / 风味分派
+    同时构造 MySQL 8.0 与 MariaDB 两套输入，覆盖 `change_replication_sql` / 启停术语 / 复制过滤 / 认证插件 /
+    GTID 解析，确保同一逻辑在两条路径都不回归（48 个单测全绿，见 `tests/README.md`）。
+  - ⏳ **环境级回归仍待做**：真实「版本 × 形态 × 发行版」矩阵与端到端链路（建节点→复制→切换→备份恢复）
+    需容器编排，不在纯单测范围内，列为后续。
 
 ---
 

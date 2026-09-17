@@ -162,19 +162,31 @@ def _align_gtid_after_restore(slave_host, slave_port, sru, srp,
         return "无法连接从库，跳过位点对齐"
     try:
         with conn.cursor() as cur:
+            # 重建后从库本地 GTID 可能是「前主人」身份（曾为主库，自有 gtid_binlog_pos /
+            # gtid_executed 含旧身份）。逻辑备份本身不写从库 GTID，但【复用既有数据目录
+            # 或曾为主库】时本地仍可能残留旧 GTID；旧实现按「非空即跳过对齐」处理，导致
+            # 从库向主库报旧身份 → MariaDB 同序列冲突(out-of-order)、MySQL 主库 purge 后 1236。
+            # 故数据既已从主库全量恢复，必须【清空自有 GTID 并对齐到主库导出位点】，
+            # 不再依赖「本地非空=已正确」的假设（该假设正是重建成功却复制仍断的根因）。
             if flavour == "mariadb":
-                cur.execute("SELECT @@gtid_slave_pos")
-                s_gtid = str((cur.fetchone() or ("",))[0] or "")
-                if s_gtid:
-                    cur.execute("SELECT GTID_SUBSET(%s, %s)", (s_gtid, m_gtid))
-                    if (cur.fetchone() or (0,))[0]:
-                        return f"从库位点已是主库子集，无需对齐（{s_gtid}）"
+                try:
+                    cur.execute("STOP SLAVE")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("RESET MASTER")
+                except Exception as e:
+                    return f"GTID 位点对齐失败(RESET MASTER): {e}"
                 cur.execute("SET GLOBAL gtid_slave_pos=%s", (m_gtid,))
                 return f"已对齐 gtid_slave_pos → 主库导出结束位点 {m_gtid}"
-            cur.execute("SELECT @@gtid_executed")
-            s_gtid = str((cur.fetchone() or ("",))[0] or "")
-            if s_gtid:
-                return f"从库已有 GTID 执行集，跳过对齐（{s_gtid}）"
+            try:
+                cur.execute("STOP REPLICA")
+            except Exception:
+                pass
+            try:
+                cur.execute("RESET MASTER")
+            except Exception as e:
+                return f"GTID 位点对齐失败(RESET MASTER): {e}"
             cur.execute("SET GLOBAL gtid_purged=%s", (m_gtid,))
             return f"已对齐 gtid_purged → 主库导出结束位点 {m_gtid}"
     except Exception as e:

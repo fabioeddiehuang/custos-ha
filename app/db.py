@@ -342,6 +342,35 @@ def init_schema():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
             except Exception as e:
                 print(f"[init_db] 创建 maintenance 表失败(可忽略): {e}")
+            # ---- v2.3.10：数据迁移向导任务表 ----
+            # 既有 MariaDB 集群 → Custos 托管集群 的迁移任务状态（步骤/配置/日志）。
+            # config 为加密 JSON（含源/目标凭据）；steps 为各步骤状态 JSON。
+            try:
+                c.execute("""CREATE TABLE IF NOT EXISTS migration_tasks (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(128) NOT NULL DEFAULT '未命名迁移',
+                    channel VARCHAR(16) NOT NULL DEFAULT 'logical',
+                    status VARCHAR(16) NOT NULL DEFAULT 'draft',
+                    config TEXT,
+                    steps TEXT,
+                    log TEXT,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    INDEX idx_status (status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+            except Exception as e:
+                print(f"[init_db] 创建 migration_tasks 表失败(可忽略): {e}")
+            # ---- 迁移向导：百分比进度与「当前阶段」文字（后台线程执行 + 前端轮询）----
+            # progress = 整任务百分比(0~100)；stage = 正在做什么的人类可读短句。
+            # 后台线程直接 UPDATE 这两列，前端轮询 /status 渲染进度条，避免长任务阻塞请求。
+            for _tbl, _col, _def in (
+                ("migration_tasks", "progress", "TINYINT UNSIGNED NOT NULL DEFAULT 0"),
+                ("migration_tasks", "stage", "varchar(255) NOT NULL DEFAULT ''"),
+            ):
+                try:
+                    c.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_def}")
+                except Exception:
+                    pass
             # ---- v2.3.0：节点「配置待生效」提示 ----
             # gen_fingerprint：最近一次生成的部署文件指纹（路径+内容），用于判断配置是否又变了
             # pending_actions：regen 后需在节点执行的动作清单（JSON，空串=无待办）

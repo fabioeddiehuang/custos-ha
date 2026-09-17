@@ -306,16 +306,18 @@ def _same(a, b):
     return ("" if a is None else str(a)) == ("" if b is None else str(b))
 
 
-def _classify_repl_state(st, is_master):
+def _classify_repl_state(st, is_master, cur_master=None):
     """数据交互状态分类：节点在集群中是否处于数据交互、健康度如何。
 
     - offline     节点探活失败（不在数据交互）
     - primary     主库·可写（接受写入并把 binlog 推给下游从库）
     - orphan      当前主身份但与只读矛盾（脱管/异常）
-    - repl_ok     从库·复制正常（从上游拉数据、位点持续前进）
+    - repl_ok     从库·复制正常（从【当前主库】拉数据、位点持续前进）
     - repl_broken 从库·复制中断（IO/SQL 线程非 Yes）
     - repl_stuck  从库·复制卡死（线程在跑但 exec_gtid 锁死不前进）
     - repl_purged 主库 binlog 已清理（1236），复制无解，必须重建该从库
+    - repl_fork   从库·复制线程双 Yes，但上游并非当前主库（F14 新增）。
+                  静默数据分叉：节点正从「幽灵/旧主」拉数据，旧逻辑却报 repl_ok 掩盖之。
     """
     if not st.get("alive"):
         return "offline"
@@ -329,10 +331,21 @@ def _classify_repl_state(st, is_master):
         return "repl_stuck"
     if st.get("slave_io") != "Yes" or st.get("slave_sql") != "Yes":
         return "repl_broken"
+    # 【F14】健康判定必须校验上游：从库复制双 Yes 只说明「在跟某个源同步」，
+    # 不说明「跟的是当前主库」。本轮真机实测：33 顶着早已消失的幽灵主库，
+    # 双线程 Yes 却持续把错误数据当正常写入，旧逻辑据此报 repl_ok 掩盖了分叉。
+    # 只有上游 == 当前主库才算真正对齐；否则标 repl_fork，让分叉在仪表盘与告警中可见，
+    # 并由每周期的 ensure_topology 自动重指回当前主库。
+    if cur_master:
+        _up = st.get("master_host")
+        if _up:
+            _up_str = "%s:%s" % (_up, int(st.get("master_port") or 0))
+            if _up_str != cur_master:
+                return "repl_fork"
     return "repl_ok"
 
 
-def _update_host(h, st, is_master=False):
+def _update_host(h, st, is_master=False, repl_state=None):
     """把节点探活结果写回 hosts；在线但复制线程中断时，记录真实复制错误便于排错。
 
     【空闲零写入】稳态（探活结果与库中已有记录完全一致）时**一次写都不做**。
@@ -368,7 +381,9 @@ def _update_host(h, st, is_master=False):
     semi_no_tx = st.get("semi_no_tx")
     semi_yes_tx = st.get("semi_yes_tx")
     # 数据交互状态：角色 + 复制健康 + 卡死；upstream/downstream 用于展示「与谁在数据交互」
-    repl_state = _classify_repl_state(st, is_master)
+    # （repl_state 由调用方预计算并传入，已含 F14 的上游校验；为空时按旧语义兜底）
+    if repl_state is None:
+        repl_state = _classify_repl_state(st, is_master)
     _up = st.get("master_host")
     upstream = ("%s:%s" % (_up, st["master_port"])) if _up else None
     try:
@@ -435,10 +450,12 @@ def _in_maintenance(cluster_id, host=None):
         return False
 
 
-def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, cluster_id, semi=None):
+def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, cluster_id,
+                         semi=None, repl_state=None, cur_master=None, upstream=None):
     """根据与上一次观测的差异发送告警，仅在状态跃迁时触发（避免刷屏）。"""
     prev = _PREV.get(key)
-    _PREV[key] = dict(status=status, is_master=is_master, repl_ok=repl_ok, delay=delay, semi=semi)
+    _PREV[key] = dict(status=status, is_master=is_master, repl_ok=repl_ok, delay=delay,
+                      semi=semi, repl_state=repl_state)
     if prev is None:
         return  # 首次观测只建立基线，不告警
     # v2.3.3：维护窗口内抑制状态类告警（离线/复制/延迟/半同步），避免维护期刷屏。
@@ -510,6 +527,23 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
                 send_alert("半同步恢复",
                            f"{tag}节点 {host} 半同步已恢复（status=ON），数据丢失(RPO)风险解除。",
                            cluster_id=cluster_id)
+        # 6) 复制指向错误主库（静默数据分叉，F14）：从库线程双 Yes 但上游≠当前主库。
+        #    旧逻辑只看 slave_io/slave_sql，会把它当 repl_ok 掩盖；此处显式告警，
+        #    并依赖每周期 ensure_topology 自动重指回当前主库（重指成功后取消告警）。
+        _ck_fork = ("fork", h_cid, h_host, h_port)
+        if status == "up" and not is_master:
+            if repl_state == "repl_fork":
+                send_alert(
+                    "复制指向错误主库(数据分叉风险)",
+                    f"{tag}节点 {host} 复制线程正常(IO/SQL=Yes)，但其上游是 {upstream}，"
+                    f"并非当前主库 {cur_master}。该节点正从「幽灵/旧主」拉数据，存在静默数据分叉；"
+                    f"管理器将在下一周期自动重指回当前主库，若持续请检查拓扑与 current_master 记录。",
+                    cluster_id=cluster_id, cancel_key=_ck_fork)
+            elif prev.get("repl_state") == "repl_fork":
+                # 此前是分叉、现已重指回正确主库：撤销告警并记一条自愈记录
+                if cancel_alert(_ck_fork, note=f"{host} 已重指回当前主库 {cur_master}"):
+                    record_alert(cluster_id, h_host, h_port, "selfheal",
+                                 f"{tag}节点 {host} 复制已重指回正确主库 {cur_master}（观察期内，未发送邮件）")
     except Exception as e:
         print(f"[monitor] 发送告警失败(可忽略): {e}")
 
@@ -779,17 +813,29 @@ def _probe_all():
                         st["stuck"] = True
                 else:
                     _STUCK_PREV[_pk_s] = ("", 0)
-            _update_host({"host": host, "port": port, "cluster_id": cid}, st, is_master)
+            # 【F14】数据交互状态分类须校验上游：从库双线程 Yes 但上游≠当前主库时，
+            # 判为 repl_fork（静默数据分叉），不能再报 repl_ok。分类结果同时供：
+            # ① _update_host 落库 repl_state（仪表盘可见）；② 下方 repl_ok 与分叉告警。
+            _cur_master_str = ("%s:%s" % cur_key) if cur_key else None
+            _up = st.get("master_host")
+            _upstream_str = ("%s:%s" % (_up, int(st.get("master_port") or 0))) if _up else None
+            repl_state = _classify_repl_state(st, is_master, _cur_master_str)
+            _update_host({"host": host, "port": port, "cluster_id": cid}, st, is_master,
+                         repl_state=repl_state)
             # 连续失败计数（用于阈值触发自动切换）
             f = run_once._fails.setdefault(cid, {})
             if not st["alive"]:
                 f[key] = f.get(key, 0) + 1
             else:
                 f[key] = 0
-            # 复制是否正常（主库无复制通道，视为主库自身即「正常」）
-            repl_ok = is_master or (st.get("slave_io") == "Yes" and st.get("slave_sql") == "Yes")
+            # 复制是否真正对齐（主库无复制通道，视为主库自身即「正常」）：
+            # repl_ok 仅在分类为 repl_ok（双线程 Yes 且上游==当前主库）时为真，
+            # 确保「顶着幽灵主库」的节点不会被当作复制正常，从而触发分叉告警而非静默。
+            repl_ok = is_master or (repl_state == "repl_ok")
             _alert_on_transition(key, "up" if st["alive"] else "down", is_master, repl_ok,
-                                 st.get("seconds_behind"), cluster_name, cid, semi)
+                                 st.get("seconds_behind"), cluster_name, cid, semi,
+                                 repl_state=repl_state, cur_master=_cur_master_str,
+                                 upstream=_upstream_str)
             # 半同步按节点自愈：SET GLOBAL 不复制，副本开关必须单独开，
             # 否则主库永远等不到半同步副本、两边 status 恒为 OFF。
             try:
@@ -1291,24 +1337,65 @@ def _verify_pending_once():
     node_gen.verify_pending_all()
 
 
+# 已成功解析的轮询间隔（秒）。读取失败时沿用此值，避免因管理库抖动而抛异常。
+_LAST_INTERVAL = None
+
+
+def _safe_check_interval():
+    """读取轮询间隔；**任何失败都不得抛出**，回落上次值/默认 2s。
+
+    背景（2026-09-16 真机实测）：原实现把 ``time.sleep(int(get_setting(...)))``
+    直接放在 ``run_forever`` 的 try/except **之外**。管理库瞬时不可用（如内置
+    ``mgmt-mysql`` 容器重启、DNS 抖动触发 Python ``socket.gaierror``）时，
+    ``get_setting`` 抛异常 → 后台监控线程**未被捕获地退出**，且当时没有任何监督
+    重启机制，于是 HA「脑死亡」：``hosts`` 状态冻结在最后一刻、告警不再产生、
+    自动切换与 VIP 逻辑彻底停摆 —— 外表看是「所有节点莫名 down」，实为监控线程
+    已死。此函数把「读间隔」这件小事做成绝不抛异常的防御性操作。
+    """
+    global _LAST_INTERVAL
+    try:
+        v = int(get_setting("CHECK_INTERVAL", "2") or 2)
+        if v < 1:
+            v = 1
+        _LAST_INTERVAL = v
+        return v
+    except Exception as e:
+        fb = _LAST_INTERVAL or 2
+        print(f"[monitor] 读取轮询间隔失败，沿用上次值 {fb}s: {e}", flush=True)
+        return fb
+
+
 def run_forever():
-    print("[monitor] 监控线程启动")
+    print("[monitor] 监控线程启动", flush=True)
     while True:
+        # 三重加固，确保**任何**异常都不会让后台监控线程退出：
+        #   ① 各阶段独立 try/except（原有）；
+        #   ② 间隔读取走 _safe_check_interval（不抛）+ sleep 再兜一层；
+        #   ③ 最外层 while 体兜底 try/except —— 即便上面漏掉某个抛点也不会死，
+        #      并做 1s 退避避免异常风暴下的忙等。
         try:
-            run_once()
+            try:
+                run_once()
+            except Exception as e:
+                # 管理库不可用等：降级，仅记录，不影响业务(keepalived 有安全回退)
+                print(f"[monitor] 周期错误(已降级继续): {e}", flush=True)
+            try:
+                _maybe_collect()
+            except Exception as e:
+                print(f"[monitor] 周期采集异常(已降级继续): {e}", flush=True)
+            try:
+                _verify_pending_once()
+            except Exception as e:
+                print(f"[monitor] 配置待生效自动核验异常(已降级继续): {e}", flush=True)
+            # 轮询间隔动态读取 setting（页面可配置），默认 2s
+            try:
+                time.sleep(_safe_check_interval())
+            except Exception as e:
+                print(f"[monitor] 轮询休眠异常(已降级继续): {e}", flush=True)
+                time.sleep(2)
         except Exception as e:
-            # 管理库不可用等：降级，仅记录，不影响业务(keepalived 有安全回退)
-            print(f"[monitor] 周期错误(已降级继续): {e}")
-        try:
-            _maybe_collect()
-        except Exception as e:
-            print(f"[monitor] 周期采集异常(已降级继续): {e}")
-        try:
-            _verify_pending_once()
-        except Exception as e:
-            print(f"[monitor] 配置待生效自动核验异常(已降级继续): {e}")
-        # 轮询间隔动态读取 setting（页面可配置），默认 2s
-        time.sleep(int(get_setting("CHECK_INTERVAL", "2") or 2))
+            print(f"[monitor] 周期致命异常(已兜底继续): {e}", flush=True)
+            time.sleep(1)
 
 
 # 周期计数：慢日志仍按周期倍数（默认关闭，影响可忽略）
@@ -1448,20 +1535,67 @@ def _maybe_scheduled_backup():
             print(f"[monitor] 备份清理异常: {e}", flush=True)
 
 
+_WATCHDOG_THREAD = None
+
+
+def _spawn_monitor():
+    """创建并启动后台监控线程（不检查存活，供 watchdog 重启复用）。"""
+    global _MONITOR_THREAD
+    t = threading.Thread(target=run_forever, name="monitor", daemon=True)
+    t.daemon = True
+    t.start()
+    _MONITOR_THREAD = t
+    return t
+
+
+def _watchdog_forever():
+    """监督后台监控线程：一旦发现它已退出（异常致死/被误杀），立即重启。
+
+    为什么必须有 supervise：``run_forever`` 即便已做了多层兜底，仍有「被外部
+    因素干掉」或「未来新代码引入未兜底抛点」的可能。一旦监控线程静默死亡，
+    系统外表完全正常（Web 可用、容器 running），却停止探活/切换/VIP —— 这是
+    最危险的「假活」故障。独立的 watchdog 线程是最后一道保险，自身也全程
+    try/except，绝不退出。
+    """
+    global _MONITOR_THREAD
+    while True:
+        try:
+            time.sleep(10)
+            if _MONITOR_THREAD is None or not _MONITOR_THREAD.is_alive():
+                print("[monitor] watchdog 检测到监控线程已停止，正在重启", flush=True)
+                _spawn_monitor()
+        except Exception as e:
+            # watchdog 自身绝不能死：吞掉一切异常，下个周期继续监督
+            print(f"[monitor] watchdog 异常(已忽略): {e}", flush=True)
+
+
+def _start_watchdog():
+    """启动 watchdog 线程（同进程只启一次）。"""
+    global _WATCHDOG_THREAD
+    if _WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive():
+        return _WATCHDOG_THREAD
+    t = threading.Thread(target=_watchdog_forever, name="monitor-watchdog", daemon=True)
+    t.daemon = True
+    t.start()
+    _WATCHDOG_THREAD = t
+    return t
+
+
 def start_in_background():
     """随 Web 进程内常驻的后台监控线程：同一进程只启动一次（daemon，随 Web 退出）。
 
     目的：彻底避免「节点起来了但 monitor 没单独起」导致的全离线/无复制/VIP 不漂。
     由 uvicorn 加载 app.api 时自动拉起（见 app/api.py），无需再 `python -m app.monitor &`。
+
+    同时启动 watchdog：若监控线程在此后任何时刻死亡，10s 内自动重启。
     """
     global _MONITOR_THREAD
     if _MONITOR_THREAD is not None and _MONITOR_THREAD.is_alive():
+        _start_watchdog()
         return _MONITOR_THREAD
-    t = threading.Thread(target=run_forever, name="monitor", daemon=True)
-    t.daemon = True
-    t.start()
-    _MONITOR_THREAD = t
-    print("[monitor] 已在 Web 进程内启动后台监控线程")
+    t = _spawn_monitor()
+    print("[monitor] 已在 Web 进程内启动后台监控线程", flush=True)
+    _start_watchdog()
     return t
 
 

@@ -1,6 +1,6 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> 当前版本：**v2.3.10**（镜像标签 `custos-server:v2.3.10`）
+> 当前版本：**v2.4.0**（镜像标签 `custos-server:v2.4.0`）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
 > 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
 
@@ -31,6 +31,7 @@
 | v2.3.8 | 防呆 | 待生效徽标真实性（ack 核验门禁）；凭证解密防覆盖；半同步 SHOW VARIABLES 复核；`/api/heal` 冷却去重；只读 403 提示 |
 | v2.3.9 | 重构 | 节点部署目录结构归整（配置/脚本/agent 分目录）；`custosctl node prepare` 自检；`.env` 去密（SECRET_KEY→`data/secret_key`，WEB_PASS/MGMT_MYSQL_PASS→compose，`.env` 纳入 git） |
 | v2.3.10 | 修复 | 凭证加密改为**默认关闭**（`CRED_ENCRYPTION`，零密钥依赖）；密钥持久化 + 解密钥匙串回退；修 ENC1 密文当复制口令导致复制集体瘫痪（1470）；`_repoint_slave` 返回值契约与假成功；`custosctl node install` 支持容器 MySQL/MariaDB |
+| v2.4.0 | 功能 | 数据迁移向导（MariaDB↔MariaDB + MySQL 5.7→MariaDB）；能力矩阵门禁；引擎方言适配；迁移前兼容性预检（dry-run） |
 
 ---
 
@@ -95,6 +96,23 @@
 - **启动自检（主动告警）**：`init_db` 启动时执行 `startup_credential_check()`，若存在解不开的凭证，立即在启动日志打印明细并写入告警中心（`alert_type=cred_key`，按集群聚合、24h 内同内容不重复）。这类故障原本**完全静默** —— 要等复制把密文当口令报 1470 才暴露，现象是「源库不可达」，与密钥毫无关联，排查成本极高。
 - **凭证加密 Web 开关 + 一键回填 + 批量重置复制口令**：设置页「凭证加密」可在线切换开关、重置密钥，并新增「从节点包回填明文」「批量重置复制口令」两个一键按钮。
 - 详见 [`doc/releases/v2.3.10.md`](./doc/releases/v2.3.10.md)。
+
+---
+
+## v2.4.0 详细变更
+
+### v2.4.0 · 数据迁移向导（灰度实测）
+
+- **新增「数据迁移向导」**：逻辑通道（dump + load）在真实旧数据上跑通，覆盖两类场景：
+  - **MariaDB → MariaDB**（同引擎）：可桥接（bridge）做增量追平，管道 `continuous`。
+  - **MySQL 5.7 → MariaDB 12.3.3**（跨产品线）：自动落进「宽松桶」，管道 `stopcopy`（停写拷贝，无增量追平）。
+- **能力矩阵 `capabilities()` 为门禁唯一真源**（非品牌分支）：同引擎才允许物理通道与桥接；跨引擎走 stopcopy；**MySQL 8.0+ → MariaDB 明确拒绝**（`refused`）。MySQL 5.7 因无 `caching_sha2` 与 `utf8mb4_0900_ai_ci` 两个必炸项，天然与 MariaDB 兼容。
+- **引擎方言适配层**：`tool_dialect` 用 `<binary> --help` 探测真实方言（Debian 的 `mysql-client` 是 `mariadb-client` 过渡包，文件名不可信）；`dump_gtid_args` / `ssl_args` 按方言分流。
+- **迁移前兼容性预检（dry-run）**：只读 `information_schema` + 结构试运行（仅结构落目标 scratch schema 真实导入再删），在 TB 级拷贝前几秒拦下 `WITH PARSER ngram` 全文索引等必炸项。
+- **后台异步逐步执行**：seed / bridge / verify / cutover / cleanup，进度 / 阶段文字 / 实时日志落库，前端 1.5s 轮询。
+- **修复 7 个实测必炸点**：mariadb-dump 无 `--set-gtid-purged`、MariaDB 无 `@@log_replica_updates`、管理器镜像缺数据库客户端（Dockerfile 已补 `mariadb-client`）、GTID 位点写入 dump 冲突、方言按文件名误判、自签证书 TLS 校验失败、subprocess 二次 flush 崩溃。
+- **已知边界**：`bridge / verify / cutover / cleanup` 四步尚未端到端实测；物理通道未实测（镜像内尚缺 `mariabackup`，且跨引擎本就被门禁拒绝）；账号/权限迁移未实现（当前排除 `mysql` 系统库）；MySQL 8.0 → MariaDB 按决策暂不实现。
+- 详见 [`doc/releases/v2.4.0.md`](./doc/releases/v2.4.0.md)。
 
 ---
 

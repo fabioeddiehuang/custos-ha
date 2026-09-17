@@ -4,6 +4,8 @@
 #
 #   sudo sh install.sh         交互式（推荐）
 #   sudo sh install.sh -y      非交互：全部用默认值 + 随机口令（脚本化部署）
+#   sudo sh install.sh --with-db  内置管理库一键：自动启用 compose 内置 mgmt-mysql（服务名直连、端口固化 3306），
+#                              无需准备任何外部 MySQL，零外部依赖一条命令起管理端（演示/小规模推荐）
 #   sh install.sh -C <目录>    指定项目目录（默认：脚本所在目录，即项目根目录）
 #
 # 做了什么
@@ -21,11 +23,13 @@ set -eu
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 CUSTOS_HOME=""
 ASSUME_YES=0
+WITH_DB=0          # P0-2：内置管理库一键（install.sh --with-db）
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -C|--dir) CUSTOS_HOME=$2; shift 2 ;;
     -y|--yes) ASSUME_YES=1; shift ;;
+    --with-db) WITH_DB=1; shift ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "未知参数：$1" >&2; exit 1 ;;
   esac
@@ -73,6 +77,15 @@ detect_iface() {
 # 返回 0=通过；非 0=未通过（调用方据此中止安装）。
 check_mgmt() {
   _h=$1; _p=$2; _u=$3; _pw=$4; _db=$5
+  # P0-2：内置管理库（mgmt-mysql 等容器内服务名）仅在 docker 网络内可达，
+  # 本机 TCP 探活必失败（且 mysql 客户端也不在管理端容器内）。跳过预检，
+  # 启动顺序由 compose 的 depends_on(condition: service_healthy) 保证。
+  case "$_h" in
+    mgmt-mysql)
+      info "管理库地址 $_h 为容器内服务名（本机不可直连），跳过 TCP 预检（依赖 compose depends_on + healthcheck 保障就绪）"
+      return 0
+      ;;
+  esac
   if command -v python3 >/dev/null 2>&1; then
     if python3 - "$_h" "$_p" "$_u" "$_pw" "$_db" <<'PY'
 import sys, socket
@@ -108,6 +121,109 @@ PY
     fi
   fi
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# P0-2：启用 compose 内置 mgmt-mysql 服务（install.sh --with-db 时调用）。
+# 把模板里被注释的 mgmt-mysql 服务块取消注释、写入 ha 账号口令、加入 ha_net 网络，
+# 并把 custos-server 的 depends_on 改为带健康条件；端口固化 3306。
+# 幂等：已启用的 compose 再次运行不会重复插入/覆盖用户口令。
+enable_builtin_db() {  # enable_builtin_db COMPOSE_FILE HA_PASS ROOT_PASS
+  _cf=$1; _hapw=$2; _rootpw=$3
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "未检测到 python3，无法自动启用内置 mgmt-mysql；请手工取消 docker-compose.yml 中 mgmt-mysql 注释并填好口令。"
+    return 0
+  fi
+  python3 - "$_cf" "$_hapw" "$_rootpw" <<'PY'
+import sys, re
+cf, hapw, rootpw = sys.argv[1:4]
+lines = open(cf, encoding='utf-8').read().split('\n')
+out = []
+in_mgmt = False
+userpw_added = False
+net_added = False
+i = 0; n = len(lines)
+while i < n:
+    line = lines[i]
+    # 进入 mgmt-mysql 服务块（可能仍是注释态或已启用）
+    if (not in_mgmt) and line.rstrip() in ('  # mgmt-mysql:', '  mgmt-mysql:'):
+        in_mgmt = True
+        out.append('  mgmt-mysql:')
+        i += 1
+        continue
+    if in_mgmt:
+        if line.lstrip().startswith('custos-server:'):
+            in_mgmt = False
+            out.append(line); i += 1
+            continue
+        # 取消注释：仅对「# 映射键(ASCII冒号) / # 列表项(- )」生效，描述性注释（如
+        # 「Custos（单容器…」「# ----」）保持原样，避免被误当 YAML 键导致解析失败。
+        _ls = len(line) - len(line.lstrip())
+        _body = line[_ls:]
+        _uncommented = False
+        if _body.startswith('#') and len(_body) >= 2 and _body[1] == ' ':
+            _content = _body[2:]
+            _c = _content.lstrip()
+            if (re.match(r'^[A-Za-z0-9_\-]+:(\s|$)', _c) or _c.startswith('- ')):
+                line = line[:_ls] + _content
+                _uncommented = True
+        # healthcheck 原写死 -pchange_me，启用内置库后 root 口令已变，须改为容器内环境变量（否则 healthcheck 失败、
+        # custos-server 因 depends_on: service_healthy 永远等不到、管理器起不来）
+        if '-pchange_me' in line:
+            line = line.replace('-pchange_me', '-p$$MYSQL_ROOT_PASSWORD')
+        # 服务内容结束后遇到描述性注释时，补 networks（让 mgmt-mysql 与 custos-server 同网，否则 DNS 不通）
+        if (not net_added) and _body.startswith('#') and (not _uncommented):
+            out.append('    networks:')
+            out.append('      - ha_net')
+            net_added = True
+        if line.lstrip().startswith('networks:'):
+            net_added = True
+            out.append(line); i += 1
+            continue
+        if line.lstrip().startswith('MYSQL_USER') or line.lstrip().startswith('MYSQL_PASSWORD'):
+            userpw_added = True
+            out.append(line); i += 1
+            continue
+        if 'MYSQL_ROOT_PASSWORD' in line:
+            if 'change_me' in line:
+                ind = line[:len(line)-len(line.lstrip())]
+                line = ind + 'MYSQL_ROOT_PASSWORD: "%s"' % rootpw
+            out.append(line); i += 1
+            continue
+        if 'MYSQL_DATABASE' in line:
+            out.append(line); i += 1
+            continue
+        if line.lstrip().startswith('environment:'):
+            # 预检：本块是否已含 MYSQL_USER/MYSQL_PASSWORD（重跑场景，避免重复插入）
+            _j = i + 1
+            while _j < n and not lines[_j].lstrip().startswith('custos-server:'):
+                _s = lines[_j].lstrip()
+                if _s.startswith('MYSQL_USER') or _s.startswith('MYSQL_PASSWORD'):
+                    userpw_added = True
+                _j += 1
+            out.append(line)
+            if not userpw_added:
+                ind = line[:len(line)-len(line.lstrip())]
+                out.append(ind + '  MYSQL_USER: "ha"')
+                out.append(ind + '  MYSQL_PASSWORD: "%s"' % hapw)
+                userpw_added = True
+            i += 1
+            continue
+        out.append(line); i += 1
+        continue
+    # custos-server 的 depends_on 取消注释并加健康条件
+    if line.rstrip() == '    # depends_on:':
+        out.append('    depends_on:')
+        i += 1
+        if i < n and lines[i].rstrip() == '    #   - mgmt-mysql':
+            out.append('      mgmt-mysql:')
+            out.append('        condition: service_healthy')
+            i += 1
+        continue
+    out.append(line); i += 1
+open(cf, 'w', encoding='utf-8').write('\n'.join(out))
+print('[install] 内置 mgmt-mysql 已启用（ha 账号口令已写入 compose；root 口令=%s）' % rootpw)
+PY
 }
 
 # ---------------------------------------------------------------------------
@@ -156,23 +272,34 @@ info "版本 $CUR_VER；将使用现有值作为默认（直接回车即采用�
 
 # ---------------------------------------------------------------------------
 say "3/6 部署参数"
-ask "管理库地址 MGMT_MYSQL_HOST" "$DEF_MGMT_HOST"; MGMT_HOST=$REPLY
-# 容器的 127.0.0.1 是【容器自己】（里面没有 MySQL），填它必然导致容器连不上管理库而反复重启。
-# 这是首次安装最易踩的坑：宿主上若正好跑着 MySQL，下方的 TCP 预检还会「通过」，
-# 误导用户以为配置正确，装完才发现容器起不来。故在此直接拦截，而不是等到启动失败。
-case "$MGMT_HOST" in
-  127.0.0.1|localhost|::1|0.0.0.0)
-    echo "错误：MGMT_MYSQL_HOST 不能填 $MGMT_HOST。" >&2
-    echo "      管理器运行在容器内，容器的 $MGMT_HOST 指向容器自身（其中没有 MySQL），" >&2
-    echo "      会导致容器连不上管理库而反复重启（custosctl tail 可见）。" >&2
-    echo "      请填管理库所在主机的【真实内网 IP】；若启用 compose 内置 mgmt-mysql 服务则填 mgmt-mysql。" >&2
-    exit 1
-    ;;
-esac
-ask "管理库端口" "$DEF_MGMT_PORT"; MGMT_PORT=$REPLY
-ask "管理库账号" "$DEF_MGMT_USER"; MGMT_USER=$REPLY
-ask "管理库密码" "${DEF_MGMT_PASS:-}"; MGMT_PASS=$REPLY
-ask "管理库库名" "$DEF_MGMT_DB"; MGMT_DB=$REPLY
+if [ "$WITH_DB" = "1" ]; then
+  # P0-2：内置管理库一键 —— 用 compose 服务名直连，端口固化 3306，ha 账号口令自动生成（内部使用）。
+  MGMT_HOST=mgmt-mysql
+  MGMT_PORT=3306
+  MGMT_USER=ha
+  MGMT_DB=ha
+  [ -n "$MGMT_PASS" ] || MGMT_PASS=$(rand_secret | head -c 16)
+  info "已启用内置管理库（--with-db）：管理库地址=$MGMT_HOST，端口固化 $MGMT_PORT，ha 账号口令已自动生成（内部使用，无需记忆）。"
+  info "启动后管理库异常会在日志给出首因，无需准备任何外部 MySQL。"
+else
+  ask "管理库地址 MGMT_MYSQL_HOST" "$DEF_MGMT_HOST"; MGMT_HOST=$REPLY
+  # 容器的 127.0.0.1 是【容器自己】（里面没有 MySQL），填它必然导致容器连不上管理库而反复重启。
+  # 这是首次安装最易踩的坑：宿主上若正好跑着 MySQL，下方的 TCP 预检还会「通过」，
+  # 误导用户以为配置正确，装完才发现容器起不来。故在此直接拦截，而不是等到启动失败。
+  case "$MGMT_HOST" in
+    127.0.0.1|localhost|::1|0.0.0.0)
+      echo "错误：MGMT_MYSQL_HOST 不能填 $MGMT_HOST。" >&2
+      echo "      管理器运行在容器内，容器的 $MGMT_HOST 指向容器自身（其中没有 MySQL），" >&2
+      echo "      会导致容器连不上管理库而反复重启（custosctl tail 可见）。" >&2
+      echo "      请填管理库所在主机的【真实内网 IP】；若启用 compose 内置 mgmt-mysql 服务则填 mgmt-mysql。" >&2
+      exit 1
+      ;;
+  esac
+  ask "管理库端口" "$DEF_MGMT_PORT"; MGMT_PORT=$REPLY
+  ask "管理库账号" "$DEF_MGMT_USER"; MGMT_USER=$REPLY
+  ask "管理库密码" "${DEF_MGMT_PASS:-}"; MGMT_PASS=$REPLY
+  ask "管理库库名" "$DEF_MGMT_DB"; MGMT_DB=$REPLY
+fi
 ask "管理器对外 IP（节点看到的来源 IP）" "$DEF_MGR_IP"; MGR_IP=$REPLY
 ask "节点网卡名 INTERFACE" "$DEF_IFACE"; IFACE=$REPLY
 ask "集群 VIP（可选，同网段空闲 IP；留空则稍后后台配置）" "${DEF_VIP:-}"; VIP=$REPLY
@@ -262,6 +389,12 @@ set_yaml MGMT_MYSQL_PORT "$MGMT_PORT"
 set_yaml MGMT_MYSQL_USER "$MGMT_USER"
 set_yaml MGMT_MYSQL_PASS "$MGMT_PASS"
 set_yaml MGMT_MYSQL_DB   "$MGMT_DB"
+# P0-2：内置管理库一键（--with-db）：取消注释 compose 中的 mgmt-mysql 服务并写入 ha 账号口令
+if [ "$WITH_DB" = "1" ]; then
+  _rootpw=$(rand_secret | head -c 16)
+  info "正在启用内置 mgmt-mysql 服务（compose 中取消注释 + 填入口令 + 加入 ha_net + depends_on 健康条件）…"
+  enable_builtin_db "$COMPOSE_FILE" "$MGMT_PASS" "$_rootpw"
+fi
 set_yaml MANAGER_PUBLIC_IP "$MGR_IP"
 set_yaml INTERFACE "$IFACE"
 set_yaml VIP_PREFIX "$VIP_PREFIX"

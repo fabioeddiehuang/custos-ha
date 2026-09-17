@@ -28,7 +28,7 @@ from .mysql_compat import default_auth_plugin, is_mariadb_node
 from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, is_semi_sync_enabled
 from . import mariadb_matrix
 from . import crypto as _crypto
-from .ha_client import get_status, ensure_ha_creds, db_uptime
+from .ha_client import get_status, ensure_ha_creds, db_uptime, repair_ha_shadow_grants
 from .clusters import get_cluster_creds
 
 logger = logging.getLogger("node_gen")
@@ -1228,10 +1228,14 @@ def _refresh_all_keepalived_conf(cluster_id=None):
     """
     try:
         if cluster_id:
-            rows = query("SELECT ip, port, server_id FROM nodes WHERE cluster_id=%s",
+            rows = query("SELECT ip, port, server_id, cluster_id FROM nodes WHERE cluster_id=%s",
                          (cluster_id,))
         else:
-            rows = query("SELECT ip, port, server_id FROM nodes")
+            # F8（2026-09-16 真机）：此前 SELECT **漏选 cluster_id**，而下方 `cid = r.get("cluster_id")
+            # 恒为 None → `_peer_ips(ip, None)` 直接返回 [] → 重新生成的 keepalived.conf 里
+            # `unicast_peer {}` 恒为空 → 节点间 VRRP 互不知情（脑裂 / VIP 不切换）。
+            # 实测 33 的 generated_nodes 配置 peer 为空即此因。
+            rows = query("SELECT ip, port, server_id, cluster_id FROM nodes")
     except Exception:
         return
     for r in rows:
@@ -2102,9 +2106,28 @@ def _node_is_read_only(ip, port, root_user, root_pass, ha_user, ha_pass):
             continue
         try:
             cur = c.cursor()
-            cur.execute("SELECT @@read_only AS ro, @@super_read_only AS sro")
-            r = cur.fetchone()
-            return bool(r and (r.get("ro") or r.get("sro")))
+            # F12（2026-09-16 真机）：MariaDB 12.3.3 **没有** super_read_only 变量，把两者写进
+            # 同一条 SELECT 会整条报 1193 → 检测失败 → 只读副本被误判为「可写」，后果：
+            #   ① 破坏「副本跳过直接账号同步」的保护（会与复制线程争用 mysql.* 元数据锁）；
+            #   ② 副本永远进不了只读分支 → 本轮 F11 的影子账号修复也永不执行。
+            # 实测 33 号节点 read_only=ON 却被判为可写。故拆成两条、各自容错。
+            ro = 0
+            try:
+                cur.execute("SELECT @@read_only AS ro")
+                _r = cur.fetchone()
+                if _r:
+                    ro = _r.get("ro") if isinstance(_r, dict) else _r[0]
+            except Exception:
+                pass
+            sro = 0
+            try:
+                cur.execute("SELECT @@super_read_only AS sro")
+                _r2 = cur.fetchone()
+                if _r2:
+                    sro = _r2.get("sro") if isinstance(_r2, dict) else _r2[0]
+            except Exception:
+                sro = 0      # MariaDB 无 super_read_only（1193）：忽略，仅以 read_only 判定
+            return bool(ro or sro)
         except Exception as e:
             last_err = e
         finally:
@@ -2169,6 +2192,18 @@ def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_r
             # CREATE/ALTER USER —— 否则会与复制线程争用 mysql.* 元数据锁，造成复制线程
             # 死锁 / 长时间等待（'Waiting for dependent transaction to commit'），
             # 复制卡死、Seconds_Behind_Source 持续增大、磁盘 I/O 居高不下。
+            # F11（2026-09-16 真机）：无论主/从，都修复 ha_monitor「精确 host 影子账号」
+            # 的权限落差 —— 否则管理器连得上却没权限（1227），复制无法自愈、切换中止。
+            # repair_ha_shadow_grants 用 root 执行 GRANT（需 GRANT OPTION）、只授权不建号
+            # 不改密 + sql_log_bin=0，因而对只读副本也安全（这正是副本无法被管理时的解药）。
+            try:
+                _rep, _rmsg = repair_ha_shadow_grants(
+                    ip, port, ha_user, ha_pass, root_user, root_pass,
+                    manager_ip=manager_public_ip)
+                if _rep:
+                    logger.info("节点 %s:%s 影子账号权限已修复：%s", ip, port, _rmsg)
+            except Exception as _e:
+                logger.info("节点 %s:%s 影子账号修复跳过：%s", ip, port, _e)
             if _node_is_read_only(ip, port, root_user, root_pass, ha_user, ha_pass):
                 logger.info("节点 %s:%s 为只读副本，跳过直接账号同步（凭证由复制同步）", ip, port)
                 ok, msg = True, "replica-skip"

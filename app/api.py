@@ -2730,6 +2730,130 @@ def api_maintenance_end(cluster_id: int = Form(...), scope: str = Form(""),
         return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"})
 
 
+# ==================================================================
+# 数据迁移向导（既有 MariaDB 集群 → Custos 托管集群）
+# 专注 MariaDB：probe/recommend/seed/bridge/verify/cutover/cleanup。
+# 步骤驱动：前端逐步调用，天然支持重试(重复调用)/暂停(不调下一步)。
+# ==================================================================
+from . import migration as _migration
+
+
+@app.get("/migration")
+def migration_page(request: Request, user=Depends(auth_required), msg: str = "", error: str = ""):
+    """数据迁移向导页。"""
+    return render("migration.html", request, user=user, msg=msg, error=error,
+                  size_threshold_gb=_migration.SIZE_THRESHOLD_GB)
+
+
+async def _json_body(request: Request):
+    try:
+        return await request.json()
+    except Exception:
+        return {}
+
+
+@app.post("/api/migration/probe")
+async def api_migration_probe(request: Request, user=Depends(auth_required)):
+    b = await _json_body(request)
+    try:
+        r = _migration.probe_source({
+            "src_host": b.get("src_host", ""),
+            "src_port": int(b.get("src_port", 3306)),
+            "src_user": b.get("src_user", "root"),
+            "src_pass": b.get("src_pass", ""),
+        })
+        return _json_ok(r)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/migration/recommend")
+async def api_migration_recommend(request: Request, user=Depends(auth_required)):
+    b = await _json_body(request)
+    probe = {"size_mb": float(b.get("size_mb", 0))}
+    return _json_ok(_migration.recommend_channel(probe, b.get("channel_pref") or None))
+
+
+@app.post("/api/migration/create")
+async def api_migration_create(request: Request, user=Depends(auth_required)):
+    b = await _json_body(request)
+    try:
+        databases = b.get("databases") or []
+        if isinstance(databases, str):
+            databases = [d.strip() for d in databases.split(",") if d.strip()]
+        repl_user = "replication"
+        repl_pass = rand_secret(16)
+        cfg = {
+            "src_host": b.get("src_host", ""),
+            "src_port": int(b.get("src_port", 3306)),
+            "src_user": b.get("src_user", "root"),
+            "src_pass": b.get("src_pass", ""),
+            "src_gtid": bool(b.get("src_gtid", True)),
+            "tgt_host": b.get("tgt_host", ""),
+            "tgt_port": int(b.get("tgt_port", 3306)),
+            "tgt_root_pass": b.get("tgt_root_pass", ""),
+            "tgt_version": b.get("tgt_version", ""),
+            "node_type": b.get("node_type", "mariadb-docker"),
+            "databases": databases,
+            "repl_user": repl_user,
+            "repl_pass": repl_pass,
+            # 产品线信息：决定 dump 工具与 GTID 参数（两者互斥，混用必失败）
+            "src_flavor": b.get("src_flavor") or "mariadb",
+            "src_major": int(b.get("src_major") or 0),
+            "tgt_flavor": b.get("tgt_flavor") or "mariadb",
+            # 数据量：逻辑通道用它做真实百分比进度的分母
+            "size_mb": float(b.get("size_mb") or 0),
+            # 物理通道源端路径（非标安装必填）
+            "src_my_cnf": b.get("src_my_cnf") or "",
+            "src_data_dir": b.get("src_data_dir") or "",
+            # 物理通道目标数据目录（留空则按 node_type 推导）
+            "tgt_datadir": b.get("tgt_datadir") or "",
+        }
+        task = {
+            "name": b.get("name") or "未命名迁移",
+            "channel": b.get("channel", "logical"),
+            "status": "draft",
+            "config": cfg,
+            "steps": {},
+            "log": "",
+        }
+        _migration.save_task(task)
+        return _json_ok({"ok": True, "id": task["id"]})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/migration/{task_id}/step")
+async def api_migration_step(task_id: int, request: Request, user=Depends(auth_required)):
+    """异步启动一步：立即返回，实际工作在后台线程，前端轮询 /status 看进度。"""
+    b = await _json_body(request)
+    step = b.get("step", "")
+    return _json_ok(_migration.start_step(task_id, step))
+
+
+@app.post("/api/migration/{task_id}/precheck")
+async def api_migration_precheck(task_id: int, user=Depends(auth_required)):
+    """迁移前兼容性预检（dry-run，不搬数据）。"""
+    try:
+        return _json_ok(_migration.precheck(task_id))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/migration/{task_id}/status")
+def api_migration_status(task_id: int, user=Depends(auth_required)):
+    task = _migration.get_task(task_id)
+    if not task:
+        return _json_ok({"ok": False, "error": "任务不存在"})
+    return _json_ok({"ok": True, **task})
+
+
+@app.get("/api/migration/list")
+def api_migration_list(user=Depends(auth_required)):
+    return _json_ok({"ok": True, "tasks": _migration.list_tasks()})
+
+
+# ==================================================================
 @app.get("/api/alerts")
 def api_alerts(
     level: str = "", status: str = "", cluster_id: int = 0,
