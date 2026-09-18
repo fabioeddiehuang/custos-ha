@@ -767,9 +767,61 @@ def seed_physical(task):
             "note": "物理恢复完成，请将目标实例作为新主继续桥接"}
 
 
+# ---------------------------------------------------------------------------
+# 迁移期间「目标节点锁定」
+#
+# 根因（2026-09-18 实测坐实，切勿删除本机制）：
+#   若目标（203）已被 Custos 纳管为某集群的【当前主】，monitor 的 ensure_topology
+#   每 ~2s 会对它调用 promote_to_master；而 promote_to_master 的「只读快检」要求
+#   「read_only=0 且无复制通道」才跳过 —— 一旦桥接建立（出现复制行），就会执行
+#   STOP REPLICA + RESET REPLICA ALL，**把 177→203 的桥接通道清掉**。
+#   于是桥接活不过一个监控周期，追平检测必然永远「无复制通道」。
+#   典型触发场景：用户先把 203/213 装成新集群（203 是当前主），再用迁移向导灌数据。
+#
+# 对策：桥接期间锁定目标节点，让 ensure_topology 整轮跳过，不再干扰。
+# ---------------------------------------------------------------------------
+_MIG_LOCKS = {}            # "ip:port" -> 过期时间戳（monotonic）
+_MIG_LOCK_TTL = 6 * 3600   # 保险丝：极端情况下忘记解锁也能自动恢复（6 小时）
+_mig_lock = threading.Lock()
+
+
+def lock_target(host, port):
+    """锁定迁移目标节点：暂停 monitor 对它（作为当前主）的拓扑维护。"""
+    if not host:
+        return
+    with _mig_lock:
+        _MIG_LOCKS["%s:%d" % (host, int(port))] = time.monotonic() + _MIG_LOCK_TTL
+
+
+def unlock_target(host, port):
+    """解除锁定（停桥之后交还 monitor 接管）。"""
+    if not host:
+        return
+    with _mig_lock:
+        _MIG_LOCKS.pop("%s:%d" % (host, int(port)), None)
+
+
+def is_target_locked(host, port):
+    """目标是否处于迁移锁定中 —— 由 failover.ensure_topology 调用。"""
+    if not host:
+        return False
+    key = "%s:%d" % (host, int(port))
+    with _mig_lock:
+        exp = _MIG_LOCKS.get(key)
+        if exp is None:
+            return False
+        if time.monotonic() > exp:  # 保险丝到期自动释放
+            _MIG_LOCKS.pop(key, None)
+            return False
+        return True
+
+
 def bridge(task):
     """在目标建立指向源的 MariaDB GTID 复制桥接（持续追平）。"""
     cfg = task["config"]
+    # ⚠ 必须先锁定目标节点再建桥接，否则 monitor 的 promote_to_master 会立刻
+    #   RESET REPLICA ALL 把通道清掉（详见上方「迁移锁定」根因注释）。
+    lock_target(cfg["tgt_host"], int(cfg["tgt_port"]))
     acct = _ensure_source_repl_account(task)  # 源端复制账号（最小权限，必要时降级复用源账号）
     use_src = bool(acct.get("used_src_creds"))
     m_user = cfg["src_user"] if use_src else cfg["repl_user"]
@@ -783,11 +835,18 @@ def bridge(task):
             cur.execute("SET GLOBAL replicate_ignore_db='mysql,ha_local'")
         except Exception:
             pass
-        # 目标须开启 log_replica_updates，否则第二节点拿不到老数据
+        # 目标必须把「从源收到的更新」写进自己的 binlog，否则下游第二节点（如 213）
+        # 永远拿不到迁移过来的数据。
+        # ⚠ MariaDB 只有 @@log_slave_updates（SELECT @@log_replica_updates 报 1193），
+        #   此前写成 log_replica_updates 会被静默吞掉 ⇒ 第二节点数据落后却不报错。
+        #   已修正为 MariaDB 正确名，并保留 MySQL 形态兜底。
         try:
-            cur.execute("SET GLOBAL log_replica_updates=ON")
+            cur.execute("SET GLOBAL log_slave_updates=ON")
         except Exception:
-            pass
+            try:
+                cur.execute("SET GLOBAL log_replica_updates=ON")
+            except Exception:
+                pass
         # 幂等：本步骤允许重复执行（第三步可重跑「建立桥接」）。
         # 若目标上已有 replica 线程在运行，CHANGE MASTER TO 会被拒绝
         # （MariaDB 要求先停止 replica 线程），故先 STOP REPLICA 再重建通道。
@@ -805,7 +864,8 @@ def bridge(task):
         cur.execute("START REPLICA")
         # 进度上报：让前端桥接阶段不再“卡住”（BUG-004）
         _tick(task, 60, stage="复制桥接已启动，目标正在从源追平（MariaDB GTID）")
-        note = "桥接已建立，目标正在从源追平（MariaDB GTID）"
+        note = ("桥接已建立，目标正在从源追平（MariaDB GTID）；"
+                "已暂停该目标节点的 Custos 自动拓扑维护，避免桥接被 monitor 清除")
         if use_src:
             note += "（使用源账号本身作为复制账号）"
         _tick(task, 100, stage="桥接完成（持续追平中，可随时做一致性校验）")
@@ -942,6 +1002,9 @@ def cutover(task):
     # 若目标已在某集群，这里只是原地更新 203 一条记录，不改其它节点（213/33 等）归属。
     _register_target_node(cluster_id, tgt_host, tgt_port, cfg["tgt_root_pass"],
                          node_type, mysql_version)
+    # 桥接已在上面 STOP REPLICA + RESET REPLICA ALL 停掉，可解除迁移锁定，
+    # 把目标交还给 monitor 正常接管（否则该集群的拓扑维护会一直被跳过）。
+    unlock_target(tgt_host, tgt_port)
     if reused:
         note = ("已停桥、对齐凭证并登记进 Custos（沿用既有集群，新主不会被移出）；"
                 "请在外部手动切换 VIP")

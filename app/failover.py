@@ -679,11 +679,31 @@ def _selfheal_cluster(cluster_id):
         _SELFHEAL_CRED_TS[cluster_id] = time.time()
 
 
+def _migration_locked(host, port):
+    """该节点是否正处于「迁移桥接锁定」中（见 migration.lock_target 的根因注释）。
+
+    目标被纳管为当前主时，若正在做 177→203 的桥接追平，绝不能对它执行
+    promote_to_master —— 快检发现存在复制通道就会 STOP REPLICA + RESET REPLICA ALL，
+    把桥接清掉，导致追平检测永远无法通过。延迟导入以避免模块级循环依赖。
+    """
+    if not host:
+        return False
+    try:
+        from . import migration
+        return migration.is_target_locked(host, port)
+    except Exception:
+        return False
+
+
 def ensure_topology(cluster_id):
     """保证每台存活的'非当前主'库都是当前主的从库（用于切后对齐 + 旧主恢复重入）。"""
     cur_h, cur_p = get_current_master(cluster_id)
     creds = load_creds(cluster_id)
     if not creds["ha_user"]:
+        return
+    # 迁移锁定：当前主正在作为迁移目标追平源库，整轮跳过本集群拓扑维护，
+    # 否则会 RESET REPLICA ALL 把桥接通道清掉（根因见 _migration_locked 注释）。
+    if cur_h and _migration_locked(cur_h, cur_p):
         return
     # 先自愈：确保各节点 gtid_mode=ON / server_id 唯一，否则后续 make_slave_of 会因
     # gtid_mode=OFF 反复失败（裸机 my.cnf 片段被覆盖时尤为常见）。SET PERSIST 持久化，
@@ -707,6 +727,9 @@ def ensure_topology(cluster_id):
             cur_h, cur_p = (preferred[0]["host"], int(preferred[0]["port"])) if preferred \
                 else (up[0]["host"], int(up[0]["port"]))
         set_current_master(cluster_id, cur_h, cur_p)
+        # 首次选主后同样要尊重迁移锁定（目标可能刚被登记、桥接尚未停）
+        if _migration_locked(cur_h, cur_p):
+            return
     # 确保被指定为主库的 MySQL 实际可写（read_only=OFF），否则 keepalived VIP 检查不通过
     ru, rp = node_root(cur_h, cluster_id)
     # 用 promote_to_master：不仅置可写，还清空残留复制通道，
