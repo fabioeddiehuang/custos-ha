@@ -1118,19 +1118,29 @@ def cleanup(task):
     cfg = task["config"]
     src = (cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"])
     conn = connect(*src, timeout=8)
+    done, failed = [], []
     try:
         cur = conn.cursor()
+        # ❗此前两项都 try/except 静默吞掉，非 root 账号时会「谎报成功」：
+        #   界面显示已收尾，实际账号没回收、老主也没置只读。故逐项记录并如实上报。
         try:
             cur.execute(f"DROP USER IF EXISTS '{cfg['repl_user']}'@'%'")
-        except Exception:
-            pass
+            done.append("已回收源端复制账号 '%s'@'%%'" % cfg["repl_user"])
+        except Exception as e:
+            failed.append("回收复制账号失败：%s（需 CREATE USER 权限）" % e)
         try:
             cur.execute("SET GLOBAL read_only=ON")  # 老主置只读暖备，防误写
-        except Exception:
-            pass
+            done.append("已把老主置为只读(read_only=ON)")
+        except Exception as e:
+            failed.append("置老主只读失败：%s（需 SUPER 权限）" % e)
     finally:
         conn.close()
-    return {"ok": True, "note": "已回收源端复制账号，老主已置只读暖备（保留期后下线）"}
+    note = "；".join(done) if done else "未执行任何操作"
+    if failed:
+        note += "。⚠ 未完成项：" + "；".join(failed)
+    # ok=True：收尾不是迁移成功的必要条件（数据已迁完），但必须如实告知未完成项。
+    return {"ok": True, "done": done, "failed": failed, "partial": bool(done and failed),
+            "note": note}
 
 
 # ---------------------------------------------------------------------------
@@ -1263,6 +1273,154 @@ def check_lag(task):
 FREEZE_SAMPLE_SEC = 3
 
 
+def audit_source_privileges(cfg):
+    """源库账号「权限体检」：列出迁移各步骤依赖的权限是否具备，缺了会影响什么。
+
+    目的：迁移大量操作依赖源账号权限（探测/种子/校验需 SELECT，桥接建账号需 CREATE USER，
+    停写检测需 PROCESS，收尾置只读需 SUPER）。非 root 时若静默失败会误导用户，
+    故在第一步就把「缺什么、影响哪一步、怎么补」讲清楚。
+    """
+    conn = connect(cfg["src_host"], int(cfg["src_port"]),
+                   cfg["src_user"], cfg["src_pass"], timeout=8)
+    try:
+        cur = conn.cursor()
+        who = grants = ""
+        try:
+            cur.execute("SELECT CURRENT_USER()")
+            r = cur.fetchone()
+            who = r[0] if r else ""
+        except Exception:
+            pass
+        try:
+            cur.execute("SHOW GRANTS FOR CURRENT_USER()")
+            grants = "\n".join(str(x[0]) for x in (cur.fetchall() or []))
+        except Exception:
+            grants = ""
+        g = (grants or "").upper()
+        has_all = ("ALL PRIVILEGES" in g) or ("GRANT ALL" in g)
+
+        def _has(p):
+            return has_all or (p in g)
+
+        def _ok(sql):
+            try:
+                cur.execute(sql)
+                cur.fetchone()
+                return True
+            except Exception:
+                return False
+
+        sel_ok = _ok("SELECT schema_name FROM information_schema.schemata LIMIT 1")
+        proc_ok = False
+        try:
+            cur.execute("SHOW GLOBAL STATUS LIKE %s", ("Com_insert",))
+            r = cur.fetchone()
+            proc_ok = bool(r and len(r) > 1 and r[1] is not None)
+        except Exception:
+            proc_ok = False
+        repl_cli_ok = _ok("SHOW REPLICA STATUS")
+        checks = [
+            {"name": "读取库/表（SELECT）", "ok": sel_ok,
+             "used": "第一步探测、数据种子、一致性校验",
+             "fix": "授予待迁移库的 SELECT"},
+            {"name": "SHOW GLOBAL STATUS（PROCESS）", "ok": proc_ok,
+             "used": "停写检测",
+             "fix": "GRANT PROCESS ON *.*；否则停写检测会判为「无法判定」而不会误报已停写"},
+            {"name": "读复制状态（REPLICATION CLIENT）", "ok": repl_cli_ok,
+             "used": "读取 GTID / 复制状态",
+             "fix": "GRANT REPLICATION CLIENT ON *.*"},
+            {"name": "建复制账号（CREATE USER）", "ok": _has("CREATE USER"),
+             "used": "建立桥接（在源库建复制账号）",
+             "fix": "GRANT CREATE USER ON *.*；无此权限时自动降级为复用源账号本身（须允许从目标连入，通常 @'%'）"},
+            {"name": "置全局变量（SUPER / SET GLOBAL）", "ok": _has("SUPER"),
+             "used": "收尾回收（把老主置为只读）",
+             "fix": "GRANT SUPER ON *.*；无此权限该步会失败，现已如实上报、不会谎报成功"},
+        ]
+        return {"ok": True, "user": who, "grants": grants, "checks": checks,
+                "missing": [c["name"] for c in checks if not c["ok"]]}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        conn.close()
+
+
+def plan_binlog_enable(cfg):
+    """源库未开 binlog 时，用已有的 root 连接把「开启方案」的准备工作做到位。
+
+    ⚠ 为什么不能直接用 root 打开 binlog（重要，别再提这个方案）：
+      `log_bin` 是【静态变量】，MySQL/MariaDB 均不支持 SET GLOBAL log_bin=ON 在线开启，
+      必须修改配置文件并重启 mysqld 进程。而向导拿到的是**数据库 root**（只能执行 SQL），
+      既改不了 my.cnf（文件系统），也重启不了 mysqld（进程管理）——除非另给源机的
+      SSH 凭据。且自动修改生产库配置并重启属极高危操作（业务中断 + binlog 磁盘规划
+      需人工决策），绝不应自动执行。故这里只做「探测 + 生成可直接照做的方案」。
+    """
+    conn = connect(cfg["src_host"], int(cfg["src_port"]),
+                   cfg["src_user"], cfg["src_pass"], timeout=8)
+    try:
+        cur = conn.cursor()
+
+        def _v(sql):
+            try:
+                cur.execute(sql)
+                r = cur.fetchone()
+                return r[0] if r else None
+            except Exception:
+                return None
+
+        ver = _v("SELECT VERSION()")
+        datadir = _v("SELECT @@datadir")
+        server_id = _v("SELECT @@server_id")
+        log_bin = _v("SELECT @@log_bin")
+        replicas = []
+        try:
+            cur.execute("SHOW SLAVE HOSTS")
+            replicas = list(cur.fetchall() or [])
+        except Exception:
+            pass
+        is_slave = False
+        try:
+            cur.execute("SHOW REPLICA STATUS")
+            is_slave = bool(cur.fetchone())
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+    try:
+        sid = int(server_id)
+    except Exception:
+        sid = 0
+    base = str(datadir or "/var/lib/mysql").rstrip("/")
+    need_lsu = bool(is_slave or replicas)
+    snippet = "\n".join([
+        "[mysqld]",
+        "server_id      = %d" % (sid if sid else 1001),
+        "log_bin        = %s/mysql-bin" % base,
+        "binlog_format  = ROW",
+    ] + (["log_slave_updates = ON   # 该库自身还挂着从库，需把上游变更写进自己的 binlog"]
+         if need_lsu else [])
+      + ["expire_logs_days = 7       # 按需调整，避免 binlog 占满磁盘（MariaDB 10.6+ 亦可用 binlog_expire_logs_seconds）"])
+    steps = [
+        "1) 备份现有配置文件（如 cp /etc/mysql/my.cnf /etc/mysql/my.cnf.bak）。",
+        "2) 把下面的配置片段写进 my.cnf 的 [mysqld] 段（配置文件常见路径见下方候选）。",
+        "3) 确认磁盘空间充足（binlog 会持续增长，务必设置过期清理）。",
+        "4) 重启 MariaDB 服务（如 systemctl restart mariadb）。",
+        "5) 回本向导重新探测；确认 log_bin=1 后会自动切回【桥接模式】。",
+    ]
+    return {
+        "version": ver, "datadir": datadir, "server_id": server_id, "log_bin": log_bin,
+        "replicas": len(replicas), "is_slave": is_slave,
+        "suggest_server_id": sid if sid else 1001,
+        "binlog_path": base + "/mysql-bin",
+        "need_log_slave_updates": need_lsu,
+        "cnf_candidates": ["/etc/mysql/mariadb.conf.d/50-server.cnf",
+                           "/etc/mysql/my.cnf", "/etc/my.cnf", "/etc/my.cnf.d/server.cnf"],
+        "snippet": snippet, "steps": steps,
+        "note": ("log_bin 为静态变量，必须改配置并重启 mysqld；本向导不会自动修改配置或重启服务"
+                 "（数据库 root 也无权这么做）——以下方案供你在源机上执行。"),
+    }
+
+
 def check_write_freeze(task):
     """停写迁移模式下的「停写检测」：实测源库是否已不再产生写入。
 
@@ -1284,12 +1442,20 @@ def check_write_freeze(task):
         try:
             cur = conn.cursor()
             vals = {}
+            missing = []
             for c in dml_ct + row_ct:
                 try:
                     cur.execute("SHOW GLOBAL STATUS LIKE %s", (c,))
                     r = cur.fetchone()
-                    vals[c] = int(r[1]) if r and r[1] is not None else 0
+                    if r is None or len(r) < 2 or r[1] is None:
+                        # 取不到值：多为源账号缺 PROCESS 权限（SHOW GLOBAL STATUS 需 PROCESS）。
+                        # 绝不能当成 0 —— 否则两次都 0、差值 0，会被误判为「已停写」。
+                        missing.append(c)
+                        vals[c] = 0
+                    else:
+                        vals[c] = int(r[1])
                 except Exception:
+                    missing.append(c)
                     vals[c] = 0
             ro = sro = None
             try:
@@ -1304,19 +1470,20 @@ def check_write_freeze(task):
                 sro = int(r[0]) if r else None
             except Exception:
                 pass
-            return vals, ro, sro
+            return vals, ro, sro, missing
         finally:
             conn.close()
 
     try:
-        a, ro, sro = _sample()
+        a, ro, sro, miss_a = _sample()
     except Exception as e:
         return {"ok": False, "frozen": False, "error": f"{type(e).__name__}: {e}"}
     time.sleep(FREEZE_SAMPLE_SEC)
     try:
-        b, ro, sro = _sample()
+        b, ro, sro, miss_b = _sample()
     except Exception as e:
         return {"ok": False, "frozen": False, "error": f"{type(e).__name__}: {e}"}
+    missing = sorted(set(miss_a) | set(miss_b))
 
     delta = {c: (b.get(c, 0) - a.get(c, 0)) for c in dml_ct + row_ct}
     writes = sum(max(0, delta.get(c, 0)) for c in dml_ct)
@@ -1325,9 +1492,15 @@ def check_write_freeze(task):
     # 此时若按 0 处理会【误判为已停写】——漏报比误报危险得多（会让用户在仍有写入时切换），
     # 故出现负值时保守判定为 unreliable，绝不置 frozen。
     negative = {c: v for c, v in delta.items() if v < 0}
-    unreliable = bool(negative)
+    # 缺失（取不到值）比回退更危险：全取不到时 delta 恒为 0，会伪装成「已停写」。
+    unreliable = bool(negative) or bool(missing)
     frozen = (writes == 0 and rows == 0 and not unreliable)
-    if unreliable:
+    if missing:
+        hint = ("无法读取源库的写入计数器（%s 项取不到值，多为账号缺少 PROCESS 权限，"
+                "SHOW GLOBAL STATUS 需要 PROCESS）。**不能据此判定已停写**，"
+                "请改用具备 PROCESS 权限的账号，或用其它方式确认源库已停写后再切换。"
+                % len(missing))
+    elif negative:
         hint = ("采样不可靠：以下计数器出现回退（可能被 FLUSH STATUS 重置）：%s。"
                 "无法判断是否真的停写，请勿据此切换，请稍后重新检测。"
                 % "、".join(negative.keys()))
@@ -1340,6 +1513,7 @@ def check_write_freeze(task):
                 "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; 加固后再检测。"
                 "否则种子/切换后这部分增量将永久丢失。" % (writes, rows))
     return {"ok": True, "frozen": frozen, "unreliable": unreliable,
+            "missing": missing, "negative": list(negative.keys()),
             "sample_sec": FREEZE_SAMPLE_SEC,
             "writes": writes, "rows": rows, "delta": delta,
             "read_only": ro, "super_read_only": sro, "hint": hint}

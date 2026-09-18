@@ -73,9 +73,19 @@
   <div id="probeBox" style="margin-top:14px;display:none">
     <div class="kv" id="probeInfo"></div>
     <div id="probeWarn" class="bk-note" style="display:none;margin-top:10px"></div>
+    <div id="binlogPlan" style="display:none;margin-top:10px">
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px">开启 binlog 的可执行方案（已用源库 root 自动探测生成）</div>
+      <pre id="binlogSnippet" class="logbox" style="white-space:pre-wrap;margin:0"></pre>
+      <div id="binlogSteps" class="bk-note" style="margin-top:8px"></div>
+      <div id="binlogNote" style="color:var(--muted);font-size:12px;margin-top:6px"></div>
+    </div>
     <div style="margin-top:10px;font-size:13px;color:var(--text);font-weight:600">可迁移用户库（排除系统库 / Custos 库）</div>
     <div class="db-grid" id="dbGrid" style="margin-top:6px"></div>
     <div class="field" style="margin-top:10px"><label>仅迁移选中库（留空=全部用户库）</label><input id="dbFilter" placeholder="逗号分隔，如 app_db,order_db"></div>
+    <div id="privBox" style="margin-top:10px;display:none">
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px">源账号权限体检</div>
+      <div id="privList" style="font-size:12px;line-height:1.7"></div>
+    </div>
     <button class="btn primary" onclick="goStep2()">下一步：配置目标 →</button>
   </div>
 </div>
@@ -286,6 +296,44 @@ async function doProbe(){
   $("dbGrid").innerHTML = b.databases.length ? b.databases.map(d=>
     '<div class="db-item"><input type="checkbox" checked value="'+d+'">'+d+'</div>').join("")
     : '<div class="db-empty">（无用户库，无需迁移）</div>';
+  // 源账号权限体检：非 root 时提前告知哪些步骤会受影响
+  const pv = await postJSON("/api/migration/privileges", {
+    src_host:body.src_host, src_port:body.src_port,
+    src_user:body.src_user, src_pass:body.src_pass });
+  if(pv && pv.ok){
+    $("privBox").style.display = "block";
+    $("privList").innerHTML =
+      "账号：<b>"+(pv.user||"-")+"</b>" +
+      (pv.missing && pv.missing.length
+        ? "　⚠ 缺少 "+pv.missing.length+" 项权限" : "　✅ 权限齐全") + "<br>" +
+      (pv.checks||[]).map(c=>
+        (c.ok ? "✅ " : "❌ ") + c.name + "　→ 用于：" + c.used +
+        (c.ok ? "" : "<br>　　<span style='color:var(--muted)'>补齐：" + c.fix + "</span>")
+      ).join("<br>");
+  }
+  // 源库未开 binlog：用已拿到的 root 连接探测并生成「开启方案」，避免用户自己瞎猜
+  if(STATE.mode === "stopwrite"){
+    const p = await postJSON("/api/migration/plan_binlog", {
+      src_host:body.src_host, src_port:body.src_port,
+      src_user:body.src_user, src_pass:body.src_pass });
+    if(p && p.ok){
+      $("binlogPlan").style.display = "block";
+      $("binlogSnippet").textContent = p.snippet;
+      $("binlogSteps").innerHTML =
+        "探测到的信息：数据目录 <b>"+(p.datadir||"-")+"</b> · 当前 server_id <b>"+
+        (p.server_id??"-")+"</b> · 该库自身"+(p.is_slave?"<b>是</b>":"<b>不是</b>")+
+        "别人的从库 · 挂着从库数 <b>"+(p.replicas??"-")+"</b>"+
+        (p.need_log_slave_updates ? "（故需 log_slave_updates）" : "")+"<br>"+
+        "配置文件常见路径：" + (p.cnf_candidates||[]).join(" / ")+"<br><br>"+
+        (p.steps||[]).map(s=>s).join("<br>");
+      $("binlogNote").textContent = p.note || "";
+    }else{
+      $("binlogPlan").style.display = "block";
+      $("binlogSnippet").textContent = "方案生成失败：" + ((p && p.error) || "未知错误");
+    }
+  }else{
+    $("binlogPlan").style.display = "none";
+  }
   $("probeBox").style.display = "block";
   // 预推荐通道
   const rec = await postJSON("/api/migration/recommend", {size_mb:b.size_mb});
@@ -646,10 +694,25 @@ async function runCleanup(){
   const b = await postJSON("/api/migration/"+STATE.taskId+"/step", {step:"cleanup"});
   if(!b.ok){ $("cleanLog").textContent = "启动失败: " + b.error; return; }
   startPolling("cleanup", (rec)=>{
-    $("cleanLog").textContent = (rec.status === "done")
-      ? JSON.stringify(rec.result||{}, null, 2)
-      : ("失败: " + (rec.error||"未知错误"));
-    if(rec.status === "done"){ markStepDone(5); $("doneBox").style.display = "block"; }
+    if(rec.status !== "done"){
+      $("cleanLog").textContent = "失败: " + (rec.error||"未知错误"); return;
+    }
+    // 如实上报：源账号权限不足时，不能一律显示「已完成」
+    const r = rec.result || {};
+    const failed = r.failed || [];
+    const lines = ["已完成：" + ((r.done||[]).join("；") || "无")];
+    if(failed.length){
+      lines.push("⚠ 未完成：" + failed.join("；"));
+      lines.push("说明：多为源账号权限不足（回收账号需 CREATE USER、置只读需 SUPER）。");
+      lines.push("可点「✓ 直接完成（不改动源库）」结束迁移，或补齐权限后重跑本步。");
+    }
+    $("cleanLog").textContent = lines.join("\n");
+    markStepDone(5);
+    $("doneBox").style.display = "block";
+    $("doneBox").textContent = failed.length
+      ? "⚠ 迁移完成，但收尾有 "+failed.length+" 项未执行（源账号权限不足）。请在外部手动切换 VIP。"
+      : "✓ 迁移完成。请在外部手动切换 VIP，老主已置只读暖备。";
+    if(failed.length) alert("收尾有未完成项（不会谎报成功）：\n\n" + failed.join("\n"));
   });
 }
 

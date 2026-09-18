@@ -2875,6 +2875,29 @@ async def api_migration_lag(task_id: int, user=Depends(auth_required)):
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
+@app.post("/api/migration/privileges")
+async def api_migration_privileges(request: Request, user=Depends(auth_required)):
+    """源库账号权限体检：列出迁移各步骤依赖的权限是否具备、缺了影响哪一步。"""
+    try:
+        b = await _json_body(request)
+        return _json_ok(_migration.audit_source_privileges(b))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/migration/plan_binlog")
+async def api_migration_plan_binlog(request: Request, user=Depends(auth_required)):
+    """源库未开 binlog 时，用源库 root 连接探测并生成「开启 binlog」的可执行方案。
+
+    只生成方案，绝不自动改配置 / 重启（log_bin 是静态变量，且属高危操作）。
+    """
+    try:
+        b = await _json_body(request)
+        return _json_ok(_migration.plan_binlog_enable(b))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
 @app.post("/api/migration/{task_id}/freeze_check")
 def api_migration_freeze_check(task_id: int, user=Depends(auth_required)):
     """停写迁移模式下的停写检测：实测源库是否已停止写入（采样写入计数器取差值）。
