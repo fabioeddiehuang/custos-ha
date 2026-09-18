@@ -831,9 +831,57 @@ def is_target_locked(host, port):
         return True
 
 
+def _check_source_binlog(cfg):
+    """桥接前置检查：源库必须开启 binlog、server_id 非 0。
+
+    否则 CHANGE MASTER + START REPLICA 依然会「成功」，但 IO 线程立刻报
+    1236 'Binary log is not open' —— 用户只能去仪表盘才发现，体验等同于静默失败。
+    故在此提前拦截，并给出可操作的修复指引。
+    """
+    conn = connect(cfg["src_host"], int(cfg["src_port"]),
+                   cfg["src_user"], cfg["src_pass"], timeout=8)
+    try:
+        cur = conn.cursor()
+
+        def _v(sql):
+            try:
+                cur.execute(sql)
+                r = cur.fetchone()
+                return r[0] if r else None
+            except Exception:
+                return None
+
+        log_bin = _v("SELECT @@log_bin")
+        server_id = _v("SELECT @@server_id")
+        lb = str(log_bin).strip().upper()
+        if lb in ("0", "OFF", "FALSE", "NONE", ""):
+            raise RuntimeError(
+                "源库 %s:%s 未开启 binlog（@@log_bin=%s），无法建立复制桥接——"
+                "IO 线程会直接报 1236 'Binary log is not open'。\n"
+                "【方案① 想继续桥接追平】在源库 my.cnf 的 [mysqld] 增加并【重启 MariaDB】：\n"
+                "    server_id = <唯一且非 0 的整数>\n"
+                "    log_bin   = /path/to/mysql-bin\n"
+                "    binlog_format = ROW\n"
+                "  （若源库自身还有从库，另需 log_slave_updates=ON）\n"
+                "  改完回到第三步重跑「建立桥接」。\n"
+                "【方案② 不方便重启源库】改走停写迁移：源库停写后只跑「数据种子」，"
+                "再勾选「源库已停写」跳过追平直接切换。"
+                % (cfg["src_host"], cfg["src_port"], log_bin))
+        if str(server_id).strip() in ("0", "None", ""):
+            raise RuntimeError(
+                "源库 %s:%s 的 server_id=%s，复制无法工作（主从 server_id 必须唯一且非 0）。"
+                "请在源库 my.cnf 设置 server_id 后重启 MariaDB。"
+                % (cfg["src_host"], cfg["src_port"], server_id))
+        return {"log_bin": log_bin, "server_id": server_id}
+    finally:
+        conn.close()
+
+
 def bridge(task):
     """在目标建立指向源的 MariaDB GTID 复制桥接（持续追平）。"""
     cfg = task["config"]
+    # 前置检查：源库未开 binlog 时建复制必然 1236 失败，提前拦截（见函数注释）
+    _check_source_binlog(cfg)
     # ⚠ 必须先锁定目标节点再建桥接，否则 monitor 的 promote_to_master 会立刻
     #   RESET REPLICA ALL 把通道清掉（详见上方「迁移锁定」根因注释）。
     lock_target(cfg["tgt_host"], int(cfg["tgt_port"]))
@@ -1157,16 +1205,31 @@ def check_lag(task):
     if not sql_ok:
         reason = "SQL 线程未运行（状态=%s，复制未工作）" % (sql_raw or "未知")
     elif not io_ok:
-        state = str(io_raw or "未知")
-        if state.lower() == "connecting":
-            reason = ("IO 线程仍在重试连源（状态=Connecting，MariaDB 默认每 60s 重试一次）："
-                      "通常是复制账号口令/授权不对，或 %s 无法访问 %s:%s"
-                      % (cfg["tgt_host"], cfg["src_host"], cfg["src_port"]))
+        le = str(last_err or "")
+        if "1236" in le or "binary log is not open" in le.lower():
+            # 1236 的根因是源库没开 binlog，不能笼统说成“口令/授权不对”误导排障
+            reason = ("源库 %s:%s 未开启 binlog，IO 线程报 1236 'Binary log is not open'"
+                      "（无从拉取 binlog 事件）——这与账号口令无关"
+                      % (cfg["src_host"], cfg["src_port"]))
         else:
-            reason = "IO 线程未运行（状态=%s），未从源拉取 binlog" % state
-        if last_err:
-            reason += "；复制错误：" + str(last_err)[:300]
-        if not acct_ok:
+            state = str(io_raw or "未知")
+            if state.lower() == "connecting":
+                reason = ("IO 线程仍在重试连源（状态=Connecting，MariaDB 默认每 60s 重试一次）："
+                          "通常是复制账号口令/授权不对，或 %s 无法访问 %s:%s"
+                          % (cfg["tgt_host"], cfg["src_host"], cfg["src_port"]))
+            else:
+                reason = "IO 线程未运行（状态=%s），未从源拉取 binlog" % state
+            if last_err:
+                reason += "；复制错误：" + le[:300]
+        if "1236" in le or "binary log is not open" in le.lower():
+            hint = ("源库 %s:%s 未开启 binlog，IO 线程报 1236 'Binary log is not open'。\n"
+                    "【方案① 想继续桥接追平】源库 my.cnf 的 [mysqld] 增加 "
+                    "server_id=<非0唯一值>、log_bin=/path/to/mysql-bin、binlog_format=ROW "
+                    "并【重启 MariaDB】，再回第三步重跑「建立桥接」。\n"
+                    "【方案② 不方便重启源库】走停写迁移：源库停写 → 只跑「数据种子」→ "
+                    "勾选下方「源库已停写」跳过追平 → 直接停桥切换。"
+                    % (cfg["src_host"], cfg["src_port"]))
+        elif not acct_ok:
             hint = ("复制账号 %s 从管理端连源库 %s:%s 失败：%s。"
                     "⇒ 账号口令或 host 授权有问题。请重跑第三步「建立桥接」"
                     "（会用 ALTER USER 强制把该账号口令同步为当前任务口令），"
@@ -1194,6 +1257,92 @@ def check_lag(task):
             "acct_ok": acct_ok, "acct_error": acct_err, "acct_user": m_user,
             "reason": reason or "已追平（Seconds_Behind_Master=%s）" % sb,
             "hint": hint, "replica": repl}
+
+
+# 停写检测采样间隔（秒）：连源库采样两次写入计数器，比较差值。
+FREEZE_SAMPLE_SEC = 3
+
+
+def check_write_freeze(task):
+    """停写迁移模式下的「停写检测」：实测源库是否已不再产生写入。
+
+    源库未开 binlog ⇒ 没有桥接可追平，数据种子是唯一数据来源；
+    种子是**一次性快照**，此后源库的新写入不会进入新集群、切换即丢失。
+    故必须确认源库确实停写，而这不该只靠用户口头判断——这里用
+    「间隔采样两次写入类状态计数器取差值」来实测。
+
+    注意：采样窗口内为 0 只能证明这 FREEZE_SAMPLE_SEC 秒内没写入，
+    不代表此后永不写入，故切换的最终放行仍由用户勾选确认（不做自动放行）。
+    """
+    cfg = task["config"]
+    dml_ct = ["Com_insert", "Com_update", "Com_delete", "Com_replace", "Com_commit"]
+    row_ct = ["Innodb_rows_inserted", "Innodb_rows_updated", "Innodb_rows_deleted"]
+
+    def _sample():
+        conn = connect(cfg["src_host"], int(cfg["src_port"]),
+                       cfg["src_user"], cfg["src_pass"], timeout=8)
+        try:
+            cur = conn.cursor()
+            vals = {}
+            for c in dml_ct + row_ct:
+                try:
+                    cur.execute("SHOW GLOBAL STATUS LIKE %s", (c,))
+                    r = cur.fetchone()
+                    vals[c] = int(r[1]) if r and r[1] is not None else 0
+                except Exception:
+                    vals[c] = 0
+            ro = sro = None
+            try:
+                cur.execute("SELECT @@read_only")
+                r = cur.fetchone()
+                ro = int(r[0]) if r else None
+            except Exception:
+                pass
+            try:
+                cur.execute("SELECT @@super_read_only")
+                r = cur.fetchone()
+                sro = int(r[0]) if r else None
+            except Exception:
+                pass
+            return vals, ro, sro
+        finally:
+            conn.close()
+
+    try:
+        a, ro, sro = _sample()
+    except Exception as e:
+        return {"ok": False, "frozen": False, "error": f"{type(e).__name__}: {e}"}
+    time.sleep(FREEZE_SAMPLE_SEC)
+    try:
+        b, ro, sro = _sample()
+    except Exception as e:
+        return {"ok": False, "frozen": False, "error": f"{type(e).__name__}: {e}"}
+
+    delta = {c: (b.get(c, 0) - a.get(c, 0)) for c in dml_ct + row_ct}
+    writes = sum(max(0, delta.get(c, 0)) for c in dml_ct)
+    rows = sum(max(0, delta.get(c, 0)) for c in row_ct)
+    # 计数器若被 FLUSH STATUS 重置（出现负值），采样即不可靠。
+    # 此时若按 0 处理会【误判为已停写】——漏报比误报危险得多（会让用户在仍有写入时切换），
+    # 故出现负值时保守判定为 unreliable，绝不置 frozen。
+    negative = {c: v for c, v in delta.items() if v < 0}
+    unreliable = bool(negative)
+    frozen = (writes == 0 and rows == 0 and not unreliable)
+    if unreliable:
+        hint = ("采样不可靠：以下计数器出现回退（可能被 FLUSH STATUS 重置）：%s。"
+                "无法判断是否真的停写，请勿据此切换，请稍后重新检测。"
+                % "、".join(negative.keys()))
+    elif frozen:
+        hint = ("最近 %.0f 秒采样窗口内源库没有任何写入，可以进行切换。"
+                "（仅代表该窗口，切换前请保持业务停写状态）" % FREEZE_SAMPLE_SEC)
+    else:
+        hint = ("源库仍在写入：窗口内 DML %d 次、行变更 %d 行。"
+                "请先停业务写入，并在源库执行 "
+                "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; 加固后再检测。"
+                "否则种子/切换后这部分增量将永久丢失。" % (writes, rows))
+    return {"ok": True, "frozen": frozen, "unreliable": unreliable,
+            "sample_sec": FREEZE_SAMPLE_SEC,
+            "writes": writes, "rows": rows, "delta": delta,
+            "read_only": ro, "super_read_only": sro, "hint": hint}
 
 
 def skip_cleanup(task_id):

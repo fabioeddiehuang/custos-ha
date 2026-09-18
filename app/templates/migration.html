@@ -72,6 +72,7 @@
   <button class="btn primary" onclick="doProbe()">🔍 探测源集群</button>
   <div id="probeBox" style="margin-top:14px;display:none">
     <div class="kv" id="probeInfo"></div>
+    <div id="probeWarn" class="bk-note" style="display:none;margin-top:10px"></div>
     <div style="margin-top:10px;font-size:13px;color:var(--text);font-weight:600">可迁移用户库（排除系统库 / Custos 库）</div>
     <div class="db-grid" id="dbGrid" style="margin-top:6px"></div>
     <div class="field" style="margin-top:10px"><label>仅迁移选中库（留空=全部用户库）</label><input id="dbFilter" placeholder="逗号分隔，如 app_db,order_db"></div>
@@ -158,10 +159,20 @@
   <h3>④ 停桥切换（cutover，需人工确认）</h3>
   <p class="bk-note">此操作不可逆转：将停止目标对源的复制、清除桥接通道，并把目标节点登记进 Custos（monitor 自动提升新主）。请在确认数据已追平、并已准备手动切换 VIP 后执行。</p>
   <button class="btn" onclick="setStep(3)">← 上一步：返回校验</button>
-  <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;align-items:center">
+  <div id="stopWriteNote" class="bk-note" style="display:none;margin-top:10px">
+    ⚠ <b>停写迁移模式</b>：源库未开启 binlog，本任务<b>没有桥接通道</b>，因此不存在「追平」这一环节。
+    请<b>先确认业务已停止写入源库</b>，然后勾选下方「源库已停写」即可解锁切换。
+    源库仍在写入就切换 ⇒ 这部分增量将<b>永久丢失</b>。
+  </div>
+  <div id="lagRow" style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;align-items:center">
     <button class="btn" onclick="runLagCheck()">🔍 追平检测（切换前必做）</button>
     <span class="st wait" id="lagState">未检测</span>
   </div>
+  <div id="freezeRow" style="display:none;gap:10px;margin-top:10px;flex-wrap:wrap;align-items:center">
+    <button class="btn" onclick="runFreezeCheck()">🔍 停写检测（确认源库已停写）</button>
+    <span class="st wait" id="freezeState">未检测</span>
+  </div>
+  <div id="freezeBox" class="logbox" style="margin-top:8px;display:none"></div>
   <div id="lagBox" class="logbox" style="margin-top:8px;display:none"></div>
   <div id="fixBridgeWrap" style="display:none;margin-top:8px">
     <button class="btn" onclick="backToBridge()">← 返回第三步，重跑「建立桥接」</button>
@@ -225,7 +236,9 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let STATE = { probe:null, channel:"logical", taskId:null, dbs:[], lagOk:false };
+// mode: "bridge" = 源库已开 binlog，可桥接追平；"stopwrite" = 源库未开 binlog，只能停写迁移。
+// 由第一步探测的 gtid_ready(即 @@log_bin) 自动判定，无需用户选择。
+let STATE = { probe:null, channel:"logical", taskId:null, dbs:[], lagOk:false, mode:"bridge" };
 
 function setStep(n){
   for (let i=1;i<=5;i++){
@@ -253,6 +266,23 @@ async function doProbe(){
     "GTID: "+(b.gtid_ready?"已开启":"未开启")+" · domain_id: "+b.gtid_domain_id+"<br>"+
     "用户库数量: "+b.databases.length;
   STATE.dbs = b.databases;
+  // 自动判定迁移模式：源库开 binlog ⇒ 桥接追平；未开 ⇒ 只能停写迁移（无法桥接）。
+  STATE.mode = b.gtid_ready ? "bridge" : "stopwrite";
+  const warn = $("probeWarn");
+  if(STATE.mode === "stopwrite"){
+    warn.style.display = "block";
+    warn.innerHTML =
+      "⚠ <b>源库未开启 binlog（GTID 未开启）</b>：无法建立复制桥接" +
+      "（强行桥接时 IO 线程会直接报 <code>1236 'Binary log is not open'</code>）。<br>" +
+      "<b>已自动切换为【停写迁移】模式</b>：第三步将只跑「数据种子 + 一致性校验」（不建桥接），" +
+      "第四步需你勾选确认「源库已停写」后直接切换。<br>" +
+      "· <b>若希望桥接追平</b>：源库 my.cnf 的 [mysqld] 加 " +
+      "<code>server_id=&lt;非0唯一值&gt;</code>、<code>log_bin=/path/to/mysql-bin</code>、" +
+      "<code>binlog_format=ROW</code> 并<b>重启 MariaDB</b>，重新探测即自动切回桥接模式；<br>" +
+      "· <b>若不便重启源库</b>：按停写迁移走 —— 先让业务停止写入源库，再执行数据种子。";
+  }else{
+    warn.style.display = "none";
+  }
   $("dbGrid").innerHTML = b.databases.length ? b.databases.map(d=>
     '<div class="db-item"><input type="checkbox" checked value="'+d+'">'+d+'</div>').join("")
     : '<div class="db-empty">（无用户库，无需迁移）</div>';
@@ -304,11 +334,20 @@ async function createTask(){
 }
 
 function buildExecList(){
-  const steps = [["seed","数据种子（导出/恢复）"],["bridge","建立桥接（GTID 追平）"],["verify","一致性校验（行数比对）"]];
-  $("execList").innerHTML = steps.map(([k,label])=>
+  const all = [["seed","数据种子（导出/恢复）"],["bridge","建立桥接（GTID 追平）"],
+               ["verify","一致性校验（行数比对）"]];
+  // 停写模式（源库未开 binlog）：不建桥接，隐藏该步骤并说明原因
+  const steps = (STATE.mode === "stopwrite") ? all.filter(x=>x[0]!=="bridge") : all;
+  let html = steps.map(([k,label])=>
     '<div class="run-row"><button class="btn primary" onclick="runStep(\''+k+'\')">执行</button>'+
     '<span class="kv">'+label+'</span><span class="st wait" id="st_'+k+'">待执行</span></div>'
   ).join("");
+  if(STATE.mode === "stopwrite"){
+    html += '<div class="bk-note" style="margin-top:8px">' +
+      '⚠ <b>停写迁移模式</b>（源库未开 binlog，无法桥接）：本步只跑「数据种子 + 一致性校验」。' +
+      '<b>请先让业务停止写入源库</b>再执行数据种子，否则种子期间的新写入不会进入新集群。</div>';
+  }
+  $("execList").innerHTML = html;
 }
 
 /* ---------- 后台轮询：百分比 / 阶段文字 / 日志增量刷新 ----------
@@ -426,10 +465,11 @@ function runStep(step){
   });
 }
 
-// 一键顺序执行：种子 → 桥接 → 校验（UX-003）
+// 一键顺序执行：桥接模式 = 种子→桥接→校验；停写模式 = 种子→校验（跳过桥接）
 async function runAll(){
   $("nextStageBtn").style.display = "none";
-  for(const s of ["seed","bridge","verify"]){
+  const seq = (STATE.mode === "stopwrite") ? ["seed","verify"] : ["seed","bridge","verify"];
+  for(const s of seq){
     const ok = await runStep(s);
     if(!ok){ alert(s + " 失败，已中止全部执行"); return; }
   }
@@ -442,7 +482,42 @@ function gotoStep4(){
   const chk = $("noLagChk"); if(chk){ chk.checked = false; }
   $("fixBridgeWrap").style.display = "none";
   $("lagBox").style.display = "none";
+  // 停写模式：没有桥接通道，隐藏「追平检测」，改显示停写说明 + 「停写检测」
+  const sw = (STATE.mode === "stopwrite");
+  $("stopWriteNote").style.display = sw ? "block" : "none";
+  $("lagRow").style.display = sw ? "none" : "flex";
+  $("freezeRow").style.display = sw ? "flex" : "none";
+  $("freezeBox").style.display = "none";
+  const fs = $("freezeState"); if(fs){ fs.className = "st wait"; fs.textContent = "未检测"; }
   setStep(4);
+}
+
+/* 停写检测（停写迁移模式）：实测源库在采样窗口内是否还有写入。
+   只提供判断依据，不自动放行切换 —— 最终仍需勾选「源库已停写」。 */
+async function runFreezeCheck(){
+  $("freezeState").className = "st wait"; $("freezeState").textContent = "检测中…";
+  $("freezeBox").style.display = "block";
+  $("freezeBox").textContent = "正在采样源库写入状态（约 3 秒）…";
+  const b = await postJSON("/api/migration/"+STATE.taskId+"/freeze_check", {});
+  if(!b.ok){
+    $("freezeState").className = "st err"; $("freezeState").textContent = "检测失败";
+    $("freezeBox").textContent = "检测失败: " + b.error;
+    return;
+  }
+  const d = b.delta || {};
+  $("freezeBox").textContent = [
+    "采样窗口 : " + (b.sample_sec || "-") + " 秒",
+    "DML 次数 : " + (b.writes ?? "-"),
+    "行变更   : " + (b.rows ?? "-"),
+    "read_only : " + (b.read_only ?? "-") + " · super_read_only : " + (b.super_read_only ?? "-"),
+    "明细 : " + JSON.stringify(d),
+    "────────────",
+    b.frozen ? "✅ 窗口内无写入，可继续（切换前请保持停写）。"
+             : "❌ 源库仍在写入，请勿切换。"
+  ].join("\n");
+  $("freezeState").className = b.frozen ? "st ok" : "st err";
+  $("freezeState").textContent = b.frozen ? "已停写" : "仍在写入";
+  if(!b.frozen) alert((b.hint||"") + "\n\n请在源库停写并加固只读后再检测。");
 }
 
 // 检测失败且「未停桥」时，引导回第三步重跑「建立桥接」（该步骤支持重复执行）
@@ -531,8 +606,12 @@ let _cutTimer = null;
 function showCutover(){
   // 二次守卫：即使有人绕过按钮 disabled 也不允许未追平就切换
   if(!STATE.lagOk){
-    alert("请先点击「追平检测」并确认已追平，才能执行停桥切换。\n" +
-          "（切换会切断 177→203 桥接，未追平的残留延迟会造成永久数据丢失）");
+    alert(STATE.mode === "stopwrite"
+      ? ("请先勾选「源库已停写、无需追平」再执行切换。\n\n" +
+         "本任务为停写迁移模式（源库未开 binlog，无桥接通道），\n" +
+         "必须先确认业务已停止写入源库，否则增量数据将永久丢失。")
+      : ("请先点击「追平检测」并确认已追平，才能执行停桥切换。\n" +
+         "（切换会切断 177→203 桥接，未追平的残留延迟会造成永久数据丢失）"));
     return;
   }
   const btn = $("cutConfirmBtn");

@@ -2875,6 +2875,21 @@ async def api_migration_lag(task_id: int, user=Depends(auth_required)):
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
+@app.post("/api/migration/{task_id}/freeze_check")
+def api_migration_freeze_check(task_id: int, user=Depends(auth_required)):
+    """停写迁移模式下的停写检测：实测源库是否已停止写入（采样写入计数器取差值）。
+
+    同步端点（内含数秒采样间隔），FastAPI 会放到线程池执行，不阻塞事件循环。
+    """
+    try:
+        task = _migration.get_task(task_id)
+        if not task:
+            return _json_ok({"ok": False, "error": "任务不存在"})
+        return _json_ok(_migration.check_write_freeze(task))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
 @app.post("/api/migration/{task_id}/skip_cleanup")
 async def api_migration_skip_cleanup(task_id: int, user=Depends(auth_required)):
     """跳过「收尾回收」直接完成迁移：不回收源端账号、不置老主只读，源库保持原状。"""
