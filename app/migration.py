@@ -324,6 +324,14 @@ def capabilities(src_flavor, src_major, tgt_flavor, tgt_major=None):
 # ---------------------------------------------------------------------------
 # 步骤实现
 # ---------------------------------------------------------------------------
+def _sql_lit(s):
+    """SQL 字符串字面量转义（账号名 / 口令可能含引号、反斜杠）。
+
+    注意：不可命名为 _q —— precheck 内部已有同名局部函数 _q(conn, sql, args)。
+    """
+    return str(s).replace("\\", "\\\\").replace("'", "\\'")
+
+
 def _ensure_source_repl_account(task):
     """在【源】MariaDB 上创建最小权限复制账号（迁移完 cleanup 可回收）。
 
@@ -335,9 +343,16 @@ def _ensure_source_repl_account(task):
     conn = connect(cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"], timeout=8)
     try:
         cur = conn.cursor()
-        u, p = cfg["repl_user"], cfg["repl_pass"]
+        u, p = _sql_lit(cfg["repl_user"]), _sql_lit(cfg["repl_pass"])
         try:
-            cur.execute(f"CREATE USER IF NOT EXISTS '{u}'@'%' IDENTIFIED BY '{p}'")
+            # ⚠ 关键坑（实测坐实）：CREATE USER IF NOT EXISTS 在用户【已存在】时
+            #   **不会更新口令**。迁移反复重装后，源库残留旧的 replication 账号（旧口令），
+            #   而新任务生成了新口令 ⇒ 该语句静默跳过、不报错、也不触发下面的降级分支，
+            #   于是目标拿着新口令连源 → "Access denied ... (using password: YES)"、
+            #   IO 线程永远起不来（追平检测报「IO 线程未运行」）。
+            #   故必须显式 ALTER USER 强制同步口令，保证幂等。
+            cur.execute(f"CREATE USER IF NOT EXISTS '{u}'@'%'")
+            cur.execute(f"ALTER USER '{u}'@'%' IDENTIFIED BY '{p}'")
             cur.execute(f"GRANT REPLICATION SLAVE ON *.* TO '{u}'@'%'")
             cur.execute("FLUSH PRIVILEGES")
             return {"used_src_creds": False}
@@ -827,6 +842,17 @@ def bridge(task):
     m_user = cfg["src_user"] if use_src else cfg["repl_user"]
     m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
     tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
+    # 建桥接前先自检：用复制账号从管理端连一次源库，口令/授权不对立刻暴露，
+    # 否则要等目标 IO 线程报 Access denied 才被发现（且只在仪表盘看得到）。
+    try:
+        probe = connect(cfg["src_host"], int(cfg["src_port"]), m_user, m_pass, timeout=8)
+        probe.close()
+    except Exception as e:
+        raise RuntimeError(
+            "复制账号 %s 无法连入源库 %s:%s：%s。"
+            "请确认源库该账号口令正确、且允许从目标 %s 连入（如 @'%%'）；"
+            "若源库残留同名旧账号，本步骤已用 ALTER USER 强制同步口令，可重跑本步骤。"
+            % (m_user, cfg["src_host"], cfg["src_port"], e, cfg["tgt_host"]))
     conn = connect(*tgt, timeout=8)
     try:
         cur = conn.cursor()

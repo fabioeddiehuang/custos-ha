@@ -166,12 +166,22 @@
   <div id="fixBridgeWrap" style="display:none;margin-top:8px">
     <button class="btn" onclick="backToBridge()">← 返回第三步，重跑「建立桥接」</button>
   </div>
-  <label style="display:flex;gap:8px;align-items:flex-start;margin-top:10px;font-size:13px;line-height:1.5">
-    <input type="checkbox" id="noLagChk" onchange="toggleNoLag()" style="margin-top:3px">
-    <span>源库已停写、无需追平（跳过追平检测，直接解锁切换）<br>
-      <span style="color:var(--muted)">仅当老主 177 已停止写入时才勾选；源库仍在写入却跳过，增量数据将永久丢失。</span>
-    </span>
-  </label>
+  <div class="bk-note" id="noLagBox" style="margin-top:10px">
+    <div style="display:flex;gap:10px;align-items:flex-start">
+      <input type="checkbox" id="noLagChk" onchange="toggleNoLag()"
+             style="margin-top:2px;flex:0 0 auto;width:16px;height:16px">
+      <div style="font-size:13px;line-height:1.6">
+        <div style="font-weight:600">源库已停写、无需追平</div>
+        <div style="color:var(--muted);margin-top:2px">
+          勾选即跳过追平检测、直接解锁「执行停桥切换」。
+        </div>
+        <div style="color:var(--muted);margin-top:4px">
+          ⚠ 仅当老主 177 已停止写入时才可勾选；若源库仍在写入就跳过，
+          这部分增量数据将<b>永久丢失</b>、无法找回。
+        </div>
+      </div>
+    </div>
+  </div>
   <button class="btn primary" id="cutBtn" disabled onclick="showCutover()">⚠ 执行停桥切换（需先追平）</button>
   <div class="logbox" id="cutLog" style="margin-top:10px"></div>
 </div>
