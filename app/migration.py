@@ -1132,14 +1132,51 @@ def check_lag(task):
                 "bridge_done": bridge_done, "cutover_done": cutover_done,
                 "need_bridge": (not cutover_done),  # 未停桥时，重跑桥接即可恢复通道
                 "replica": repl}
-    io_ok = str(repl.get("io_running") or "").lower() == "yes"
-    sql_ok = str(repl.get("sql_running") or "").lower() == "yes"
+    io_raw = repl.get("io_running")
+    sql_raw = repl.get("sql_running")
+    io_ok = str(io_raw or "").lower() == "yes"
+    sql_ok = str(sql_raw or "").lower() == "yes"
     sb = repl.get("seconds_behind")
     last_err = repl.get("last_error")
+
+    # 附加自检：用复制账号从【管理端】连一次源库。
+    # 目的：区分「账号/口令或授权问题」与「203 → 177 网络不通」——两者表现都是 IO 起不来。
+    steps_prev = task.get("steps") or {}
+    bres = (steps_prev.get("bridge") or {}).get("result") or {}
+    use_src = bool(bres.get("used_src_creds"))
+    m_user = cfg["src_user"] if use_src else cfg["repl_user"]
+    m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
+    acct_ok, acct_err = True, ""
+    try:
+        _c = connect(cfg["src_host"], int(cfg["src_port"]), m_user, m_pass, timeout=8)
+        _c.close()
+    except Exception as e:
+        acct_ok, acct_err = False, str(e)
+
+    hint = ""
     if not sql_ok:
-        reason = "SQL 线程未运行（复制未工作）"
+        reason = "SQL 线程未运行（状态=%s，复制未工作）" % (sql_raw or "未知")
     elif not io_ok:
-        reason = "IO 线程未运行（未从源拉取 binlog）"
+        state = str(io_raw or "未知")
+        if state.lower() == "connecting":
+            reason = ("IO 线程仍在重试连源（状态=Connecting，MariaDB 默认每 60s 重试一次）："
+                      "通常是复制账号口令/授权不对，或 %s 无法访问 %s:%s"
+                      % (cfg["tgt_host"], cfg["src_host"], cfg["src_port"]))
+        else:
+            reason = "IO 线程未运行（状态=%s），未从源拉取 binlog" % state
+        if last_err:
+            reason += "；复制错误：" + str(last_err)[:300]
+        if not acct_ok:
+            hint = ("复制账号 %s 从管理端连源库 %s:%s 失败：%s。"
+                    "⇒ 账号口令或 host 授权有问题。请重跑第三步「建立桥接」"
+                    "（会用 ALTER USER 强制把该账号口令同步为当前任务口令），"
+                    "并确认源库允许目标 %s 连入（@'%%'）。"
+                    % (m_user, cfg["src_host"], cfg["src_port"], acct_err, cfg["tgt_host"]))
+        else:
+            hint = ("复制账号从管理端能连上源库，但目标 %s 连不上 ⇒ 请检查 %s → %s:%s 的网络连通"
+                    "（防火墙 / 端口），以及源库是否允许来自 %s 的连接。"
+                    % (cfg["tgt_host"], cfg["tgt_host"], cfg["src_host"], cfg["src_port"],
+                       cfg["tgt_host"]))
     elif last_err:
         reason = "存在复制错误：" + str(last_err)[:300]
     elif sb is None:
@@ -1151,10 +1188,12 @@ def check_lag(task):
             lag = 0
         reason = "" if lag <= LAG_CAUGHT_UP_SEC else \
             "尚未追平，仍有 %d 秒延迟（阈值 %ds）" % (lag, LAG_CAUGHT_UP_SEC)
-    return {"ok": True, "caught_up": not reason, "io_running": repl.get("io_running"),
-            "sql_running": repl.get("sql_running"), "seconds_behind": sb,
+    return {"ok": True, "caught_up": not reason,
+            "io_running": io_raw, "sql_running": sql_raw, "seconds_behind": sb,
             "last_error": last_err,
-            "reason": reason or "已追平（Seconds_Behind_Master=%s）" % sb, "replica": repl}
+            "acct_ok": acct_ok, "acct_error": acct_err, "acct_user": m_user,
+            "reason": reason or "已追平（Seconds_Behind_Master=%s）" % sb,
+            "hint": hint, "replica": repl}
 
 
 def skip_cleanup(task_id):

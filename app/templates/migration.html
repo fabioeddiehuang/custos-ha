@@ -488,6 +488,9 @@ async function runLagCheck(){
     "IO  线程 : " + (b.io_running || "-"),
     "SQL 线程 : " + (b.sql_running || "-"),
     "延迟(Seconds_Behind_Master) : " + sb + " 秒",
+    "复制账号自检 : " + (b.acct_ok === undefined ? "未执行"
+        : (b.acct_ok ? ("管理端可连源 ✅（账号 " + (b.acct_user||"") + "）")
+                     : ("管理端连源失败 ❌ " + (b.acct_error||"")))),
     "复制错误 : " + (b.last_error || "无"),
     "────────────",
     (b.caught_up ? "✅ 已追平，可以切换。" : "❌ 未追平：" + (b.reason||"")),
