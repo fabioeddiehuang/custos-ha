@@ -2864,13 +2864,17 @@ async def api_migration_precheck(task_id: int, user=Depends(auth_required)):
 
 
 @app.post("/api/migration/{task_id}/lag")
-async def api_migration_lag(task_id: int, user=Depends(auth_required)):
-    """停桥切换前的追平检测（只读）：确认目标已从源追平，未追平不允许切换。"""
+async def api_migration_lag(task_id: int, request: Request, user=Depends(auth_required)):
+    """停桥切换前的追平检测（只读）：确认目标已从源追平，未追平不允许切换。
+
+    body: {"skip_acct": true} 可跳过账号自检（前端高频追踪采样时使用）。
+    """
     try:
+        b = await _json_body(request)
         task = _migration.get_task(task_id)
         if not task:
             return _json_ok({"ok": False, "error": "任务不存在"})
-        return _json_ok(_migration.check_lag(task))
+        return _json_ok(_migration.check_lag(task, skip_acct=bool(b.get("skip_acct"))))
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 

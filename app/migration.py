@@ -1151,10 +1151,11 @@ def cleanup(task):
 LAG_CAUGHT_UP_SEC = 0
 
 
-def check_lag(task):
+def check_lag(task, skip_acct=False):
     """停桥切换前的「追平检测」：确认目标已从源追平，避免带差切换导致数据丢失。
 
     纯只读，不改动任何节点。返回 caught_up 供前端放行「执行停桥切换」按钮。
+    skip_acct=True 时跳过「复制账号自检」（用于高频追踪采样，避免反复连源库）。
     """
     cfg = task["config"]
     tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
@@ -1204,12 +1205,17 @@ def check_lag(task):
     use_src = bool(bres.get("used_src_creds"))
     m_user = cfg["src_user"] if use_src else cfg["repl_user"]
     m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
-    acct_ok, acct_err = True, ""
-    try:
-        _c = connect(cfg["src_host"], int(cfg["src_port"]), m_user, m_pass, timeout=8)
-        _c.close()
-    except Exception as e:
-        acct_ok, acct_err = False, str(e)
+    # skip_acct：前端「追平追踪」每 2s 采样一次，若每次都连源库做账号自检，
+    # 5 分钟就是上百次连接，对老主是无谓负担 ⇒ 仅首次采样做自检，后续跳过。
+    if skip_acct:
+        acct_ok, acct_err, m_user = None, "", m_user
+    else:
+        acct_ok, acct_err = True, ""
+        try:
+            _c = connect(cfg["src_host"], int(cfg["src_port"]), m_user, m_pass, timeout=8)
+            _c.close()
+        except Exception as e:
+            acct_ok, acct_err = False, str(e)
 
     hint = ""
     if not sql_ok:

@@ -42,6 +42,16 @@
   .modal h3{margin:0 0 10px;color:var(--text)}
   .modal p{font-size:13px;color:var(--muted);line-height:1.7;margin:6px 0}
   .modal .acts{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+  /* 说明块：本页多处使用，但此前只在 backup.html 里有定义，迁移页缺失 ⇒ 裸文本无样式 */
+  .bk-note{font-size:12.5px;color:var(--muted);line-height:1.75;margin-top:10px;
+    padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface-2)}
+  .bk-note b{color:var(--text)}
+  /* 告警型说明（用于停写/丢数据风险等强提示） */
+  .bk-note.warn{border-color:var(--danger-border);background:var(--danger-bg)}
+  /* 按钮行：统一各步操作按钮排版（原先是裸 button，间距与换行不一致） */
+  .btn-row{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:center}
+  /* 无用户库时的占位提示（此前仅在 backup.html 有定义，本页缺失） */
+  .db-empty{color:var(--muted);font-size:12.5px;padding:8px 0}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -69,7 +79,7 @@
   <div class="field"><label>端口</label><input id="srcPort" value="3306"></div>
   <div class="field"><label>账号</label><input id="srcUser" value="root"></div>
   <div class="field"><label>密码</label><input id="srcPass" type="password"></div>
-  <button class="btn primary" onclick="doProbe()">🔍 探测源集群</button>
+  <button class="btn btn-primary" onclick="doProbe()">🔍 探测源集群</button>
   <div id="probeBox" style="margin-top:14px;display:none">
     <div class="kv" id="probeInfo"></div>
     <div id="probeWarn" class="bk-note" style="display:none;margin-top:10px"></div>
@@ -86,7 +96,7 @@
       <div style="font-size:13px;font-weight:600;margin-bottom:6px">源账号权限体检</div>
       <div id="privList" style="font-size:12px;line-height:1.7"></div>
     </div>
-    <button class="btn primary" onclick="goStep2()">下一步：配置目标 →</button>
+    <button class="btn btn-primary" onclick="goStep2()">下一步：配置目标 →</button>
   </div>
 </div>
 
@@ -136,22 +146,24 @@
   <div class="kv" id="recInfo" style="margin-top:8px"></div>
 
   <div class="field" style="margin-top:12px"><label>迁移任务名称</label><input id="taskName" value="MariaDB 迁移"></div>
-  <button class="btn" onclick="setStep(1)">← 上一步</button>
-  <button class="btn primary" onclick="createTask()">✓ 创建迁移任务并继续</button>
+  <div class="btn-row">
+    <button class="btn" onclick="setStep(1)">← 上一步</button>
+    <button class="btn btn-primary" onclick="createTask()">✓ 创建迁移任务并继续</button>
+  </div>
 </div>
 
 <div class="card" id="step3" style="display:none">
   <h3>③ 执行迁移（逐步运行，支持重试）</h3>
-  <div class="field" style="margin-bottom:10px">
-    <button class="btn" onclick="runPrecheck()">🛡 迁移前兼容性预检（dry-run，不搬数据）</button>
-    <div id="preBox" style="margin-top:8px;display:none"></div>
+  <div class="btn-row">
+    <button class="btn btn-primary" onclick="runPrecheck()">🛡 迁移前兼容性预检（dry-run，不搬数据）</button>
   </div>
+  <div id="preBox" class="logbox" style="display:none"></div>
   <div id="execList"></div>
-  <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
-    <button class="btn primary" onclick="runAll()">▶ 全部执行（种子→桥接→校验）</button>
+  <div class="btn-row">
+    <button class="btn btn-primary" onclick="runAll()">▶ 全部执行（种子→桥接→校验）</button>
     <button class="btn" onclick="showHistory()">📜 查看历史迁移任务</button>
     <button class="btn" onclick="setStep(2)">← 上一步：改目标</button>
-    <button class="btn primary" id="nextStageBtn" style="display:none" onclick="gotoStep4()">进入下一阶段：停桥切换 →</button>
+    <button class="btn btn-primary" id="nextStageBtn" style="display:none" onclick="gotoStep4()">进入下一阶段：停桥切换 →</button>
   </div>
   <div id="progWrap" style="margin-top:12px;display:none">
     <div style="display:flex;justify-content:space-between;align-items:baseline;font-size:13px;margin-bottom:6px">
@@ -168,21 +180,31 @@
 <div class="card" id="step4" style="display:none">
   <h3>④ 停桥切换（cutover，需人工确认）</h3>
   <p class="bk-note">此操作不可逆转：将停止目标对源的复制、清除桥接通道，并把目标节点登记进 Custos（monitor 自动提升新主）。请在确认数据已追平、并已准备手动切换 VIP 后执行。</p>
-  <button class="btn" onclick="setStep(3)">← 上一步：返回校验</button>
-  <div id="stopWriteNote" class="bk-note" style="display:none;margin-top:10px">
+  <div id="stopWriteNote" class="bk-note warn" style="display:none;margin-top:10px">
     ⚠ <b>停写迁移模式</b>：源库未开启 binlog，本任务<b>没有桥接通道</b>，因此不存在「追平」这一环节。
     请<b>先确认业务已停止写入源库</b>，然后勾选下方「源库已停写」即可解锁切换。
     源库仍在写入就切换 ⇒ 这部分增量将<b>永久丢失</b>。
   </div>
-  <div id="lagRow" style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;align-items:center">
+  <div id="lagRow" class="btn-row">
     <button class="btn" onclick="runLagCheck()">🔍 追平检测（切换前必做）</button>
     <span class="st wait" id="lagState">未检测</span>
   </div>
-  <div id="freezeRow" style="display:none;gap:10px;margin-top:10px;flex-wrap:wrap;align-items:center">
+  <div id="freezeRow" class="btn-row" style="display:none">
     <button class="btn" onclick="runFreezeCheck()">🔍 停写检测（确认源库已停写）</button>
     <span class="st wait" id="freezeState">未检测</span>
   </div>
   <div id="freezeBox" class="logbox" style="margin-top:8px;display:none"></div>
+  <div id="lagProgWrap" style="margin-top:10px;display:none">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;font-size:13px;margin-bottom:6px">
+      <span id="lagProgStage" style="color:var(--text);font-weight:600">正在追平…</span>
+      <span id="lagProgPct" style="color:var(--muted);font-variant-numeric:tabular-nums">0%</span>
+    </div>
+    <div style="height:10px;background:var(--surface-3);border-radius:6px;overflow:hidden">
+      <div id="lagProgBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--primary),var(--accent,#0ABAB5));transition:width .4s ease"></div>
+    </div>
+    <div id="lagProgInfo" style="color:var(--muted);font-size:12px;margin-top:6px;line-height:1.6"></div>
+    <button class="btn" style="margin-top:8px" onclick="stopLagTrackByUser()">停止追踪</button>
+  </div>
   <div id="lagBox" class="logbox" style="margin-top:8px;display:none"></div>
   <div id="fixBridgeWrap" style="display:none;margin-top:8px">
     <button class="btn" onclick="backToBridge()">← 返回第三步，重跑「建立桥接」</button>
@@ -203,7 +225,10 @@
       </div>
     </div>
   </div>
-  <button class="btn primary" id="cutBtn" disabled onclick="showCutover()">⚠ 执行停桥切换（需先追平）</button>
+  <div class="btn-row">
+    <button class="btn" onclick="setStep(3)">← 上一步：返回校验</button>
+    <button class="btn btn-primary" id="cutBtn" disabled onclick="showCutover()">⚠ 执行停桥切换（需先追平）</button>
+  </div>
   <div class="logbox" id="cutLog" style="margin-top:10px"></div>
 </div>
 
@@ -213,9 +238,11 @@
     ① 源库执行 <code>DROP USER IF EXISTS 'replication'@'%'</code> —— 回收桥接专用的源端复制账号；<br>
     ② 源库执行 <code>SET GLOBAL read_only=ON</code> —— 将老主置为只读暖备（保留期后下线）。<br>
     目标集群的新主 203 及其从节点（如 213/33）不受影响，仍由 Custos 正常托管。</p>
-  <button class="btn" onclick="setStep(4)">← 上一步：返回切换</button>
-  <button class="btn" onclick="runCleanup()">回收源端账号 / 老主只读</button>
-  <button class="btn primary" onclick="skipCleanup()">✓ 直接完成（不改动源库）</button>
+  <div class="btn-row">
+    <button class="btn" onclick="setStep(4)">← 上一步：返回切换</button>
+    <button class="btn" onclick="runCleanup()">回收源端账号 / 老主只读</button>
+    <button class="btn btn-primary" onclick="skipCleanup()">✓ 直接完成（不改动源库）</button>
+  </div>
   <div class="logbox" id="cleanLog" style="margin-top:10px"></div>
   <div id="doneBox" style="margin-top:12px;display:none" class="banner ok">✓ 迁移完成。请在外部手动切换 VIP，老主已置只读暖备。</div>
 </div>
@@ -230,7 +257,7 @@
     <p>4. 操作前请确认校验步骤已通过、复制已追平（SHOW REPLICA STATUS 的 Seconds_Behind_Master≈0）。</p>
     <div class="acts">
       <button class="btn" onclick="hideCutover()">取消</button>
-      <button class="btn danger" id="cutConfirmBtn" onclick="runCutover()">确认切换</button>
+      <button class="btn btn-danger" id="cutConfirmBtn" onclick="runCutover()">确认切换</button>
     </div>
   </div>
 </div>
@@ -387,7 +414,7 @@ function buildExecList(){
   // 停写模式（源库未开 binlog）：不建桥接，隐藏该步骤并说明原因
   const steps = (STATE.mode === "stopwrite") ? all.filter(x=>x[0]!=="bridge") : all;
   let html = steps.map(([k,label])=>
-    '<div class="run-row"><button class="btn primary" onclick="runStep(\''+k+'\')">执行</button>'+
+    '<div class="run-row"><button class="btn btn-primary" onclick="runStep(\''+k+'\')">执行</button>'+
     '<span class="kv">'+label+'</span><span class="st wait" id="st_'+k+'">待执行</span></div>'
   ).join("");
   if(STATE.mode === "stopwrite"){
@@ -523,6 +550,9 @@ async function runAll(){
   }
 }
 function gotoStep4(){
+  // 离开/进入第四步都停掉正在进行的追平追踪，避免后台空转
+  stopLagTrack();
+  $("lagProgWrap").style.display = "none";
   // 每次进入第四步都重置追平门禁：必须重新检测通过才允许切换
   STATE.lagOk = false;
   const cb = $("cutBtn"); if(cb){ cb.disabled = true; }
@@ -596,43 +626,123 @@ function toggleNoLag(){
 }
 
 /* 停桥前追平检测：只读（SHOW REPLICA STATUS），未追平【禁止】切换。
-   切换即切断 177→203 桥接，任何残留延迟都会变成永久丢失，故门禁放在前端强校验。 */
-async function runLagCheck(){
-  $("lagState").className = "st wait"; $("lagState").textContent = "检测中…";
-  $("lagBox").style.display = "block"; $("lagBox").textContent = "正在读取目标复制状态…";
-  const b = await postJSON("/api/migration/"+STATE.taskId+"/lag", {});
-  if(!b.ok){
-    $("lagState").className = "st err"; $("lagState").textContent = "检测失败";
-    $("lagBox").textContent = "检测失败: " + b.error;
-    STATE.lagOk = false; $("cutBtn").disabled = true; return;
-  }
+   切换即切断 177→203 桥接，任何残留延迟都会变成永久丢失，故门禁放在前端强校验。
+
+   追平是【持续过程】，故这里不是读一次就完：以首次采样到的延迟为基准持续追踪，
+   用进度条实时反映「剩余延迟被消化的百分比」，追到 0 才解锁切换。 */
+const LAG_TRACK_INTERVAL_MS = 2000;   // 采样间隔
+const LAG_TRACK_MAX_SEC     = 300;    // 最长追踪 5 分钟，超时后提示可再次检测
+let _lagTimer = null, _lagBase = null, _lagStart = 0, _lagPrev = null, _lagStuck = 0;
+let _lagTracking = false;   // 是否处于追踪中（_lagFinish / stopLagTrack 置 false）
+
+function _lagRender(b, elapsed){
+  const sb = (b.seconds_behind === null || b.seconds_behind === undefined) ? null : b.seconds_behind;
+  let pct = 0;
+  if(sb === 0) pct = 100;
+  else if(_lagBase && sb !== null && sb < _lagBase) pct = Math.max(0, Math.min(100, (_lagBase - sb) / _lagBase * 100));
+  $("lagProgBar").style.width = pct.toFixed(1) + "%";
+  $("lagProgPct").textContent = pct.toFixed(0) + "%";
+  $("lagProgStage").textContent = (pct >= 100) ? "✅ 已追平" : "正在追平…";
+  $("lagProgInfo").innerHTML = [
+    "基准延迟：<b>" + (_lagBase === null ? "-" : _lagBase) + " 秒</b>　当前延迟：<b>"
+      + (sb === null ? "未知（复制未运行）" : sb + " 秒") + "</b>　已用时：<b>" + elapsed + " 秒</b>",
+    "IO 线程：" + (b.io_running || "-") + "　SQL 线程：" + (b.sql_running || "-"),
+    (b.last_error ? "复制错误：" + b.last_error : "")
+  ].filter(Boolean).join("<br>");
+}
+
+function _lagFinish(b, ok, elapsed){
+  stopLagTrack();
   const sb = (b.seconds_behind === null || b.seconds_behind === undefined) ? "未知" : b.seconds_behind;
+  $("lagBox").style.display = "block";
   $("lagBox").textContent = [
     "IO  线程 : " + (b.io_running || "-"),
     "SQL 线程 : " + (b.sql_running || "-"),
     "延迟(Seconds_Behind_Master) : " + sb + " 秒",
-    "复制账号自检 : " + (b.acct_ok === undefined ? "未执行"
+    "复制账号自检 : " + (b.acct_ok == null ? "未执行（追踪采样已跳过）"
         : (b.acct_ok ? ("管理端可连源 ✅（账号 " + (b.acct_user||"") + "）")
                      : ("管理端连源失败 ❌ " + (b.acct_error||"")))),
     "复制错误 : " + (b.last_error || "无"),
+    "追踪用时 : " + elapsed + " 秒",
     "────────────",
-    (b.caught_up ? "✅ 已追平，可以切换。" : "❌ 未追平：" + (b.reason||"")),
+    (ok ? "✅ 已追平，可以切换。" : "❌ 未追平：" + (b.reason||"")),
     b.hint ? ("→ 处理建议：" + b.hint) : ""
   ].filter(Boolean).join("\n");
-  STATE.lagOk = !!b.caught_up;
-  $("fixBridgeWrap").style.display = (!b.caught_up && b.need_bridge) ? "block" : "none";
-  if(b.caught_up){
+  STATE.lagOk = !!ok;
+  $("fixBridgeWrap").style.display = (!ok && b.need_bridge) ? "block" : "none";
+  if(ok){
     $("lagState").className = "st ok"; $("lagState").textContent = "已追平";
     $("cutBtn").disabled = false; $("cutBtn").textContent = "⚠ 执行停桥切换";
   }else{
     $("lagState").className = "st err"; $("lagState").textContent = "未追平";
     $("cutBtn").disabled = true;
-    if(b.need_bridge){
-      alert("尚未追平：" + (b.reason||"") + "\n\n" + (b.hint||""));
-    }else{
-      alert("尚未追平：" + (b.reason||"") + "\n\n请等待目标追平后再检测，确认追平后才允许停桥切换。");
-    }
+    const tail = b.need_bridge ? (b.hint||"") : "请等待目标追平后再检测，确认追平后才允许停桥切换。";
+    alert("尚未追平：" + (b.reason||"") + "\n\n" + tail);
   }
+}
+
+async function _lagSample(isFirst){
+  const elapsed = Math.round((Date.now() - _lagStart) / 1000);
+  let b;
+  try{
+    // 仅首次做「复制账号自检」（会连源库）；高频追踪时跳过，避免反复连老主
+    b = await postJSON("/api/migration/"+STATE.taskId+"/lag", {skip_acct: !isFirst});
+  }catch(e){
+    _lagFinish({reason:"检测请求失败："+e}, false, elapsed); return;
+  }
+  if(!b.ok){ _lagFinish({reason:b.error}, false, elapsed); return; }
+  // 首次采样：记录基准延迟
+  if(_lagBase === null && typeof b.seconds_behind === "number") _lagBase = b.seconds_behind;
+
+  // 复制通道消失 / 有致命错误：立即停止追踪并上报
+  if(b.why || b.last_error || b.caught_up){
+    _lagRender(b, elapsed);
+    _lagFinish(b, !!b.caught_up, elapsed);
+    return;
+  }
+  // 停滞检测：延迟连续 5 次没有下降 => 提示可能卡住
+  const cur = (typeof b.seconds_behind === "number") ? b.seconds_behind : null;
+  if(cur !== null && _lagPrev !== null && cur >= _lagPrev) _lagStuck++; else _lagStuck = 0;
+  _lagPrev = cur;
+  _lagRender(b, elapsed);
+  if(_lagStuck >= 5){
+    $("lagProgStage").textContent = "⚠ 延迟未继续下降";
+    $("lagProgInfo").innerHTML += "<br>延迟连续 5 次采样未见下降，可能是源库写入速度超过追平速度，或复制卡住。";
+  }
+  if(elapsed >= LAG_TRACK_MAX_SEC){
+    _lagFinish(b, false, elapsed);
+    alert("已追踪 " + elapsed + " 秒仍未追平（当前延迟 " +
+          (cur === null ? "未知" : cur + " 秒") + "）。\n\n" +
+          "追平可能仍在进行，请稍后再次点击「追平检测」继续观察。");
+  }
+}
+
+function stopLagTrack(){
+  if(_lagTimer){ clearInterval(_lagTimer); _lagTimer = null; }
+  _lagTracking = false;
+}
+
+// 用户手动停止：保留进度条当前状态，明确提示可再次检测
+function stopLagTrackByUser(){
+  stopLagTrack();
+  $("lagState").className = "st wait"; $("lagState").textContent = "已停止追踪";
+  $("lagProgStage").textContent = "已停止追踪";
+  $("lagProgInfo").innerHTML += "<br>已手动停止（追平可能仍在后台进行）。可再次点击「追平检测」继续观察。";
+}
+
+async function runLagCheck(){
+  stopLagTrack();
+  _lagBase = null; _lagPrev = null; _lagStuck = 0; _lagStart = Date.now();
+  $("lagState").className = "st wait"; $("lagState").textContent = "追踪中…";
+  $("lagBox").style.display = "none";
+  $("lagProgWrap").style.display = "block";
+  $("lagProgBar").style.width = "0%"; $("lagProgPct").textContent = "0%";
+  $("lagProgStage").textContent = "正在追平…";
+  $("lagProgInfo").textContent = "正在读取目标复制状态…";
+  _lagTracking = true;
+  await _lagSample(true);
+  // 若首次采样后仍未结束（还在追平），启动周期追踪
+  if(_lagTracking) _lagTimer = setInterval(()=>_lagSample(false), LAG_TRACK_INTERVAL_MS);
 }
 
 /* 跳过收尾直接完成：不回收源端账号、不置老主只读，源库 177 保持原状。 */
