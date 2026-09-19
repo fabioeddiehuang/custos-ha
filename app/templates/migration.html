@@ -133,6 +133,8 @@
   <div class="wz-step" data-step="5"><span class="idx">5</span><div><div class="t">收尾回收</div><div class="s">cleanup</div></div></div>
 </div>
 
+<div id="wzGuide" style="margin:10px 0;padding:10px 12px;border:1px solid var(--border,var(--surface-3));border-radius:8px;background:var(--surface-2,rgba(127,127,127,.06))"></div>
+
 <div class="card" id="step1">
   <div class="step-head"><span class="num">1</span><h3>录入源 MariaDB 集群（主库）</h3></div>
   <div class="mig-type" id="migTypeBar">
@@ -235,6 +237,12 @@
   </div>
   <div id="preBox" class="logbox" style="display:none"></div>
   <div id="execList"></div>
+  <label style="display:block;margin-top:8px;font-size:12px;color:var(--muted)">
+    <input type="checkbox" id="deepVerifyChk"> 一致性校验时同时做内容级比对（CHECKSUM，较慢但更强，建议切换前跑一次）
+  </label>
+  <div id="verifyBox" style="margin-top:10px;display:none"></div>
+  <div id="binlogPlanBox" style="margin-top:10px;display:none"></div>
+  <div id="stepErrBox" style="margin-top:10px;display:none"></div>
   <div class="btn-row">
     <button class="btn btn-primary" onclick="runAll()">▶ 全部执行（种子→桥接→校验）</button>
     <button class="btn" onclick="showHistory()">📜 查看历史迁移任务</button>
@@ -299,7 +307,7 @@
           勾选即跳过追平检测、直接解锁「执行停桥切换」。
         </div>
         <div style="color:var(--muted);margin-top:4px">
-          ⚠ 仅当老主 177 已停止写入时才可勾选；若源库仍在写入就跳过，
+          ⚠ 仅当源库（原主库）已停止写入时才可勾选；若源库仍在写入就跳过，
           这部分增量数据将<b>永久丢失</b>、无法找回。
         </div>
       </div>
@@ -314,17 +322,25 @@
 
 <div class="card" id="step5" style="display:none">
   <div class="step-head"><span class="num">5</span><h3>收尾回收</h3></div>
-  <p class="bk-note">本步仅作用于<b>源库（老主）</b>，<b>绝不改动目标集群（新主 203）</b>。将执行：<br>
-    ① 源库执行 <code>DROP USER IF EXISTS 'replication'@'%'</code> —— 回收桥接专用的源端复制账号；<br>
-    ② 源库执行 <code>SET GLOBAL read_only=ON</code> —— 将老主置为只读暖备（保留期后下线）。<br>
-    目标集群的新主 203 及其从节点（如 213/33）不受影响，仍由 Custos 正常托管。</p>
+  <div class="bk-note">
+    <div><b>本步仅作用于源库（原主库），绝不改动目标集群（新主）。</b></div>
+    <div style="margin-top:6px">① 回收桥接专用的源端复制账号 —— 源库执行
+      <code>DROP USER IF EXISTS 'replication'@'%'</code>。</div>
+    <div>② 把源库置为只读暖备（保留期后再下线）—— 源库执行
+      <code>SET GLOBAL read_only=ON</code>。</div>
+    <div style="margin-top:6px">⚠ 关于「只读」的两个前提：<code>read_only</code>
+      <b>只限制非特权账号</b>写入，root / SUPER 用户仍可写入；且它是<b>运行时变量、重启后会失效</b>，
+      要永久只读需写进配置文件。执行它还需要源库账号具备 SUPER 权限，
+      不具备时本步会如实上报未完成项，不会谎报成功。</div>
+    <div style="margin-top:6px">目标集群（新主及其从节点）不受影响，仍由 Custos 正常托管。</div>
+  </div>
   <div class="btn-row">
     <button class="btn" onclick="setStep(4)">← 上一步：返回切换</button>
-    <button class="btn" onclick="runCleanup()">回收源端账号 / 老主只读</button>
+    <button class="btn" onclick="runCleanup()">回收源端账号 / 源库置只读</button>
     <button class="btn btn-primary" onclick="skipCleanup()">✓ 直接完成（不改动源库）</button>
   </div>
   <div class="logbox" id="cleanLog" style="margin-top:10px"></div>
-  <div id="doneBox" style="margin-top:12px;display:none" class="banner ok">✓ 迁移完成。请在外部手动切换 VIP，老主已置只读暖备。</div>
+  <div id="doneBox" style="margin-top:12px;display:none" class="banner ok">✓ 迁移完成。请在外部手动切换 VIP，源库已置只读暖备。</div>
 </div>
 
 <!-- 切流确认弹窗 -->
@@ -332,7 +348,7 @@
   <div class="modal">
     <h3>确认执行停桥切换？</h3>
     <p>1. 目标停止从源复制（STOP REPLICA）并清除桥接通道。</p>
-    <p>2. 目标节点登记进 Custos（<b>沿用既有集群，新主 203 不会被移出集群</b>），monitor 自动提升新主、接管 HA。</p>
+    <p>2. 目标节点登记进 Custos（<b>沿用既有集群，新主不会被移出集群</b>），monitor 自动提升新主、接管 HA。</p>
     <p>3. <b>VIP 需你在外部手动切换</b>（Custos 不自动接管本场景 VIP）。</p>
     <p>4. 操作前请确认校验步骤已通过、复制已追平（SHOW REPLICA STATUS 的 Seconds_Behind_Master≈0）。</p>
     <div class="acts">
@@ -388,6 +404,45 @@ function setStep(n){
   // 进度填充：连接线随当前步推进（4% 内边距，可用宽度 92%）
   const f = $("wzFill");
   if(f){ f.style.width = ((n-1)/(5-1)*92) + "%"; }
+  updateGuide(n);
+}
+
+/* ---- 迁移流程指引（让用户随时知道：走到哪一步 / 用哪种方式迁 / 接下来做什么）----
+   迁移方式由第一步探测「源库是否开启 binlog」自动决定，用户无需也无法手工选择：
+     bridge    = 源库已开 binlog，可建复制桥接并验证追平（安全）；
+     stopwrite = 源库未开 binlog，只能停写后一次性拷贝（无法验证追平）。          */
+function guideInfo(n){
+  const bridge = (STATE.mode === "bridge");
+  const next = ({
+    1: "录入源库地址与账号后点「探测」，确认版本、待迁库表，以及是否开启 binlog。",
+    2: "选择目标节点与迁移通道，填写目标 root 密码后创建迁移任务。",
+    3: bridge ? "依次执行「数据种子 → 建立桥接 → 一致性校验」；校验通过后点「进入下一阶段」。"
+              : "依次执行「数据种子 → 一致性校验」（源库未开 binlog，无桥接，不支持追平验证）。",
+    4: bridge ? "先点「追平检测」，确认目标已追平后再执行停桥切换。"
+              : "先确认源库已停写（可用「停写检测」辅助判断），再勾选确认并执行切换。",
+    5: "回收源端复制账号并把源库置为只读暖备；不想改动源库可直接完成。",
+  })[n] || "";
+  return {
+    way: bridge ? "桥接追平" : "停写迁移",
+    wayNote: bridge
+      ? "源库已开启 binlog：目标会持续追平原库的增量，切换前可以验证追平，数据不会丢。"
+      : "源库未开启 binlog：无法建立复制桥接，只能先让业务停写、再做一次性拷贝，切换依赖你确认源库已停写。",
+    next: next,
+  };
+}
+function updateGuide(n){
+  const el = $("wzGuide"); if(!el) return;
+  const g = guideInfo(n);
+  const wayCls = (STATE.mode === "bridge")
+    ? "background:rgba(46,204,113,.15);color:var(--ok,#2ecc71)"
+    : "background:rgba(230,162,60,.18);color:var(--warn,#e6a23c)";
+  el.innerHTML =
+    '<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:6px">'
+    + '<b style="font-size:13px">当前：第 ' + n + ' 步</b>'
+    + '<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;'
+    + 'font-weight:600;' + wayCls + '">迁移方式：' + g.way + '</span></div>'
+    + '<div style="font-size:12px;color:var(--muted);line-height:1.6">' + g.wayNote + '</div>'
+    + '<div style="font-size:12px;line-height:1.6;margin-top:4px"><b>接下来：</b>' + g.next + '</div>';
 }
 function markStepDone(n){ const s=document.querySelector('.wz-step[data-step="'+n+'"]'); if(s){s.classList.remove('on');s.classList.add('done');} }
 function markStepErr(n){ const s=document.querySelector('.wz-step[data-step="'+n+'"]'); if(s){s.classList.add('err');} }
@@ -549,7 +604,11 @@ function buildExecList(){
   if(STATE.mode === "stopwrite"){
     html += '<div class="bk-note" style="margin-top:8px">' +
       '⚠ <b>停写迁移模式</b>（源库未开 binlog，无法桥接）：本步只跑「数据种子 + 一致性校验」。' +
-      '<b>请先让业务停止写入源库</b>再执行数据种子，否则种子期间的新写入不会进入新集群。</div>';
+      '<b>请先让业务停止写入源库</b>再执行数据种子，否则种子期间的新写入不会进入新集群。' +
+      '<div style="margin-top:6px">没有追平验证 ⇒ 无法用复制延迟证明“已追平”，' +
+      '因此本向导改用<b>逐表行数比对 + 可选内容级校验</b>来确认数据已完整复制到目标主库。</div>' +
+      '<button class="btn" style="margin-top:6px" onclick="loadBinlogPlan()">' +
+      '🔧 查看「开启 binlog」方案（开启后即可桥接追平）</button></div>';
   }
   $("execList").innerHTML = html;
 }
@@ -636,9 +695,14 @@ function runStep(step){
   return new Promise((resolve)=>{
     const stEl = $("st_"+step);
     if(stEl){ stEl.className = "st wait"; stEl.textContent = "执行中…"; }
-    postJSON("/api/migration/"+STATE.taskId+"/step", {step}).then(b=>{
+    hideStepErr();
+    const body = {step};
+    // 内容级深度校验：可选开关（CHECKSUM 逐表比对，较慢，切换前建议跑一次）
+    if(step === "verify"){ body.deep = !!($("deepVerifyChk") && $("deepVerifyChk").checked); }
+    postJSON("/api/migration/"+STATE.taskId+"/step", body).then(b=>{
       if(!b.ok){
         if(stEl){ stEl.className = "st err"; stEl.textContent = "失败"; }
+        showStepErr(step, b.error);
         alert(step + " 启动失败: " + b.error); markStepErr(3); resolve(false); return;
       }
       startPolling(step, (rec, j)=>{
@@ -649,6 +713,10 @@ function runStep(step){
             appendLog("\n[种子 ✓] 工具=" + r.dump_tool + "，库=" +
                       JSON.stringify(r.databases||[]) +
                       (r.bytes ? ("，传输 " + (r.bytes/1048576).toFixed(1) + " MB") : ""));
+          }else if(step === "verify"){
+            const vr = rec.result || {};
+            appendLog("\n[校验 ✓] " + (vr.summary||""));
+            renderVerify(vr);
           }else if(step === "bridge"){
             appendLog("\n[桥接 ✓] " + ((rec.result||{}).note||""));
           }else{
@@ -661,12 +729,157 @@ function runStep(step){
           if(stEl){ stEl.className = "st err"; stEl.textContent = "失败"; }
           markStepErr(3);
           setProg(j.progress||0, "失败：" + (rec.error||"未知错误"));
+          showStepErr(step, rec.error, rec.result);
           alert(step + " 失败: " + (rec.error||"未知错误，详见日志"));
           resolve(false);
         }
       });
     });
   });
+}
+
+/* ================= 失败根因展示：不让「验证不通过」变成黑盒 =================
+   后端抛出的异常信息多为原始英文报错，用户看不懂也无法行动；这里按常见根因归类，
+   给出「是什么问题 + 为什么会导致验证不通过 + 怎么修」。 */
+function hideStepErr(){
+  const b = $("stepErrBox"); if(b){ b.style.display = "none"; b.innerHTML = ""; }
+}
+function rootCauseHint(err){
+  const e = String(err || "");
+  if(/1236|Binary log is not open/i.test(e))
+    return {title:"源库未开启 binlog",
+            detail:"目标无法从源库拉取 binlog 事件，因此【既不能建立桥接、也无法验证追平】。" +
+                   "修法二选一：① 在源库开启 binlog（改配置文件并重启）后重跑，即可走桥接追平；" +
+                   "② 保持停写迁移 —— 先让业务停写，再用「数据种子 + 一致性校验」确认数据完整。"};
+  if(/PROCESS/i.test(e))
+    return {title:"源库账号缺少 PROCESS 权限",
+            detail:"停写检测需要读取 SHOW GLOBAL STATUS（需 PROCESS 权限）。" +
+                   "请以源库管理员身份为迁移使用的账号授予 PROCESS，或换用具备该权限的账号。"};
+  if(/Access denied|1045/i.test(e))
+    return {title:"账号口令不正确，或不允许从该主机连入",
+            detail:"请确认第一步填写的源库账号密码正确，且该账号允许从管理器和目标节点连入（通常为 @'%'）。"};
+  if(/Can't connect|timed out|2003|2002/i.test(e))
+    return {title:"网络/端口不可达",
+            detail:"请确认端口可达（防火墙、容器端口映射、bind-address）。" +
+                   "特别注意：桥接时是【目标主动连源库】，必须保证目标能连到源库端口。"};
+  if(/SUPER/i.test(e))
+    return {title:"源库账号缺少 SUPER 权限",
+            detail:"置只读（SET GLOBAL read_only）等全局操作需要 SUPER。" +
+                   "该步骤已如实上报未完成项，不会谎报成功。"};
+  return null;
+}
+function showStepErr(step, err, result){
+  const box = $("stepErrBox"); if(!box) return;
+  const h = rootCauseHint(err);
+  let s = '<div style="padding:8px 10px;border-radius:8px;margin-bottom:8px;'
+        + 'background:rgba(231,76,60,.12);color:var(--danger)">'
+        + '<b>' + (step||"步骤") + ' 未通过</b>'
+        + '<div style="margin-top:4px;white-space:pre-wrap;font-size:12px">'
+        + String(err || "未知错误") + '</div></div>';
+  if(h){
+    s += '<div style="font-size:12px;line-height:1.6;margin-bottom:6px">'
+       + '<b>根因：' + h.title + '</b>'
+       + '<div style="color:var(--muted);margin-top:2px">' + h.detail + '</div></div>';
+  }
+  if(/1236|Binary log is not open/i.test(String(err||""))){
+    s += '<button class="btn" style="margin-top:4px" onclick="loadBinlogPlan()">'
+       + '🔧 查看「开启 binlog」可执行方案</button>';
+  }
+  box.innerHTML = s; box.style.display = "block";
+}
+
+/* ================= 一致性校验明细：让用户逐表看到数据是否完整复制到目标主库 ================= */
+function renderVerify(r){
+  const box = $("verifyBox"); if(!box) return;
+  const ok = !!r.consistent;
+  let h = '<div style="padding:8px 10px;border-radius:8px;margin-bottom:8px;'
+        + (ok ? 'background:rgba(46,204,113,.12);color:var(--ok,#2ecc71)'
+              : 'background:rgba(231,76,60,.12);color:var(--danger)')
+        + '"><b>' + (ok ? '✅ ' : '⚠ ') + (r.summary || '校验完成') + '</b></div>';
+  if((r.missing||[]).length){
+    h += '<div style="font-size:12px;color:var(--danger);margin-bottom:6px"><b>目标缺失的表：</b>'
+       + r.missing.map(m => m.db + '.' + m.table + (m.reason ? '（' + m.reason + '）' : '')).join('、')
+       + '</div>';
+  }
+  const rows = r.tables || [];
+  if(rows.length){
+    h += '<div style="max-height:320px;overflow:auto">'
+       + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+       + '<thead><tr style="text-align:left;color:var(--muted)">'
+       + '<th style="padding:4px 6px">库.表</th><th style="padding:4px 6px">源库行数</th>'
+       + '<th style="padding:4px 6px">目标行数</th>'
+       + (r.deep ? '<th style="padding:4px 6px">内容校验</th>' : '')
+       + '<th style="padding:4px 6px">结果</th></tr></thead><tbody>';
+    for(const t of rows){
+      const bad = !t.rows_ok;
+      const ck = (t.ck_ok === true) ? '一致' : (t.ck_ok === false ? '有差异' : (t.ck_note ? '不可用' : '-'));
+      const rs = (t.rows_src === null || t.rows_src === undefined) ? '-' : t.rows_src;
+      const rt = (t.rows_tgt === null || t.rows_tgt === undefined) ? '-' : t.rows_tgt;
+      h += '<tr style="border-top:1px solid var(--surface-3)">'
+         + '<td style="padding:4px 6px;font-family:monospace">' + t.db + '.' + t.table + '</td>'
+         + '<td style="padding:4px 6px">' + rs + '</td>'
+         + '<td style="padding:4px 6px">' + rt + '</td>'
+         + (r.deep ? '<td style="padding:4px 6px">' + ck + '</td>' : '')
+         + '<td style="padding:4px 6px;color:' + (bad ? 'var(--danger)' : 'var(--ok,#2ecc71)') + '">'
+         + (bad ? '不一致' : '一致') + (t.note ? '（' + t.note + '）' : '') + '</td></tr>';
+    }
+    h += '</tbody></table></div>';
+  }
+  if(r.deep){
+    const c = r.checksum || {};
+    h += '<div style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.6">'
+       + '内容级校验（CHECKSUM）已对 ' + (c.checked||0) + ' 张表执行'
+       + ((c.unsupported||0) ? ('，' + c.unsupported + ' 张不支持') : '') + '。'
+       + '注意：跨大版本或不同行格式时 CHECKSUM 可能出现“非真实差异”的告警，'
+       + '请以行数比对为准，内容差异建议人工抽检确认。</div>';
+  }
+  box.innerHTML = h; box.style.display = "block";
+}
+
+/* ================= 开启 binlog 方案面板 =================
+   log_bin 是静态变量，必须改配置并重启；容器化部署时宿主机 /etc/my.cnf 常常并不生效，
+   所以这里优先让用户用命令定位「真正生效」的那份配置文件，再给配置项与操作步骤。 */
+async function loadBinlogPlan(){
+  const box = $("binlogPlanBox"); if(!box) return;
+  box.style.display = "block";
+  box.textContent = "正在生成方案…";
+  const b = await postJSON("/api/migration/plan_binlog", {
+    src_host:$("srcHost").value.trim(), src_port:+$("srcPort").value||3306,
+    src_user:$("srcUser").value.trim()||"root", src_pass:$("srcPass").value,
+    tgt_host:$("tgtHost").value.trim(), tgt_port:+$("tgtPort").value||3306,
+    tgt_root_pass:$("tgtRoot").value,
+  });
+  if(!b.ok){ box.textContent = "生成失败: " + (b.error||"未知错误"); return; }
+  const sid = (b.server_id === null || b.server_id === undefined) ? '-' : b.server_id;
+  const tsid = (b.tgt_server_id === null || b.tgt_server_id === undefined) ? '-' : b.tgt_server_id;
+  const lbin = (b.log_bin === null || b.log_bin === undefined) ? '-' : b.log_bin;
+  let h = '<div style="font-size:13px;font-weight:600;margin-bottom:6px">开启 binlog 的可执行方案</div>';
+  if(b.warn_container){
+    h += '<div style="padding:8px 10px;border-radius:8px;font-size:12px;line-height:1.6;'
+       + 'margin-bottom:8px;background:rgba(231,76,60,.12);color:var(--danger)">'
+       + b.warn_container + '</div>';
+  }
+  h += '<div style="font-size:12px;line-height:1.7;margin-bottom:8px">'
+     + '当前实测：version=<code>' + (b.version||'-') + '</code>，datadir=<code>' + (b.datadir||'-')
+     + '</code>，server_id=<code>' + sid + '</code>，log_bin=<code>' + lbin
+     + '</code>，目标 server_id=<code>' + tsid + '</code></div>';
+  h += '<div style="font-size:12px;color:var(--muted);margin-bottom:4px">'
+     + '<b>① 先定位真正生效的配置文件</b>（容器化部署时宿主机 /etc/my.cnf 往往不生效）：</div>'
+     + '<pre class="logbox" style="white-space:pre-wrap;margin:0 0 8px">'
+     + (b.config_locator||[]).join("\n") + '</pre>';
+  h += '<div style="font-size:12px;color:var(--muted);margin-bottom:4px">'
+     + '<b>② 配置项</b>（server_id 已避开与目标冲突）：</div>'
+     + '<pre class="logbox" style="white-space:pre-wrap;margin:0 0 8px">' + (b.snippet||'') + '</pre>';
+  h += '<div style="font-size:12px;color:var(--muted);margin-bottom:4px"><b>③ 操作步骤</b>：</div>'
+     + '<div style="font-size:12px;line-height:1.7">'
+     + (b.steps||[]).map(s => '· ' + s).join('<br>') + '</div>';
+  if(b.binlog_path){
+    h += '<div style="font-size:12px;color:var(--muted);margin-top:6px">建议 binlog 路径：<code>'
+       + b.binlog_path + '</code>'
+       + (b.need_log_slave_updates ? '；该库自身还挂着从库，需同时配置 log_slave_updates=ON。' : '')
+       + '</div>';
+  }
+  box.innerHTML = h;
 }
 
 // 一键顺序执行：桥接模式 = 种子→桥接→校验；停写模式 = 种子→校验（跳过桥接）
@@ -735,7 +948,7 @@ async function runFreezeCheck(){
 // 检测失败且「未停桥」时，引导回第三步重跑「建立桥接」（该步骤支持重复执行）
 function backToBridge(){
   alert("请点击「建立桥接」那一行的【执行】按钮重跑。\n" +
-        "桥接支持重复执行；成功后目标会重建 177→203 复制通道，\n" +
+        "桥接支持重复执行；成功后目标会重建「源库 → 目标集群」的复制通道，\n" +
         "回到本步再点「追平检测」即可。");
   setStep(3);
 }
@@ -745,7 +958,7 @@ function toggleNoLag(){
   const chk = $("noLagChk");
   if(chk.checked){
     if(!confirm("⚠ 危险操作确认\n\n" +
-        "勾选表示你确认：源库（老主 177）已经停止写入、不会再产生新数据。\n\n" +
+        "勾选表示你确认：源库（原主库）已经停止写入、不会再产生新数据。\n\n" +
         "如果源库仍在写入就跳过追平检测，\n" +
         "这部分增量数据将【永久丢失、无法找回】。\n\n" +
         "确认源库确实已停写？")){ chk.checked = false; return; }
@@ -760,7 +973,7 @@ function toggleNoLag(){
 }
 
 /* 停桥前追平检测：只读（SHOW REPLICA STATUS），未追平【禁止】切换。
-   切换即切断 177→203 桥接，任何残留延迟都会变成永久丢失，故门禁放在前端强校验。
+   切换即切断「源库 → 目标集群」的桥接，任何残留延迟都会变成永久丢失，故门禁放在前端强校验。
 
    追平是【持续过程】，故这里不是读一次就完：以首次采样到的延迟为基准持续追踪，
    用进度条实时反映「剩余延迟被消化的百分比」，追到 0 才解锁切换。 */
@@ -879,11 +1092,11 @@ async function runLagCheck(){
   if(_lagTracking) _lagTimer = setInterval(()=>_lagSample(false), LAG_TRACK_INTERVAL_MS);
 }
 
-/* 跳过收尾直接完成：不回收源端账号、不置老主只读，源库 177 保持原状。 */
+/* 跳过收尾直接完成：不回收源端账号、不把源库置只读，源库保持原状。 */
 async function skipCleanup(){
   if(!confirm("确认「直接完成」？\n\n将【不会】执行：\n" +
               "  ① 源库 DROP 桥接复制账号\n" +
-              "  ② 源库 SET GLOBAL read_only=ON（老主只读）\n\n" +
+              "  ② 源库 SET GLOBAL read_only=ON（源库置只读）\n\n" +
               "源端服务器保持原状、不作任何改动，迁移到此结束。")) return;
   const b = await postJSON("/api/migration/"+STATE.taskId+"/skip_cleanup", {});
   if(!b.ok){ alert("跳过失败: "+b.error); return; }
@@ -903,7 +1116,7 @@ function showCutover(){
          "本任务为停写迁移模式（源库未开 binlog，无桥接通道），\n" +
          "必须先确认业务已停止写入源库，否则增量数据将永久丢失。")
       : ("请先点击「追平检测」并确认已追平，才能执行停桥切换。\n" +
-         "（切换会切断 177→203 桥接，未追平的残留延迟会造成永久数据丢失）"));
+         "（切换会切断「源库 → 目标集群」的桥接，未追平的残留延迟会造成永久数据丢失）"));
     return;
   }
   const btn = $("cutConfirmBtn");
@@ -955,7 +1168,7 @@ async function runCleanup(){
     $("doneBox").style.display = "block";
     $("doneBox").textContent = failed.length
       ? "⚠ 迁移完成，但收尾有 "+failed.length+" 项未执行（源账号权限不足）。请在外部手动切换 VIP。"
-      : "✓ 迁移完成。请在外部手动切换 VIP，老主已置只读暖备。";
+      : "✓ 迁移完成。请在外部手动切换 VIP，源库已置只读暖备。";
     if(failed.length) alert("收尾有未完成项（不会谎报成功）：\n\n" + failed.join("\n"));
   });
 }

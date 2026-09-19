@@ -987,45 +987,118 @@ def bridge(task):
         conn.close()
 
 
-def verify(task):
-    """逐表行数比对（源 vs 目标）+ 复制状态。"""
+def verify(task, deep=False):
+    """数据一致性校验：确认源库数据已【完整】复制到新集群主库。
+
+    判据分三层，逐层加强，任一层不达标都会在结果里逐条列出便于定位：
+      ① 表级存在性：源库有、目标没有 ⇒ 数据没迁全（最关键，缺表必须暴露）；
+      ② 表级行数：逐表 COUNT(*) 比对（快速一致性判据）；
+      ③ 表级内容：CHECKSUM TABLE 比对（deep=True 才做；较慢，且跨大版本 / 不同
+         引擎行格式可能产生差异，故仅作参考，不推翻 ①② 的结论）。
+
+    ⚠ 为什么不能只回一个 "ok"：用户要看到「哪些表一致、哪些不一致」才敢切换；
+      此前只返回行数有差异的表名列表，且前端直接 JSON 打印整体结果，用户难以
+      判断数据到底迁没迁全（缺表还会直接抛异常中断整个校验）。
+    """
     cfg = task["config"]
     src = (cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"])
     tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
     databases = cfg.get("databases") or []
-    diffs = []
-    tables_checked = 0
     s_conn = connect(*src, timeout=8)
     t_conn = connect(*tgt, timeout=8)
+    tables, missing, diffs = [], [], []
+    ck_checked = ck_mismatch = ck_unsupported = 0
     try:
         for db in databases:
-            cs = s_conn.cursor()
-            cs.execute(
-                "SELECT TABLE_NAME FROM information_schema.TABLES "
-                "WHERE TABLE_SCHEMA=%s AND TABLE_TYPE='BASE TABLE'", (db,))
-            tbls = [x[0] for x in cs.fetchall()]
-            for tbl in tbls:
-                tables_checked += 1
-                q = f"SELECT COUNT(*) FROM `{db}`.`{tbl}`"
-                cs.execute(q)
-                n1 = cs.fetchone()[0]
-                ct = t_conn.cursor()
-                ct.execute(q)
-                n2 = ct.fetchone()[0]
-                if n1 != n2:
-                    diffs.append({"db": db, "table": tbl, "src": n1, "tgt": n2})
+            def _tables(conn, dbname):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT TABLE_NAME FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA=%s AND TABLE_TYPE='BASE TABLE'", (dbname,))
+                return set(x[0] for x in cur.fetchall())
+
+            s_tbls = _tables(s_conn, db)
+            try:
+                t_tbls = _tables(t_conn, db)
+            except Exception as e:
+                # 目标整库读不到 ⇒ 该库所有表都算缺失，并如实记录原因
+                t_tbls = set()
+                missing.append({"db": db, "table": "*",
+                                "reason": "读取目标库表清单失败：%s" % e})
+
+            # ① 缺表检测：目标库还没有 / 拼错库名等情况在此暴露，不再让 COUNT 抛异常中断
+            for tbl in sorted(s_tbls - t_tbls):
+                missing.append({"db": db, "table": tbl, "reason": "目标库中不存在该表"})
+
+            for tbl in sorted(s_tbls & t_tbls):
+                q = "SELECT COUNT(*) FROM `%s`.`%s`" % (db, tbl)
+                row = {"db": db, "table": tbl, "rows_src": None, "rows_tgt": None,
+                       "rows_ok": False, "note": ""}
+                try:
+                    cs = s_conn.cursor(); cs.execute(q); row["rows_src"] = cs.fetchone()[0]
+                    ct = t_conn.cursor(); ct.execute(q); row["rows_tgt"] = ct.fetchone()[0]
+                    row["rows_ok"] = (row["rows_src"] == row["rows_tgt"])
+                except Exception as e:
+                    row["note"] = "行数比对失败：%s" % e
+                if not row["rows_ok"]:
+                    diffs.append({"db": db, "table": tbl, "src": row["rows_src"],
+                                  "tgt": row["rows_tgt"], "reason": row["note"]})
+                # ③ 内容级校验（可选，逐表 CHECKSUM）
+                if deep:
+                    try:
+                        cq = "CHECKSUM TABLE `%s`.`%s`" % (db, tbl)
+                        cs = s_conn.cursor(); cs.execute(cq); r1 = cs.fetchone()
+                        ct = t_conn.cursor(); ct.execute(cq); r2 = ct.fetchone()
+                        row["ck_src"] = list(r1)[-1] if r1 else None
+                        row["ck_tgt"] = list(r2)[-1] if r2 else None
+                        if row["ck_src"] is None and row["ck_tgt"] is None:
+                            # CHECKSUM TABLE 在部分引擎/版本上对 InnoDB 直接返回 NULL。
+                            # 两侧同为 NULL 绝不能判为「一致」——那等于对不支持的表谎报成功，
+                            # 必须标记为「不可用」，让用户知道该表没被内容级校验覆盖。
+                            row["ck_ok"] = None
+                            row["ck_note"] = "该表不支持内容校验（CHECKSUM 返回空）"
+                            ck_unsupported += 1
+                        else:
+                            row["ck_ok"] = (row["ck_src"] == row["ck_tgt"])
+                            ck_checked += 1
+                            if not row["ck_ok"]:
+                                ck_mismatch.append({"db": db, "table": tbl,
+                                                    "src": row["ck_src"], "tgt": row["ck_tgt"]})
+                    except Exception as e:
+                        row["ck_ok"] = None
+                        row["ck_note"] = "内容校验不可用：%s" % e
+                        ck_unsupported += 1
+                tables.append(row)
     finally:
-        s_conn.close()
-        t_conn.close()
+        s_conn.close(); t_conn.close()
 
     # 复制状态（MariaDB：SHOW REPLICA STATUS，兼容 Replica_/Slave_ 两种列名）
     repl = _replica_status(tgt)
+    ok_n = sum(1 for t in tables if t["rows_ok"])
+    consistent = (not diffs) and (not missing)
+    if consistent:
+        summary = "已校验 %d 张表，行数全部一致" % ok_n
+    else:
+        summary = ("共 %d 张表：%d 张一致，%d 张行数不一致，%d 张目标缺失"
+                   % (len(tables) + len(missing), ok_n, len(diffs), len(missing)))
+    if deep:
+        summary += "；内容级校验 " + ("全部一致" if (ck_checked and not ck_mismatch)
+                                 else ("存在差异 %d 处" % len(ck_mismatch) if ck_mismatch
+                                       else "不可用"))
     return {
         "ok": True,
-        "tables_checked": tables_checked,
+        "deep": bool(deep),
+        "tables_checked": len(tables),
+        "tables_ok": ok_n,
         "diffs": diffs,
-        "consistent": len(diffs) == 0,
+        "missing": missing,
+        "consistent": consistent,
+        "tables": tables,
+        "checksum": {"enabled": bool(deep), "checked": ck_checked,
+                     "mismatch": ck_mismatch, "unsupported": ck_unsupported},
         "replica": repl,
+        "summary": summary,
+        "note": summary,
     }
 
 
@@ -1414,6 +1487,7 @@ def plan_binlog_enable(cfg):
 
         ver = _v("SELECT VERSION()")
         datadir = _v("SELECT @@datadir")
+        basedir = _v("SELECT @@basedir")
         server_id = _v("SELECT @@server_id")
         log_bin = _v("SELECT @@log_bin")
         replicas = []
@@ -1431,36 +1505,80 @@ def plan_binlog_enable(cfg):
     finally:
         conn.close()
 
+    # ---- 目标 server_id：源与目标的 server_id 必须不同，否则复制会因 id 相同直接失败 ----
+    tgt_sid = None
+    try:
+        if cfg.get("tgt_host"):
+            tc = connect(cfg["tgt_host"], int(cfg.get("tgt_port") or 3306), "root",
+                         cfg.get("tgt_root_pass") or "", timeout=5)
+            try:
+                tcur = tc.cursor()
+                tcur.execute("SELECT @@server_id")
+                tr = tcur.fetchone()
+                tgt_sid = int(tr[0]) if tr else None
+            finally:
+                tc.close()
+    except Exception:
+        tgt_sid = None
+
+    # ---- 部署形态推断：容器化 MariaDB 的宿主机 /etc/my.cnf 常常【并不生效】----
+    # 官方镜像版本串形如 10.11.17-MariaDB-ubu2204-log（带发行版后缀、无发行包修订号 ~）；
+    # 发行版包安装的形如 10.11.17-MariaDB-1:10.11.17+maria~ubu2204（含 ~）。据此粗判。
+    _ver = str(ver or "")
+    container_like = ("~" not in _ver) and any(
+        k in _ver for k in ("-ubu", "-ubi", "-deb", "-alma", "-rocky", "-centos", "-fedo"))
+
     try:
         sid = int(server_id)
     except Exception:
         sid = 0
     base = str(datadir or "/var/lib/mysql").rstrip("/")
     need_lsu = bool(is_slave or replicas)
+    # server_id：非 0，且与目标不冲突
+    final_sid = sid if sid else 1001
+    if tgt_sid is not None and final_sid == tgt_sid:
+        final_sid = (tgt_sid + 11) or 1001
     snippet = "\n".join([
         "[mysqld]",
-        "server_id      = %d" % (sid if sid else 1001),
+        "server_id      = %d" % final_sid,
         "log_bin        = %s/mysql-bin" % base,
         "binlog_format  = ROW",
     ] + (["log_slave_updates = ON   # 该库自身还挂着从库，需把上游变更写进自己的 binlog"]
          if need_lsu else [])
       + ["expire_logs_days = 7       # 按需调整，避免 binlog 占满磁盘（MariaDB 10.6+ 亦可用 binlog_expire_logs_seconds）"])
     steps = [
-        "1) 备份现有配置文件（如 cp /etc/mysql/my.cnf /etc/mysql/my.cnf.bak）。",
-        "2) 把下面的配置片段写进 my.cnf 的 [mysqld] 段（配置文件常见路径见下方候选）。",
+        "1) 先在源机上定位「真正生效」的配置文件（命令见 config_locator）——容器化部署时"
+        "宿主机 /etc/my.cnf 往往并不生效，必须以实际挂载 / mysqld 实际读取的那份为准。",
+        "2) 备份该文件后，把下面的片段加进其 [mysqld] 段（建议追加到文件末尾，"
+        "可避免被 include 的同名项覆盖）。",
         "3) 确认磁盘空间充足（binlog 会持续增长，务必设置过期清理）。",
-        "4) 重启 MariaDB 服务（如 systemctl restart mariadb）。",
+        "4) 重启 MariaDB（容器：docker restart <容器名>；系统服务：systemctl restart mariadb）。",
         "5) 回本向导重新探测；确认 log_bin=1 后会自动切回【桥接模式】。",
     ]
     return {
         "ok": True,
-        "version": ver, "datadir": datadir, "server_id": server_id, "log_bin": log_bin,
+        "version": ver, "datadir": datadir, "basedir": basedir,
+        "server_id": server_id, "log_bin": log_bin,
         "replicas": len(replicas), "is_slave": is_slave,
-        "suggest_server_id": sid if sid else 1001,
+        "suggest_server_id": final_sid,
+        "tgt_server_id": tgt_sid,
         "binlog_path": base + "/mysql-bin",
         "need_log_slave_updates": need_lsu,
+        "container_like": container_like,
         "cnf_candidates": ["/etc/mysql/mariadb.conf.d/50-server.cnf",
                            "/etc/mysql/my.cnf", "/etc/my.cnf", "/etc/my.cnf.d/server.cnf"],
+        "config_locator": [
+            "# 1) 先看 MariaDB 是不是跑在容器里",
+            "docker ps --format '{{.Names}}\\t{{.Image}}\\t{{.Ports}}' | grep -iE 'maria|mysql'",
+            "# 2) 若是容器：看它挂载了宿主机的哪份配置（这里的宿主机路径才是真正生效的）",
+            "docker inspect <容器名> --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'",
+            "# 3) 若是裸机服务：确认 mysqld 实际按顺序读取哪些配置文件",
+            "mysqld --verbose --help 2>/dev/null | head -20",
+        ],
+        "warn_container": ("" if not container_like else
+            "⚠ 该实例的版本串形如官方容器镜像，疑似跑在 Docker / 面板（如 1Panel）的容器里："
+            "宿主机 /etc/my.cnf 通常【不生效】，必须改容器挂载的那份配置，"
+            "否则照着改完、重启后 log_bin 依然为 0。"),
         "snippet": snippet, "steps": steps,
         "note": ("log_bin 为静态变量，必须改配置并重启 mysqld；本向导不会自动修改配置或重启服务"
                  "（数据库 root 也无权这么做）——以下方案供你在源机上执行。"),
@@ -1679,12 +1797,12 @@ def _cap_of(task):
                         cfg.get("tgt_flavor") or "mariadb")
 
 
-def _thread_body(tid, step):
+def _thread_body(tid, step, opts=None):
     rep = _Reporter(tid)
     try:
         rep.prog(0, "正在启动…")
         rep.log("开始步骤：%s" % STEP_LABELS.get(step, step))
-        result = _execute_step(tid, step)
+        result = _execute_step(tid, step, opts)
         _finish_step(tid, step, True, payload=result)
         rep.log("步骤完成：%s" % STEP_LABELS.get(step, step))
     except Exception as e:
@@ -1698,8 +1816,11 @@ def _thread_body(tid, step):
         _RUNNING.discard(tid)
 
 
-def start_step(task_id, step):
-    """异步启动一个步骤，HTTP 立即返回（真正的活交给后台线程）。"""
+def start_step(task_id, step, opts=None):
+    """异步启动一个步骤，HTTP 立即返回（真正的活交给后台线程）。
+
+    opts：可选附加参数。目前仅 {"deep": true} —— 触发一致性校验的内容级深度比对。
+    """
     task = get_task(task_id)
     if not task:
         return {"ok": False, "error": "任务不存在"}
@@ -1713,7 +1834,7 @@ def start_step(task_id, step):
     _RUNNING.add(task_id)
     _REP[task_id] = {"rep": _Reporter(task_id), "step": step}
     execute("UPDATE migration_tasks SET status='running',updated_at=NOW() WHERE id=%s", (task_id,))
-    threading.Thread(target=_thread_body, args=(task_id, step), daemon=True).start()
+    threading.Thread(target=_thread_body, args=(task_id, step, opts), daemon=True).start()
     return {"ok": True, "started": True, "step": step}
 
 
@@ -1728,8 +1849,8 @@ def run_step(task_id, step):
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-def _execute_step(task_id, step):
-    """真正干活（不含线程/落库）。"""
+def _execute_step(task_id, step, opts=None):
+    """真正干活（不含线程/落库）。opts 为可选附加参数（如 {"deep": true}）。"""
     task = get_task(task_id)
     if not task:
         raise ValueError("任务不存在")
@@ -1754,7 +1875,7 @@ def _execute_step(task_id, step):
                                "请在停写窗口内一次性拷贝后直接切换。")
         return bridge(task)
     if step == "verify":
-        return verify(task)
+        return verify(task, deep=bool((opts or {}).get("deep")))
     if step == "cutover":
         return cutover(task)
     if step == "cleanup":

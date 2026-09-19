@@ -2857,7 +2857,8 @@ async def api_migration_step(task_id: int, request: Request, user=Depends(auth_r
     """异步启动一步：立即返回，实际工作在后台线程，前端轮询 /status 看进度。"""
     b = await _json_body(request)
     step = b.get("step", "")
-    return _json_ok(_migration.start_step(task_id, step))
+    opts = {"deep": True} if b.get("deep") else None
+    return _json_ok(_migration.start_step(task_id, step, opts))
 
 
 @app.post("/api/migration/{task_id}/precheck")
