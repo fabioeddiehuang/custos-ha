@@ -313,7 +313,7 @@
       <input type="checkbox" id="noLagChk" onchange="toggleNoLag()"
              style="margin-top:2px;flex:0 0 auto;width:16px;height:16px">
       <div style="font-size:13px;line-height:1.6">
-        <div style="font-weight:600">源库已停写、无需追平</div>
+        <div style="font-weight:600">跳过检测（源库已停写、无需追平）</div>
         <div style="color:var(--muted);margin-top:2px">
           勾选即跳过追平检测、直接解锁「执行停桥切换」。
         </div>
@@ -365,6 +365,17 @@
     <div class="acts">
       <button class="btn" onclick="hideCutover()">取消</button>
       <button class="btn btn-danger" id="cutConfirmBtn" onclick="runCutover()">确认切换</button>
+    </div>
+  </div>
+</div>
+
+<!-- 迁移完成弹窗：完成确认 + 下一步该做什么 -->
+<div class="modal-mask" id="doneMask">
+  <div class="modal" style="width:660px;max-width:96vw">
+    <h3 id="doneTitle">✓ 迁移完成</h3>
+    <div id="doneBody" style="font-size:13px;line-height:1.75"></div>
+    <div class="acts">
+      <button class="btn btn-primary" onclick="closeDoneModal()">我知道了</button>
     </div>
   </div>
 </div>
@@ -1126,14 +1137,49 @@ async function skipCleanup(){
   $("doneBox").style.display = "block";
   $("doneBox").textContent =
     "✓ 迁移完成（已跳过收尾回收，源库未做任何改动）。请在外部手动切换 VIP。";
+  showDoneModal("skip", []);
 }
+
+/* 迁移完成弹窗：无论走「回收账号」还是「直接完成」，都必须明确告知已完成 + 下一步做什么。
+   两条路的【源库状态完全不同】（只读 vs 仍然可写），下一步说明必须区分 ——
+   否则走「直接完成」的用户会误以为源库已安全只读，新旧库同时被写将造成数据错乱。 */
+function showDoneModal(how, failed){
+  const cleaned = (how === "cleanup");
+  const warn = (failed && failed.length)
+    ? '<div style="padding:8px 10px;border-radius:8px;margin-bottom:10px;'
+      + 'background:rgba(231,76,60,.12);color:var(--danger);font-size:12px;line-height:1.6">'
+      + '<b>⚠ 收尾有 ' + failed.length + ' 项未执行（多为源账号权限不足）</b><br>'
+      + failed.join('<br>')
+      + '<div style="margin-top:4px">可补齐权限后重跑本步，或不再处理、按下方步骤继续。</div></div>'
+    : '';
+  const srcState = cleaned
+    ? '③ <b>源库已处置</b>：桥接复制账号已回收、源库已置为只读暖备。注意 '
+      + '<code>read_only</code> 只限制非特权账号（root / SUPER 仍可写），且<b>重启后会失效</b>；'
+      + '建议保留观察期，确认业务稳定后再下线老主。'
+    : '③ <b style="color:var(--danger)">⚠ 源库未做任何改动，仍然可写</b>：'
+      + '请务必先断开业务与源库的连接（或自行把源库设为只读），'
+      + '否则新旧库同时被写入会造成数据错乱。';
+  $("doneTitle").textContent = cleaned ? "✓ 迁移完成（已收尾回收）" : "✓ 迁移完成（已跳过收尾）";
+  $("doneBody").innerHTML = warn
+    + '<div>数据已迁移到目标集群，目标已由 Custos 接管（monitor 已提升新主并纳管 HA）。</div>'
+    + '<div style="margin-top:10px;font-weight:600">接下来请你做：</div>'
+    + '<div style="margin-top:4px">'
+    + '① <b>在外部手动切换 VIP</b>：把业务访问入口指向新集群 —— '
+    + 'Custos <b>不会</b>自动接管本场景的 VIP，这一步必须由你完成。<br>'
+    + '② <b>验证业务</b>：确认应用读写正常；建议先灰度放量、观察一段时间再全量切换。<br>'
+    + srcState + '<br>'
+    + '④ 本任务记录保留在「历史迁移」中，可随时查看详情或删除。'
+    + '</div>';
+  $("doneMask").classList.add("show");
+}
+function closeDoneModal(){ $("doneMask").classList.remove("show"); }
 
 let _cutTimer = null;
 function showCutover(){
   // 二次守卫：即使有人绕过按钮 disabled 也不允许未追平就切换
   if(!STATE.lagOk){
     alert(STATE.mode === "stopwrite"
-      ? ("请先勾选「源库已停写、无需追平」再执行切换。\n\n" +
+      ? ("请先勾选「跳过检测（源库已停写、无需追平）」再执行切换。\n\n" +
          "本任务为停写迁移模式（源库未开 binlog，无桥接通道），\n" +
          "必须先确认业务已停止写入源库，否则增量数据将永久丢失。")
       : ("请先点击「追平检测」并确认已追平，才能执行停桥切换。\n" +
@@ -1190,7 +1236,8 @@ async function runCleanup(){
     $("doneBox").textContent = failed.length
       ? "⚠ 迁移完成，但收尾有 "+failed.length+" 项未执行（源账号权限不足）。请在外部手动切换 VIP。"
       : "✓ 迁移完成。请在外部手动切换 VIP，源库已置只读暖备。";
-    if(failed.length) alert("收尾有未完成项（不会谎报成功）：\n\n" + failed.join("\n"));
+    // 完成弹窗统一告知「已完成 + 下一步」，未完成项也在弹窗里如实列出
+    showDoneModal("cleanup", failed);
   });
 }
 
