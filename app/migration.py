@@ -491,6 +491,8 @@ def seed_logical(task):
     p1 = subprocess.Popen(dump_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     p2 = subprocess.Popen(load_args, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # 登记子进程：卡死时自愈守护可以直接杀掉它们，让阻塞在管道上的线程脱离
+    _STEP_PROCS.setdefault(task.get("id"), []).extend([p1, p2])
 
     # ⚠ 所有「本进程不主动消费」的管道都必须有线程持续排空，否则写满 64KB 即死锁。
     # 实测就是栽在这里：只排空了 dump 端 stderr，导入端 stdout/stderr 没人读 ⇒
@@ -1772,6 +1774,13 @@ STEP_WEIGHTS = {"seed": 45, "bridge": 15, "verify": 20, "cutover": 15, "cleanup"
 _REP = {}          # tid -> {"rep": _Reporter, "step": step}
 _RUNNING = set()   # 正在执行步骤的 tid（并发门禁）
 
+# ---- 卡死自愈（避免并发门禁被一个卡死的步骤永久占用）----
+_STEP_HB = {}       # tid -> 该步骤最近一次进度的时刻（心跳）
+_STEP_PROCS = {}    # tid -> 该步骤 spawn 的子进程列表（卡死时杀掉它们即可解除阻塞）
+_FORCE_TS = {}      # tid -> 首次触发自愈的时刻（宽限期过后才强制释放）
+STEP_STALL_SEC = 900    # 步骤超过这么久没有任何进度 ⇒ 触发自愈
+STEP_FORCE_GRACE = 120  # 杀掉子进程后再给这么久，仍不退出才强制释放门禁
+
 
 class _Reporter:
     def __init__(self, tid):
@@ -1782,6 +1791,9 @@ class _Reporter:
                 "WHERE id=%s", (f"[{_now()}] {msg}\n", self.tid))
 
     def prog(self, pct, stage=None):
+        # 心跳：供常驻自愈守护判断「这个步骤还活着吗」
+        if self.tid in _RUNNING:
+            _STEP_HB[self.tid] = time.time()
         pct = int(max(0, min(100, pct)))
         if stage is None:
             execute("UPDATE migration_tasks SET progress=%s,updated_at=NOW() WHERE id=%s",
@@ -1862,6 +1874,75 @@ def _thread_body(tid, step, opts=None):
     finally:
         _REP.pop(tid, None)
         _RUNNING.discard(tid)
+        # 清理自愈相关状态（线程正常结束时也应清干净）
+        _STEP_HB.pop(tid, None)
+        _STEP_PROCS.pop(tid, None)
+        _FORCE_TS.pop(tid, None)
+
+
+_HEALER_ON = {"started": False}
+
+
+def _ensure_healer():
+    """启动常驻自愈守护（进程内只起一次）。"""
+    if _HEALER_ON["started"]:
+        return
+    _HEALER_ON["started"] = True
+    threading.Thread(target=_stall_healer, daemon=True).start()
+
+
+def _stall_healer():
+    """常驻守护：步骤长时间无任何进度时自愈，保证并发门禁不会被永久占用。
+
+    Python 无法安全杀死线程，所以不能"杀线程"，只能让它自己退出：
+      ① 先杀掉该步骤启动的子进程 —— 阻塞在管道读写上的线程会立刻返回、自行退出，
+         随后 finally 正常释放门禁（对 seed 这类管道卡死就是根治手段）；
+      ② 若仍不退出（没有子进程 / 卡在别处），宽限期后强制释放门禁并标记失败，
+         保证一个卡死的步骤不会把后续所有迁移全部挡死。
+    """
+    while True:
+        time.sleep(30)
+        now = time.time()
+        for tid in list(_RUNNING):
+            ts = _STEP_HB.get(tid)
+            if ts is None:            # 还没上报过进度：先记一次心跳，避免误判
+                _STEP_HB[tid] = now
+                continue
+            if now - ts < STEP_STALL_SEC:
+                continue
+            first = _FORCE_TS.get(tid)
+            if first is None:
+                # ① 杀掉子进程，解除阻塞
+                _FORCE_TS[tid] = now
+                killed = 0
+                for p in _STEP_PROCS.pop(tid, []):
+                    try:
+                        p.kill()
+                        killed += 1
+                    except Exception:
+                        pass
+                try:
+                    _Reporter(tid).log(
+                        "自愈：步骤超过 %d 秒没有任何进度，已终止 %d 个子进程以解除阻塞；"
+                        "若 %d 秒内仍不退出，将强制释放并发门禁"
+                        % (STEP_STALL_SEC, killed, STEP_FORCE_GRACE))
+                except Exception:
+                    pass
+                _STEP_HB[tid] = now    # 给一个宽限期，让它自行收尾退出
+                continue
+            if now - first > STEP_FORCE_GRACE:
+                # ② 兜底：强制释放门禁 —— 绝不让一个卡死步骤挡住后续所有任务
+                _RUNNING.discard(tid)
+                _REP.pop(tid, None)
+                _STEP_HB.pop(tid, None)
+                _FORCE_TS.pop(tid, None)
+                try:
+                    execute("UPDATE migration_tasks SET status='error',stage=%s,updated_at=NOW() "
+                            "WHERE id=%s",
+                            ("步骤无响应超时，已强制释放并发门禁（后台线程可能仍在运行，"
+                             "建议重启管理器彻底清理）", tid))
+                except Exception:
+                    pass
 
 
 def start_step(task_id, step, opts=None):
@@ -1878,10 +1959,17 @@ def start_step(task_id, step, opts=None):
     # 并发执行会互相踩踏复制通道造成数据错乱）。同一任务重复启动也被此挡住。
     if _RUNNING:
         busy = ", ".join("#%d" % t for t in sorted(_RUNNING))
-        return {"ok": False, "error": "已有迁移任务正在执行（%s），请等待其完成后再操作" % busy}
+        return {"ok": False, "error": (
+            "已有迁移任务正在执行（%s），同一时间只允许一个迁移任务运行。\n"
+            "⚠ 这是【管理器进程内】的并发门禁，删除或清理历史记录【不会】释放它。\n"
+            "· 若该任务确实还在跑：等它结束即可；\n"
+            "· 若它已卡死（进度长时间不动）：点「中止任务」，"
+            "或在管理器所在机器上杀掉卡住的 mariadb-dump / mariadb 子进程；\n"
+            "· 仍无法释放：重启管理器进程强制清空。" % busy)}
     _RUNNING.add(task_id)
     _REP[task_id] = {"rep": _Reporter(task_id), "step": step}
     execute("UPDATE migration_tasks SET status='running',updated_at=NOW() WHERE id=%s", (task_id,))
+    _ensure_healer()
     threading.Thread(target=_thread_body, args=(task_id, step, opts), daemon=True).start()
     return {"ok": True, "started": True, "step": step}
 
