@@ -434,6 +434,15 @@ def _snapshot_src_gtid(cfg):
         return ""
 
 
+# 数据种子的卡死判定阈值（秒）：超过这么久没有任何字节推进即判定假死并主动中止。
+# 为什么必须有兜底：线程一旦永久阻塞就再也不会退出，_RUNNING 也就永不释放，
+# 并发门禁会把后续【所有】迁移任务全部挡死（只能重启管理器才能解开）。
+SEED_STALL_SEC = 300
+
+# 用户主动中止的任务 id 集合（前端「中止任务」写入，步骤循环在安全点检测并退出）
+_CANCEL = set()
+
+
 def seed_logical(task):
     """逻辑通道：仅用户库导出 → 流式导入目标（排除系统库 / Custos 库）。
 
@@ -483,25 +492,55 @@ def seed_logical(task):
     p2 = subprocess.Popen(load_args, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    # 单独线程读源端 stderr，防止管道撑满导致死锁
-    derr_box = []
-    t_err = threading.Thread(target=lambda: derr_box.append(p1.stderr.read()), daemon=True)
-    t_err.start()
+    # ⚠ 所有「本进程不主动消费」的管道都必须有线程持续排空，否则写满 64KB 即死锁。
+    # 实测就是栽在这里：只排空了 dump 端 stderr，导入端 stdout/stderr 没人读 ⇒
+    # 客户端一输出就阻塞 ⇒ 不再读 stdin ⇒ 主进程写 p2.stdin 跟着阻塞 ⇒
+    # 界面永远「执行中、进度 0%」的假死（传输量恰好卡在 64KB，即管道缓冲大小）。
+    derr_box, lout_box, lerr_box = [], [], []
+    t_err  = threading.Thread(target=lambda: derr_box.append(p1.stderr.read()), daemon=True)
+    t_lout = threading.Thread(target=lambda: lout_box.append(p2.stdout.read()), daemon=True)
+    t_lerr = threading.Thread(target=lambda: lerr_box.append(p2.stderr.read()), daemon=True)
+    for _t in (t_err, t_lout, t_lerr):
+        _t.start()
 
     read_bytes = 0
     next_report = 0
+    stall = {"msg": None}
+    last_ts = [time.time()]     # 最近一次真正推进字节的时刻（供看门狗判定卡死）
+
+    def _watchdog():
+        # 卡死兜底：长时间一个字节都没推进 ⇒ 杀掉两端让主循环脱离阻塞并如实报错，
+        # 否则线程永远不退出，_RUNNING 永不释放，后续所有迁移都被并发门禁挡死。
+        while stall["msg"] is None:
+            time.sleep(10)
+            if time.time() - last_ts[0] > SEED_STALL_SEC:
+                stall["msg"] = ("数据种子超过 %d 秒没有任何字节推进（已传输 %.1f MB），"
+                                "判定为卡死并中止" % (SEED_STALL_SEC, read_bytes / 1048576.0))
+                for _p in (p1, p2):
+                    try:
+                        _p.kill()
+                    except Exception:
+                        pass
+                return
+    t_wd = threading.Thread(target=_watchdog, daemon=True)
+    t_wd.start()
+
     try:
         while True:
+            if task.get("id") in _CANCEL:
+                raise RuntimeError("任务已被用户中止")
             chunk = p1.stdout.read(65536)
             if not chunk:
                 break
             read_bytes += len(chunk)
+            last_ts[0] = time.time()
             # 写入端慢会在此自然阻塞 ⇒ 进度真实反映落地速度，而非纯导出速度
             p2.stdin.write(chunk)
             if total_bytes > 0 and read_bytes >= next_report:
                 next_report = read_bytes + 8 * 1024 * 1024
                 pct = min(95.0, read_bytes * 100.0 / total_bytes)
-                _tick(task, pct, stage="已传输 %.0f / %.0f MB（%d 个库）"
+                # 保留 1 位小数：整 MB 会让小库长期显示「0 / N MB」，看着像没动
+                _tick(task, pct, stage="已传输 %.1f / %.1f MB（%d 个库）"
                                        % (read_bytes / 1048576.0, total_bytes / 1048576.0, len(databases)))
     except BrokenPipeError:
         pass
@@ -523,11 +562,20 @@ def seed_logical(task):
         p1.wait(timeout=60)
     except Exception:
         pass
-    t_err.join(timeout=5)
+    for _t in (t_err, t_lout, t_lerr):
+        _t.join(timeout=5)
     derr = derr_box[0] if derr_box else b""
+    lerr = lerr_box[0] if lerr_box else b""
+
+    # 卡死中止：把导入端真实输出一并报出，否则用户只看到「进度 0%」根本无从下手
+    if stall["msg"]:
+        _CANCEL.discard(task.get("id"))
+        raise RuntimeError(stall["msg"] + "。导入端输出："
+                           + (lerr or b"").decode(errors="replace")[:500])
 
     if p2.returncode != 0 or p1.returncode != 0:
         detail = (err2 or b"").decode(errors="replace")[:2000] \
+            or (lerr or b"").decode(errors="replace")[:2000] \
             or (derr or b"").decode(errors="replace")[:2000]
         raise RuntimeError("逻辑导入失败（退出码 dump=%s load=%s）: %s"
                            % (p1.returncode, p2.returncode, detail))
@@ -1836,6 +1884,21 @@ def start_step(task_id, step, opts=None):
     execute("UPDATE migration_tasks SET status='running',updated_at=NOW() WHERE id=%s", (task_id,))
     threading.Thread(target=_thread_body, args=(task_id, step, opts), daemon=True).start()
     return {"ok": True, "started": True, "step": step}
+
+
+def request_cancel(tid):
+    """请求中止任务：只置标记，由步骤循环在安全点自行退出。
+
+    为什么不直接杀线程：Python 无法安全杀死线程，强杀会留下半截状态
+    （桥接建了一半、目标残留复制账号、管道未关闭）。置标记后步骤循环退出，
+    线程正常结束，finally 会释放 _RUNNING，并发门禁随之自动解除。
+
+    若步骤正阻塞在外部命令（如 mariadb-dump）上，看门狗会在 SEED_STALL_SEC 内兜底。
+    """
+    _CANCEL.add(int(tid))
+    return {"ok": True, "tid": int(tid),
+            "note": ("已请求中止，步骤会在下一个安全点退出；若正阻塞在外部命令上，"
+                     "最多再等 %d 秒由看门狗兜底中止。" % SEED_STALL_SEC)}
 
 
 def run_step(task_id, step):

@@ -2861,6 +2861,21 @@ async def api_migration_step(task_id: int, request: Request, user=Depends(auth_r
     return _json_ok(_migration.start_step(task_id, step, opts))
 
 
+@app.post("/api/migration/{task_id}/cancel")
+def api_migration_cancel(task_id: int, user=Depends(auth_required)):
+    """中止执行中的迁移任务（置标记，由步骤循环安全退出并释放并发门禁）。
+
+    用途：任务卡死（如进度长时间 0%）时给运维一个出口，避免并发门禁被永久占用。
+    """
+    try:
+        task = _migration.get_task(task_id)
+        if not task:
+            return _json_ok({"ok": False, "error": "任务不存在"})
+        return _json_ok(_migration.request_cancel(task_id))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
 @app.post("/api/migration/{task_id}/precheck")
 async def api_migration_precheck(task_id: int, user=Depends(auth_required)):
     """迁移前兼容性预检（dry-run，不搬数据）。"""

@@ -19,6 +19,16 @@
   .pbar{display:inline-block;width:80px;height:8px;border-radius:999px;background:var(--surface-3,#eef1f5);overflow:hidden;vertical-align:middle;margin-right:6px}
   .pbar-in{height:100%;background:var(--primary,#2f6fed);width:0;transition:width .4s}
   .pct{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  /* 执行中任务的进度条「活动态」：百分比长时间不动时也能一眼看出还活着；
+     progress=0 时改用不确定态(滑块往复)，否则静态 0% 看起来跟卡死一样。 */
+  .pbar.run{box-shadow:0 0 0 1px rgba(47,111,237,.25)}
+  .pbar-in.active{background-image:linear-gradient(90deg,rgba(255,255,255,.38) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.38) 50%,rgba(255,255,255,.38) 75%,transparent 75%,transparent);background-size:14px 14px;animation:pbarStripes .7s linear infinite}
+  @keyframes pbarStripes{from{background-position:0 0}to{background-position:14px 0}}
+  .pbar.indet .pbar-in{width:40%!important;animation:pbarSlide 1.3s ease-in-out infinite}
+  @keyframes pbarSlide{0%{margin-left:-40%}100%{margin-left:100%}}
+  .dot-live{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok,#2ecc71);margin-right:5px;vertical-align:middle;animation:dotPulse 1.2s ease-in-out infinite}
+  @keyframes dotPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(.7)}}
+  .stall{font-size:11.5px;color:var(--warn,#e6a23c);margin-left:6px}
   .mini-btn{font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);cursor:pointer;margin:2px 4px 2px 0}
   .mini-btn:hover{border-color:var(--primary)}
   .mini-btn.danger{color:var(--danger);border-color:var(--danger-border,#f0c0bb)}
@@ -97,7 +107,49 @@ async function loadHistory(){
   }catch(e){ $("histList").innerHTML = '<div class="db-empty">加载失败: '+escapeHtml(e)+'</div>'; }
 }
 
+// ---- 进度「无推进」监测：执行中但百分比长期不变 ⇒ 明确告警，避免与卡死混淆 ----
+const _progWatch = {};   // id -> {p, ts}
+function progStall(id, p){
+  const now = Date.now();
+  const w = _progWatch[id];
+  if(!w || w.p !== p){ _progWatch[id] = {p:p, ts:now}; return ""; }
+  const sec = Math.round((now - w.ts) / 1000);
+  if(sec < 60) return "";
+  const txt = sec < 3600 ? (Math.floor(sec/60) + " 分钟") : (Math.floor(sec/3600) + " 小时");
+  return '<span class="stall" title="任务处于执行中，但进度已这么久没有变化">⚠ 已 '
+       + txt + '无推进</span>';
+}
+// ---- 进度条单元格：执行中显示活动态（条纹流动 / 0% 时滑块往复 + 心跳点）----
+function progressCell(t){
+  const run = (t.status === "running");
+  const p = t.progress || 0;
+  const indet = run && p <= 0;
+  return '<div class="pbar' + (run ? " run" : "") + (indet ? " indet" : "") + '">'
+       + '<div class="pbar-in' + (run ? " active" : "") + '" style="width:' + p + '%"></div></div>'
+       + '<span class="pct">' + (run ? '<span class="dot-live"></span>' : '') + p + '%</span>';
+}
+// ---- 有任务在跑时自动刷新列表，让进度条真的动起来 ----
+let _histTimer = null;
+function stopHistRefresh(){ if(_histTimer){ clearInterval(_histTimer); _histTimer = null; } }
+function scheduleHistRefresh(list){
+  if(!(list||[]).some(t => t.status === "running")){ stopHistRefresh(); return; }
+  if(_histTimer) return;
+  _histTimer = setInterval(async ()=>{
+    // 正在查看详情 / 正在勾选时不刷新，避免打断操作或丢掉已勾选项
+    const dm = $("detailMask");
+    if(dm && dm.classList.contains("show")) return;
+    if(document.querySelector('#histList .hist-sel:checked')) return;
+    try{
+      const r = await fetch("/api/migration/list",
+                    {headers:{"Accept":"application/json"}, cache:"no-store"});
+      const b = await r.json();
+      renderHistory((b && b.ok && b.tasks) ? b.tasks : []);
+    }catch(e){ /* 网络抖动忽略，下一轮再试 */ }
+  }, 3000);
+}
+
 function renderHistory(list){
+  scheduleHistRefresh(list);
   if(!list.length){
     $("histCount").textContent = "";
     $("histList").innerHTML = '<div class="db-empty">（暂无迁移任务）</div>';
@@ -116,8 +168,8 @@ function renderHistory(list){
       <td>${escapeHtml(t.name||"")}</td>
       <td>${t.channel==="physical"?"B 物理":"A 逻辑"}</td>
       <td><span class="mbadge ${statusClass(t.status)}">${statusLabel(t.status)}</span></td>
-      <td><div class="pbar"><div class="pbar-in" style="width:${t.progress||0}%"></div></div><span class="pct">${t.progress||0}%</span></td>
-      <td class="muted">${escapeHtml(t.stage||"")}</td>
+      <td>${progressCell(t)}</td>
+      <td class="muted">${escapeHtml(t.stage||"")}${progStall(t.id, t.progress||0)}</td>
       <td class="muted">${escapeHtml(t.updated_at||"")}</td>
       <td class="acts-cell">
         ${canResume?`<button class="mini-btn" onclick="resumeTask(${t.id})">继续</button>`:""}
