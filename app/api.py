@@ -2939,6 +2939,12 @@ def api_migration_list(user=Depends(auth_required)):
     return _json_ok({"ok": True, "tasks": _migration.list_tasks()})
 
 
+@app.delete("/api/migration/{task_id}")
+def api_migration_delete(task_id: int, user=Depends(auth_required)):
+    """删除迁移任务（执行中的任务禁止删除）。"""
+    return _json_ok(_migration.delete_task(task_id))
+
+
 # ==================================================================
 @app.get("/api/alerts")
 def api_alerts(

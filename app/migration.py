@@ -112,14 +112,32 @@ def get_task(tid):
         "log": t.get("log") or "",
         "config": _dec(t.get("config")),
         "steps": json.loads(t.get("steps") or "{}"),
+        "created_at": t.get("created_at") or "",
+        "updated_at": t.get("updated_at") or "",
     }
 
 
 def list_tasks():
     rows = query(
-        "SELECT id, name, channel, status, created_at, updated_at FROM migration_tasks ORDER BY id DESC"
+        "SELECT id, name, channel, status, progress, stage, created_at, updated_at "
+        "FROM migration_tasks ORDER BY id DESC"
     )
     return rows
+
+
+def delete_task(tid):
+    """删除迁移任务。仅当没有后台步骤正在执行时才允许（防止砍断在途迁移）。
+
+    注意：status=='running' 但 tid 不在 _RUNNING（如管理器重启后残留的陈旧状态）
+    视为可删 —— 因为没有真实线程在跑，删除是安全的。
+    """
+    if tid in _RUNNING:
+        return {"ok": False, "error": "任务正在执行，无法删除，请等待其完成"}
+    task = get_task(tid)
+    if not task:
+        return {"ok": False, "error": "任务不存在"}
+    execute("DELETE FROM migration_tasks WHERE id=%s", (tid,))
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1502,10 +1520,20 @@ def check_write_freeze(task):
     unreliable = bool(negative) or bool(missing)
     frozen = (writes == 0 and rows == 0 and not unreliable)
     if missing:
-        hint = ("无法读取源库的写入计数器（%s 项取不到值，多为账号缺少 PROCESS 权限，"
-                "SHOW GLOBAL STATUS 需要 PROCESS）。**不能据此判定已停写**，"
-                "请改用具备 PROCESS 权限的账号，或用其它方式确认源库已停写后再切换。"
-                % len(missing))
+        hint = (
+            "停写检测需要读取源库的「写入活动统计」来判断是否还有业务在写入，"
+            "但当前用来连接源库的账号权限不足，读不到这些统计（共 %s 项取不到值），本次检测不可信。\n"
+            "原因：读取写入统计需要源库账号具备 PROCESS 权限，而当前这个账号没有该权限。\n\n"
+            "如何避免（任选其一）：\n"
+            "1) 给源库上「本迁移任务里填写的那个账号」补授予 PROCESS 权限，"
+            "以源库管理员(root)身份执行下面语句（主机填你填迁移信息时用的那个）：\n"
+            "   GRANT PROCESS ON *.* TO '<源库账号>'@'<对应主机>'; FLUSH PRIVILEGES;\n"
+            "   授权后回到本页重新点「停写检测」即可。\n"
+            "2) 或重新填写一个已经具备 PROCESS 权限的源库账号，再重新检测。\n\n"
+            "若暂时不方便授权：请改用其它方式人工确认源库已停写"
+            "（如查看源库是否还有业务连接、binlog 或数据文件是否仍在增长），"
+            "确认无误后再勾选「源库已停写」执行切换，切勿仅凭本结果判断。"
+            % len(missing))
     elif negative:
         hint = ("采样不可靠：以下计数器出现回退（可能被 FLUSH STATUS 重置）：%s。"
                 "无法判断是否真的停写，请勿据此切换，请稍后重新检测。"
@@ -1655,8 +1683,11 @@ def start_step(task_id, step):
         return {"ok": False, "error": "任务不存在"}
     if step not in STEPS:
         return {"ok": False, "error": f"未知步骤: {step}"}
-    if task_id in _RUNNING:
-        return {"ok": False, "error": "该任务已有步骤正在执行，请等待完成后再操作"}
+    # 并发门禁：全局同时只允许一个迁移任务在跑（不同任务会争用同一目标集群，
+    # 并发执行会互相踩踏复制通道造成数据错乱）。同一任务重复启动也被此挡住。
+    if _RUNNING:
+        busy = ", ".join("#%d" % t for t in sorted(_RUNNING))
+        return {"ok": False, "error": "已有迁移任务正在执行（%s），请等待其完成后再操作" % busy}
     _RUNNING.add(task_id)
     _REP[task_id] = {"rep": _Reporter(task_id), "step": step}
     execute("UPDATE migration_tasks SET status='running',updated_at=NOW() WHERE id=%s", (task_id,))
