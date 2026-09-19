@@ -4,18 +4,25 @@
 {% block content %}
 <style>
   /* ===== 向导步进条（复用站点 CSS 变量，保持风格统一） ===== */
-  .wz-steps{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
-  .wz-step{flex:1;min-width:120px;display:flex;align-items:center;gap:10px;padding:12px 14px;
-    border:1px solid var(--border);border-radius:12px;background:var(--surface-2);transition:.15s}
-  .wz-step .idx{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;
-    justify-content:center;font-size:13px;font-weight:700;background:var(--surface-3);
-    color:var(--muted);border:1px solid var(--border)}
-  .wz-step .t{font-size:13.5px;font-weight:600;color:var(--text)}
-  .wz-step .s{font-size:11.5px;color:var(--muted)}
-  .wz-step.on{border-color:var(--primary);background:var(--primary-light);box-shadow:0 0 0 1px var(--primary) inset}
-  .wz-step.on .idx{background:var(--primary);color:#fff;border-color:var(--primary)}
-  .wz-step.done .idx{background:var(--ok,#2ecc71);color:#fff;border-color:var(--ok,#2ecc71)}
-  .wz-step.err .idx{background:var(--danger);color:#fff;border-color:var(--danger)}
+  /* 分步向导：带连接线 + 进度填充的圆形步进器 */
+  .wz-steps{position:relative;display:flex;justify-content:space-between;align-items:flex-start;
+    margin:4px 0 26px;padding:0 4%}
+  .wz-track{position:absolute;top:18px;left:4%;right:4%;height:3px;background:var(--border);
+    border-radius:3px;z-index:0}
+  .wz-fill{position:absolute;top:18px;left:4%;height:3px;background:linear-gradient(90deg,var(--primary),var(--accent,#0ABAB5));
+    border-radius:3px;z-index:0;transition:width .35s ease;width:0}
+  .wz-step{position:relative;z-index:1;flex:1;display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center}
+  .wz-step .idx{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    font-size:15px;font-weight:700;background:var(--surface,#fff);border:3px solid var(--border);
+    color:var(--muted);transition:.25s}
+  .wz-step .t{font-size:13px;font-weight:600;color:var(--muted);transition:.2s}
+  .wz-step .s{font-size:11px;color:var(--muted);opacity:.75}
+  .wz-step.on .idx{border-color:var(--primary);color:var(--primary);box-shadow:0 0 0 5px var(--primary-light,#e7f0ff)}
+  .wz-step.on .t{color:var(--text)}
+  .wz-step.done .idx{border-color:var(--ok,#2ecc71);background:var(--ok,#2ecc71);color:#fff;font-size:0}
+  .wz-step.done .idx::after{content:"✓";font-size:18px}
+  .wz-step.done .t{color:var(--text)}
+  .wz-step.err .idx{border-color:var(--danger);background:var(--danger);color:#fff}
   /* 通道对比卡 */
   .chan-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
   @media (max-width:980px){ .chan-grid{grid-template-columns:1fr} }
@@ -73,6 +80,27 @@
   .mini-btn.danger:hover{background:var(--danger-bg,#fdecea)}
   .acts-cell{white-space:nowrap}
   .muted{color:var(--muted);font-size:12px}
+  .hist-toolbar{display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap}
+  .chk-all{display:inline-flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none}
+  .hist-toolbar .btn.danger{margin:0}
+  .sel-col{width:34px;text-align:center}
+  .sel-col input{width:16px;height:16px;cursor:pointer}
+  .mig-type{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+    padding:12px 14px;border:1px solid var(--border);border-radius:12px;
+    background:var(--surface-2);margin-bottom:16px}
+  .mt-lbl{font-weight:700;color:var(--text);font-size:14px}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden}
+  .seg-btn{border:0;background:transparent;padding:7px 16px;font-size:13px;cursor:pointer;
+    color:var(--muted);transition:.15s}
+  .seg-btn.on{background:var(--primary,#2f6fed);color:#fff;font-weight:600}
+  .mt-hint{font-size:12.5px;color:var(--muted);flex-basis:100%;margin-top:2px}
+  /* 向导表单：字段两列网格，更像分步表单 */
+  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 18px}
+  @media (max-width:680px){ .form-grid{grid-template-columns:1fr} }
+  .step-head{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+  .step-head .num{width:24px;height:24px;border-radius:7px;background:var(--primary-light,#e7f0ff);
+    color:var(--primary);font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center}
+  .step-head h3{margin:0}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -96,6 +124,8 @@
 
 <!-- 步进条 -->
 <div class="wz-steps" id="stepsBar">
+  <div class="wz-track"></div>
+  <div class="wz-fill" id="wzFill"></div>
   <div class="wz-step on" data-step="1"><span class="idx">1</span><div><div class="t">录入源</div><div class="s">连接并探测</div></div></div>
   <div class="wz-step" data-step="2"><span class="idx">2</span><div><div class="t">目标与通道</div><div class="s">选策略建任务</div></div></div>
   <div class="wz-step" data-step="3"><span class="idx">3</span><div><div class="t">执行迁移</div><div class="s">种子/桥接/校验</div></div></div>
@@ -104,11 +134,21 @@
 </div>
 
 <div class="card" id="step1">
-  <h3>① 录入源 MariaDB 集群（主库）</h3>
-  <div class="field"><label>源主库地址</label><input id="srcHost" placeholder="如 10.0.0.11"></div>
-  <div class="field"><label>端口</label><input id="srcPort" value="3306"></div>
-  <div class="field"><label>账号</label><input id="srcUser" value="root"></div>
-  <div class="field"><label>密码</label><input id="srcPass" type="password"></div>
+  <div class="step-head"><span class="num">1</span><h3>录入源 MariaDB 集群（主库）</h3></div>
+  <div class="mig-type" id="migTypeBar">
+    <span class="mt-lbl">迁移类型</span>
+    <div class="seg">
+      <button class="seg-btn on" data-type="general" onclick="setMigType('general')">通用模式（逻辑通道）</button>
+      <button class="seg-btn" data-type="advanced" onclick="setMigType('advanced')">高级模式（热备）</button>
+    </div>
+    <div class="mt-hint" id="migTypeHint">适合大多数兼容版本：操作简单、无需额外配置，自动走逻辑通道。</div>
+  </div>
+  <div class="form-grid">
+    <div class="field"><label>源主库地址</label><input id="srcHost" placeholder="如 10.0.0.11"></div>
+    <div class="field"><label>端口</label><input id="srcPort" value="3306"></div>
+    <div class="field"><label>账号</label><input id="srcUser" value="root"></div>
+    <div class="field"><label>密码</label><input id="srcPass" type="password"></div>
+  </div>
   <div class="btn-row">
     <button class="btn btn-primary" onclick="doProbe()">🔍 探测源集群</button>
   </div>
@@ -135,16 +175,18 @@
 </div>
 
 <div class="card" id="step2" style="display:none">
-  <h3>② 目标 Custos 节点与迁移通道</h3>
-  <div class="field"><label>目标节点地址（已安装 MariaDB 12.3.3）</label><input id="tgtHost" placeholder="如 10.0.0.21"></div>
-  <div class="field"><label>目标端口</label><input id="tgtPort" value="3306"></div>
-  <div class="field"><label>目标 root 密码</label><input id="tgtRoot" type="password"></div>
-  <div class="field"><label>目标节点形态</label>
-    <select id="tgtType">
-      <option value="" disabled selected>请选择节点形态</option>
-      <option value="mariadb-docker">容器化 MariaDB（mariadb-docker）</option>
-      <option value="mariadb">裸机 MariaDB（mariadb）</option>
-    </select>
+  <div class="step-head"><span class="num">2</span><h3>目标 Custos 节点与迁移通道</h3></div>
+  <div class="form-grid">
+    <div class="field"><label>目标节点地址（已安装 MariaDB 12.3.3）</label><input id="tgtHost" placeholder="如 10.0.0.21"></div>
+    <div class="field"><label>目标端口</label><input id="tgtPort" value="3306"></div>
+    <div class="field"><label>目标 root 密码</label><input id="tgtRoot" type="password"></div>
+    <div class="field"><label>目标节点形态</label>
+      <select id="tgtType">
+        <option value="" disabled selected>请选择节点形态</option>
+        <option value="mariadb-docker">容器化 MariaDB（mariadb-docker）</option>
+        <option value="mariadb">裸机 MariaDB（mariadb）</option>
+      </select>
+    </div>
   </div>
   <!-- 以下为「物理通道 B」专属字段，逻辑通道 A 时隐藏（DESIGN-002/003） -->
   <div id="bOnly" style="display:none">
@@ -166,7 +208,7 @@
     </div>
   </div>
 
-  <div style="margin-top:12px;font-size:13px;color:var(--text);font-weight:600">迁移通道（系统已按数据量推荐，可覆盖）</div>
+  <div id="chanLabel" style="margin-top:12px;font-size:13px;color:var(--text);font-weight:600">迁移通道（系统已按数据量推荐，可覆盖）</div>
   <div class="chan-grid" id="chanGrid" style="margin-top:8px">
     <div class="chan" data-chan="logical" onclick="selChan('logical')">
       <h4>A 逻辑通道 <span class="tag" id="tagA">通用/干净</span></h4>
@@ -187,7 +229,7 @@
 </div>
 
 <div class="card" id="step3" style="display:none">
-  <h3>③ 执行迁移（逐步运行，支持重试）</h3>
+  <div class="step-head"><span class="num">3</span><h3>执行迁移（逐步运行，支持重试）</h3></div>
   <div class="btn-row">
     <button class="btn btn-primary" onclick="runPrecheck()">🛡 迁移前兼容性预检（dry-run，不搬数据）</button>
   </div>
@@ -212,7 +254,7 @@
 </div>
 
 <div class="card" id="step4" style="display:none">
-  <h3>④ 停桥切换（cutover，需人工确认）</h3>
+  <div class="step-head"><span class="num">4</span><h3>停桥切换（cutover，需人工确认）</h3></div>
   <p class="bk-note">此操作不可逆转：将停止目标对源的复制、清除桥接通道，并把目标节点登记进 Custos（monitor 自动提升新主）。请在确认数据已追平、并已准备手动切换 VIP 后执行。</p>
   <div id="stopWriteNote" class="bk-note warn" style="display:none;margin-top:10px">
     ⚠ <b>停写迁移模式</b>：源库未开启 binlog，本任务<b>没有桥接通道</b>，因此不存在「追平」这一环节。
@@ -271,7 +313,7 @@
 </div>
 
 <div class="card" id="step5" style="display:none">
-  <h3>⑤ 收尾回收</h3>
+  <div class="step-head"><span class="num">5</span><h3>收尾回收</h3></div>
   <p class="bk-note">本步仅作用于<b>源库（老主）</b>，<b>绝不改动目标集群（新主 203）</b>。将执行：<br>
     ① 源库执行 <code>DROP USER IF EXISTS 'replication'@'%'</code> —— 回收桥接专用的源端复制账号；<br>
     ② 源库执行 <code>SET GLOBAL read_only=ON</code> —— 将老主置为只读暖备（保留期后下线）。<br>
@@ -302,12 +344,17 @@
 
 <!-- 历史迁移任务面板（P1） -->
 <div class="modal-mask" id="histMask">
-  <div class="modal" style="width:800px;max-width:96vw">
+  <div class="modal" style="width:820px;max-width:96vw">
     <h3>历史迁移任务 <span class="badge sky" id="histCount"></span></h3>
     <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
-      可查询任务进度，并对任务执行「继续 / 详情 / 删除」操作。
+      可查询任务进度，并对任务执行「继续 / 详情 / 删除」操作。勾选任务可批量删除（执行中的任务不可勾选）。
     </div>
-    <div id="histList" style="max-height:56vh;overflow:auto"></div>
+    <div class="hist-toolbar">
+      <label class="chk-all"><input type="checkbox" id="histSelAll" onchange="toggleSelAll(this)"> 全选</label>
+      <button class="btn danger" onclick="batchDelete()">🗑 批量删除</button>
+      <span id="histSelInfo" class="muted" style="font-size:12px"></span>
+    </div>
+    <div id="histList" style="max-height:52vh;overflow:auto"></div>
     <div class="acts"><button class="btn" onclick="hideHistory()">关闭</button></div>
   </div>
 </div>
@@ -329,7 +376,7 @@
 const $ = (id) => document.getElementById(id);
 // mode: "bridge" = 源库已开 binlog，可桥接追平；"stopwrite" = 源库未开 binlog，只能停写迁移。
 // 由第一步探测的 gtid_ready(即 @@log_bin) 自动判定，无需用户选择。
-let STATE = { probe:null, channel:"logical", taskId:null, dbs:[], lagOk:false, mode:"bridge" };
+let STATE = { probe:null, channel:"logical", taskId:null, dbs:[], lagOk:false, mode:"bridge", migType:"general" };
 
 function setStep(n){
   for (let i=1;i<=5;i++){
@@ -337,6 +384,9 @@ function setStep(n){
     const s = document.querySelector('.wz-step[data-step="'+i+'"]');
     if(s){ s.classList.toggle('on', i===n); }
   }
+  // 进度填充：连接线随当前步推进（4% 内边距，可用宽度 92%）
+  const f = $("wzFill");
+  if(f){ f.style.width = ((n-1)/(5-1)*92) + "%"; }
 }
 function markStepDone(n){ const s=document.querySelector('.wz-step[data-step="'+n+'"]'); if(s){s.classList.remove('on');s.classList.add('done');} }
 function markStepErr(n){ const s=document.querySelector('.wz-step[data-step="'+n+'"]'); if(s){s.classList.add('err');} }
@@ -362,15 +412,21 @@ async function doProbe(){
   const warn = $("probeWarn");
   if(STATE.mode === "stopwrite"){
     warn.style.display = "block";
-    warn.innerHTML =
-      "⚠ <b>源库未开启 binlog（GTID 未开启）</b>：无法建立复制桥接" +
-      "（强行桥接时 IO 线程会直接报 <code>1236 'Binary log is not open'</code>）。<br>" +
-      "<b>已自动切换为【停写迁移】模式</b>：第三步将只跑「数据种子 + 一致性校验」（不建桥接），" +
-      "第四步需你勾选确认「源库已停写」后直接切换。<br>" +
-      "· <b>若希望桥接追平</b>：源库 my.cnf 的 [mysqld] 加 " +
-      "<code>server_id=&lt;非0唯一值&gt;</code>、<code>log_bin=/path/to/mysql-bin</code>、" +
-      "<code>binlog_format=ROW</code> 并<b>重启 MariaDB</b>，重新探测即自动切回桥接模式；<br>" +
-      "· <b>若不便重启源库</b>：按停写迁移走 —— 先让业务停止写入源库，再执行数据种子。";
+    if(STATE.migType === "general"){
+      warn.innerHTML =
+        "⚠ <b>源库未开启 binlog</b>：无法桥接追平，已自动切换为【停写迁移】。<br>" +
+        "请先停止业务写入源库，再执行数据种子；第四步勾选「源库已停写」后即可切换。";
+    }else{
+      warn.innerHTML =
+        "⚠ <b>源库未开启 binlog（GTID 未开启）</b>：无法建立复制桥接" +
+        "（强行桥接时 IO 线程会直接报 <code>1236 'Binary log is not open'</code>）。<br>" +
+        "<b>已自动切换为【停写迁移】模式</b>：第三步将只跑「数据种子 + 一致性校验」（不建桥接），" +
+        "第四步需你勾选确认「源库已停写」后直接切换。<br>" +
+        "· <b>若希望桥接追平</b>：源库 my.cnf 的 [mysqld] 加 " +
+        "<code>server_id=&lt;非0唯一值&gt;</code>、<code>log_bin=/path/to/mysql-bin</code>、" +
+        "<code>binlog_format=ROW</code> 并<b>重启 MariaDB</b>，重新探测即自动切回桥接模式；<br>" +
+        "· <b>若不便重启源库</b>：按停写迁移走 —— 先让业务停止写入源库，再执行数据种子。";
+    }
   }else{
     warn.style.display = "none";
   }
@@ -425,6 +481,24 @@ function goStep2(){
   setStep(2);
   selChan(STATE.channel);
 }
+/* 迁移类型：通用（逻辑通道，简单）/ 高级（热备，开放参数与路径自由度） */
+function setMigType(type){
+  STATE.migType = type;
+  document.querySelectorAll('#migTypeBar .seg-btn').forEach(b=>b.classList.toggle('on', b.dataset.type===type));
+  const adv = (type === "advanced");
+  // 通用：强制逻辑通道、隐藏通道选择与高级字段（无多余注解，简单）
+  // 高级：显示通道选择 + 版本/数据目录/源端路径等高级字段
+  $("chanLabel").style.display = adv ? "block" : "none";
+  $("chanGrid").style.display  = adv ? "grid"  : "none";
+  $("recInfo").style.display   = adv ? "block" : "none";
+  $("bOnly").style.display     = adv ? "block" : "none";
+  $("migTypeHint").textContent = adv
+    ? "适合有数据库运维能力者：可自选热备（物理）通道，并配置版本、数据目录、源端路径等参数。"
+    : "适合大多数兼容版本：操作简单、无需额外配置，自动走逻辑通道。";
+  if(!adv){ STATE.channel = "logical"; }
+  else { STATE.channel = "physical"; selChan("physical"); }
+}
+
 function selChan(c){
   STATE.channel = c;
   document.querySelectorAll('.chan').forEach(el=>el.classList.toggle('sel', el.dataset.chan===c));
@@ -931,6 +1005,7 @@ async function boot(){
       $("resumeBanner").style.display = "block";
     }
   }catch(e){ /* 检测失败不阻塞首屏 */ }
+  setMigType(STATE.migType || "general");   // 应用初始类型：通用默认隐藏高级字段/通道选择
   setStep(1);
 }
 function resumeFromBanner(){ const id=_bootTaskId; dismissResume(); if(id) resumeTask(id); }
@@ -1012,6 +1087,7 @@ function renderHistory(list){
     const canDelete = t.status !== "running";
     const canResume = (t.status==="draft" || t.status==="running" || t.status==="error");
     return `<tr>
+      <td class="sel-col"><input type="checkbox" class="hist-sel" value="${t.id}" ${canDelete?"":"disabled"} onchange="updateSelInfo()"></td>
       <td>${t.id}</td>
       <td>${escapeHtml(t.name||"")}</td>
       <td>${t.channel==="physical"?"B 物理":"A 逻辑"}</td>
@@ -1028,8 +1104,43 @@ function renderHistory(list){
   }).join("");
   $("histList").innerHTML =
     `<table class="mig-table"><thead><tr>
+      <th style="width:34px"><input type="checkbox" id="histSelAllHead" onchange="toggleSelAll(this)"></th>
       <th>#</th><th>名称</th><th>通道</th><th>状态</th><th>进度</th><th>阶段</th><th>更新时间</th><th>操作</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
+  const sa = $("histSelAll"); if(sa) sa.checked = false;
+  updateSelInfo();
+}
+
+function toggleSelAll(box){
+  document.querySelectorAll('#histList .hist-sel:not([disabled])').forEach(c=>c.checked = box.checked);
+  const head = $("histSelAllHead"); if(head) head.checked = box.checked;
+  updateSelInfo();
+}
+function updateSelInfo(){
+  const ids = Array.from(document.querySelectorAll('#histList .hist-sel:checked'));
+  const el = $("histSelInfo"); if(el) el.textContent = ids.length ? ("已选 "+ids.length+" 个") : "";
+  const head = $("histSelAllHead");
+  if(head){
+    const all = document.querySelectorAll('#histList .hist-sel:not([disabled])');
+    head.checked = all.length>0 && ids.length===all.length;
+  }
+}
+
+// ---- P3：批量删除 ----
+async function batchDelete(){
+  const ids = Array.from(document.querySelectorAll('#histList .hist-sel:checked')).map(c=>+c.value);
+  if(!ids.length){ alert("请先勾选要删除的任务（执行中的任务不可勾选）。"); return; }
+  if(!confirm("确认批量删除选中的 "+ids.length+" 个迁移任务？\n删除后不可恢复，且执行中的任务不会被勾选。")) return;
+  let okN=0, failN=0; const errs=[];
+  await Promise.all(ids.map(async id=>{
+    try{
+      const r = await fetch("/api/migration/"+id, {method:"DELETE", headers:{"Accept":"application/json"}});
+      const b = await r.json();
+      if(b && b.ok){ okN++; } else { failN++; errs.push("#"+id+": "+(b&&b.error||"失败")); }
+    }catch(e){ failN++; errs.push("#"+id+": "+e); }
+  }));
+  alert("已删除 "+okN+" 个"+(failN?("，失败 "+failN+" 个：\n"+errs.join("\n")):""));
+  showHistory();
 }
 
 async function showHistory(){

@@ -1432,6 +1432,7 @@ def plan_binlog_enable(cfg):
         "5) 回本向导重新探测；确认 log_bin=1 后会自动切回【桥接模式】。",
     ]
     return {
+        "ok": True,
         "version": ver, "datadir": datadir, "server_id": server_id, "log_bin": log_bin,
         "replicas": len(replicas), "is_slave": is_slave,
         "suggest_server_id": sid if sid else 1001,
