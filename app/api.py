@@ -2745,6 +2745,12 @@ def migration_page(request: Request, user=Depends(auth_required), msg: str = "",
                   size_threshold_gb=_migration.SIZE_THRESHOLD_GB)
 
 
+@app.get("/migration/history")
+def migration_history_page(request: Request, user=Depends(auth_required)):
+    """历史迁移记录独立页面。"""
+    return render("migration_history.html", request, user=user)
+
+
 async def _json_body(request: Request):
     try:
         return await request.json()
@@ -2941,8 +2947,14 @@ def api_migration_list(user=Depends(auth_required)):
 
 @app.delete("/api/migration/{task_id}")
 def api_migration_delete(task_id: int, user=Depends(auth_required)):
-    """删除迁移任务（执行中的任务禁止删除）。"""
+    """删除迁移任务（执行中的任务仅移除记录，不停止后台步骤）。"""
     return _json_ok(_migration.delete_task(task_id))
+
+
+@app.post("/api/migration/cleanup-stale")
+def api_migration_cleanup_stale(user=Depends(auth_required)):
+    """清理卡死/陈旧的执行中任务（无后台线程在跑的 running 记录）。"""
+    return _json_ok(_migration.cleanup_stale_running_tasks())
 
 
 # ==================================================================

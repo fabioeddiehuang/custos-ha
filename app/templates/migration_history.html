@@ -1,0 +1,286 @@
+{% extends "base.html" %}
+{% block title %}历史迁移 · Custos{% endblock %}
+{% block page_title %}历史迁移{% endblock %}
+{% block content %}
+<style>
+  /* ===== 历史迁移独立页（样式自包含，不依赖 migration.html 内联块） ===== */
+  .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:200}
+  .modal-mask.show{display:flex}
+  .modal .acts{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+  .mig-table{width:100%;border-collapse:collapse;font-size:12.5px}
+  .mig-table th,.mig-table td{border-bottom:1px solid var(--border);padding:8px 6px;text-align:left;vertical-align:middle}
+  .mig-table th{color:var(--muted);font-weight:600;background:var(--surface-2);white-space:nowrap}
+  .mig-table tr:hover td{background:var(--surface-2)}
+  .mbadge{font-size:11px;padding:2px 9px;border-radius:999px;font-weight:600;white-space:nowrap}
+  .mbadge.g{background:var(--ok-bg,#e6f9ee);color:var(--ok,#2ecc71)}
+  .mbadge.r{background:var(--danger-bg,#fdecea);color:var(--danger,#e74c3c)}
+  .mbadge.b{background:var(--primary-light,#e7f0ff);color:var(--primary,#2f6fed)}
+  .mbadge.m{background:var(--surface-3,#eef1f5);color:var(--muted,#8a94a6)}
+  .pbar{display:inline-block;width:80px;height:8px;border-radius:999px;background:var(--surface-3,#eef1f5);overflow:hidden;vertical-align:middle;margin-right:6px}
+  .pbar-in{height:100%;background:var(--primary,#2f6fed);width:0;transition:width .4s}
+  .pct{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .mini-btn{font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);cursor:pointer;margin:2px 4px 2px 0}
+  .mini-btn:hover{border-color:var(--primary)}
+  .mini-btn.danger{color:var(--danger);border-color:var(--danger-border,#f0c0bb)}
+  .mini-btn.danger:hover{background:var(--danger-bg,#fdecea)}
+  .acts-cell{white-space:nowrap}
+  .muted{color:var(--muted);font-size:12px}
+  .hist-toolbar{display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap}
+  .chk-all{display:inline-flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none}
+  .hist-toolbar .btn.danger{margin:0}
+  .sel-col{width:34px;text-align:center}
+  .sel-col input{width:16px;height:16px;cursor:pointer}
+  .db-empty{color:var(--muted);font-size:13px;padding:18px 0;text-align:center}
+  .page-bar{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+  .page-bar h2{font-size:16px;margin:0}
+</style>
+
+<div class="page-bar">
+  <h2>历史迁移任务</h2>
+  <span class="badge sky" id="histCount"></span>
+  <span class="spacer" style="flex:1"></span>
+  <a class="btn btn-primary" href="/migration">＋ 新建迁移</a>
+  <button class="btn" onclick="loadHistory()">⟳ 刷新</button>
+</div>
+
+<div class="hist-toolbar">
+  <label class="chk-all"><input type="checkbox" id="histSelAll" onchange="toggleSelAll(this)"> 全选</label>
+  <button class="btn danger" onclick="batchDelete()">🗑 批量删除</button>
+  <button class="btn danger" onclick="cleanupStale()">🧹 清理卡死/陈旧记录</button>
+  <span id="histSelInfo" class="muted"></span>
+  <span class="muted" style="margin-left:auto">勾选任务可批量删除；执行中的任务也可删除，但需二次确认并提示风险。</span>
+</div>
+
+<div id="histList"><div class="db-empty">加载中…</div></div>
+
+<!-- 任务详情抽屉（复用详情渲染逻辑） -->
+<div class="modal-mask" id="detailMask">
+  <div class="modal" style="width:680px;max-width:96vw">
+    <h3 id="detailTitle">任务详情</h3>
+    <div id="detailBody"></div>
+    <div class="acts">
+      <button class="btn danger" onclick="detailDelete()">删除任务</button>
+      <button class="btn" onclick="closeDetail()">关闭</button>
+      <button class="btn btn-primary" onclick="detailResume()">回到向导</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function postJSON(url, body){
+  return fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})})
+    .then(r => r.json().catch(() => ({ok:false, error:"非JSON响应"})));
+}
+function statusLabel(s){ return ({draft:"草稿",running:"执行中",error:"失败",done:"完成"})[s] || s; }
+function statusClass(s){ return ({draft:"m",running:"b",error:"r",done:"g"})[s] || "m"; }
+function escapeHtml(s){
+  return String(s==null?"":s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+const STEPS = ["seed","bridge","verify","cutover","cleanup"];
+const STEP_LABELS_JS = {seed:"数据种子",bridge:"建立桥接",verify:"一致性校验",
+                        cutover:"停桥切换",cleanup:"收尾回收"};
+let _detailId = null;
+let _detailData = null;   // 当前详情任务数据（供删除判定执行中）
+let _histTasks = [];   // 最近一次渲染的任务列表（供批量删除判定执行中任务）
+
+// ---- 加载列表 ----
+async function loadHistory(){
+  try{
+    const r = await fetch("/api/migration/list", {headers:{"Accept":"application/json"}, cache:"no-store"});
+    const b = await r.json();
+    const list = (b && b.ok && b.tasks) ? b.tasks : [];
+    renderHistory(list);
+  }catch(e){ $("histList").innerHTML = '<div class="db-empty">加载失败: '+escapeHtml(e)+'</div>'; }
+}
+
+function renderHistory(list){
+  if(!list.length){
+    $("histCount").textContent = "";
+    $("histList").innerHTML = '<div class="db-empty">（暂无迁移任务）</div>';
+    return;
+  }
+  _histTasks = list;
+  $("histCount").textContent = list.length + " 个";
+  const rows = list.map(t=>{
+    // 执行中任务也允许删除（批量删除有二次确认 + 风险提示；单行删除有风险提示）
+    const canDelete = true;
+    const canResume = (t.status==="draft" || t.status==="running" || t.status==="error");
+    const isRunning = (t.status==="running");
+    return `<tr>
+      <td class="sel-col"><input type="checkbox" class="hist-sel" value="${t.id}" onchange="updateSelInfo()"></td>
+      <td>${t.id}</td>
+      <td>${escapeHtml(t.name||"")}</td>
+      <td>${t.channel==="physical"?"B 物理":"A 逻辑"}</td>
+      <td><span class="mbadge ${statusClass(t.status)}">${statusLabel(t.status)}</span></td>
+      <td><div class="pbar"><div class="pbar-in" style="width:${t.progress||0}%"></div></div><span class="pct">${t.progress||0}%</span></td>
+      <td class="muted">${escapeHtml(t.stage||"")}</td>
+      <td class="muted">${escapeHtml(t.updated_at||"")}</td>
+      <td class="acts-cell">
+        ${canResume?`<button class="mini-btn" onclick="resumeTask(${t.id})">继续</button>`:""}
+        <button class="mini-btn" onclick="openDetail(${t.id})">详情</button>
+        ${canDelete?`<button class="mini-btn danger" onclick="deleteTask(${t.id}, ${isRunning})">删除</button>`:""}
+      </td>
+    </tr>`;
+  }).join("");
+  $("histList").innerHTML =
+    `<table class="mig-table"><thead><tr>
+      <th style="width:34px"><input type="checkbox" id="histSelAllHead" onchange="toggleSelAll(this)"></th>
+      <th>#</th><th>名称</th><th>通道</th><th>状态</th><th>进度</th><th>阶段</th><th>更新时间</th><th>操作</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+  const sa = $("histSelAll"); if(sa) sa.checked = false;
+  updateSelInfo();
+}
+
+// ---- 全选 / 选择信息 ----
+function toggleSelAll(box){
+  document.querySelectorAll('#histList .hist-sel:not([disabled])').forEach(c=>c.checked = box.checked);
+  const head = $("histSelAllHead"); if(head) head.checked = box.checked;
+  updateSelInfo();
+}
+function updateSelInfo(){
+  const ids = Array.from(document.querySelectorAll('#histList .hist-sel:checked'));
+  const el = $("histSelInfo"); if(el) el.textContent = ids.length ? ("已选 "+ids.length+" 个") : "";
+  const all = document.querySelectorAll('#histList .hist-sel:not([disabled])');
+  const allOn = all.length>0 && ids.length===all.length;
+  const head = $("histSelAllHead"); if(head) head.checked = allOn;
+  const sa = $("histSelAll"); if(sa) sa.checked = allOn;
+}
+
+// ---- 批量删除（执行中任务需二次确认 + 风险提示） ----
+async function batchDelete(){
+  const ids = Array.from(document.querySelectorAll('#histList .hist-sel:checked')).map(c=>+c.value);
+  if(!ids.length){ alert("请先勾选要删除的任务。"); return; }
+  // 第一确认
+  if(!confirm("确认批量删除选中的 "+ids.length+" 个迁移任务？\n删除后不可恢复。")) return;
+  // 含执行中任务 → 第二确认（明确风险）
+  const running = _histTasks.filter(t => ids.indexOf(t.id)>=0 && t.status==="running");
+  if(running.length){
+    const ok = confirm(
+      "⚠ 风险提示：本次删除包含 " + running.length + " 个【仍在执行中】的任务。\n" +
+      "删除仅移除任务记录，不会停止后台正在进行的迁移步骤（数据导出/恢复、GTID 桥接等），\n" +
+      "可能导致目标集群数据不完整、源端复制账号 / 桥接残留，且无法再在此界面监控进度。\n\n" +
+      "确认强制删除这些执行中的任务记录？");
+    if(!ok) return;
+  }
+  let okN=0, failN=0; const errs=[];
+  await Promise.all(ids.map(async id=>{
+    try{
+      const r = await fetch("/api/migration/"+id, {method:"DELETE", headers:{"Accept":"application/json"}});
+      const b = await r.json();
+      if(b && b.ok){ okN++; } else { failN++; errs.push("#"+id+": "+(b&&b.error||"失败")); }
+    }catch(e){ failN++; errs.push("#"+id+": "+e); }
+  }));
+  alert("已删除 "+okN+" 个"+(failN?("，失败 "+failN+" 个：\n"+errs.join("\n")):""));
+  loadHistory();
+}
+
+// ---- 清理卡死/陈旧的执行中记录（仅删无后台线程在跑的 running 记录） ----
+async function cleanupStale(){
+  if(!confirm(
+    "确认清理所有【卡死 / 陈旧】的执行中记录？\n" +
+    "即状态为「执行中」但实际已无后台线程在跑的任务（如管理器重启后残留的状态）。\n" +
+    "真正在跑的迁移不会被清理。清理后不可恢复。")) return;
+  try{
+    const r = await fetch("/api/migration/cleanup-stale",
+                  {method:"POST", headers:{"Accept":"application/json"}});
+    const b = await r.json();
+    if(!b || b.ok===false){ alert("清理失败: "+(b&&b.error||"未知错误")); return; }
+    alert(b.deleted ? ("已清理 "+b.deleted+" 条卡死 / 陈旧记录。") :
+                      "没有需要清理的卡死 / 陈旧记录。");
+    loadHistory();
+  }catch(e){ alert("清理失败: "+e); }
+}
+
+// ---- 单条删除（执行中任务需风险提示） ----
+async function deleteTask(tid, isRunning){
+  if(isRunning){
+    if(!confirm(
+      "⚠ 风险提示：该任务【仍在执行中】。\n" +
+      "删除仅移除任务记录，不会停止后台正在进行的迁移步骤，" +
+      "可能导致目标集群数据不完整、源端复制账号 / 桥接残留，且无法再监控进度。\n\n" +
+      "确认强制删除？")) return;
+  }else{
+    if(!confirm("确认删除迁移任务 #"+tid+"？\n删除后不可恢复。")) return;
+  }
+  try{
+    const r = await fetch("/api/migration/"+tid, {method:"DELETE", headers:{"Accept":"application/json"}});
+    const b = await r.json();
+    if(!b.ok){ alert("删除失败: "+b.error); return; }
+    alert("已删除任务 #"+tid);
+    loadHistory();
+  }catch(e){ alert("删除失败: "+e); }
+}
+
+// ---- 继续 / 回到向导：跳回迁移向导并加载该任务 ----
+function resumeTask(tid){ window.location.href = "/migration?task=" + tid; }
+function detailResume(){ const id=_detailId; closeDetail(); if(id) resumeTask(id); }
+
+// ---- 详情 ----
+async function openDetail(tid){
+  _detailId = tid;
+  let j;
+  try{
+    const r = await fetch("/api/migration/"+tid+"/status",
+                  {headers:{"Accept":"application/json"}, cache:"no-store"});
+    j = await r.json();
+  }catch(e){ alert("加载详情失败: "+e); return; }
+  if(!j || j.ok===false){ alert("任务不存在或加载失败"); return; }
+  _detailData = j;
+  renderDetail(j);
+  $("detailMask").classList.add("show");
+}
+function closeDetail(){ $("detailMask").classList.remove("show"); }
+async function detailDelete(){
+  const id=_detailId; if(!id) return;
+  const running = (_detailData && _detailData.status==="running");
+  await deleteTask(id, running);
+  closeDetail();
+}
+
+function renderDetail(j){
+  const steps = j.steps || {};
+  const stepRows = STEPS.map(s=>{
+    const st = (steps[s]||{}).status || "pending";
+    const lbl = ({pending:"待执行",running:"执行中",done:"成功",error:"失败"})[st] || st;
+    const cls = ({pending:"m",running:"b",done:"g",error:"r"})[st] || "m";
+    const err = (steps[s]||{}).error
+      ? '<div class="muted" style="margin-top:4px">失败原因：'+escapeHtml(steps[s].error)+'</div>' : "";
+    const retry = (st==="error")
+      ? '<button class="mini-btn danger" style="margin-left:8px" onclick="retryStep('+j.id+',\''+s+'\')">重试该步骤</button>' : "";
+    const base = '<tr><td style="font-weight:600;color:var(--text)">'+STEP_LABELS_JS[s]+
+                 '</td><td><span class="mbadge '+cls+'">'+lbl+'</span>'+retry+'</td></tr>';
+    return base + (err ? '<tr><td></td><td>'+err+'</td></tr>' : '');
+  }).join("");
+  $("detailTitle").textContent = "任务 #"+j.id+" · "+(j.name||"");
+  $("detailBody").innerHTML =
+    '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;font-size:12.5px">'+
+      '<span>通道：'+(j.channel==="physical"?"B 物理":"A 逻辑")+'</span>'+
+      '<span>状态：<span class="mbadge '+statusClass(j.status)+'">'+statusLabel(j.status)+'</span></span>'+
+      '<span>创建：'+escapeHtml(j.created_at||"")+'</span>'+
+      '<span>更新：'+escapeHtml(j.updated_at||"")+'</span>'+
+    '</div>'+
+    '<div style="display:flex;justify-content:space-between;align-items:baseline;font-size:12.5px;margin-bottom:6px">'+
+      '<span class="muted">'+escapeHtml(j.stage||"")+'</span>'+
+      '<span class="pct">'+(j.progress||0)+'%</span></div>'+
+    '<div class="pbar" style="width:100%;height:10px"><div class="pbar-in" style="width:'+(j.progress||0)+'%"></div></div>'+
+    '<div style="margin-top:14px;font-weight:600;color:var(--text)">步骤状态</div>'+
+    '<table class="mig-table" style="margin-top:6px"><tbody>'+stepRows+'</tbody></table>'+
+    '<div style="margin-top:14px;font-weight:600;color:var(--text)">执行日志</div>'+
+    '<pre class="logbox" style="margin-top:6px;max-height:30vh">'+escapeHtml(j.log||"（暂无日志）")+'</pre>'+
+    '<div class="btn-row" style="margin-top:10px"><button class="btn" onclick="openDetail('+j.id+')">↻ 刷新状态</button></div>';
+}
+
+async function retryStep(tid, step){
+  if(!confirm("确认重试步骤「"+STEP_LABELS_JS[step]+"」？\n该步骤将从头重新执行。")) return;
+  const b = await postJSON("/api/migration/"+tid+"/step", {step});
+  if(!b.ok){ alert("启动失败: "+b.error); return; }
+  await openDetail(tid);   // 刷新详情中的步骤状态
+}
+
+loadHistory();
+</script>
+{% endblock %}

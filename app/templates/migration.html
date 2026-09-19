@@ -347,11 +347,12 @@
   <div class="modal" style="width:820px;max-width:96vw">
     <h3>历史迁移任务 <span class="badge sky" id="histCount"></span></h3>
     <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
-      可查询任务进度，并对任务执行「继续 / 详情 / 删除」操作。勾选任务可批量删除（执行中的任务不可勾选）。
+      可查询任务进度，并对任务执行「继续 / 详情 / 删除」操作。勾选任务可批量删除；执行中的任务也可删除，但需二次确认并提示风险。
     </div>
     <div class="hist-toolbar">
       <label class="chk-all"><input type="checkbox" id="histSelAll" onchange="toggleSelAll(this)"> 全选</label>
       <button class="btn danger" onclick="batchDelete()">🗑 批量删除</button>
+      <button class="btn danger" onclick="cleanupStale()">🧹 清理卡死/陈旧记录</button>
       <span id="histSelInfo" class="muted" style="font-size:12px"></span>
     </div>
     <div id="histList" style="max-height:52vh;overflow:auto"></div>
@@ -979,7 +980,7 @@ async function probeTarget(){
 const STEPS = ["seed","bridge","verify","cutover","cleanup"];
 const STEP_LABELS_JS = {seed:"数据种子",bridge:"建立桥接",verify:"一致性校验",
                         cutover:"停桥切换",cleanup:"收尾回收"};
-let _detailId = null, _detailData = null, _bootTaskId = null;
+let _detailId = null, _detailData = null, _bootTaskId = null, _histTasks = [];
 
 function statusLabel(s){ return ({draft:"草稿",running:"执行中",error:"失败",done:"完成"})[s] || s; }
 function statusClass(s){ return ({draft:"m",running:"b",error:"r",done:"g"})[s] || "m"; }
@@ -990,6 +991,12 @@ function escapeHtml(s){
 
 // ---- P0：页面启动即检测进行中的任务，避免刷新后误以为停止 ----
 async function boot(){
+  // 从历史迁移页「回到向导」跳转而来（?task=<id>）：直接恢复到该任务的执行界面
+  const _tp = new URLSearchParams(location.search).get('task');
+  if(_tp){
+    try{ await resumeTask(Number(_tp)); }catch(e){ /* 加载失败则退回新建流程 */ }
+    return;
+  }
   try{
     const r = await fetch("/api/migration/list", {headers:{"Accept":"application/json"}, cache:"no-store"});
     const b = await r.json();
@@ -1083,11 +1090,14 @@ function renderHistory(list){
     return;
   }
   $("histCount").textContent = list.length + " 个";
+  _histTasks = list;
   const rows = list.map(t=>{
-    const canDelete = t.status !== "running";
+    // 执行中任务也允许删除（批量删除有二次确认 + 风险提示；单行/详情删除有风险提示）
+    const canDelete = true;
     const canResume = (t.status==="draft" || t.status==="running" || t.status==="error");
+    const isRunning = (t.status==="running");
     return `<tr>
-      <td class="sel-col"><input type="checkbox" class="hist-sel" value="${t.id}" ${canDelete?"":"disabled"} onchange="updateSelInfo()"></td>
+      <td class="sel-col"><input type="checkbox" class="hist-sel" value="${t.id}" onchange="updateSelInfo()"></td>
       <td>${t.id}</td>
       <td>${escapeHtml(t.name||"")}</td>
       <td>${t.channel==="physical"?"B 物理":"A 逻辑"}</td>
@@ -1098,7 +1108,7 @@ function renderHistory(list){
       <td class="acts-cell">
         ${canResume?`<button class="mini-btn" onclick="resumeTask(${t.id})">继续</button>`:""}
         <button class="mini-btn" onclick="openDetail(${t.id})">详情</button>
-        ${canDelete?`<button class="mini-btn danger" onclick="deleteTask(${t.id})">删除</button>`:""}
+        ${canDelete?`<button class="mini-btn danger" onclick="deleteTask(${t.id}, ${isRunning})">删除</button>`:""}
       </td>
     </tr>`;
   }).join("");
@@ -1126,11 +1136,22 @@ function updateSelInfo(){
   }
 }
 
-// ---- P3：批量删除 ----
+// ---- P3：批量删除（执行中任务需二次确认 + 风险提示） ----
 async function batchDelete(){
   const ids = Array.from(document.querySelectorAll('#histList .hist-sel:checked')).map(c=>+c.value);
-  if(!ids.length){ alert("请先勾选要删除的任务（执行中的任务不可勾选）。"); return; }
-  if(!confirm("确认批量删除选中的 "+ids.length+" 个迁移任务？\n删除后不可恢复，且执行中的任务不会被勾选。")) return;
+  if(!ids.length){ alert("请先勾选要删除的任务。"); return; }
+  // 第一确认
+  if(!confirm("确认批量删除选中的 "+ids.length+" 个迁移任务？\n删除后不可恢复。")) return;
+  // 含执行中任务 → 第二确认（明确风险）
+  const running = _histTasks.filter(t => ids.indexOf(t.id)>=0 && t.status==="running");
+  if(running.length){
+    const ok = confirm(
+      "⚠ 风险提示：本次删除包含 " + running.length + " 个【仍在执行中】的任务。\n" +
+      "删除仅移除任务记录，不会停止后台正在进行的迁移步骤（数据导出/恢复、GTID 桥接等），\n" +
+      "可能导致目标集群数据不完整、源端复制账号 / 桥接残留，且无法再在此界面监控进度。\n\n" +
+      "确认强制删除这些执行中的任务记录？");
+    if(!ok) return;
+  }
   let okN=0, failN=0; const errs=[];
   await Promise.all(ids.map(async id=>{
     try{
@@ -1141,6 +1162,23 @@ async function batchDelete(){
   }));
   alert("已删除 "+okN+" 个"+(failN?("，失败 "+failN+" 个：\n"+errs.join("\n")):""));
   showHistory();
+}
+
+// ---- 清理卡死/陈旧的执行中记录（仅删无后台线程在跑的 running 记录） ----
+async function cleanupStale(){
+  if(!confirm(
+    "确认清理所有【卡死 / 陈旧】的执行中记录？\n" +
+    "即状态为「执行中」但实际已无后台线程在跑的任务（如管理器重启后残留的状态）。\n" +
+    "真正在跑的迁移不会被清理。清理后不可恢复。")) return;
+  try{
+    const r = await fetch("/api/migration/cleanup-stale",
+                  {method:"POST", headers:{"Accept":"application/json"}});
+    const b = await r.json();
+    if(!b || b.ok===false){ alert("清理失败: "+(b&&b.error||"未知错误")); return; }
+    alert(b.deleted ? ("已清理 "+b.deleted+" 条卡死 / 陈旧记录。") :
+                      "没有需要清理的卡死 / 陈旧记录。");
+    showHistory();
+  }catch(e){ alert("清理失败: "+e); }
 }
 
 async function showHistory(){
@@ -1170,7 +1208,12 @@ async function openDetail(tid){
 }
 function closeDetail(){ $("detailMask").classList.remove("show"); }
 function detailResume(){ const id=_detailId; closeDetail(); if(id) resumeTask(id); }
-async function detailDelete(){ const id=_detailId; if(id) await deleteTask(id); closeDetail(); }
+async function detailDelete(){
+  const id=_detailId; if(!id) return;
+  const running = (_detailData && _detailData.status==="running");
+  await deleteTask(id, running);
+  closeDetail();
+}
 
 function renderDetail(j){
   const steps = j.steps || {};
@@ -1216,9 +1259,17 @@ async function retryStep(tid, step){
   }
 }
 
-// ---- P3：删除 ----
-async function deleteTask(tid){
-  if(!confirm("确认删除迁移任务 #"+tid+"？\n删除后不可恢复。")) return;
+// ---- P3：删除（执行中任务需风险提示） ----
+async function deleteTask(tid, isRunning){
+  if(isRunning){
+    if(!confirm(
+      "⚠ 风险提示：该任务【仍在执行中】。\n" +
+      "删除仅移除任务记录，不会停止后台正在进行的迁移步骤，" +
+      "可能导致目标集群数据不完整、源端复制账号 / 桥接残留，且无法再监控进度。\n\n" +
+      "确认强制删除？")) return;
+  }else{
+    if(!confirm("确认删除迁移任务 #"+tid+"？\n删除后不可恢复。")) return;
+  }
   try{
     const r = await fetch("/api/migration/"+tid, {method:"DELETE", headers:{"Accept":"application/json"}});
     const b = await r.json();

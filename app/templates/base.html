@@ -81,7 +81,13 @@
         <div class="sub" id="clusterSub"><!-- 由 /api/status 动态填充 --></div>
       </div>
       <a class="nav1" href="/nodes" data-path="/nodes"><span class="ic">⛁</span>节点管理</a>
-      <a class="nav1" href="/migration" data-path="/migration"><span class="ic">⇄</span>数据迁移</a>
+      <div class="nav-group" id="navMigrationGroup">
+        <a class="nav1" href="/migration" data-path="/migration"><span class="ic">⇄</span>数据迁移<span class="caret" onclick="toggleMigration(event)">▶</span></a>
+        <div class="sub" id="migrationSub">
+          <a href="/migration" data-path="/migration">迁移向导</a>
+          <a href="/migration/history" data-path="/migration/history">历史迁移</a>
+        </div>
+      </div>
       <a class="nav1" href="/alerts" data-path="/alerts"><span class="ic">✦</span>告警中心</a>
       <a class="nav1" href="/settings" data-path="/settings"><span class="ic">⚙</span>系统设置</a>
     </nav>
@@ -153,6 +159,17 @@ var _p = location.pathname;
       var g1 = g.querySelector('.nav1'); if(g1) g1.classList.add('open');
       s.classList.add('show');
     }
+    // 数据迁移子菜单（迁移向导 / 历史迁移）
+    var mg = document.getElementById('navMigrationGroup'), ms = document.getElementById('migrationSub');
+    if(mg && ms && _p.indexOf('/migration')===0){
+      mg.classList.add('open');
+      var mg1 = mg.querySelector('.nav1'); if(mg1) mg1.classList.add('open');
+      ms.classList.add('show');
+      ms.querySelectorAll('a[data-path]').forEach(function(a){
+        var p = a.dataset.path;
+        a.classList.toggle('active', (p===_p) || (_p.indexOf(p)===0 && p!=='/migration'));
+      });
+    }
     var t = document.getElementById('pageTitle');
     // 模板已指定标题时不覆盖（如「集群管理-集群名」）
     if(act && t && !t.textContent.trim()){ t.textContent = act.textContent.replace('▶','').trim(); }
@@ -162,6 +179,13 @@ var _p = location.pathname;
   window.toggleCluster = function(e){
     if(e){ e.stopPropagation(); e.preventDefault(); }
     var g = document.getElementById('navClusterGroup'), s = document.getElementById('clusterSub');
+    if(g){ g.classList.toggle('open'); var g1 = g.querySelector('.nav1'); if(g1) g1.classList.toggle('open'); }
+    if(s) s.classList.toggle('show');
+  };
+
+  window.toggleMigration = function(e){
+    if(e){ e.stopPropagation(); e.preventDefault(); }
+    var g = document.getElementById('navMigrationGroup'), s = document.getElementById('migrationSub');
     if(g){ g.classList.toggle('open'); var g1 = g.querySelector('.nav1'); if(g1) g1.classList.toggle('open'); }
     if(s) s.classList.toggle('show');
   };

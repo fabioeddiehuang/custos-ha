@@ -126,18 +126,39 @@ def list_tasks():
 
 
 def delete_task(tid):
-    """删除迁移任务。仅当没有后台步骤正在执行时才允许（防止砍断在途迁移）。
+    """删除迁移任务。
 
-    注意：status=='running' 但 tid 不在 _RUNNING（如管理器重启后残留的陈旧状态）
-    视为可删 —— 因为没有真实线程在跑，删除是安全的。
+    允许删除「执行中(running)」的任务记录：删除仅移除管理记录，不会停止后台
+    正在进行的迁移步骤（如数据导出/恢复、GTID 桥接）。后台线程跑完后会在
+    finally 中自行清理 _RUNNING，并发门禁随之自动解除，不会造成永久死锁。
+    前端在删除执行中任务时会做二次确认并提示该风险。
     """
-    if tid in _RUNNING:
-        return {"ok": False, "error": "任务正在执行，无法删除，请等待其完成"}
     task = get_task(tid)
     if not task:
         return {"ok": False, "error": "任务不存在"}
     execute("DELETE FROM migration_tasks WHERE id=%s", (tid,))
     return {"ok": True}
+
+
+def cleanup_stale_running_tasks():
+    """清理「卡死/陈旧」的执行中任务：状态为 running 但已无后台线程在跑
+    （典型场景：管理器重启后，原本在跑的任务线程丢失、状态却残留在 running）。
+
+    真正在跑的任务（tid in _RUNNING）不会被清理，避免误杀在途迁移。
+    """
+    try:
+        if _RUNNING:
+            busy = tuple(sorted(_RUNNING))
+            rows = query("SELECT id FROM migration_tasks WHERE status='running' AND id NOT IN %s", (busy,))
+        else:
+            rows = query("SELECT id FROM migration_tasks WHERE status='running'")
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    ids = [int(r["id"]) for r in rows]
+    if not ids:
+        return {"ok": True, "deleted": 0, "ids": []}
+    execute("DELETE FROM migration_tasks WHERE id IN %s", (tuple(ids),))
+    return {"ok": True, "deleted": len(ids), "ids": ids}
 
 
 # ---------------------------------------------------------------------------
