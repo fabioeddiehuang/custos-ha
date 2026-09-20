@@ -825,6 +825,26 @@ def _container_staging(staging_host, data_dir_host):
     return "/var/lib/mysql" + staging_host[len(data_dir_host.rstrip("/")):]
 
 
+def _docker_datadir_host_mount(cfg, host, cid, use_src_cred, node_type):
+    """探测容器 /var/lib/mysql 在宿主机的真实挂载源路径（bind 或 named volume 均可）。
+
+    docker 节点的「宿主机数据目录」不能写死（1panel 等安装的数据目录并不在
+    /data/custos-ha/mariadb12）——必须按实际挂载。rsync 在宿主机层拉取备份，
+    只能访问真实挂载源。返回宿主机绝对路径或 None。
+    """
+    if not cid:
+        return None
+    sh = _ssh_run(cfg, host,
+                  "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/var/lib/mysql\"}}"
+                  "{{.Source}}{{end}}{{end}}' %s 2>/dev/null" % cid,
+                  use_src_cred, node_type)
+    if sh.returncode == 0:
+        p = sh.stdout.strip()
+        if p:
+            return p
+    return None
+
+
 # agent-exec 的 HTTP 等待上限（与 SSH 同量级；mariabackup 可能跑很久）
 AGENT_EXEC_TIMEOUT = 3600 * 6
 
@@ -1108,6 +1128,19 @@ def seed_physical(task):
     snt = cfg.get("src_type", nt)                           # 源形态（默认同目标）
     dd = _tgt_datadir(cfg)                                  # 目标数据目录（宿主机路径）
     src_dd = cfg.get("src_data_dir") or _default_src_datadir(snt)
+    # docker 节点：容器 /var/lib/mysql 的真实宿主机挂载源必须实测，不能依赖硬编码默认
+    # （1panel 等安装的数据目录并不在 /data/custos-ha/mariadb12）；否则 rsync 按错路径拉取会
+    # 找不到暂存目录（No such file or directory）。裸机直接用配置/默认。
+    if str(snt).endswith("-docker"):
+        scid, _ = _find_mariadb_container(cfg["src_host"], cfg, True, snt)
+        m = _docker_datadir_host_mount(cfg, cfg["src_host"], scid, True, snt)
+        if m:
+            src_dd = m
+    if str(nt).endswith("-docker"):
+        tcid, _ = _find_mariadb_container(cfg["tgt_host"], cfg, False, nt)
+        m = _docker_datadir_host_mount(cfg, cfg["tgt_host"], tcid, False, nt)
+        if m:
+            dd = m
     staging = _mig_staging_path(nt, dd, task["id"])          # 目标机暂存（宿主机路径）
     src_staging = _mig_staging_path(snt, src_dd, task["id"]) # 源机暂存（宿主机路径）
     # 裸机节点解析 mariabackup 完整路径（tarball 装在 /opt/mariadb/bin，常不在 PATH）；容器用镜像内 PATH
