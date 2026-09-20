@@ -2839,6 +2839,9 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
             "src_type": b.get("src_type") or "",
             "src_ssh_user": b.get("src_ssh_user") or "root",
             "src_ssh_pass": b.get("src_ssh_pass") or "",
+            # 目标端 SSH 账号/密码（物理通道 B 在目标节点本地跑 docker/mariabackup/copy-back 用）
+            "tgt_ssh_user": b.get("tgt_ssh_user") or "root",
+            "tgt_ssh_pass": b.get("tgt_ssh_pass") or "",
             # 物理通道目标数据目录（留空则按 node_type 推导）
             "tgt_datadir": b.get("tgt_datadir") or "",
         }

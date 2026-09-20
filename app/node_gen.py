@@ -123,6 +123,10 @@ def render_agent_service(log_dir_host):
       - /:/host:ro
       - ./agent/node_agent.py:/app/node_agent.py:ro
       - {log_dir_host}:/var/log/custos-ha:z
+      # Plan B：迁移物理通道经 agent 在宿主跑 docker/mariabackup，需宿主 docker.sock。
+      # 同时挂到 /host/var/run/docker.sock 供 chroot /host 后的脚本解析。
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/host/var/run/docker.sock
 """
 
 def _valid_vip(vip):

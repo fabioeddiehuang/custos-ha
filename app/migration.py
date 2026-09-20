@@ -23,11 +23,14 @@ import time
 import shutil
 import subprocess
 import threading
+import urllib.request
+import urllib.error
 import pymysql
 from datetime import datetime
 
 from .db import query, execute
 from . import crypto
+from .config import get_mgmt_host, NODE_AGENT_PORT, NODE_AGENT_TOKEN, NODE_AGENT_TIMEOUT
 from .ha_client import connect
 from .clusters import create_cluster, get_cluster_creds
 from . import node_gen
@@ -818,13 +821,63 @@ def _container_staging(staging_host, data_dir_host):
     return "/var/lib/mysql" + staging_host[len(data_dir_host.rstrip("/")):]
 
 
-def _ssh_opt_string(cfg, host, use_src_cred):
-    """构造 ssh 连接串（含可选密码）。源端可用独立账号/密码，目标端用默认 root 密钥。"""
+# agent-exec 的 HTTP 等待上限（与 SSH 同量级；mariabackup 可能跑很久）
+AGENT_EXEC_TIMEOUT = 3600 * 6
+
+
+def _ssh_creds(cfg, use_src_cred):
+    """返回 (user, pwd)。源端用 src_ssh_*；目标端用 tgt_ssh_*（默认 root）。
+
+    根因：目标端原本写死 root + 默认密钥，但管理器从不为节点装公钥、节点 compose 也无
+    sshd 之外的 SSH 通道，导致目标 SSH 必失败 → 被静默吞成「没容器」。现统一走账号/密码
+    （sshpass），与源端对称。
+    """
     if use_src_cred:
-        user = cfg.get("src_ssh_user") or "root"
-        pwd = cfg.get("src_ssh_pass") or ""
-    else:
-        user, pwd = "root", ""
+        return cfg.get("src_ssh_user") or "root", cfg.get("src_ssh_pass") or ""
+    return cfg.get("tgt_ssh_user") or "root", cfg.get("tgt_ssh_pass") or ""
+
+
+def _ssh_connect_failed(cp):
+    """SSH 是否「连不上 / 认证失败」（而非命令本身执行失败）。用于决定是否退回 agent-exec。"""
+    if cp is None or cp.returncode == 0:
+        return False
+    err = (getattr(cp, "stderr", "") or "") + (getattr(cp, "stdout", "") or "")
+    keys = ("Permission denied", "Connection refused", "Connection timed out",
+            "No route to host", "Connection reset", "Name or service not known",
+            "Host key verification failed", "ssh: connect", "timed out", "Timeout")
+    low = err.lower()
+    return any(k.lower() in low for k in keys)
+
+
+def _agent_exec(host, script):
+    """经节点 agent 的 /exec 端点在【宿主】执行命令（容器节点经 docker.sock 跑 docker）。
+
+    返回 subprocess.CompletedProcess，或 None（agent 不可达 / 无 /exec / 未授权 / 异常）。
+    仅作为 SSH 连不上时的兜底；裸机节点因 agent 容器无法写宿主文件系统，仍应走 SSH。
+    """
+    if not NODE_AGENT_PORT:
+        return None
+    try:
+        url = "http://%s:%s/exec" % (host, NODE_AGENT_PORT)
+        data = json.dumps({"script": script}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if NODE_AGENT_TOKEN:
+            headers["Authorization"] = "Bearer %s" % NODE_AGENT_TOKEN
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=AGENT_EXEC_TIMEOUT) as resp:
+            obj = json.loads(resp.read().decode("utf-8"))
+        if not obj.get("ok"):
+            return None
+        return subprocess.CompletedProcess(
+            args=script, returncode=int(obj.get("rc", 1)),
+            stdout=obj.get("stdout", "") or "", stderr=obj.get("stderr", "") or "")
+    except Exception:
+        return None
+
+
+def _ssh_opt_string(cfg, host, use_src_cred):
+    """构造 rsync 的 ssh 连接串（含可选密码）。源/目标端均按各自账号密码（sshpass）。"""
+    user, pwd = _ssh_creds(cfg, use_src_cred)
     ssh = "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 %s@%s" % (user, host)
     if pwd:
         return "sshpass -p %s rsync -az --delete -e %s" % (_sh_quote(pwd), _sh_quote(ssh))
@@ -844,39 +897,75 @@ def _rsync_push(cfg, local_path, host, remote_path):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600)
 
 
-def _ssh_run(cfg, host, script, use_src_cred):
-    if use_src_cred:
-        user = cfg.get("src_ssh_user") or "root"
-        pwd = cfg.get("src_ssh_pass") or ""
-    else:
-        user, pwd = "root", ""
+def _ssh_run(cfg, host, script, use_src_cred, node_type=None):
+    """在节点上执行 shell 脚本：先试 SSH（源/目标各自账号密码），连不上则退回 agent-exec（容器节点）。
+
+    node_type 用于判断是否为容器节点（agent-exec 仅对容器节点可靠）。返回 subprocess.CompletedProcess。
+    """
+    user, pwd = _ssh_creds(cfg, use_src_cred)
     base = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=no",
             "-o", "ConnectTimeout=15", "%s@%s" % (user, host)]
-    if pwd:
-        return subprocess.run(["sshpass", "-p", pwd] + base + [script],
-                              capture_output=True, text=True, timeout=3600 * 6)
-    return subprocess.run(base + [script], capture_output=True, text=True, timeout=3600 * 6)
+    cp = None
+    try:
+        if pwd:
+            cp = subprocess.run(["sshpass", "-p", pwd] + base + [script],
+                                capture_output=True, text=True, timeout=3600 * 6)
+        else:
+            cp = subprocess.run(base + [script], capture_output=True, text=True, timeout=3600 * 6)
+    except Exception:
+        cp = None
+    # SSH 连不上 / 认证失败 → 退回 agent-exec（仅容器节点可靠）
+    if (cp is None or _ssh_connect_failed(cp)) and node_type and str(node_type).endswith("-docker"):
+        ap = _agent_exec(host, script)
+        if ap is not None:
+            return ap
+    if cp is None:
+        raise RuntimeError("无法 SSH 到 %s（命令执行异常），且 agent-exec 不可用。"
+                           "请核对目标节点 SSH 账号/密码（向导「目标机 SSH」），"
+                           "或对目标节点执行 regen 启用 agent-exec。" % host)
+    return cp
 
 
-def _find_mariadb_container(host, cfg, use_src_cred):
-    """在宿主机上定位 MariaDB 容器（Custos 节点优先按 compose 服务 / 容器名，再回退镜像）。
+def _find_mariadb_container(host, cfg, use_src_cred, node_type=None):
+    """在宿主机定位运行中的 MariaDB 容器，返回 (cid, diag)。
 
-    不依赖端口发布：容器可能用 host 网络、或发布端口与向导填写不一致，
-    按 `publish=端口` 探测会落空（实测 33 节点即此情形）。
-    返回首个匹配的运行中容器 ID，找不到返回空串。
+    diag 取值：'ok'（找到）/'ssh_fail'（SSH 不可达）/'docker_missing'（docker 不可用）
+              /'no_container'（确实无匹配容器）。
+    关键：把「SSH 失败 / docker 缺失」与「容器不存在」区分开，避免把 SSH 不通误报成「没容器」
+    （实测 33 节点：MySQL 连通性预检通过 ≠ SSH 能跑 docker ps，二者是两套凭证/通道）。
+    匹配：优先 compose 服务 mariadb；否则按 容器名/镜像 含 'mariadb' 选取（不依赖发布端口/精确名/compose 路径）。
     """
     sh = _ssh_run(cfg, host,
+                  "command -v docker >/dev/null 2>&1 && echo DOCKER_OK || echo DOCKER_NO; "
                   "cd /data/custos-ha 2>/dev/null && docker compose ps -q mariadb 2>/dev/null; "
-                  "docker ps -q --filter status=running --filter name=custos-mariadb 2>/dev/null; "
-                  "docker ps -q --filter status=running --filter ancestor=mariadb 2>/dev/null",
-                  use_src_cred)
+                  "docker ps --filter status=running --format '{{.ID}}|{{.Names}}|{{.Image}}'",
+                  use_src_cred, node_type)
     if sh.returncode != 0:
-        return ""
-    ids = [l.strip() for l in sh.stdout.splitlines() if l.strip()]
-    return ids[0] if ids else ""
+        return "", "ssh_fail"
+    out = sh.stdout
+    nl = out.find("\n")
+    marker = out[:nl].strip() if nl != -1 else out.strip()
+    if marker != "DOCKER_OK":
+        return "", "docker_missing"
+    rest = out[nl + 1:] if nl != -1 else ""
+    compose_id = ""
+    for line in rest.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "|" not in line:
+            if not compose_id:
+                compose_id = line          # compose ps 输出：纯容器 id（无 '|'）
+            continue
+        cid, names, image = (line.split("|") + ["", ""])[:3]
+        if "mariadb" in (names + " " + image).lower():
+            return cid, "ok"
+    if compose_id:
+        return compose_id, "ok"
+    return "", "no_container"
 
 
-def _resolve_mb(host, cfg, use_src_cred):
+def _resolve_mb(host, cfg, use_src_cred, node_type=None):
     """解析裸机节点上的 mariabackup 路径。
 
     裸机靠 tarball 装在 /opt/mariadb/bin，常不在 PATH；容器节点在镜像 PATH 内。
@@ -885,7 +974,7 @@ def _resolve_mb(host, cfg, use_src_cred):
     sh = _ssh_run(cfg, host,
                   "MB=$(command -v /opt/mariadb/bin/mariabackup 2>/dev/null); "
                   "[ -z \"$MB\" ] && MB=$(command -v mariabackup 2>/dev/null); "
-                  "printf '%s' \"$MB\"", use_src_cred)
+                  "printf '%s' \"$MB\"", use_src_cred, node_type)
     if sh.returncode == 0:
         p = sh.stdout.strip()
         if p:
@@ -897,17 +986,26 @@ def _check_node_mb(node_type, host, port, cfg, use_src_cred):
     """物理通道前置探测：确认源/目标节点存在 mariabackup，否则抛清晰错误 + 安装指引。"""
     is_docker = str(node_type).endswith("-docker")
     if is_docker:
-        cid = _find_mariadb_container(host, cfg, use_src_cred)
+        cid, diag = _find_mariadb_container(host, cfg, use_src_cred, node_type)
+        if diag == "ssh_fail":
+            raise RuntimeError("物理通道前置检查失败：无法 SSH 到 %s（SSH 不可达或认证失败）。"
+                               "源端请在向导核对「源机 SSH 账号/密码」；目标端请核对「目标机 SSH 账号/密码」，"
+                               "或对目标节点执行 regen 启用 agent-exec（经 docker.sock 免 SSH 执行）。"
+                               % host)
+        if diag == "docker_missing":
+            raise RuntimeError("物理通道前置检查失败：%s 上 docker 不可用（command -v docker 为空），"
+                               "请确认该节点已安装并启动 Docker。" % host)
         if not cid:
             raise RuntimeError("物理通道前置检查失败：未在 %s 找到运行中的 MariaDB 容器"
-                               "（已尝试 compose 服务 mariadb / 容器名 custos-mariadb / mariadb 镜像）。"
+                               "（已按 compose 服务 / 容器名 / 镜像 匹配均无）。"
                                "请确认该节点已部署并运行 Custos MariaDB 容器。" % host)
-        sh = _ssh_run(cfg, host, "docker exec %s command -v mariabackup || true" % cid, use_src_cred)
+        sh = _ssh_run(cfg, host, "docker exec %s command -v mariabackup || true" % cid,
+                      use_src_cred, node_type)
         present = bool(sh.stdout.strip())
     else:
         sh = _ssh_run(cfg, host,
                       "command -v /opt/mariadb/bin/mariabackup 2>/dev/null "
-                      "|| command -v mariabackup 2>/dev/null || true", use_src_cred)
+                      "|| command -v mariabackup 2>/dev/null || true", use_src_cred, node_type)
         present = bool(sh.stdout.strip())
     if not present:
         where = ("容器 %s：请改用自带 mariabackup 的官方 mariadb 镜像" % host
@@ -927,8 +1025,8 @@ def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=No
     """
     is_docker = str(node_type).endswith("-docker")
     if mb_bin is None:
-        mb_bin = "mariabackup" if is_docker else _resolve_mb(host, cfg, use_src_cred=(op != "copyback"))
-    if op == "backup":
+        mb_bin = "mariabackup" if is_docker else _resolve_mb(host, cfg, use_src_cred=(op != "copyback"),
+                                                              node_type=node_type)
         mb = [mb_bin, "--backup",
               "--host=%s" % src[0], "--port=%s" % src[1],
               "--user=%s" % src[2], "--password=%s" % src[3],
@@ -956,20 +1054,25 @@ def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=No
                 "chown -R 999:999 %s; docker compose start mariadb; rm -rf %s"
                 % (staging_host, inner, datadir, staging_host)
             )
-            return _ssh_run(cfg, host, script, use_src_cred=False)
+            return _ssh_run(cfg, host, script, use_src_cred=False, node_type=node_type)
         # backup / prepare：容器运行中，docker exec 进容器（暂存放在数据目录挂载内）
-        cid = _find_mariadb_container(host, cfg, use_src_cred=True)
+        cid, diag = _find_mariadb_container(host, cfg, use_src_cred=True, node_type=node_type)
+        if diag == "ssh_fail":
+            raise RuntimeError("无法 SSH 到源机 %s（SSH 不可达或认证失败），请核对向导「源机 SSH 账号/密码」。"
+                               % host)
+        if diag == "docker_missing":
+            raise RuntimeError("源机 %s 上 docker 不可用，无法执行备份。" % host)
         if not cid:
             raise RuntimeError("未在源机 %s 找到运行中的 MariaDB 容器"
-                               "（已尝试 compose 服务 mariadb / 容器名 custos-mariadb / mariadb 镜像）；"
+                               "（已按 compose 服务 / 容器名 / 镜像 匹配均无）；"
                                "若源为裸机 MariaDB 请在「源端形态」选「裸机 MariaDB」" % host)
         inner_staging = _container_staging(staging_host, src_data_dir or _default_src_datadir(node_type))
         mb[-1] = "--target-dir=%s" % inner_staging
         inner = " ".join(_sh_quote(a) for a in mb)
-        return _ssh_run(cfg, host, "docker exec %s %s" % (cid, inner), use_src_cred=True)
+        return _ssh_run(cfg, host, "docker exec %s %s" % (cid, inner), use_src_cred=True, node_type=node_type)
     # 裸机：直接 SSH 执行
     inner = " ".join(_sh_quote(a) for a in mb)
-    return _ssh_run(cfg, host, inner, use_src_cred=(op != "copyback"))
+    return _ssh_run(cfg, host, inner, use_src_cred=(op != "copyback"), node_type=node_type)
 
 
 def seed_physical(task):
@@ -992,9 +1095,9 @@ def seed_physical(task):
     src_staging = _mig_staging_path(snt, src_dd, task["id"]) # 源机暂存（宿主机路径）
     # 裸机节点解析 mariabackup 完整路径（tarball 装在 /opt/mariadb/bin，常不在 PATH）；容器用镜像内 PATH
     src_mb = ("mariabackup" if str(snt).endswith("-docker")
-              else _resolve_mb(cfg["src_host"], cfg, use_src_cred=True))
+              else _resolve_mb(cfg["src_host"], cfg, use_src_cred=True, node_type=snt))
     tgt_mb = ("mariabackup" if str(nt).endswith("-docker")
-              else _resolve_mb(cfg["tgt_host"], cfg, use_src_cred=False))
+              else _resolve_mb(cfg["tgt_host"], cfg, use_src_cred=False, node_type=nt))
     relay = f"/tmp/custos_mig_relay_{task['id']}"            # 管理器中转（避免源→目标直连 ssh）
     os.makedirs(relay, exist_ok=True)
     try:

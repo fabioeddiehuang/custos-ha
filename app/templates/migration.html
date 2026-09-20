@@ -232,6 +232,9 @@
     </div>
     <div class="field"><label>源机 SSH 账号（可选，默认 root）</label><input id="srcSshUser" placeholder="默认 root（密钥或密码）"></div>
     <div class="field"><label>源机 SSH 密码（可选；留空走密钥）</label><input id="srcSshPass" type="password"></div>
+    <div style="margin-top:10px;font-size:12px;color:var(--muted)">目标端（新主）同样需在本机执行 docker / mariabackup / copy-back：管理器经 SSH 到目标机（账号/密码，默认 root）操作；若目标机不可 SSH，可对目标节点执行 regen 启用 agent-exec（免 SSH）。</div>
+    <div class="field"><label>目标机 SSH 账号（可选，默认 root）</label><input id="tgtSshUser" placeholder="默认 root（密钥或密码）"></div>
+    <div class="field"><label>目标机 SSH 密码（可选；留空走密钥或 agent-exec）</label><input id="tgtSshPass" type="password"></div>
   </div>
 
   <div id="chanLabel" style="margin-top:12px;font-size:13px;color:var(--text);font-weight:600">迁移通道（系统已按数据量推荐，可覆盖）</div>
@@ -614,6 +617,8 @@ async function createTask(){
     src_type:$("srcType").value||null,
     src_ssh_user:$("srcSshUser").value.trim()||null,
     src_ssh_pass:$("srcSshPass").value||null,
+    tgt_ssh_user:$("tgtSshUser").value.trim()||null,
+    tgt_ssh_pass:$("tgtSshPass").value||null,
     // 产品线决定 dump 工具与 GTID 参数（两者互斥）；size_mb 用于真实百分比进度
     src_flavor:(STATE.probe&&STATE.probe.flavor)||"mariadb",
     src_major:(STATE.probe&&STATE.probe.major)||0,

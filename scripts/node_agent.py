@@ -8,7 +8,8 @@
 #
 # 设计原则：
 #   - 纯标准库，无第三方依赖（节点缺网也能跑）；若环境有 psutil 则优先用（更准）。
-#   - 只暴露只读采集，绝不接受任何写/执行请求。
+#   - 默认只暴露只读采集；额外的 POST /exec（受同一 NODE_AGENT_TOKEN 保护）仅用于
+#     迁移物理通道在宿主执行 docker/mariabackup，属可控的受信写端点，非公开能力。
 #   - 完全可选：管理器侧 agent 不可达时静默降级，不影响 HA 主逻辑。
 #
 # 用法：
@@ -25,6 +26,7 @@ import json
 import logging
 import os
 import socket
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -341,6 +343,32 @@ def _self_started_at(root):
 
 
 # ---------------------------------------------------------------------------
+# 宿主命令执行（Plan B：迁移物理通道 agent-exec 兜底）
+# ---------------------------------------------------------------------------
+def exec_on_host(script):
+    """在宿主文件系统执行 shell 脚本，返回 {ok, rc, stdout, stderr}。
+
+    容器节点：agent 容器挂了 /:/host:ro 且 pid:host，故 chroot /host 后执行，
+    使脚本里的宿主路径（如 /data/custos-ha）与宿主 docker（/host/usr/bin/docker +
+    挂载的 /host/var/run/docker.sock）都正确解析；docker 命令实际在宿主 dockerd 上跑，
+    写入发生在目标容器内，不写宿主只读层。裸机节点：/host 即宿主根，等同原生执行。
+    仅迁移场景使用；与 /stats 同样受 NODE_AGENT_TOKEN 保护。
+    """
+    env = dict(os.environ)
+    if os.path.isdir("/host") and (os.path.exists("/host/usr/bin/docker")
+                                   or os.path.exists("/host/bin/docker")):
+        env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        args = ["chroot", "/host", "/bin/sh", "-c", script]
+    else:
+        args = ["/bin/sh", "-c", script]
+    try:
+        cp = subprocess.run(args, env=env, capture_output=True, text=True, timeout=3600 * 6)
+        return {"ok": True, "rc": cp.returncode, "stdout": cp.stdout, "stderr": cp.stderr}
+    except Exception as e:
+        return {"ok": False, "rc": 1, "stdout": "", "stderr": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # HTTP 服务
 # ---------------------------------------------------------------------------
 def make_handler(collector, token):
@@ -422,6 +450,26 @@ def make_handler(collector, token):
                     })
                 except Exception as e:
                     self._send(500, {"ok": False, "error": str(e)})
+                return
+            self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/exec":
+                if not self._allow():
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                    script = body.get("script") or ""
+                    if not script:
+                        self._send(400, {"error": "missing script"})
+                        return
+                    self._send(200, exec_on_host(script))
+                except Exception as e:
+                    self._send(500, {"error": str(e)})
                 return
             self._send(404, {"error": "not found"})
 
