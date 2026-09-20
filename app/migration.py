@@ -858,12 +858,22 @@ def _ssh_run(cfg, host, script, use_src_cred):
     return subprocess.run(base + [script], capture_output=True, text=True, timeout=3600 * 6)
 
 
-def _find_mariadb_container(host, port, cfg, use_src_cred):
-    sh = _ssh_run(cfg, host, "docker ps -q --filter 'publish=%s' --filter status=running"
-                  % port, use_src_cred)
+def _find_mariadb_container(host, cfg, use_src_cred):
+    """在宿主机上定位 MariaDB 容器（Custos 节点优先按 compose 服务 / 容器名，再回退镜像）。
+
+    不依赖端口发布：容器可能用 host 网络、或发布端口与向导填写不一致，
+    按 `publish=端口` 探测会落空（实测 33 节点即此情形）。
+    返回首个匹配的运行中容器 ID，找不到返回空串。
+    """
+    sh = _ssh_run(cfg, host,
+                  "cd /data/custos-ha 2>/dev/null && docker compose ps -q mariadb 2>/dev/null; "
+                  "docker ps -q --filter status=running --filter name=custos-mariadb 2>/dev/null; "
+                  "docker ps -q --filter status=running --filter ancestor=mariadb 2>/dev/null",
+                  use_src_cred)
     if sh.returncode != 0:
         return ""
-    return sh.stdout.strip().split("\n")[0].strip() if sh.stdout.strip() else ""
+    ids = [l.strip() for l in sh.stdout.splitlines() if l.strip()]
+    return ids[0] if ids else ""
 
 
 def _resolve_mb(host, cfg, use_src_cred):
@@ -887,11 +897,11 @@ def _check_node_mb(node_type, host, port, cfg, use_src_cred):
     """物理通道前置探测：确认源/目标节点存在 mariabackup，否则抛清晰错误 + 安装指引。"""
     is_docker = str(node_type).endswith("-docker")
     if is_docker:
-        cid = _find_mariadb_container(host, port, cfg, use_src_cred)
+        cid = _find_mariadb_container(host, cfg, use_src_cred)
         if not cid:
-            raise RuntimeError("物理通道前置检查失败：未在 %s 找到运行中的 mariadb 容器"
-                               "（按端口 %s 探测）。请确认该节点已部署并运行 Custos MariaDB 容器。"
-                               % (host, port))
+            raise RuntimeError("物理通道前置检查失败：未在 %s 找到运行中的 MariaDB 容器"
+                               "（已尝试 compose 服务 mariadb / 容器名 custos-mariadb / mariadb 镜像）。"
+                               "请确认该节点已部署并运行 Custos MariaDB 容器。" % host)
         sh = _ssh_run(cfg, host, "docker exec %s command -v mariabackup || true" % cid, use_src_cred)
         present = bool(sh.stdout.strip())
     else:
@@ -948,11 +958,11 @@ def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=No
             )
             return _ssh_run(cfg, host, script, use_src_cred=False)
         # backup / prepare：容器运行中，docker exec 进容器（暂存放在数据目录挂载内）
-        cid = _find_mariadb_container(host, cfg.get("src_port"), cfg, use_src_cred=True)
+        cid = _find_mariadb_container(host, cfg, use_src_cred=True)
         if not cid:
-            raise RuntimeError("未在源机 %s 找到运行中的 mariadb 容器（按端口 %s 探测）；"
-                               "若源为裸机 MariaDB 请在「源端形态」选「裸机 MariaDB」"
-                               % (host, cfg.get("src_port")))
+            raise RuntimeError("未在源机 %s 找到运行中的 MariaDB 容器"
+                               "（已尝试 compose 服务 mariadb / 容器名 custos-mariadb / mariadb 镜像）；"
+                               "若源为裸机 MariaDB 请在「源端形态」选「裸机 MariaDB」" % host)
         inner_staging = _container_staging(staging_host, src_data_dir or _default_src_datadir(node_type))
         mb[-1] = "--target-dir=%s" % inner_staging
         inner = " ".join(_sh_quote(a) for a in mb)
