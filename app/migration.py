@@ -880,9 +880,14 @@ def _agent_exec(host, script):
 
 
 def _ssh_opt_string(cfg, host, use_src_cred):
-    """构造 rsync 的 ssh 连接串（含可选密码）。源/目标端均按各自账号密码（sshpass）。"""
+    """构造 rsync 的 ssh 传输串（仅 ssh 选项与可选密码，不内含 host）。
+
+    源/目标的 user@host 由调用方拼到 rsync 的 host:path 参数里，避免 -e 与 host:path
+    双重带 host 导致 rsync 把 host 当作远端要执行的命令（远端 zsh 报
+    "command not found: <host>"）。
+    """
     user, pwd = _ssh_creds(cfg, use_src_cred)
-    ssh = "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 %s@%s" % (user, host)
+    ssh = "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15"
     if pwd:
         return "sshpass -p %s rsync -az --delete -e %s" % (_sh_quote(pwd), _sh_quote(ssh))
     return "rsync -az --delete -e %s" % _sh_quote(ssh)
@@ -890,14 +895,16 @@ def _ssh_opt_string(cfg, host, use_src_cred):
 
 def _rsync_pull(cfg, host, remote_path, local_path):
     os.makedirs(local_path, exist_ok=True)
-    cmd = "%s %s:%s %s/" % (_ssh_opt_string(cfg, host, True),
-                            host, _sh_quote(remote_path), _sh_quote(local_path))
+    user, _ = _ssh_creds(cfg, True)
+    cmd = "%s %s@%s:%s %s/" % (_ssh_opt_string(cfg, host, True),
+                                user, host, _sh_quote(remote_path), _sh_quote(local_path))
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600)
 
 
 def _rsync_push(cfg, local_path, host, remote_path):
-    cmd = "%s %s/ %s:%s" % (_ssh_opt_string(cfg, host, False),
-                            _sh_quote(local_path), host, _sh_quote(remote_path))
+    user, _ = _ssh_creds(cfg, False)
+    cmd = "%s %s/ %s@%s:%s" % (_ssh_opt_string(cfg, host, False),
+                                _sh_quote(local_path), user, host, _sh_quote(remote_path))
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600)
 
 
