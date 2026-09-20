@@ -221,17 +221,17 @@
       <div class="field-hint">到目标节点执行 <code>SELECT VERSION();</code>，把返回的原文整串粘入（如 12.3.3-MariaDB）。</div>
     </div>
     <div class="field"><label>目标数据目录（可选，物理通道 B 用）</label>
-      <input id="tgtData" placeholder="如 /data/custos-ha/mariadb12（容器）或 /data/mariadb（裸机）">
-      <div class="field-hint">目标实例的数据目录；留空按形态取默认（容器 /data/custos-ha/mariadb12，裸机 /data/mariadb）。</div>
+      <input id="tgtData" placeholder="如 /data/custos-ha/mariadb12（容器）或 /data/custos-ha/mariadb（裸机）">
+      <div class="field-hint"><b>留空即可自动探测</b>：容器目标用 docker inspect 实测挂载源；裸机目标依次用 Custos 安装状态文件、<b>运行中的 mysqld/mariadbd 进程</b>、systemd 服务单元（mariadb-ha / mariadb / mysqld / mysql 等都会枚举匹配）、my.cnf 逐级兜底 —— 标准包管理、tarball 编译、Custos 安装都能命中。仅当自动探测不到时才需手动填写。</div>
     </div>
-    <div style="margin-top:10px;font-size:12px;color:var(--muted)">以下两项为「物理通道 B」源端路径（非标安装必填）：每个人的 my.cnf / 数据目录位置不同，必须显式指定，否则 mariabackup 找不到。</div>
+    <div style="margin-top:10px;font-size:12px;color:var(--muted)">以下两项为「物理通道 B」源端路径（非标安装才需填）：位置因人而异，探测不到时必须显式指定，否则 mariabackup 找不到。</div>
     <div class="field"><label>源端 my.cnf 路径（可选，物理通道 B 用）</label>
       <input id="srcCnf" placeholder="如 /etc/mysql/my.cnf 或 /data/mariadb/my.cnf">
-      <div class="field-hint">源 MariaDB 的配置文件路径。<b>裸机源</b>且非标准位置时必填；<b>容器源</b>留空（自动读取容器内自带配置）。</div>
+      <div class="field-hint">源 MariaDB 的配置文件路径。<b>裸机源</b>留空时会自动采用运行中进程的 <code>--defaults-file</code>；容器源留空（自动读取容器内自带配置）。</div>
     </div>
     <div class="field"><label>源端数据目录（可选，物理通道 B 用）</label>
       <input id="srcData" placeholder="如 /var/lib/mysql 或 /data/mariadb/data">
-      <div class="field-hint">源 MariaDB 的真实数据目录。<b>裸机源</b>且非标准位置时必填；<b>容器源</b>留空（固定 /var/lib/mysql）。</div>
+      <div class="field-hint">源 MariaDB 的真实数据目录。<b>裸机源</b>留空时按上面同样的方式自动探测；<b>容器源</b>留空（实测容器 /var/lib/mysql 的宿主机挂载源）。</div>
     </div>
     <div style="margin-top:10px;font-size:12px;color:var(--muted)">物理通道 B 还需源端形态与源机 SSH 访问：备份 / prepare 在<b>源节点本地</b>执行（mariabackup 只能读本地 datadir，无法备份远程），故管理器需经 SSH 到源机操作。</div>
     <div class="field"><label>源端形态（物理通道 B 用）</label>
@@ -241,15 +241,15 @@
       </select>
       <div class="field-hint">源 MariaDB 是容器化还是裸机，决定备份/prepare 的执行方式（docker exec 还是 SSH 直连）。</div>
     </div>
-    <div class="field"><label>源机 SSH 账号（可选，默认 root）</label><input id="srcSshUser" placeholder="默认 root（密钥或密码）">
+    <div class="field"><label>源机 SSH 账号（默认 root）</label><input id="srcSshUser" placeholder="默认 root">
       <div class="field-hint">管理器经 SSH 到源机执行 mariabackup 用的账号；留空默认 root。</div></div>
-    <div class="field"><label>源机 SSH 密码（可选；留空走密钥）</label><input id="srcSshPass" type="password">
-      <div class="field-hint">源机 SSH 密码；留空则走密钥认证（需事先已配置免密）。</div></div>
-    <div style="margin-top:10px;font-size:12px;color:var(--muted)">目标端（新主）同样需在本机执行 docker / mariabackup / copy-back：管理器经 SSH 到目标机（账号/密码，默认 root）操作；若目标机不可 SSH，可对目标节点执行 regen 启用 agent-exec（免 SSH）。</div>
-    <div class="field"><label>目标机 SSH 账号（可选，默认 root）</label><input id="tgtSshUser" placeholder="默认 root（密钥或密码）">
+    <div class="field"><label>源机 SSH 密码（通常必填）</label><input id="srcSshPass" type="password">
+      <div class="field-hint">必填的是该机器<b>宿主机 root 的 SSH 密码</b>（不是数据库密码）。管理器默认不给节点下发公钥，<b>留空不会自动走密钥，会直接报「无法 SSH 到源机」</b>；除非你已自行配置免密。</div></div>
+    <div style="margin-top:10px;font-size:12px;color:var(--muted)">目标端（新主）同样需在本机执行 docker / mariabackup / copy-back：管理器经 SSH 到目标机（账号/密码，默认 root）操作。若该节点是 <b>Custos 纳管节点</b>且不方便给 SSH，可到「节点管理」对该节点点「重新生成」重新下发节点包，节点 agent 会提供 /exec 免 SSH 通道（即 agent-exec）。</div>
+    <div class="field"><label>目标机 SSH 账号（默认 root）</label><input id="tgtSshUser" placeholder="默认 root">
       <div class="field-hint">管理器经 SSH 到目标机执行 copy-back 用的账号；留空默认 root。</div></div>
-    <div class="field"><label>目标机 SSH 密码（可选；留空走密钥或 agent-exec）</label><input id="tgtSshPass" type="password">
-      <div class="field-hint">目标机 SSH 密码；留空则走密钥或 agent-exec（节点已启用 agent-exec 时免 SSH）。</div></div>
+    <div class="field"><label>目标机 SSH 密码（通常必填）</label><input id="tgtSshPass" type="password">
+      <div class="field-hint">该机器<b>宿主机 root 的 SSH 密码</b>（不是数据库密码）。留空仅在「该节点已由 Custos 纳管并通过「节点管理→重新生成」启用 agent-exec」时才可免填；源库等外部机器无 agent，必须填。</div></div>
   </div>
 
   <div id="chanLabel" style="margin-top:12px;font-size:13px;color:var(--text);font-weight:600">迁移通道（系统已按数据量推荐，可覆盖）</div>
@@ -260,7 +260,9 @@
     </div>
     <div class="chan" data-chan="physical" onclick="selChan('physical')">
       <h4>B 物理通道 <span class="tag" id="tagB">大库/高速</span></h4>
-      <p>mariabackup 热备+恢复，适合 TB 级大库；须匹配源版本工具，跨大版本启动自动升级。</p>
+      <p>mariabackup 热备+恢复，适合 TB 级大库。基于 mariabackup，<b>仅 MariaDB → MariaDB</b>；
+         <b>支持跨版本</b>（实测 10.11 → 12.3 跑通，启动自动升级），但<b>不能降级</b>（高版本备份无法恢复到低版本）。
+         MySQL 请用 A 逻辑通道（MySQL 5.7 ⇄ MariaDB 支持；MySQL 8.0+ → MariaDB 不支持）。</p>
     </div>
   </div>
   <div class="kv" id="recInfo" style="margin-top:8px"></div>
@@ -618,6 +620,24 @@ async function createTask(){
   const filter = $("dbFilter").value.trim();
   let databases = selected;
   if(filter){ databases = filter.split(",").map(s=>s.trim()).filter(Boolean); }
+  // 物理通道 B：管理器默认不给节点下发公钥，SSH 密码留空【不会】自动走密钥认证，
+  // 必然在第 3 步才报「无法 SSH 到源机/目标机」（实测踩过）。这里提前拦截，
+  // 并主动提议复用「数据库 root 密码」（多数部署两者相同），避免又白跑一趟。
+  if(STATE.channel === "physical"){
+    if(!$("srcSshPass").value){
+      if(confirm("「源机 SSH 密码」为空。\n\n管理器默认不给节点下发公钥，留空不会自动走密钥认证，物理迁移会在第 3 步报「无法 SSH 到源机」。\n\n是否用刚填的「源库 root 密码」作为源机 SSH 密码？\n（若源机 root 的 SSH 密码与其数据库密码不同，请点「取消」后手动填写）")){
+        $("srcSshPass").value = $("srcPass").value;
+      } else {
+        alert("已取消：请手动填写「源机 SSH 密码」（该机器宿主机 root 的 SSH 密码）后再执行。");
+        return;
+      }
+    }
+    if(!$("tgtSshPass").value){
+      if(confirm("「目标机 SSH 密码」为空。\n\n若目标节点已由 Custos 纳管、并在「节点管理」里点过「重新生成」启用了 agent-exec，可留空（免 SSH）；\n否则会在第 3 步报「无法 SSH 到目标机」。\n\n是否用刚填的「目标 root 密码」作为目标机 SSH 密码？")){
+        $("tgtSshPass").value = $("tgtRoot").value;
+      }
+    }
+  }
   const body = {
     name:$("taskName").value.trim()||"MariaDB 迁移",
     src_host:$("srcHost").value.trim(), src_port:+$("srcPort").value||3306,

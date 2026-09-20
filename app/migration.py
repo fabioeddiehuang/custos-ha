@@ -991,9 +991,8 @@ def _ssh_run(cfg, host, script, use_src_cred, node_type=None):
         if ap is not None:
             return ap
     if cp is None:
-        raise RuntimeError("无法 SSH 到 %s（命令执行异常），且 agent-exec 不可用。"
-                           "请核对目标节点 SSH 账号/密码（向导「目标机 SSH」），"
-                           "或对目标节点执行 regen 启用 agent-exec。" % host)
+        raise RuntimeError("无法 SSH 到 %s（命令执行异常），且 agent-exec 不可用。%s"
+                           % (host, _ssh_help(use_src_cred)))
     return cp
 
 
@@ -1053,16 +1052,144 @@ def _resolve_mb(host, cfg, use_src_cred, node_type=None):
     return "mariabackup"
 
 
+# ---------------------------------------------------------------------------
+# 裸机节点的 datadir / systemd 单元 / my.cnf —— 多候选 + 保底，绝不猜单一名字或单一位置
+#
+# 根因（2026-09-20 实测坐实，203 节点）：
+#   Install-ha-mariadb-Node.sh 把权威值写进 /etc/ha-mysql-node/install-state-mariadb：
+#       DATA_DIR=/data/custos-ha/mariadb      SYSTEMD_UNIT=mariadb-ha.service
+#   而迁移代码此前把裸机 datadir 猜成 /data/mariadb、systemd 单元猜成 mariadb.service，
+#   于是 copy-back 停服一步直接失败：「Failed to stop mariadb.service: Unit mariadb.service not loaded.」
+#
+# 但【Custos 安装只是其中一种形态】：用户也可能是标准包管理安装（/etc/my.cnf + /var/lib/mysql +
+# mysql.service / mysqld.service / mariadb.service）、tarball 自编译（/opt/mariadb + /data/... +
+# 自定义单元名），容器化（另走 docker inspect 分支）。所以检测必须多路取证、层层兜底：
+#   ① Custos 状态文件 /etc/ha-mysql-node/install-state-*（装了 Custos 就有）
+#   ② **运行中的 mariadbd/mysqld 进程**（--datadir / --defaults-file）—— 最通用、最真实：
+#      标准包管理、tarball、自定义端口/目录都能命中，且反映「当前真正在跑的那个实例」
+#   ③ systemd 单元：**枚举**名字含 maria/mysql 的服务，再用 ExecStart 是否指向服务端二进制确认
+#      ⇒ mariadb-ha.service / mariadb.service / mysqld.service / mysql.service 全都能命中，
+#        不依赖任何硬编码单元名
+#   ④ my.cnf 兜底 grep datadir（进程没带 --datadir 时）
+# 仍全部落空才用内置默认值。整段只在远端 shell 跑一次，不增加 SSH 往返。
+# ---------------------------------------------------------------------------
+_BARE_STATE_DIR = "/etc/ha-mysql-node"
+_BARE_UNIT_FALLBACK = {"mysql": "mysql.service", "mariadb": "mariadb-ha.service"}
+
+# 远端探测脚本（不要对它做 % 格式化：内含 printf '%s=%s\n'）。
+_BARE_PROBE = r'''
+emit() { printf '%s=%s\n' "$1" "$2"; }
+DD=""; UNIT=""; CNF=""; SRC=""
+
+# ① Custos 安装状态文件（存在即用，但仅作为候选之一）
+#    必须用 find 而不是 "for f in .../install-state-*" —— 节点登录 shell 可能是 zsh，
+#    zsh 在 glob 无匹配时是【致命错误】会直接中止整个脚本（实测：没装 Custos 的节点上
+#    探测直接返回空，什么兜底都走不到）。find 无匹配只是输出为空，安全。
+for f in $(find /etc/ha-mysql-node -maxdepth 1 -name 'install-state-*' 2>/dev/null); do
+  [ -f "$f" ] || continue
+  . "$f" 2>/dev/null || true
+done
+[ -n "${DATA_DIR:-}" ] && { DD="$DATA_DIR"; SRC="custos-state"; }
+[ -n "${SYSTEMD_UNIT:-}" ] && UNIT="$SYSTEMD_UNIT"
+
+# ② 运行中的服务端进程（最通用的保底来源）
+PCD=""; PID=""
+for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+  c=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null) || continue
+  case "$c" in
+    *mysqld_safe*|*mariabackup*|*mariadb-backup*|*mysqldump*|*mysqlbackup*|*xtrabackup*|*exporter*) continue ;;
+    *mariadbd*|*mysqld*) PCD="$c"; PID="$p"; break ;;
+  esac
+done
+if [ -n "$PCD" ]; then
+  emit SRV_PID "$PID"
+  d=$(printf '%s' "$PCD" | tr ' ' '\n' | sed -n 's/^--datadir=//p' | head -1)
+  [ -n "$d" ] && { DD="$d"; SRC="process"; }
+  c=$(printf '%s' "$PCD" | tr ' ' '\n' | sed -n 's/^--defaults-file=//p' | head -1)
+  [ -n "$c" ] && CNF="$c"
+fi
+
+# ③ systemd 单元：枚举 + 用 ExecStart 指向服务端二进制来确认（不硬编码单元名）
+if [ -z "$UNIT" ]; then
+  for u in $(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -iE 'maria|mysql'); do
+    es=$(systemctl show -p ExecStart --value "$u" 2>/dev/null)
+    case "$es" in
+      *mariadbd*|*mysqld*) UNIT="$u"; emit UNIT_EXEC "$es"; break ;;
+    esac
+  done
+fi
+
+# ④ 配置文件兜底（进程没带 --datadir 时）
+if [ -z "$DD" ]; then
+  for c in $CNF /etc/my.cnf /etc/mysql/my.cnf /etc/my.cnf.d/server.cnf /etc/mysql/mariadb.conf.d/50-server.cnf; do
+    [ -n "$c" ] || continue
+    [ -f "$c" ] || continue
+    d=$(sed -n 's/^[[:space:]]*datadir[[:space:]]*=[[:space:]]*//p' "$c" 2>/dev/null | head -1 | tr -d '"' | tr -d "'")
+    [ -n "$d" ] && { DD="$d"; [ -n "$CNF" ] || CNF="$c"; SRC="mycnf"; break; }
+  done
+fi
+
+emit DATA_DIR "$DD"
+emit SYSTEMD_UNIT "$UNIT"
+emit MYCNF "$CNF"
+emit DD_SOURCE "$SRC"
+emit PROBE_DONE 1
+'''
+
+
+def _bare_kind(node_type):
+    """裸机形态归类：mysql* → mysql，其余（mariadb*）→ mariadb。"""
+    return "mysql" if str(node_type).startswith("mysql") else "mariadb"
+
+
+def _node_bare_state(kind, host, cfg, use_src_cred, node_type):
+    """探测裸机节点的 datadir / systemd 单元 / my.cnf（多候选 + 保底，见上方说明）。
+
+    返回 {'DATA_DIR':.., 'SYSTEMD_UNIT':.., 'MYCNF':.., 'DD_SOURCE':..}；
+    SSH 不通或全部落空时对应键缺省，由调用方回退到内置默认值。
+    """
+    try:
+        sh = _ssh_run(cfg, host, _BARE_PROBE, use_src_cred, node_type)
+    except Exception:
+        return {}
+    st = {}
+    for line in (getattr(sh, "stdout", "") or "").splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k in ("DATA_DIR", "SYSTEMD_UNIT", "MYCNF", "DD_SOURCE", "SRV_PID"):
+            st[k] = v.strip().strip('"').strip("'")   # printf %q / 引号兜底
+    return st
+
+
+def _ssh_help(use_src_cred):
+    """SSH 不可达/认证失败时的可操作指引（用户明确反馈：原提示没说要到哪里去开 agent-exec）。"""
+    side = "源机" if use_src_cred else "目标机"
+    return (
+        "\n【怎么修】\n"
+        "  1) 回到迁移向导「高级模式（物理通道 B）」第 2 步，填写「%s SSH 账号」/「%s SSH 密码」"
+        "——它要的是该机器【宿主机 root】的 SSH 密码，不是数据库 root 密码。\n"
+        "     注意：本管理器默认【不】给节点下发公钥，所以 SSH 密码留空【不会】自动改走密钥认证，"
+        "会直接失败；请务必填写（或你事先自行配好了免密）。\n"
+        "  2) 若该节点是 Custos 纳管节点、且确实不方便给 SSH：到「节点管理」页找到该节点，"
+        "点该行的「重新生成」（多个节点可用「批量重新生成」）重新下发节点包。\n"
+        "     重新下发后节点 agent 会提供 /exec 通道，管理器即可【免 SSH】在该节点执行 docker/mariabackup"
+        " —— 这就是错误里说的 agent-exec。\n"
+        "  3) 若该节点【不是】Custos 纳管节点（例如外部库 / 1panel 装的源库）：它没有 agent，"
+        "只能填 SSH 密码，没有第二条路。\n"
+        % (side, side)
+    )
+
+
 def _check_node_mb(node_type, host, port, cfg, use_src_cred):
     """物理通道前置探测：确认源/目标节点存在 mariabackup，否则抛清晰错误 + 安装指引。"""
     is_docker = str(node_type).endswith("-docker")
     if is_docker:
         cid, diag = _find_mariadb_container(host, cfg, use_src_cred, node_type)
         if diag == "ssh_fail":
-            raise RuntimeError("物理通道前置检查失败：无法 SSH 到 %s（SSH 不可达或认证失败）。"
-                               "源端请在向导核对「源机 SSH 账号/密码」；目标端请核对「目标机 SSH 账号/密码」，"
-                               "或对目标节点执行 regen 启用 agent-exec（经 docker.sock 免 SSH 执行）。"
-                               % host)
+            raise RuntimeError("物理通道前置检查失败：无法 SSH 到 %s（SSH 不可达或认证失败）。%s"
+                               % (host, _ssh_help(use_src_cred)))
         if diag == "docker_missing":
             raise RuntimeError("物理通道前置检查失败：%s 上 docker 不可用（command -v docker 为空），"
                                "请确认该节点已安装并启动 Docker。" % host)
@@ -1074,9 +1201,14 @@ def _check_node_mb(node_type, host, port, cfg, use_src_cred):
                       use_src_cred, node_type)
         present = bool(sh.stdout.strip())
     else:
+        # 裸机：原实现只看 stdout 是否为空 ⇒ SSH 本身失败时会被误报成「未找到 mariabackup」，
+        # 把用户引到装包方向去（错方向）。这里先区分「SSH 不通」与「真没装」。
         sh = _ssh_run(cfg, host,
                       "command -v /opt/mariadb/bin/mariabackup 2>/dev/null "
                       "|| command -v mariabackup 2>/dev/null || true", use_src_cred, node_type)
+        if _ssh_connect_failed(sh):
+            raise RuntimeError("物理通道前置检查失败：无法 SSH 到 %s（SSH 不可达或认证失败）。%s"
+                               % (host, _ssh_help(use_src_cred)))
         present = bool(sh.stdout.strip())
     if not present:
         where = ("容器 %s：请改用自带 mariabackup 的官方 mariadb 镜像" % host
@@ -1088,7 +1220,7 @@ def _check_node_mb(node_type, host, port, cfg, use_src_cred):
 
 
 def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=None,
-               datadir=None, mb_bin=None):
+               datadir=None, mb_bin=None, svc_unit=None, src_my_cnf=None):
     """在 node_type 节点上执行 mariabackup 的某步（backup/prepare/copyback）。
 
     容器节点经 SSH + docker 执行；裸机经 SSH 直连执行。返回 CompletedProcess。
@@ -1106,8 +1238,11 @@ def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=No
         # 裸机：源 my.cnf 在宿主机真实路径，mariabackup 直连读取；
         # 容器节点里 mariabackup 在容器内执行（docker exec），应读容器自带 my.cnf（自动），
         # 传宿主机路径会因容器内不存在而报 Could not open required defaults file。
-        if cfg.get("src_my_cnf") and not is_docker:
-            mb.insert(1, "--defaults-file=%s" % cfg["src_my_cnf"])
+        # 裸机源：优先用向导填的 --src_my_cnf；未填则用自动探测到的（运行进程的 --defaults-file），
+        # 这样「标准编译/tarball 用了自定义 defaults-file」的节点也能正确读到 datadir/socket。
+        _cnf = src_my_cnf or cfg.get("src_my_cnf")
+        if _cnf and not is_docker:
+            mb.insert(1, "--defaults-file=%s" % _cnf)
         # 裸机才传 --datadir（宿主机真实数据目录）；容器节点里 mariabackup 的数据目录
         # 固定为 /var/lib/mysql，且下方 docker 分支会把 --target-dir 改写为容器内路径
         if src_data_dir and not is_docker:
@@ -1184,13 +1319,19 @@ def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=No
         # 时序：停服务 → 旧 datadir 改名(_pre_restore_bak) → 建空 datadir → copy-back →
         #       失败则自动回滚并把服务拉回 → chown 回属主 → 启动服务 → 清理暂存。
         # 停服失败直接中断（绝不在服务仍运行时改名 datadir，否则数据损坏）。
-        svc = "mysql" if str(node_type).startswith("mysql") else "mariadb"
+        # 单元名必须用【真实】systemd 单元（由 seed_physical 从安装状态文件取，见 _node_bare_state）：
+        # 猜成 mariadb.service 会直接报 "Unit mariadb.service not loaded."（203 实测踩过）。
+        svc = svc_unit or _BARE_UNIT_FALLBACK.get(_bare_kind(node_type), "mariadb-ha.service")
+        q_svc = _sh_quote(svc)
         ddv = (datadir or "/var/lib/mysql").rstrip("/")
         q_dd = _sh_quote(ddv)
         q_bak = _sh_quote(ddv + "_pre_restore_bak")
         inner = " ".join(_sh_quote(a) for a in mb)
         script = (
-            "set -e; systemctl stop %s; "
+            "set -e; "
+            "systemctl cat %s >/dev/null 2>&1 || { "
+            "echo '找不到 systemd 单元 %s：该裸机实例可能不是按 Custos 安装脚本部署的' >&2; exit 1; }; "
+            "systemctl stop %s; "
             "rm -rf %s; mv %s %s; mkdir -p %s; "
             "if ! %s; then "
             "echo 'copy-back FAILED, rolling back data dir' >&2; "
@@ -1198,8 +1339,8 @@ def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=No
             "fi; "
             "chown -R mysql:mysql %s 2>/dev/null || true; "
             "systemctl start %s; rm -rf %s"
-            % (svc, q_bak, q_dd, q_bak, q_dd, inner,
-               q_dd, q_bak, q_dd, svc, q_dd, svc, _sh_quote(staging_host))
+            % (q_svc, q_svc, q_svc, q_bak, q_dd, q_bak, q_dd, inner,
+               q_dd, q_bak, q_dd, q_svc, q_dd, q_svc, _sh_quote(staging_host))
         )
         return _ssh_run(cfg, host, script, use_src_cred=False, node_type=node_type)
     if op == "backup":
@@ -1240,13 +1381,86 @@ def _wait_target_ready(cfg, timeout=None):
         % (cfg["tgt_host"], cfg["tgt_port"], timeout, last))
 
 
+def _sql_version(host, port, cands, timeout=8):
+    """连上去取 VERSION()（多组凭据依次尝试）。失败返回 ("", "")。"""
+    for u, p in cands:
+        try:
+            conn = connect(host, int(port), u, p, timeout=timeout)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT VERSION()")
+                row = cur.fetchone()
+                v = str((row[0] if row else "") or "")
+            finally:
+                conn.close()
+            low = v.lower()
+            return ("mariadb" if "mariadb" in low else "mysql"), v
+        except Exception:
+            continue
+    return "", ""
+
+
+def _ver_tuple(v):
+    """从版本串取数字元组，用于比较升级/降级（如 '12.3.3-MariaDB' → (12,3,3)）。"""
+    nums = []
+    for part in str(v).split("-")[0].split("."):
+        d = "".join(ch for ch in part if ch.isdigit())
+        if d == "":
+            break
+        nums.append(int(d))
+    return tuple(nums) if nums else (0,)
+
+
+def _assert_physical_compatible(cfg):
+    """物理通道（高级模式）的兼容性门禁 —— 开跑前实测两端，避免跑到深处才报看不懂的错。
+
+    实测口径（2026-09-20，177 MariaDB 10.11 → 203 MariaDB 12.3.3 跑通）：
+      · 物理通道基于 **mariabackup**，它是 MariaDB 自带工具 —— MySQL 上根本没有该命令
+        （MySQL 要用 xtrabackup/mysqlbackup），且 MySQL 8 起改用全局数据字典，MariaDB 读不懂
+        其数据文件。故物理通道**只能 MariaDB → MariaDB**。
+      · MariaDB 之间**跨版本可以**，但有方向性：mariabackup 备份**不能恢复到更旧的版本**
+        （升级方向 OK，降级不行）。故 src 版本 > tgt 版本时明确拒绝，避免用户拿到半死不活的实例。
+    说明：向导里 tgt_flavor 目前硬编码 mariadb，若源是 MySQL 会被误判成"跨引擎"、MySQL→MySQL 又会被
+    误判成"同引擎"而放行 —— 所以这里以 SQL 实测 VERSION() 为准，而不是相信配置里的品牌字段。
+    """
+    sf, sv = _sql_version(cfg["src_host"], int(cfg["src_port"]),
+                          [(cfg.get("src_user") or "root", cfg.get("src_pass") or "")])
+    tf, tv = _sql_version(cfg["tgt_host"], int(cfg["tgt_port"]),
+                          [("root", cfg.get("tgt_root_pass") or ""),
+                           (cfg.get("src_user") or "root", cfg.get("src_pass") or "")])
+    if sf == "mysql" or tf == "mysql":
+        side = "源库" if sf == "mysql" else "目标库"
+        ver = sv if sf == "mysql" else tv
+        raise RuntimeError(
+            "物理通道（高级模式）只能 MariaDB → MariaDB：实测【%s】是 MySQL（VERSION()=%s）。\n"
+            "mariabackup 是 MariaDB 自带工具，MySQL 上没有该命令（MySQL 需 xtrabackup/mysqlbackup）；"
+            "且 MySQL 8 起改用全局数据字典，MariaDB 无法读取其数据文件。\n"
+            "【请改用标准模式（逻辑通道）】：MariaDB ⇄ MySQL 5.7 的互迁是支持的；"
+            "MySQL 8.0+ → MariaDB 目前不支持（需先做排序规则/认证插件换算）。\n"
+            "若两端都是 MariaDB（可跨版本），物理通道是支持的。"
+            % (side, ver or "?"))
+    if sf == "mariadb" and tf == "mariadb" and sv and tv:
+        if _ver_tuple(sv) > _ver_tuple(tv):
+            raise RuntimeError(
+                "物理通道（高级模式）不能把 mariabackup 备份恢复到【更旧】的 MariaDB：\n"
+                "  源 %s：%s\n  目标 %s：%s\n"
+                "物理备份只能向上兼容（低版本备份 → 高版本实例），降级恢复官方不支持，"
+                "强行恢复会得到无法启动或数据损坏的实例。\n"
+                "如需往低版本迁移，请改用【标准模式（逻辑通道）】（跨版本可用逻辑导出/导入）。"
+                % (cfg["src_host"], sv, cfg["tgt_host"], tv))
+    return {"src_flavor": sf, "src_version": sv, "tgt_flavor": tf, "tgt_version": tv}
+
+
 def seed_physical(task):
     """物理通道：源节点 mariabackup 热备 → prepare → 传到目标 → 目标节点 copy-back。
 
     关键时序（务必遵守）：mariabackup 只能读取【本地】数据目录，无法备份远程服务器，
     所以「备份 / prepare」在【源节点】执行（源自带 mariabackup，版本天然匹配源），
-    「copy-back」在【目标节点】执行（目标自带 mariaback，版本匹配目标 12.3.3）。
+    「copy-back」在【目标节点】执行（目标自带 mariaback，版本匹配目标）。
     管理器/宿主机不预装 mariabackup，仅需 openssh-client + rsync + sshpass 做编排。
+
+    版本兼容：**MariaDB 各版本之间可用**（实测 10.11.17 → 12.3.3 跑通），方向必须是
+    低版本→高版本；MySQL 不适用（见 _assert_physical_compatible）。
 
     源端 my.cnf / 数据目录非标安装时，须显式填写 src_my_cnf / src_data_dir。
     """
@@ -1266,8 +1480,11 @@ def seed_physical(task):
     # 就是这个原因，排查被严重误导）。故先置 None，finally 判空跳过。
     dd = src_dd = staging = src_staging = None
     try:
-        # 0) 物理通道前置探测：源/目标节点须存在 mariabackup，否则提前给清晰错误 + 安装指引
-        #    （先验证 SSH/docker 连通性，确保下方 docker inspect 探测挂载源时 SSH 已可用）
+        # 0) 兼容性门禁：物理通道只能 MariaDB→MariaDB，且不能降级恢复（实测 VERSION() 判定）。
+        #    放在最前面，避免用户等完一整套备份/传输才拿到一个看不懂的错。
+        _assert_physical_compatible(cfg)
+        # 0.1) 物理通道前置探测：源/目标节点须存在 mariabackup，否则提前给清晰错误 + 安装指引
+        #      （先验证 SSH/docker 连通性，确保下方 docker inspect 探测挂载源时 SSH 已可用）
         _check_node_mb(snt, cfg["src_host"], int(cfg["src_port"]), cfg, use_src_cred=True)
         _check_node_mb(nt, cfg["tgt_host"], int(cfg["tgt_port"]), cfg, use_src_cred=False)
         # 1) 解析源/目标数据目录（宿主机路径）
@@ -1298,11 +1515,29 @@ def seed_physical(task):
                     "请确认目标为运行中的 MariaDB 容器，或在向导「目标数据目录」显式填写容器 "
                     "/var/lib/mysql 对应的宿主机绝对路径（如 1panel 的 "
                     "/opt/1panel/apps/mariadb/mariadb/data）。" % cfg["tgt_host"])
+        # 裸机节点：datadir / systemd 单元 / my.cnf 全部【多候选探测】，绝不用内置默认值猜
+        # （猜错就是 203 实测的「Unit mariadb.service not loaded」+ 指向不存在的数据目录）。
+        # 探测顺序见 _node_bare_state：Custos 状态文件 → 运行中进程 → 枚举 systemd 单元 → my.cnf。
+        tgt_unit = None
+        src_my_cnf = cfg.get("src_my_cnf") or ""
+        if not str(snt).endswith("-docker"):
+            st = _node_bare_state(_bare_kind(snt), cfg["src_host"], cfg, True, snt)
+            if st.get("DATA_DIR") and not cfg.get("src_data_dir"):
+                src_dd = st["DATA_DIR"]
+            if not src_my_cnf and st.get("MYCNF"):
+                src_my_cnf = st["MYCNF"]
+            task["_bare_src"] = st
+        if not str(nt).endswith("-docker"):
+            st = _node_bare_state(_bare_kind(nt), cfg["tgt_host"], cfg, False, nt)
+            if st.get("DATA_DIR") and not cfg.get("tgt_datadir"):
+                dd = st["DATA_DIR"]
+            tgt_unit = st.get("SYSTEMD_UNIT") or _BARE_UNIT_FALLBACK[_bare_kind(nt)]
+            task["_bare_tgt"] = st
         staging = _mig_staging_path_tgt(nt, dd, task["id"])      # 目标机暂存：必须在 datadir 之外
         src_staging = _mig_staging_path(snt, src_dd, task["id"]) # 源机暂存（容器节点须在 datadir 内）
         # 1) 源节点热备（读源本地 datadir；--host 仅用于连接源做协调，不读远端文件）
         bk = _remote_mb(snt, cfg["src_host"], cfg, "backup", src_staging,
-                        src=src, src_data_dir=src_dd, mb_bin=src_mb)
+                        src=src, src_data_dir=src_dd, mb_bin=src_mb, src_my_cnf=src_my_cnf)
         if bk.returncode != 0:
             raise RuntimeError("源节点 mariabackup 备份失败: " + _tail(bk.stderr))
         # 2) 源节点 prepare（回放 redo，使其一致）
@@ -1317,7 +1552,8 @@ def seed_physical(task):
         if push.returncode != 0:
             raise RuntimeError("推送备份到目标失败(rsync): " + _tail(push.stderr))
         # 4) 目标节点 copy-back（停实例→恢复→授权→启动）
-        cb = _remote_mb(nt, cfg["tgt_host"], cfg, "copyback", staging, datadir=dd, mb_bin=tgt_mb)
+        cb = _remote_mb(nt, cfg["tgt_host"], cfg, "copyback", staging, datadir=dd,
+                        mb_bin=tgt_mb, svc_unit=tgt_unit)
         if cb.returncode != 0:
             raise RuntimeError("目标节点 copy-back 失败: " + _tail(cb.stderr))
         # 4.1) 等目标实例就绪：copy-back 完成时容器刚 docker start，entrypoint 可能仍在
