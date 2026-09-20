@@ -793,8 +793,14 @@ def _tgt_datadir(cfg):
 # 容器节点：经 SSH 到宿主机后 docker exec / docker compose run 进容器执行
 # （官方 mariadb 镜像自带 mariabackup）；裸机节点：SSH 直连宿主机执行。
 #
-# 暂存目录放置约定：容器节点把暂存放在「数据目录挂载点之内」，保证对容器内
-# mariabackup 可见（容器只挂载了数据目录，如 /data/custos-ha/mariadb12 → 容器内 /var/lib/mysql）。
+# 暂存目录放置约定（务必遵守 —— 物理通道反复失败的根因即在此）：
+#   · 源节点：容器节点把暂存放在「数据目录挂载点之内」，保证对容器内 mariabackup 可见
+#     （容器只挂了数据目录，如 /data/custos-ha/mariadb12 → 容器内 /var/lib/mysql），
+#     docker exec 才能读写到该 target-dir。
+#   · 目标节点：**必须放在数据目录【之外】的兄弟路径**。mariabackup --copy-back 明确要求
+#     --datadir 为空，若暂存目录位于 datadir 之内，datadir 必然非空，copy-back 直接失败
+#     「Original data directory /var/lib/mysql is not empty!」并拒绝写入，结果就是目标
+#     数据目录被清空、容器起不来（已实测坐实）。故目标暂存一律用 datadir 的兄弟目录。
 # ---------------------------------------------------------------------------
 
 def _tail(s, n=2000):
@@ -814,15 +820,38 @@ def _default_src_datadir(snt):
 
 
 def _mig_staging_path(node_type, data_dir_host, task_id):
-    """暂存目录（宿主机路径）。容器节点放在数据目录挂载点之内（见上方说明）。"""
+    """源节点暂存目录（宿主机路径）。容器节点放在数据目录挂载点之内（见上方说明）。"""
     if str(node_type).endswith("-docker"):
         return os.path.join(data_dir_host.rstrip("/"), ".custos_mig_staging_%s" % task_id)
     return "/data/custos_mig_staging_%s" % task_id
 
 
-def _container_staging(staging_host, data_dir_host):
-    """宿主机暂存路径 → 容器内路径（数据目录在容器内固定为 /var/lib/mysql）。"""
-    return "/var/lib/mysql" + staging_host[len(data_dir_host.rstrip("/")):]
+def _mig_staging_path_tgt(node_type, data_dir_host, task_id):
+    """目标节点暂存目录（宿主机路径）——**必须落在数据目录之外**。
+
+    根因（2026-09-20 实测坐实，切勿改回 datadir 之内）：
+      mariabackup --copy-back 的第一步就是校验目标 --datadir 为空，否则直接：
+        [00] Original data directory /var/lib/mysql is not empty!
+      此前目标暂存被放在 <datadir>/.custos_mig_staging_<id>，copy-back 前把暂存「搬回」
+      新建的空 datadir，datadir 立刻非空 → copy-back 拒绝写入且 set -e 中断，
+      目标 datadir 停留在空目录、容器被 stop，节点直接不可用（这就是物理通道反复失败的根因）。
+      改为 datadir 的兄弟目录后，datadir 在 copy-back 时真正为空，实测 COPYBACK_RC=0。
+    容器/裸机均适用：该路径只是宿主机上的一个临时目录，copy-back 时以 -v 挂到 /backup。
+    """
+    return "%s_mig_staging_%s" % (data_dir_host.rstrip("/"), task_id)
+
+
+def _container_staging(staging_host):
+    """宿主机暂存路径 → 容器内路径（数据目录在容器内固定为 /var/lib/mysql）。
+
+    只取暂存目录【最后一段】(.custos_mig_staging_xxx) 拼到 /var/lib/mysql 下，**不依赖**
+    「data_dir_host 是 staging_host 前缀」的脆弱字符串切片——此前挂载源路径与暂存路径
+    不完全对齐时会拼出 /var/lib/mysqlmariadb/db/data/... 这类乱码路径
+    （mariabackup 报 Can't change dir to ...）。只要 src_dd 是 /var/lib/mysql 的真实
+    挂载源，basename 映射就恒定成立：<挂载源>/<basename> ↔ 容器内 /var/lib/mysql/<basename>。
+    """
+    base = os.path.basename(staging_host.rstrip("/"))
+    return "/var/lib/mysql/" + base
 
 
 def _docker_datadir_host_mount(cfg, host, cid, use_src_cred, node_type):
@@ -843,6 +872,17 @@ def _docker_datadir_host_mount(cfg, host, cid, use_src_cred, node_type):
         if p:
             return p
     return None
+
+
+def _docker_image(cfg, host, cid, use_src_cred, node_type):
+    """取 MariaDB 容器的镜像名（copy-back 用 --volumes-from 时复用其镜像）。"""
+    sh = _ssh_run(cfg, host, "docker inspect -f '{{.Config.Image}}' %s 2>/dev/null" % cid,
+                  use_src_cred, node_type)
+    if sh.returncode == 0:
+        p = sh.stdout.strip()
+        if p:
+            return p
+    return "mariadb"
 
 
 # agent-exec 的 HTTP 等待上限（与 SSH 同量级；mariabackup 可能跑很久）
@@ -1075,41 +1115,129 @@ def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=No
     elif op == "prepare":
         mb = [mb_bin, "--prepare", "--target-dir=%s" % staging_host]
     elif op == "copyback":
-        # 目标容器内数据目录固定为 /var/lib/mysql（镜像挂载约定）
+        # 容器目标的 copy-back 在下方 is_docker 分支用「显式 -v 挂载 + 空 datadir」执行，
+        # 不会用到这里的 mb；此处仅供裸机使用，必须是宿主机真实路径。
         mb = [mb_bin, "--copy-back",
-              "--target-dir=/backup", "--datadir=/var/lib/mysql"]
+              "--target-dir=%s" % staging_host,
+              "--datadir=%s" % (datadir or "/var/lib/mysql")]
     else:
         raise RuntimeError("未知 mariabackup 操作: %s" % op)
 
     if is_docker:
+        cid, diag = _find_mariadb_container(host, cfg, op != "copyback", node_type)
+        if diag == "ssh_fail":
+            raise RuntimeError("无法 SSH 到节点 %s（SSH 不可达或认证失败），请核对向导 SSH 账号/密码。" % host)
+        if diag == "docker_missing":
+            raise RuntimeError("节点 %s 上 docker 不可用，无法执行该操作。" % host)
+        if not cid:
+            raise RuntimeError("未在节点 %s 找到运行中的 MariaDB 容器"
+                               "（已按 compose 服务 / 容器名 / 镜像 匹配均无）。" % host)
         if op == "copyback":
-            inner = " ".join(_sh_quote(a) for a in mb)
-            # 停服务 → 在临时容器内 copy-back（挂载 staging 与数据目录）→ 授权 → 起服务
+            # 目标 docker：直接用容器 cid 操作，**不依赖 compose 项目目录**（Custos 节点 compose
+            # 未必在 /data/custos-ha，硬编码会导致 docker compose 找不到项目→静默失败→假成功）。
+            # 流程：停实例 → 旧数据目录改名留作回滚点 → 重建【空】数据目录 →
+            #       显式 -v 挂载 datadir=/var/lib/mysql + 暂存=/backup 执行 copy-back →
+            #       chown 到 999 → 启动 → 清理暂存。
+            # 两个关键点（缺一即失败，均已实测坐实）：
+            #  ① 暂存目录必须在 datadir **之外**（由 _mig_staging_path_tgt 保证）。若在 datadir 内，
+            #     copy-back 会报「Original data directory /var/lib/mysql is not empty!」拒绝写入，
+            #     结果是数据目录被清空、容器被 stop，节点直接不可用 —— 这是物理通道反复失败的根因。
+            #  ② 临时恢复容器以 root(--user 0:0) 运行并显式 -v 挂载，避免镜像默认 uid 999
+            #     写不进 root 属主目录；恢复后统一 chown 999（官方镜像默认用户），使目标容器
+            #     无论以 0:0 还是 999 运行都能读写。
+            # 失败即【自动回滚】（把 _pre_restore_bak 挪回并重启容器），绝不把目标节点留在
+            # 「空数据目录 + 容器已停」的死状态。
+            image = _docker_image(cfg, host, cid, op != "copyback", node_type)
+            data_dir = datadir or "/var/lib/mysql"
+            bak = data_dir.rstrip("/") + "_pre_restore_bak"
+            q_dd, q_bak, q_stg = (_sh_quote(data_dir), _sh_quote(bak),
+                                  _sh_quote(staging_host))
             script = (
-                "cd /data/custos-ha && docker compose stop mariadb; "
-                "docker compose run --rm -v %s:/backup mariadb %s; "
-                "chown -R 999:999 %s; docker compose start mariadb; rm -rf %s"
-                % (staging_host, inner, datadir, staging_host)
+                "set -e; docker stop %s || true; "
+                "rm -rf %s; mv %s %s; mkdir -p %s; "
+                "if ! docker run --rm --user 0:0 --entrypoint mariabackup "
+                "-v %s:/var/lib/mysql -v %s:/backup %s "
+                "--copy-back --target-dir=/backup --datadir=/var/lib/mysql; then "
+                "echo 'copy-back FAILED, rolling back data dir' >&2; "
+                "rm -rf %s; mv %s %s; docker start %s; exit 1; "
+                "fi; "
+                "chown -R 999:999 %s; docker start %s; rm -rf %s"
+                % (cid, q_bak, q_dd, q_bak, q_dd,
+                   q_dd, q_stg, _sh_quote(image),
+                   q_dd, q_bak, q_dd, cid,
+                   q_dd, cid, q_stg)
             )
             return _ssh_run(cfg, host, script, use_src_cred=False, node_type=node_type)
         # backup / prepare：容器运行中，docker exec 进容器（暂存放在数据目录挂载内）
-        cid, diag = _find_mariadb_container(host, cfg, use_src_cred=True, node_type=node_type)
-        if diag == "ssh_fail":
-            raise RuntimeError("无法 SSH 到源机 %s（SSH 不可达或认证失败），请核对向导「源机 SSH 账号/密码」。"
-                               % host)
-        if diag == "docker_missing":
-            raise RuntimeError("源机 %s 上 docker 不可用，无法执行备份。" % host)
-        if not cid:
-            raise RuntimeError("未在源机 %s 找到运行中的 MariaDB 容器"
-                               "（已按 compose 服务 / 容器名 / 镜像 匹配均无）；"
-                               "若源为裸机 MariaDB 请在「源端形态」选「裸机 MariaDB」" % host)
-        inner_staging = _container_staging(staging_host, src_data_dir or _default_src_datadir(node_type))
+        inner_staging = _container_staging(staging_host)
+        # 仅备份前清空 target-dir（mariabackup 要求为空/不存在）；prepare/copyback 不可清，
+        # 否则会把刚备份好的目录删掉（prepare 报 No such file or directory）。
+        if op == "backup":
+            _ssh_run(cfg, host, "docker exec %s rm -rf %s" % (cid, _sh_quote(inner_staging)),
+                     use_src_cred=True, node_type=node_type)
         mb[-1] = "--target-dir=%s" % inner_staging
         inner = " ".join(_sh_quote(a) for a in mb)
         return _ssh_run(cfg, host, "docker exec %s %s" % (cid, inner), use_src_cred=True, node_type=node_type)
     # 裸机：直接 SSH 执行
+    if op == "copyback":
+        # 裸机目标与容器目标遵守同一条铁律：copy-back 时 datadir 必须为空，且必须留回滚点。
+        # 时序：停服务 → 旧 datadir 改名(_pre_restore_bak) → 建空 datadir → copy-back →
+        #       失败则自动回滚并把服务拉回 → chown 回属主 → 启动服务 → 清理暂存。
+        # 停服失败直接中断（绝不在服务仍运行时改名 datadir，否则数据损坏）。
+        svc = "mysql" if str(node_type).startswith("mysql") else "mariadb"
+        ddv = (datadir or "/var/lib/mysql").rstrip("/")
+        q_dd = _sh_quote(ddv)
+        q_bak = _sh_quote(ddv + "_pre_restore_bak")
+        inner = " ".join(_sh_quote(a) for a in mb)
+        script = (
+            "set -e; systemctl stop %s; "
+            "rm -rf %s; mv %s %s; mkdir -p %s; "
+            "if ! %s; then "
+            "echo 'copy-back FAILED, rolling back data dir' >&2; "
+            "rm -rf %s; mv %s %s; systemctl start %s || true; exit 1; "
+            "fi; "
+            "chown -R mysql:mysql %s 2>/dev/null || true; "
+            "systemctl start %s; rm -rf %s"
+            % (svc, q_bak, q_dd, q_bak, q_dd, inner,
+               q_dd, q_bak, q_dd, svc, q_dd, svc, _sh_quote(staging_host))
+        )
+        return _ssh_run(cfg, host, script, use_src_cred=False, node_type=node_type)
+    if op == "backup":
+        _ssh_run(cfg, host, "rm -rf %s" % _sh_quote(staging_host),
+                 use_src_cred=(op != "copyback"), node_type=node_type)
     inner = " ".join(_sh_quote(a) for a in mb)
     return _ssh_run(cfg, host, inner, use_src_cred=(op != "copyback"), node_type=node_type)
+
+
+_TGT_READY_TIMEOUT = 300   # copy-back 后目标可能需 mariadb-upgrade（跨大版本实测数十秒）
+
+
+def _wait_target_ready(cfg, timeout=None):
+    """物理 copy-back 后等待目标实例真正可连。
+
+    根因（2026-09-20 实测坐实）：copy-back 后 docker start 会触发 entrypoint 的
+    mariadb-upgrade（源/目标版本不同时 Phase 1~8，实测约 1 分钟），期间端口未就绪。
+    若不等就立刻进入桥接阶段，会以 Connection refused 报错、被误判成迁移失败。
+    凭据先试【源端】（物理恢复后目标的 mysql.user 表整体来自源），再退回向导里的目标 root 密码。
+    """
+    timeout = timeout or _TGT_READY_TIMEOUT
+    cands = [(cfg.get("src_user") or "root", cfg.get("src_pass") or ""),
+             ("root", cfg.get("tgt_root_pass") or "")]
+    t0 = time.time()
+    last = None
+    while time.time() - t0 < timeout:
+        for u, p in cands:
+            try:
+                c = connect(cfg["tgt_host"], int(cfg["tgt_port"]), u, p, timeout=5)
+                c.close()
+                return True
+            except Exception as e:
+                last = e
+        time.sleep(3)
+    raise RuntimeError(
+        "物理恢复已写入数据，但等待目标 %s:%s 就绪超时（%ds）：%s。"
+        "请查看目标 MariaDB 容器日志（可能仍在 mariadb-upgrade，或启动失败）后重试。"
+        % (cfg["tgt_host"], cfg["tgt_port"], timeout, last))
 
 
 def seed_physical(task):
@@ -1126,23 +1254,6 @@ def seed_physical(task):
     src = (cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"])
     nt = cfg.get("node_type", "mariadb-docker")            # 目标形态
     snt = cfg.get("src_type", nt)                           # 源形态（默认同目标）
-    dd = _tgt_datadir(cfg)                                  # 目标数据目录（宿主机路径）
-    src_dd = cfg.get("src_data_dir") or _default_src_datadir(snt)
-    # docker 节点：容器 /var/lib/mysql 的真实宿主机挂载源必须实测，不能依赖硬编码默认
-    # （1panel 等安装的数据目录并不在 /data/custos-ha/mariadb12）；否则 rsync 按错路径拉取会
-    # 找不到暂存目录（No such file or directory）。裸机直接用配置/默认。
-    if str(snt).endswith("-docker"):
-        scid, _ = _find_mariadb_container(cfg["src_host"], cfg, True, snt)
-        m = _docker_datadir_host_mount(cfg, cfg["src_host"], scid, True, snt)
-        if m:
-            src_dd = m
-    if str(nt).endswith("-docker"):
-        tcid, _ = _find_mariadb_container(cfg["tgt_host"], cfg, False, nt)
-        m = _docker_datadir_host_mount(cfg, cfg["tgt_host"], tcid, False, nt)
-        if m:
-            dd = m
-    staging = _mig_staging_path(nt, dd, task["id"])          # 目标机暂存（宿主机路径）
-    src_staging = _mig_staging_path(snt, src_dd, task["id"]) # 源机暂存（宿主机路径）
     # 裸机节点解析 mariabackup 完整路径（tarball 装在 /opt/mariadb/bin，常不在 PATH）；容器用镜像内 PATH
     src_mb = ("mariabackup" if str(snt).endswith("-docker")
               else _resolve_mb(cfg["src_host"], cfg, use_src_cred=True, node_type=snt))
@@ -1150,10 +1261,45 @@ def seed_physical(task):
               else _resolve_mb(cfg["tgt_host"], cfg, use_src_cred=False, node_type=nt))
     relay = f"/tmp/custos_mig_relay_{task['id']}"            # 管理器中转（避免源→目标直连 ssh）
     os.makedirs(relay, exist_ok=True)
+    # 提前初始化：finally 里要按这些路径清理远端暂存，若前面某步就抛错（如前置探测失败），
+    # 引用未赋值变量会抛 UnboundLocalError，**把真正的失败原因整个盖掉**（此前日志只剩 START
+    # 就是这个原因，排查被严重误导）。故先置 None，finally 判空跳过。
+    dd = src_dd = staging = src_staging = None
     try:
         # 0) 物理通道前置探测：源/目标节点须存在 mariabackup，否则提前给清晰错误 + 安装指引
+        #    （先验证 SSH/docker 连通性，确保下方 docker inspect 探测挂载源时 SSH 已可用）
         _check_node_mb(snt, cfg["src_host"], int(cfg["src_port"]), cfg, use_src_cred=True)
         _check_node_mb(nt, cfg["tgt_host"], int(cfg["tgt_port"]), cfg, use_src_cred=False)
+        # 1) 解析源/目标数据目录（宿主机路径）
+        #    docker 节点：容器 /var/lib/mysql 的真实宿主机挂载源【必须实测】，不能依赖硬编码默认
+        #    （1panel 等安装的数据目录并不在 /data/custos-ha/mariadb12）。探测不到就显式报错，
+        #    绝不静默回退到错误默认路径（否则 rsync change_dir 失败 / 乱码容器路径）。
+        dd = _tgt_datadir(cfg)
+        src_dd = cfg.get("src_data_dir") or _default_src_datadir(snt)
+        if str(snt).endswith("-docker"):
+            scid, _ = _find_mariadb_container(cfg["src_host"], cfg, True, snt)
+            m = _docker_datadir_host_mount(cfg, cfg["src_host"], scid, True, snt)
+            if m:
+                src_dd = m
+            else:
+                raise RuntimeError(
+                    "无法探测源节点 %s 容器 /var/lib/mysql 的宿主机挂载源（docker inspect 未返回）。"
+                    "请确认源为运行中的 MariaDB 容器，或在向导「源端数据目录」显式填写容器 "
+                    "/var/lib/mysql 对应的宿主机绝对路径（如 1panel 的 "
+                    "/opt/1panel/apps/mariadb/mariadb/data）。" % cfg["src_host"])
+        if str(nt).endswith("-docker"):
+            tcid, _ = _find_mariadb_container(cfg["tgt_host"], cfg, False, nt)
+            m = _docker_datadir_host_mount(cfg, cfg["tgt_host"], tcid, False, nt)
+            if m:
+                dd = m
+            else:
+                raise RuntimeError(
+                    "无法探测目标节点 %s 容器 /var/lib/mysql 的宿主机挂载源（docker inspect 未返回）。"
+                    "请确认目标为运行中的 MariaDB 容器，或在向导「目标数据目录」显式填写容器 "
+                    "/var/lib/mysql 对应的宿主机绝对路径（如 1panel 的 "
+                    "/opt/1panel/apps/mariadb/mariadb/data）。" % cfg["tgt_host"])
+        staging = _mig_staging_path_tgt(nt, dd, task["id"])      # 目标机暂存：必须在 datadir 之外
+        src_staging = _mig_staging_path(snt, src_dd, task["id"]) # 源机暂存（容器节点须在 datadir 内）
         # 1) 源节点热备（读源本地 datadir；--host 仅用于连接源做协调，不读远端文件）
         bk = _remote_mb(snt, cfg["src_host"], cfg, "backup", src_staging,
                         src=src, src_data_dir=src_dd, mb_bin=src_mb)
@@ -1174,14 +1320,21 @@ def seed_physical(task):
         cb = _remote_mb(nt, cfg["tgt_host"], cfg, "copyback", staging, datadir=dd, mb_bin=tgt_mb)
         if cb.returncode != 0:
             raise RuntimeError("目标节点 copy-back 失败: " + _tail(cb.stderr))
+        # 4.1) 等目标实例就绪：copy-back 完成时容器刚 docker start，entrypoint 可能仍在
+        #      mariadb-upgrade（跨大版本实测约 1 分钟），此时端口不可达；不等就进桥接会
+        #      Connection refused，被误判成迁移失败（实测）。
+        _wait_target_ready(cfg)
     finally:
         shutil.rmtree(relay, ignore_errors=True)
-        # 清理远端暂存目录：物理通道 B 在源/目标 datadir 内建了 .custos_mig_staging_*，
-        # 残留会被 MariaDB 当成 #mysql50# 伪库（既不能迁移、也会让 mariadb-dump 报
-        # Incorrect database name）。无论成败都尽量删掉。docker 节点的暂存是 bind-mount
-        # 的宿主机路径，须走宿主机 SSH 删除（传裸机 node_type 绕过 docker-exec 路由）。
+        # 清理远端暂存目录：源节点容器暂存放在 datadir 内的 .custos_mig_staging_*（不清理会被
+        # MariaDB 当成 #mysql50# 伪库）；目标暂存是 datadir 的兄弟目录。无论成败都尽量删掉。
+        # docker 节点的暂存是 bind-mount 的宿主机路径，须走宿主机 SSH 删除（传裸机 node_type
+        # 绕过 docker-exec 路由）。_st 为空（前面某步就失败、路径未解析）时跳过，避免
+        # UnboundLocalError/空路径误删掩盖真实错误。
         for _h, _st, _src in ((cfg["src_host"], src_staging, True),
                                (cfg["tgt_host"], staging, False)):
+            if not _st:
+                continue
             try:
                 _ssh_run(cfg, _h, "rm -rf " + _sh_quote(_st),
                          use_src_cred=_src, node_type="mariadb")
