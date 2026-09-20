@@ -2835,6 +2835,10 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
             # 物理通道源端路径（非标安装必填）
             "src_my_cnf": b.get("src_my_cnf") or "",
             "src_data_dir": b.get("src_data_dir") or "",
+            # 物理通道 B：源端形态（默认同目标）与源机 SSH 凭据（管理器经 SSH 到源机跑 mariabackup）
+            "src_type": b.get("src_type") or "",
+            "src_ssh_user": b.get("src_ssh_user") or "root",
+            "src_ssh_pass": b.get("src_ssh_pass") or "",
             # 物理通道目标数据目录（留空则按 node_type 推导）
             "tgt_datadir": b.get("tgt_datadir") or "",
         }

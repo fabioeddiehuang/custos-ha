@@ -99,7 +99,8 @@
     padding:12px 14px;border:1px solid var(--border);border-radius:12px;
     background:var(--surface-2);margin-bottom:16px}
   .mt-lbl{font-weight:700;color:var(--text);font-size:14px}
-  .seg{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden;flex-wrap:wrap}
+  .seg-btn{white-space:nowrap}
   .seg-btn{border:0;background:transparent;padding:7px 16px;font-size:13px;cursor:pointer;
     color:var(--muted);transition:.15s}
   .seg-btn.on{background:var(--primary,#2f6fed);color:#fff;font-weight:600}
@@ -111,6 +112,9 @@
   .step-head .num{width:24px;height:24px;border-radius:7px;background:var(--primary-light,#e7f0ff);
     color:var(--primary);font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center}
   .step-head h3{margin:0}
+  /* 统一字段标签样式：标题类文字尽量完整可读，不缩减不挤压 */
+  .field label{display:block;font-size:13px;font-weight:600;color:var(--text);margin-bottom:5px;line-height:1.35;word-break:keep-all}
+  .field-hint{font-size:12px;color:var(--muted);margin-top:3px;line-height:1.4}
 </style>
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
@@ -140,7 +144,7 @@
   <div class="wz-step" data-step="2"><span class="idx">2</span><div><div class="t">目标与通道</div><div class="s">选策略建任务</div></div></div>
   <div class="wz-step" data-step="3"><span class="idx">3</span><div><div class="t">执行迁移</div><div class="s">种子/桥接/校验</div></div></div>
   <div class="wz-step" data-step="4"><span class="idx">4</span><div><div class="t">停桥切换</div><div class="s">cutover</div></div></div>
-  <div class="wz-step" data-step="5"><span class="idx">5</span><div><div class="t">收尾回收</div><div class="s">cleanup</div></div></div>
+  <div class="wz-step" data-step="5"><span class="idx">5</span><div><div class="t">收尾工作</div><div class="s">cleanup</div></div></div>
 </div>
 
 <div id="wzGuide" style="margin:10px 0;padding:10px 12px;border:1px solid var(--border,var(--surface-3));border-radius:8px;background:var(--surface-2,rgba(127,127,127,.06))"></div>
@@ -189,12 +193,13 @@
 <div class="card" id="step2" style="display:none">
   <div class="step-head"><span class="num">2</span><h3>目标 Custos 节点与迁移通道</h3></div>
   <div class="form-grid">
-    <div class="field"><label>目标节点地址（已安装 MariaDB 12.3.3）</label><input id="tgtHost" placeholder="如 10.0.0.21"></div>
+    <div class="field"><label>目标节点地址</label><input id="tgtHost" placeholder="如 10.0.0.21">
+      <div class="field-hint">须为已部署 MariaDB 12.3.3 的 Custos 节点</div></div>
     <div class="field"><label>目标端口</label><input id="tgtPort" value="3306"></div>
     <div class="field"><label>目标 root 密码</label><input id="tgtRoot" type="password"></div>
     <div class="field"><label>目标节点形态</label>
       <select id="tgtType">
-        <option value="" disabled selected>请选择节点形态</option>
+        <option value="" disabled selected>请选择节点形态（目标须 MariaDB 12.3.3）</option>
         <option value="mariadb-docker">容器化 MariaDB（mariadb-docker）</option>
         <option value="mariadb">裸机 MariaDB（mariadb）</option>
       </select>
@@ -218,6 +223,15 @@
     <div class="field"><label>源端数据目录（可选，物理通道 B 用）</label>
       <input id="srcData" placeholder="如 /var/lib/mysql 或 /data/mariadb/data">
     </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--muted)">物理通道 B 还需源端形态与源机 SSH 访问：备份 / prepare 在<b>源节点本地</b>执行（mariabackup 只能读本地 datadir，无法备份远程），故管理器需经 SSH 到源机操作。</div>
+    <div class="field"><label>源端形态（物理通道 B 用）</label>
+      <select id="srcType">
+        <option value="mariadb-docker">容器化 MariaDB（mariadb-docker）</option>
+        <option value="mariadb">裸机 MariaDB（mariadb）</option>
+      </select>
+    </div>
+    <div class="field"><label>源机 SSH 账号（可选，默认 root）</label><input id="srcSshUser" placeholder="默认 root（密钥或密码）"></div>
+    <div class="field"><label>源机 SSH 密码（可选；留空走密钥）</label><input id="srcSshPass" type="password"></div>
   </div>
 
   <div id="chanLabel" style="margin-top:12px;font-size:13px;color:var(--text);font-weight:600">迁移通道（系统已按数据量推荐，可覆盖）</div>
@@ -248,9 +262,15 @@
   <div id="preBox" class="logbox" style="display:none"></div>
   <div id="runBanner" style="display:none;padding:10px 12px;border-radius:8px;margin:8px 0;font-size:12px;line-height:1.6;background:rgba(230,162,60,.12);color:var(--warn,#e6a23c)"></div>
   <div id="execList"></div>
-  <label style="display:block;margin-top:8px;font-size:12px;color:var(--muted)">
-    <input type="checkbox" id="deepVerifyChk"> 一致性校验时同时做内容级比对（CHECKSUM，较慢但更强，建议切换前跑一次）
-  </label>
+  <div style="margin-top:10px">
+    <div style="display:flex;gap:10px;align-items:flex-start">
+      <input type="checkbox" id="deepVerifyChk" style="margin-top:2px;flex:0 0 auto;width:16px;height:16px">
+      <div style="font-size:13px;line-height:1.6">
+        <div style="font-weight:600">一致性校验时做内容级比对（CHECKSUM）</div>
+        <div style="color:var(--muted);margin-top:2px">较慢但更强，建议在切换前跑一次。</div>
+      </div>
+    </div>
+  </div>
   <div id="verifyBox" style="margin-top:10px;display:none"></div>
   <div id="binlogPlanBox" style="margin-top:10px;display:none"></div>
   <div id="stepErrBox" style="margin-top:10px;display:none"></div>
@@ -332,18 +352,10 @@
 </div>
 
 <div class="card" id="step5" style="display:none">
-  <div class="step-head"><span class="num">5</span><h3>收尾回收</h3></div>
+  <div class="step-head"><span class="num">5</span><h3>收尾工作</h3></div>
   <div class="bk-note">
-    <div><b>本步仅作用于源库（原主库），绝不改动目标集群（新主）。</b></div>
-    <div style="margin-top:6px">① 回收桥接专用的源端复制账号 —— 源库执行
-      <code>DROP USER IF EXISTS 'replication'@'%'</code>。</div>
-    <div>② 把源库置为只读暖备（保留期后再下线）—— 源库执行
-      <code>SET GLOBAL read_only=ON</code>。</div>
-    <div style="margin-top:6px">⚠ 关于「只读」的两个前提：<code>read_only</code>
-      <b>只限制非特权账号</b>写入，root / SUPER 用户仍可写入；且它是<b>运行时变量、重启后会失效</b>，
-      要永久只读需写进配置文件。执行它还需要源库账号具备 SUPER 权限，
-      不具备时本步会如实上报未完成项，不会谎报成功。</div>
-    <div style="margin-top:6px">目标集群（新主及其从节点）不受影响，仍由 Custos 正常托管。</div>
+    <div><b>说明：</b>本步仅作用于源库（原主库），回收桥接复制账号 <code>DROP USER IF EXISTS 'replication'@'%'</code> 并把源库置为只读暖备（保留期后再下线）；目标集群（新主）不受影响，仍由 Custos 正常托管。</div>
+    <div style="margin-top:8px">⚠ <b>警告：</b>「只读」只限制普通账号写入，root / SUPER 仍可写；且它是运行时变量，重启即失效，要永久只读须写进配置文件。源库账号缺 SUPER 权限时本步会如实上报未完成项，不会谎报成功。</div>
   </div>
   <div class="btn-row">
     <button class="btn" onclick="setStep(4)">← 上一步：返回切换</button>
@@ -599,6 +611,9 @@ async function createTask(){
     tgt_datadir:$("tgtData").value.trim()||null,
     src_my_cnf:$("srcCnf").value.trim()||null,
     src_data_dir:$("srcData").value.trim()||null,
+    src_type:$("srcType").value||null,
+    src_ssh_user:$("srcSshUser").value.trim()||null,
+    src_ssh_pass:$("srcSshPass").value||null,
     // 产品线决定 dump 工具与 GTID 参数（两者互斥）；size_mb 用于真实百分比进度
     src_flavor:(STATE.probe&&STATE.probe.flavor)||"mariadb",
     src_major:(STATE.probe&&STATE.probe.major)||0,

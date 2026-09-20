@@ -12,11 +12,12 @@ RUN pip install --no-cache-dir \
     --timeout 120 --retries 10 \
     -r requirements.txt
 
-# 数据迁移必须的数据库客户端：没有它们，迁移向导的逻辑通道与物理通道都无法运行。
-# ⚠ 注意：脱离了客户端，/migration 页面能打开但一点即错，务必保留此层。
-# MariaDB 源使用 mariadb-dump / mariadb；MySQL 源按官方建议应使用 MySQL 自带 mysqldump
-# （Debian 仓库的 mysql-client 只是指向 mariadb-client 的过渡包），
-# 如需严格使用官方 mysqldump，可在宿主机安装后挂载进容器 PATH。
+# 数据迁移必须的客户端与编排工具：
+#   · mariadb-client —— 逻辑通道 A 的 mariadb-dump / mariadb（连远程源库导出/导入）。
+#   · openssh-client + rsync + sshpass —— 物理通道 B 的编排：管理器经 SSH 到【源/目标节点】
+#     执行 mariabackup（备份在源节点、copy-back 在目标节点，mariabackup 只能读本地 datadir，
+#     无法备份远程服务器，故管理器【不】预装 mariabackup，节点自带即可）。
+# ⚠ 注意：脱离了这些工具，/migration 页面能打开但一点即错，务必保留此层。
 # 国内镜像源（阿里云）加速 apt；覆盖 deb.debian.org 与 security.debian.org，
 # 并兼容 deb822（bookworm 的 debian.sources）与传统 sources.list 两种写法——
 # 否则 apt-get update 直连境外源，是国内构建慢的主因（与 keepalived/Dockerfile 一致）。
@@ -25,7 +26,7 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors
     sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com/debian-security|g' \
         /etc/apt/sources.list 2>/dev/null || true; \
     apt-get update && apt-get install -y --no-install-recommends \
-        mariadb-client \
+        mariadb-client openssh-client rsync sshpass \
     && rm -rf /var/lib/apt/lists/*
 
 # 依赖装完后再引入随版本变化的元数据：LABEL 内含 ${VERSION}，

@@ -50,7 +50,7 @@ STEP_LABELS = {
     "bridge": "建立桥接",
     "verify": "一致性校验",
     "cutover": "停桥切换",
-    "cleanup": "收尾回收",
+    "cleanup": "收尾工作",
 }
 
 _lock = threading.Lock()
@@ -775,98 +775,244 @@ def _tgt_datadir(cfg):
     return node_gen.MYSQL_DOCKER_DATA_DIR
 
 
+# ---------------------------------------------------------------------------
+# 物理通道 B 的 mariabackup 编排
+#
+# 根因（务必遵守）：mariabackup 只能读取【本地】数据目录，无法备份远程服务器，
+# 所以「备份」必须在【源节点】执行、「恢复(copy-back)」必须在【目标节点】执行。
+# 管理器/宿主机一律不预装 mariabackup（既装不上匹配版本、也读不到远端 datadir），
+# 管理器只需 openssh-client + rsync + sshpass 做 SSH 编排与文件传输。
+#
+# 容器节点：经 SSH 到宿主机后 docker exec / docker compose run 进容器执行
+# （官方 mariadb 镜像自带 mariabackup）；裸机节点：SSH 直连宿主机执行。
+#
+# 暂存目录放置约定：容器节点把暂存放在「数据目录挂载点之内」，保证对容器内
+# mariabackup 可见（容器只挂载了数据目录，如 /data/custos-ha/mariadb12 → 容器内 /var/lib/mysql）。
+# ---------------------------------------------------------------------------
+
+def _tail(s, n=2000):
+    return (s or "")[-n:]
+
+
+def _sh_quote(a):
+    return "'" + str(a).replace("'", "'\\''") + "'"
+
+
+def _default_src_datadir(snt):
+    if str(snt).endswith("-docker"):
+        return "/data/custos-ha/mariadb12"
+    if str(snt).startswith("mariadb"):
+        return "/data/mariadb"
+    return "/var/lib/mysql"
+
+
+def _mig_staging_path(node_type, data_dir_host, task_id):
+    """暂存目录（宿主机路径）。容器节点放在数据目录挂载点之内（见上方说明）。"""
+    if str(node_type).endswith("-docker"):
+        return os.path.join(data_dir_host.rstrip("/"), ".custos_mig_staging_%s" % task_id)
+    return "/data/custos_mig_staging_%s" % task_id
+
+
+def _container_staging(staging_host, data_dir_host):
+    """宿主机暂存路径 → 容器内路径（数据目录在容器内固定为 /var/lib/mysql）。"""
+    return "/var/lib/mysql" + staging_host[len(data_dir_host.rstrip("/")):]
+
+
+def _ssh_opt_string(cfg, host, use_src_cred):
+    """构造 ssh 连接串（含可选密码）。源端可用独立账号/密码，目标端用默认 root 密钥。"""
+    if use_src_cred:
+        user = cfg.get("src_ssh_user") or "root"
+        pwd = cfg.get("src_ssh_pass") or ""
+    else:
+        user, pwd = "root", ""
+    ssh = "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 %s@%s" % (user, host)
+    if pwd:
+        return "sshpass -p %s rsync -az --delete -e %s" % (_sh_quote(pwd), _sh_quote(ssh))
+    return "rsync -az --delete -e %s" % _sh_quote(ssh)
+
+
+def _rsync_pull(cfg, host, remote_path, local_path):
+    os.makedirs(local_path, exist_ok=True)
+    cmd = "%s %s:%s %s/" % (_ssh_opt_string(cfg, host, True),
+                            host, _sh_quote(remote_path), _sh_quote(local_path))
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600)
+
+
+def _rsync_push(cfg, local_path, host, remote_path):
+    cmd = "%s %s/ %s:%s" % (_ssh_opt_string(cfg, host, False),
+                            _sh_quote(local_path), host, _sh_quote(remote_path))
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600)
+
+
+def _ssh_run(cfg, host, script, use_src_cred):
+    if use_src_cred:
+        user = cfg.get("src_ssh_user") or "root"
+        pwd = cfg.get("src_ssh_pass") or ""
+    else:
+        user, pwd = "root", ""
+    base = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=no",
+            "-o", "ConnectTimeout=15", "%s@%s" % (user, host)]
+    if pwd:
+        return subprocess.run(["sshpass", "-p", pwd] + base + [script],
+                              capture_output=True, text=True, timeout=3600 * 6)
+    return subprocess.run(base + [script], capture_output=True, text=True, timeout=3600 * 6)
+
+
+def _find_mariadb_container(host, port, cfg, use_src_cred):
+    sh = _ssh_run(cfg, host, "docker ps -q --filter 'publish=%s' --filter status=running"
+                  % port, use_src_cred)
+    if sh.returncode != 0:
+        return ""
+    return sh.stdout.strip().split("\n")[0].strip() if sh.stdout.strip() else ""
+
+
+def _resolve_mb(host, cfg, use_src_cred):
+    """解析裸机节点上的 mariabackup 路径。
+
+    裸机靠 tarball 装在 /opt/mariadb/bin，常不在 PATH；容器节点在镜像 PATH 内。
+    找不到时回退 'mariabackup'（缺失由 _check_node_mb 前置探测拦截，这里只保证路径解析）。
+    """
+    sh = _ssh_run(cfg, host,
+                  "MB=$(command -v /opt/mariadb/bin/mariabackup 2>/dev/null); "
+                  "[ -z \"$MB\" ] && MB=$(command -v mariabackup 2>/dev/null); "
+                  "printf '%s' \"$MB\"", use_src_cred)
+    if sh.returncode == 0:
+        p = sh.stdout.strip()
+        if p:
+            return p
+    return "mariabackup"
+
+
+def _check_node_mb(node_type, host, port, cfg, use_src_cred):
+    """物理通道前置探测：确认源/目标节点存在 mariabackup，否则抛清晰错误 + 安装指引。"""
+    is_docker = str(node_type).endswith("-docker")
+    if is_docker:
+        cid = _find_mariadb_container(host, port, cfg, use_src_cred)
+        if not cid:
+            raise RuntimeError("物理通道前置检查失败：未在 %s 找到运行中的 mariadb 容器"
+                               "（按端口 %s 探测）。请确认该节点已部署并运行 Custos MariaDB 容器。"
+                               % (host, port))
+        sh = _ssh_run(cfg, host, "docker exec %s command -v mariabackup || true" % cid, use_src_cred)
+        present = bool(sh.stdout.strip())
+    else:
+        sh = _ssh_run(cfg, host,
+                      "command -v /opt/mariadb/bin/mariabackup 2>/dev/null "
+                      "|| command -v mariabackup 2>/dev/null || true", use_src_cred)
+        present = bool(sh.stdout.strip())
+    if not present:
+        where = ("容器 %s：请改用自带 mariabackup 的官方 mariadb 镜像" % host
+                 if is_docker else
+                 "裸机 %s：tarball 安装通常在 /opt/mariadb/bin/mariabackup；"
+                 "若缺失请执行 apt-get install -y mariadb-backup 或 dnf install -y MariaDB-backup" % host)
+        raise RuntimeError("物理通道前置检查失败：节点 %s 未找到 mariabackup。%s" % (host, where))
+    return True
+
+
+def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=None,
+               datadir=None, mb_bin=None):
+    """在 node_type 节点上执行 mariabackup 的某步（backup/prepare/copyback）。
+
+    容器节点经 SSH + docker 执行；裸机经 SSH 直连执行。返回 CompletedProcess。
+    mb_bin 为已解析的 mariabackup 路径（容器用镜像内 PATH 的 'mariabackup'）。
+    """
+    is_docker = str(node_type).endswith("-docker")
+    if mb_bin is None:
+        mb_bin = "mariabackup" if is_docker else _resolve_mb(host, cfg, use_src_cred=(op != "copyback"))
+    if op == "backup":
+        mb = [mb_bin, "--backup",
+              "--host=%s" % src[0], "--port=%s" % src[1],
+              "--user=%s" % src[2], "--password=%s" % src[3],
+              "--target-dir=%s" % staging_host]
+        if cfg.get("src_my_cnf"):
+            mb.insert(1, "--defaults-file=%s" % cfg["src_my_cnf"])
+        if src_data_dir:
+            mb.append("--datadir=%s" % src_data_dir)
+    elif op == "prepare":
+        mb = [mb_bin, "--prepare", "--target-dir=%s" % staging_host]
+    elif op == "copyback":
+        # 目标容器内数据目录固定为 /var/lib/mysql（镜像挂载约定）
+        mb = [mb_bin, "--copy-back",
+              "--target-dir=/backup", "--datadir=/var/lib/mysql"]
+    else:
+        raise RuntimeError("未知 mariabackup 操作: %s" % op)
+
+    if is_docker:
+        if op == "copyback":
+            inner = " ".join(_sh_quote(a) for a in mb)
+            # 停服务 → 在临时容器内 copy-back（挂载 staging 与数据目录）→ 授权 → 起服务
+            script = (
+                "cd /data/custos-ha && docker compose stop mariadb; "
+                "docker compose run --rm -v %s:/backup mariadb %s; "
+                "chown -R 999:999 %s; docker compose start mariadb; rm -rf %s"
+                % (staging_host, inner, datadir, staging_host)
+            )
+            return _ssh_run(cfg, host, script, use_src_cred=False)
+        # backup / prepare：容器运行中，docker exec 进容器（暂存放在数据目录挂载内）
+        cid = _find_mariadb_container(host, cfg.get("src_port"), cfg, use_src_cred=True)
+        if not cid:
+            raise RuntimeError("未在源机 %s 找到运行中的 mariadb 容器（按端口 %s 探测）；"
+                               "若源为裸机 MariaDB 请在「源端形态」选「裸机 MariaDB」"
+                               % (host, cfg.get("src_port")))
+        inner_staging = _container_staging(staging_host, src_data_dir or _default_src_datadir(node_type))
+        mb[-1] = "--target-dir=%s" % inner_staging
+        inner = " ".join(_sh_quote(a) for a in mb)
+        return _ssh_run(cfg, host, "docker exec %s %s" % (cid, inner), use_src_cred=True)
+    # 裸机：直接 SSH 执行
+    inner = " ".join(_sh_quote(a) for a in mb)
+    return _ssh_run(cfg, host, inner, use_src_cred=(op != "copyback"))
+
+
 def seed_physical(task):
-    """物理通道：mariabackup（MariaDB 版）热备源 → prepare → 恢复到目标。
+    """物理通道：源节点 mariabackup 热备 → prepare → 传到目标 → 目标节点 copy-back。
 
-    注意：物理备份须使用【匹配源主版本】的 mariabackup（同 MariaDB 大版本）。
-    源→目标跨大版本时，目标 12.3.3 首次启动会自动 mysql_upgrade，向导会监控其结果。
+    关键时序（务必遵守）：mariabackup 只能读取【本地】数据目录，无法备份远程服务器，
+    所以「备份 / prepare」在【源节点】执行（源自带 mariabackup，版本天然匹配源），
+    「copy-back」在【目标节点】执行（目标自带 mariaback，版本匹配目标 12.3.3）。
+    管理器/宿主机不预装 mariabackup，仅需 openssh-client + rsync + sshpass 做编排。
 
-    源端 my.cnf / 数据目录因人而异（裸机 / 容器 / 自定义路径），非标安装须在向导中
-    显式填写 src_my_cnf（--defaults-file）与 src_data_dir（--datadir），否则
-    mariabackup 无法定位源数据目录。
+    源端 my.cnf / 数据目录非标安装时，须显式填写 src_my_cnf / src_data_dir。
     """
     cfg = task["config"]
     src = (cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"])
-    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
-    if not _which("mariabackup"):
-        raise RuntimeError("管理端未安装 mariabackup（MariaDB 物理备份工具），无法使用物理通道")
-    tmp = f"/tmp/custos_mig_backup_{int(time.time())}"
-    os.makedirs(tmp, exist_ok=True)
-    # 1) 热备（对源几乎无锁）
-    # 源端 my.cnf / 数据目录因人而异（裸机/容器/自定义），非标安装必须显式指定：
-    #   --defaults-file 放在最前（mariabackup 要求）；--datadir 覆盖探测到的数据目录。
-    bk_args = ["mariabackup"]
-    if cfg.get("src_my_cnf"):
-        bk_args.append(f"--defaults-file={cfg['src_my_cnf']}")
-    bk_args += ["--backup", f"--host={src[0]}", f"--port={src[1]}",
-                f"--user={src[2]}", f"--password={src[3]}", f"--target-dir={tmp}"]
-    if cfg.get("src_data_dir"):
-        bk_args.append(f"--datadir={cfg['src_data_dir']}")
-    bk = subprocess.run(
-        bk_args,
-        capture_output=True, text=True, timeout=3600 * 6,
-    )
-    if bk.returncode != 0:
-        raise RuntimeError("mariabackup 备份失败: " + bk.stderr[:2000])
-    # 2) prepare（回放 redo，使其一致）
-    pr = subprocess.run(
-        ["mariabackup", "--prepare", f"--target-dir={tmp}"],
-        capture_output=True, text=True, timeout=3600,
-    )
-    if pr.returncode != 0:
-        raise RuntimeError("mariabackup prepare 失败: " + pr.stderr[:2000])
-    # 3) 恢复到目标：先把已 prepare 的备份传到目标「暂存目录」，再在目标机
-    #    copy-back 到目标数据目录（显式 --datadir 落盘，不依赖目标 my.cnf）。
-    #    注意：绝不能直接 rsync 进目标数据目录再 copy-back（会循环/落错位置）。
-    dd = _tgt_datadir(cfg)
-    nt = cfg.get("node_type", "mariadb-docker")
-    staging = f"/data/custos_mig_staging_{task['id']}"
+    nt = cfg.get("node_type", "mariadb-docker")            # 目标形态
+    snt = cfg.get("src_type", nt)                           # 源形态（默认同目标）
+    dd = _tgt_datadir(cfg)                                  # 目标数据目录（宿主机路径）
+    src_dd = cfg.get("src_data_dir") or _default_src_datadir(snt)
+    staging = _mig_staging_path(nt, dd, task["id"])          # 目标机暂存（宿主机路径）
+    src_staging = _mig_staging_path(snt, src_dd, task["id"]) # 源机暂存（宿主机路径）
+    # 裸机节点解析 mariabackup 完整路径（tarball 装在 /opt/mariadb/bin，常不在 PATH）；容器用镜像内 PATH
+    src_mb = ("mariabackup" if str(snt).endswith("-docker")
+              else _resolve_mb(cfg["src_host"], cfg, use_src_cred=True))
+    tgt_mb = ("mariabackup" if str(nt).endswith("-docker")
+              else _resolve_mb(cfg["tgt_host"], cfg, use_src_cred=False))
+    relay = f"/tmp/custos_mig_relay_{task['id']}"            # 管理器中转（避免源→目标直连 ssh）
+    os.makedirs(relay, exist_ok=True)
     try:
-        r = subprocess.run(
-            ["rsync", "-az", "--delete", f"{tmp}/", f"{tgt[0]}:{staging}/"],
-            capture_output=True, text=True, timeout=3600,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr[:1500])
-        # 先停实例→清空目标数据目录→copy-back（--datadir 显式落盘）→授权→启动；
-        # 按形态分支：裸机 systemctl，容器 docker compose（数据目录为宿主机挂载）。
-        if nt.endswith("-docker"):
-            cb = (f"cd /data/custos-ha && docker compose stop mariadb; "
-                  f"rm -rf {dd} && mkdir -p {dd} && "
-                  f"mariabackup --copy-back --target-dir={staging} --datadir={dd} && "
-                  f"chown -R root:root {dd} && "
-                  f"docker compose start mariadb; "
-                  f"rm -rf {staging}")
-        else:
-            svc = "mariadb" if nt.startswith("mariadb") else "mysql"
-            cb = (f"systemctl stop {svc}; "
-                  f"rm -rf {dd} && mkdir -p {dd} && "
-                  f"mariabackup --copy-back --target-dir={staging} --datadir={dd} && "
-                  f"chown -R mysql:mysql {dd} && systemctl start {svc}; "
-                  f"rm -rf {staging}")
-        rb = subprocess.run(["ssh", tgt[0], cb], capture_output=True, text=True, timeout=3600)
-        if rb.returncode != 0:
-            raise RuntimeError("远程 copy-back 失败: " + rb.stderr[:1500])
-    except FileNotFoundError as e:
-        if nt.endswith("-docker"):
-            stop_hint, start_hint, chown = (
-                "cd /data/custos-ha && docker compose stop mariadb",
-                "docker compose start mariadb", "root:root")
-        else:
-            svc = "mariadb" if nt.startswith("mariadb") else "mysql"
-            stop_hint, start_hint, chown = (
-                f"systemctl stop {svc}", f"systemctl start {svc}", "mysql:mysql")
-        raise RuntimeError(
-            "未找到 rsync/ssh，无法自动恢复到目标。请手动执行：\n"
-            f"  rsync -az --delete {tmp}/ {tgt[0]}:{staging}/\n"
-            f"  目标机执行: {stop_hint}; rm -rf {dd} && mkdir -p {dd} && "
-            f"mariabackup --copy-back --target-dir={staging} --datadir={dd} && "
-            f"chown -R {chown} {dd} && {start_hint}; rm -rf {staging}\n"
-            f"（原始错误: {e}）"
-        )
+        # 0) 物理通道前置探测：源/目标节点须存在 mariabackup，否则提前给清晰错误 + 安装指引
+        _check_node_mb(snt, cfg["src_host"], int(cfg["src_port"]), cfg, use_src_cred=True)
+        _check_node_mb(nt, cfg["tgt_host"], int(cfg["tgt_port"]), cfg, use_src_cred=False)
+        # 1) 源节点热备（读源本地 datadir；--host 仅用于连接源做协调，不读远端文件）
+        bk = _remote_mb(snt, cfg["src_host"], cfg, "backup", src_staging,
+                        src=src, src_data_dir=src_dd, mb_bin=src_mb)
+        if bk.returncode != 0:
+            raise RuntimeError("源节点 mariabackup 备份失败: " + _tail(bk.stderr))
+        # 2) 源节点 prepare（回放 redo，使其一致）
+        pr = _remote_mb(snt, cfg["src_host"], cfg, "prepare", src_staging, mb_bin=src_mb)
+        if pr.returncode != 0:
+            raise RuntimeError("源节点 mariabackup prepare 失败: " + _tail(pr.stderr))
+        # 3) 拉取源机暂存 → 管理器中转 → 推到目标机暂存
+        pull = _rsync_pull(cfg, cfg["src_host"], src_staging + "/", relay)
+        if pull.returncode != 0:
+            raise RuntimeError("拉取源备份失败(rsync): " + _tail(pull.stderr))
+        push = _rsync_push(cfg, relay, cfg["tgt_host"], staging + "/")
+        if push.returncode != 0:
+            raise RuntimeError("推送备份到目标失败(rsync): " + _tail(push.stderr))
+        # 4) 目标节点 copy-back（停实例→恢复→授权→启动）
+        cb = _remote_mb(nt, cfg["tgt_host"], cfg, "copyback", staging, datadir=dd, mb_bin=tgt_mb)
+        if cb.returncode != 0:
+            raise RuntimeError("目标节点 copy-back 失败: " + _tail(cb.stderr))
     finally:
-        # 清理管理器本机临时备份目录（TB 级，避免撑爆管理端磁盘）
-        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(relay, ignore_errors=True)
     return {"ok": True, "datadir": dd, "staging": staging,
             "note": "物理恢复完成，请将目标实例作为新主继续桥接"}
 
