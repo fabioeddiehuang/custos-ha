@@ -197,7 +197,11 @@ def probe_source(cfg):
             f"WHERE schema_name NOT IN ({placeholders})",
             tuple(IGNORE_DBS),
         )
-        databases = [x[0] for x in cur.fetchall()]
+        raw_dbs = [x[0] for x in cur.fetchall()]
+        # 排除 MariaDB 把数据目录内隐藏子目录编码成的伪库名（如 #mysql50#.xxx）。
+        # 物理通道 B 会在源/目标 datadir 内建 .custos_mig_staging_* 暂存，若残留即被当成库，
+        # 既不能迁移、也会让 mariadb-dump 报 Incorrect database name。
+        databases = [d for d in raw_dbs if d and not d.startswith("#")]
 
         cur.execute(
             f"SELECT COALESCE(SUM(data_length+index_length),0)/1024/1024 "
@@ -455,7 +459,7 @@ def seed_logical(task):
     cfg = task["config"]
     src = (cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"])
     tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
-    databases = cfg.get("databases") or []
+    databases = [d for d in (cfg.get("databases") or []) if d and not d.startswith("#")]
     if not databases:
         raise ValueError("没有可迁移的用户库（仅系统库，无需迁移）")
 
@@ -613,7 +617,7 @@ def precheck(task_id):
         return {"ok": False, "blocked": True,
                 "error": "该组合暂不支持：MySQL 8.0+ → MariaDB 需先做排序规则与认证插件换算。"}
 
-    databases = [d for d in (cfg.get("databases") or []) if d]
+    databases = [d for d in (cfg.get("databases") or []) if d and not d.startswith("#")]
     findings = []
     src_flavor = cfg.get("src_flavor") or "mariadb"
     dump, cli, dialect = resolve_client_tools(src_flavor)
@@ -1132,6 +1136,17 @@ def seed_physical(task):
             raise RuntimeError("目标节点 copy-back 失败: " + _tail(cb.stderr))
     finally:
         shutil.rmtree(relay, ignore_errors=True)
+        # 清理远端暂存目录：物理通道 B 在源/目标 datadir 内建了 .custos_mig_staging_*，
+        # 残留会被 MariaDB 当成 #mysql50# 伪库（既不能迁移、也会让 mariadb-dump 报
+        # Incorrect database name）。无论成败都尽量删掉。docker 节点的暂存是 bind-mount
+        # 的宿主机路径，须走宿主机 SSH 删除（传裸机 node_type 绕过 docker-exec 路由）。
+        for _h, _st, _src in ((cfg["src_host"], src_staging, True),
+                               (cfg["tgt_host"], staging, False)):
+            try:
+                _ssh_run(cfg, _h, "rm -rf " + _sh_quote(_st),
+                         use_src_cred=_src, node_type="mariadb")
+            except Exception:
+                pass
     return {"ok": True, "datadir": dd, "staging": staging,
             "note": "物理恢复完成，请将目标实例作为新主继续桥接"}
 
