@@ -1027,13 +1027,16 @@ def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=No
     if mb_bin is None:
         mb_bin = "mariabackup" if is_docker else _resolve_mb(host, cfg, use_src_cred=(op != "copyback"),
                                                               node_type=node_type)
+    if op == "backup":
         mb = [mb_bin, "--backup",
               "--host=%s" % src[0], "--port=%s" % src[1],
               "--user=%s" % src[2], "--password=%s" % src[3],
               "--target-dir=%s" % staging_host]
         if cfg.get("src_my_cnf"):
             mb.insert(1, "--defaults-file=%s" % cfg["src_my_cnf"])
-        if src_data_dir:
+        # 裸机才传 --datadir（宿主机真实数据目录）；容器节点里 mariabackup 的数据目录
+        # 固定为 /var/lib/mysql，且下方 docker 分支会把 --target-dir 改写为容器内路径
+        if src_data_dir and not is_docker:
             mb.append("--datadir=%s" % src_data_dir)
     elif op == "prepare":
         mb = [mb_bin, "--prepare", "--target-dir=%s" % staging_host]
