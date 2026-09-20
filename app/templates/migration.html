@@ -194,15 +194,18 @@
   <div class="step-head"><span class="num">2</span><h3>目标 Custos 节点与迁移通道</h3></div>
   <div class="form-grid">
     <div class="field"><label>目标节点地址</label><input id="tgtHost" placeholder="如 10.0.0.21">
-      <div class="field-hint">须为已部署 MariaDB 12.3.3 的 Custos 节点</div></div>
-    <div class="field"><label>目标端口</label><input id="tgtPort" value="3306"></div>
-    <div class="field"><label>目标 root 密码</label><input id="tgtRoot" type="password"></div>
+      <div class="field-hint">即「新主」所在的 Custos 节点 IP；须已部署 MariaDB 12.3.3 且管理器能连上它。</div></div>
+    <div class="field"><label>目标端口</label><input id="tgtPort" value="3306">
+      <div class="field-hint">目标 MariaDB 监听端口，默认 3306。</div></div>
+    <div class="field"><label>目标 root 密码</label><input id="tgtRoot" type="password">
+      <div class="field-hint">即新主（目标节点）的数据库 root 密码。</div></div>
     <div class="field"><label>目标节点形态</label>
       <select id="tgtType">
         <option value="" disabled selected>请选择节点形态（目标须 MariaDB 12.3.3）</option>
         <option value="mariadb-docker">容器化 MariaDB（mariadb-docker）</option>
         <option value="mariadb">裸机 MariaDB（mariadb）</option>
       </select>
+      <div class="field-hint">目标 MariaDB 是运行在容器里，还是直接装在该节点上（裸机）。</div>
     </div>
   </div>
   <!-- 以下为「物理通道 B」专属字段，逻辑通道 A 时隐藏（DESIGN-002/003） -->
@@ -212,16 +215,20 @@
         <input id="tgtVer" placeholder="如 12.3.3-MariaDB" style="flex:1">
         <button class="btn" type="button" onclick="probeTarget()">探测目标版本</button>
       </div>
+      <div class="field-hint">到目标节点执行 <code>SELECT VERSION();</code>，把返回的原文整串粘入（如 12.3.3-MariaDB）。</div>
     </div>
-    <div class="field"><label>目标数据目录（可选，物理通道 B 用；留空按形态默认）</label>
+    <div class="field"><label>目标数据目录（可选，物理通道 B 用）</label>
       <input id="tgtData" placeholder="如 /data/custos-ha/mariadb12（容器）或 /data/mariadb（裸机）">
+      <div class="field-hint">目标实例的数据目录；留空按形态取默认（容器 /data/custos-ha/mariadb12，裸机 /data/mariadb）。</div>
     </div>
     <div style="margin-top:10px;font-size:12px;color:var(--muted)">以下两项为「物理通道 B」源端路径（非标安装必填）：每个人的 my.cnf / 数据目录位置不同，必须显式指定，否则 mariabackup 找不到。</div>
     <div class="field"><label>源端 my.cnf 路径（可选，物理通道 B 用）</label>
       <input id="srcCnf" placeholder="如 /etc/mysql/my.cnf 或 /data/mariadb/my.cnf">
+      <div class="field-hint">源 MariaDB 的配置文件路径。<b>裸机源</b>且非标准位置时必填；<b>容器源</b>留空（自动读取容器内自带配置）。</div>
     </div>
     <div class="field"><label>源端数据目录（可选，物理通道 B 用）</label>
       <input id="srcData" placeholder="如 /var/lib/mysql 或 /data/mariadb/data">
+      <div class="field-hint">源 MariaDB 的真实数据目录。<b>裸机源</b>且非标准位置时必填；<b>容器源</b>留空（固定 /var/lib/mysql）。</div>
     </div>
     <div style="margin-top:10px;font-size:12px;color:var(--muted)">物理通道 B 还需源端形态与源机 SSH 访问：备份 / prepare 在<b>源节点本地</b>执行（mariabackup 只能读本地 datadir，无法备份远程），故管理器需经 SSH 到源机操作。</div>
     <div class="field"><label>源端形态（物理通道 B 用）</label>
@@ -229,12 +236,17 @@
         <option value="mariadb-docker">容器化 MariaDB（mariadb-docker）</option>
         <option value="mariadb">裸机 MariaDB（mariadb）</option>
       </select>
+      <div class="field-hint">源 MariaDB 是容器化还是裸机，决定备份/prepare 的执行方式（docker exec 还是 SSH 直连）。</div>
     </div>
-    <div class="field"><label>源机 SSH 账号（可选，默认 root）</label><input id="srcSshUser" placeholder="默认 root（密钥或密码）"></div>
-    <div class="field"><label>源机 SSH 密码（可选；留空走密钥）</label><input id="srcSshPass" type="password"></div>
+    <div class="field"><label>源机 SSH 账号（可选，默认 root）</label><input id="srcSshUser" placeholder="默认 root（密钥或密码）">
+      <div class="field-hint">管理器经 SSH 到源机执行 mariabackup 用的账号；留空默认 root。</div></div>
+    <div class="field"><label>源机 SSH 密码（可选；留空走密钥）</label><input id="srcSshPass" type="password">
+      <div class="field-hint">源机 SSH 密码；留空则走密钥认证（需事先已配置免密）。</div></div>
     <div style="margin-top:10px;font-size:12px;color:var(--muted)">目标端（新主）同样需在本机执行 docker / mariabackup / copy-back：管理器经 SSH 到目标机（账号/密码，默认 root）操作；若目标机不可 SSH，可对目标节点执行 regen 启用 agent-exec（免 SSH）。</div>
-    <div class="field"><label>目标机 SSH 账号（可选，默认 root）</label><input id="tgtSshUser" placeholder="默认 root（密钥或密码）"></div>
-    <div class="field"><label>目标机 SSH 密码（可选；留空走密钥或 agent-exec）</label><input id="tgtSshPass" type="password"></div>
+    <div class="field"><label>目标机 SSH 账号（可选，默认 root）</label><input id="tgtSshUser" placeholder="默认 root（密钥或密码）">
+      <div class="field-hint">管理器经 SSH 到目标机执行 copy-back 用的账号；留空默认 root。</div></div>
+    <div class="field"><label>目标机 SSH 密码（可选；留空走密钥或 agent-exec）</label><input id="tgtSshPass" type="password">
+      <div class="field-hint">目标机 SSH 密码；留空则走密钥或 agent-exec（节点已启用 agent-exec 时免 SSH）。</div></div>
   </div>
 
   <div id="chanLabel" style="margin-top:12px;font-size:13px;color:var(--text);font-weight:600">迁移通道（系统已按数据量推荐，可覆盖）</div>

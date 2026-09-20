@@ -1032,7 +1032,10 @@ def _remote_mb(node_type, host, cfg, op, staging_host, src=None, src_data_dir=No
               "--host=%s" % src[0], "--port=%s" % src[1],
               "--user=%s" % src[2], "--password=%s" % src[3],
               "--target-dir=%s" % staging_host]
-        if cfg.get("src_my_cnf"):
+        # 裸机：源 my.cnf 在宿主机真实路径，mariabackup 直连读取；
+        # 容器节点里 mariabackup 在容器内执行（docker exec），应读容器自带 my.cnf（自动），
+        # 传宿主机路径会因容器内不存在而报 Could not open required defaults file。
+        if cfg.get("src_my_cnf") and not is_docker:
             mb.insert(1, "--defaults-file=%s" % cfg["src_my_cnf"])
         # 裸机才传 --datadir（宿主机真实数据目录）；容器节点里 mariabackup 的数据目录
         # 固定为 /var/lib/mysql，且下方 docker 分支会把 --target-dir 改写为容器内路径
