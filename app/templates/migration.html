@@ -557,6 +557,31 @@ function setStep(n){
   const f = $("wzFill");
   if(f){ f.style.width = ((n-1)/(5-1)*92) + "%"; }
   updateGuide(n);
+  // ⚠ 第三步的「数据种子 / 建立桥接 / 一致性校验」三行独立执行按钮，原本只在
+  //   createTask() 里构建一次。两种常见路径会让它【从未渲染】而变成空白：
+  //     ① 从历史任务「继续」恢复时若三步都已 done ⇒ 直接落在第四步（land=4），
+  //        buildExecList() 不会执行；
+  //     ② 随后点第四步的「← 上一步：返回校验」或追平失败提示里的「返回第三步重跑桥接」
+  //        ⇒ 只切到第三步，列表依旧是空的 ⇒ 用户看不到任何【执行】按钮（实测反馈）。
+  //   故每次进入第三步都确保列表已渲染，并按任务真实步骤状态回显（支持直接重跑桥接）。
+  if(n===3){
+    const box = $("execList");
+    if(box && !box.querySelector(".run-row")){
+      buildExecList();
+      if(STATE.taskId){
+        fetch("/api/migration/"+STATE.taskId+"/status",
+              {headers:{"Accept":"application/json"}, cache:"no-store"})
+          .then(function(r){ return r.json(); })
+          .then(function(j){
+            if(!j || j.ok===false) return;
+            refreshStepStatuses(j.steps||{});
+            // 若任务仍在后台跑（典型：刷新/恢复后又点了执行），立刻接上进度跟随
+            if(j.status==="running") startResumePoll();
+          })
+          .catch(function(){});
+      }
+    }
+  }
   // 切步后回到页面顶部：此前停在页面中段，用户看不到新步骤的开头（实测反馈）
   try{ window.scrollTo({top:0, behavior:"smooth"}); }
   catch(e){ try{ window.scrollTo(0,0); }catch(e2){} }
