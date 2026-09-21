@@ -2,7 +2,7 @@
 
 v2.0 Docker(MySQL 8.0.x) 集群在复制 SQL 上保持「字节级不变」；
 v2.1 新增对 8.0.22+/8.4 的 REPLICATION SOURCE/REPLICA 新语法；
-v2.2 新增 MariaDB 12.x 裸机独立路径（脱离宝塔），与 MySQL 双路径完全独立。
+v2.2 新增 MariaDB 12.x 裸机独立路径，与 MySQL 双路径完全独立。
 
 双路径根本不兼容：
 - MySQL 8.0：gtid_mode=ON + UUID GTID 域，CHANGE REPLICATION SOURCE ...

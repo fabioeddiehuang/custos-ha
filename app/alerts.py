@@ -20,7 +20,7 @@ def _cfg():
         port=int(get_setting("SMTP_PORT") or env("SMTP_PORT") or 25),
         user=get_setting("SMTP_USER") or env("SMTP_USER"),
         passwd=get_setting("SMTP_PASS") or env("SMTP_PASS"),
-        # 独立发件人地址（可选）：部分中继（如 API-Key 登录的 SendGrid/阿里云邮件推送）
+        # 独立发件人地址（可选）：部分中继（如 API-Key 登录的邮件推送服务）
         # 登录名与发件人并不相同，必须能单独指定；留空则回退到 SMTP_USER。
         frm=get_setting("SMTP_FROM") or env("SMTP_FROM"),
     )
@@ -268,7 +268,7 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
         msg["To"] = ", ".join(recipients)
         port = int(c["port"] or 25)
         if port == 465:
-            # 显式 SSL（如腾讯企业邮 / 阿里云邮）
+            # 显式 SSL（如企业邮件服务）
             with smtplib.SMTP_SSL(c["host"], port, timeout=10) as s:
                 if c["user"] and c["passwd"]:
                     s.login(c["user"], c["passwd"])
