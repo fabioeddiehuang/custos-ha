@@ -31,10 +31,13 @@ from datetime import datetime
 from .db import query, execute
 from . import crypto
 from .config import get_mgmt_host, NODE_AGENT_PORT, NODE_AGENT_TOKEN, NODE_AGENT_TIMEOUT
-from .ha_client import connect
+from .ha_client import connect, ensure_ha_creds
 from .clusters import create_cluster, get_cluster_creds
 from . import node_gen
-from .config import get_mgmt_host
+from .config import (get_mgmt_host, get_manager_public_ip,
+                     get_manager_docker_subnet_wildcard)
+from .mysql_compat import (detect_flavour, change_replication_sql,
+                           start_replication_sql, F_MYSQL8)
 
 # ---- 库范围常量 ----
 # MariaDB 系统库（永远不迁移、桥接也须忽略）
@@ -429,6 +432,47 @@ def _pw_arg(pw):
     return [f"-p{pw}"] if pw else []
 
 
+def _ensure_target_accounts(cfg, stage=""):
+    """seed / 桥接后【立刻】补齐目标节点上的 Custos 账号（幂等，失败不阻断）。
+
+    根因（v2.4.0 追平测试实测，203/213 集群）：物理通道 copy-back 会用【源库数据目录】
+    整库覆盖目标 datadir，`mysql.user` 一并被替换 ⇒ 目标上原有的 ha_monitor /
+    replication / app 账号**全部消失**；而旧逻辑只在 cutover 才 `_align_target_creds`
+    补账号 ⇒ 从 seed 到 cutover 的整个桥接/追平窗口内，目标处于「无 Custos 账号」状态：
+
+      · 同集群第二节点（213）连新主（203）报 1045
+        ``Access denied for user 'replication'@'192.168.1.213'``（账号根本不存在）；
+      · 管理器自身连不上目标（ha_monitor 不存在）⇒ 仪表盘复制/IO 全是 “—”；
+      · 又因「迁移锁定」让 ensure_topology 整轮跳过（见 failover），这段窗口内
+        没有任何机制能把它修回来，只能等 cutover。
+
+    对策：seed 完成（目标实例就绪）后立刻按目标所属集群的凭证重建账号，并在 bridge()
+    开头再兜底一次。目标尚未登记进任何集群时无可对齐的凭证 → 跳过（由 cutover 统一处理）。
+    """
+    try:
+        rows = query("SELECT cluster_id FROM nodes WHERE ip=%s AND port=%s",
+                     (cfg["tgt_host"], int(cfg["tgt_port"])))
+        cid = (rows[0].get("cluster_id") if rows else None)
+        if not cid:
+            return {"ok": True, "skipped": "目标尚未登记进 Custos 集群，留待 cutover 对齐凭证"}
+        cc = query("SELECT ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass "
+                   "FROM clusters WHERE id=%s", (cid,))
+        if not cc:
+            return {"ok": True, "skipped": "目标所属集群凭证缺失"}
+        c = cc[0]
+        mip = get_manager_public_ip()
+        msub = get_manager_docker_subnet_wildcard()
+        ensure_ha_creds(cfg["tgt_host"], int(cfg["tgt_port"]),
+                        _tgt_user(cfg), cfg["tgt_root_pass"],
+                        c["ha_user"], c["ha_pass"], c["repl_user"], c["repl_pass"],
+                        c["app_user"], c["app_pass"], mip, msub)
+        return {"ok": True, "cluster_id": cid, "stage": stage,
+                "note": "已按集群 #%s 凭证重建目标 Custos 账号" % cid}
+    except Exception as e:
+        # 不阻断迁移主线：账号可由 cutover / monitor 再次自愈，但必须如实回传原因
+        return {"ok": False, "stage": stage, "error": str(e)}
+
+
 def _snapshot_src_gtid(cfg):
     """在同引擎可桥接时，先取源 GreatTID 位点。
 
@@ -597,8 +641,14 @@ def seed_logical(task):
         raise RuntimeError("逻辑导入失败（退出码 dump=%s load=%s）: %s"
                            % (p1.returncode, p2.returncode, detail))
 
+    # 导入可能覆盖/重建 mysql 库（全库导入场景）⇒ 目标账号有被冲掉的风险，
+    # 导入完成后立刻按集群凭证重建一次（幂等；未登记集群时自动跳过）。
+    _acct = _ensure_target_accounts(cfg, stage="seed_logical")
+    if not _acct.get("ok"):
+        print("[migration] 目标账号重建失败（不阻断）：%s" % _acct.get("error"))
     _tick(task, 100, stage="逻辑导入完成", log="导入完成，共传输 %.1f MB" % (read_bytes / 1048576.0))
     return {"ok": True, "dump_tool": os.path.basename(dump), "databases": databases,
+            "accounts": _acct,
             "bytes": read_bytes, "src_gtid": src_gtid, "capabilities": {
                 k: cap[k] for k in ("same_engine", "cross_engine", "pipeline", "bridge")}}
 
@@ -1603,6 +1653,11 @@ def seed_physical(task):
         #      mariadb-upgrade（跨大版本实测约 1 分钟），此时端口不可达；不等就进桥接会
         #      Connection refused，被误判成迁移失败（实测）。
         _wait_target_ready(cfg)
+        # 4.2) copy-back 已用源库数据目录整库覆盖目标（mysql.user 一并被替换），
+        #      此刻必须立刻重建 Custos 账号，否则第二节点/管理器在整个追平窗口内都连不上目标。
+        _acct = _ensure_target_accounts(cfg, stage="seed_physical")
+        if not _acct.get("ok"):
+            print("[migration] 目标账号重建失败（不阻断，cutover 会重试）：%s" % _acct.get("error"))
         _tick(task, 100, stage="物理恢复完成，可继续执行「建立桥接」", log="目标实例就绪，物理种子完成")
     finally:
         shutil.rmtree(relay, ignore_errors=True)
@@ -1620,6 +1675,22 @@ def seed_physical(task):
                          use_src_cred=_src, node_type="mariadb")
             except Exception:
                 pass
+        # 即便 rm -rf 因权限/容器挂载失败，源库上仍会残留 MariaDB 把 datadir 内
+        # .custos_mig_staging_* 编码成的【伪库】`#mysql50#.custos_mig_staging_<id>`
+        # （实测 177 上残留了 62 / 1007 两个），会被库列表误选、让后续迁移报
+        # "Incorrect database name"。这里再 best-effort DROP 一次。
+        try:
+            _c = connect(cfg["src_host"], int(cfg["src_port"]),
+                         cfg["src_user"], cfg["src_pass"], timeout=8)
+            try:
+                _cur = _c.cursor()
+                _cur.execute("DROP DATABASE IF EXISTS `%s`" %
+                             ("#mysql50#.custos_mig_staging_%s" % task["id"]).replace("`", ""))
+                _c.commit()
+            finally:
+                _c.close()
+        except Exception:
+            pass
     return {"ok": True, "datadir": dd, "staging": staging,
             "note": "物理恢复完成，请将目标实例作为新主继续桥接"}
 
@@ -1750,6 +1821,9 @@ def bridge(task):
     # ⚠ 必须先锁定目标节点再建桥接，否则 monitor 的 promote_to_master 会立刻
     #   RESET REPLICA ALL 把通道清掉（详见上方「迁移锁定」根因注释）。
     lock_target(cfg["tgt_host"], int(cfg["tgt_port"]))
+    # 桥接前兜底补齐目标账号：seed 之后若目标又被重装/回滚过（或 seed 时账号重建失败），
+    # 这里再补一次，保证桥接与追平窗口内目标始终可被管理器与同集群节点连入。
+    _ensure_target_accounts(cfg, stage="bridge")
     acct = _ensure_source_repl_account(task)  # 源端复制账号（最小权限，必要时降级复用源账号）
     use_src = bool(acct.get("used_src_creds"))
     m_user = cfg["src_user"] if use_src else cfg["repl_user"]
@@ -1793,14 +1867,22 @@ def bridge(task):
         try:
             cur.execute("STOP REPLICA")
         except Exception:
-            pass
-        # MariaDB GTID 桥接：MASTER_USE_GTID=slave_pos
-        cur.execute(
-            "CHANGE MASTER TO MASTER_HOST=%s, MASTER_PORT=%s, "
-            "MASTER_USER=%s, MASTER_PASSWORD=%s, MASTER_USE_GTID=slave_pos",
-            (cfg["src_host"], int(cfg["src_port"]), m_user, m_pass),
-        )
-        cur.execute("START REPLICA")
+            try:
+                cur.execute("STOP SLAVE")
+            except Exception:
+                pass
+        # ⚠ 必须按目标【真实 flavour】生成挂载 SQL，且 MariaDB 分支必须带 MASTER_SSL=0。
+        #   v2.4.0 追平测试实测故障：此前硬编码 MariaDB 语法（MASTER_USE_GTID=slave_pos）
+        #   且未关 SSL ⇒ 从库以「要求 SSL」的方式连源（SHOW REPLICA STATUS 显示
+        #   Master_SSL_Allowed=Yes），而源库 have_ssl=DISABLED ⇒ IO 线程永久 Connecting：
+        #     error connecting to master 'replication@x:3306' ...
+        #     message: SSL connection error: SSL is required, but the server does not support it
+        #   内网复制无需 TLS，显式关闭即可根治；MySQL 8 目标则走 SOURCE_AUTO_POSITION=1
+        #   （并索取服务端公钥，规避 caching_sha2_password 非 TLS 握手失败）。
+        _flav = detect_flavour(cur)
+        cur.execute(change_replication_sql(_flav, cfg["src_host"], int(cfg["src_port"]),
+                                            m_user, m_pass, public_key=(_flav == F_MYSQL8)))
+        cur.execute(start_replication_sql(_flav))
         # 进度上报：让前端桥接阶段不再“卡住”（BUG-004）
         _tick(task, 60, stage="复制桥接已启动，目标正在从源追平（MariaDB GTID）")
         note = ("桥接已建立，目标正在从源追平（MariaDB GTID）；"
@@ -1992,14 +2074,31 @@ def cutover(task):
     tgt_port = int(cfg["tgt_port"])
     tgt = (tgt_host, tgt_port, _tgt_user(cfg), cfg["tgt_root_pass"])
     conn = connect(*tgt, timeout=8)
+    _real_version = None
     try:
         cur = conn.cursor()
         cur.execute("STOP REPLICA")
         cur.execute("RESET REPLICA ALL")  # MariaDB：清除桥接通道，避免 monitor 误判
+        # ⚠ 登记前必须【在线探测真实版本】：v2.4.0 实测出现过 nodes 表登记为
+        #   docker / 8.0.46，而目标真实是 MariaDB 12.3.3 —— 此后 ha_client /
+        #   mysql_compat 会按 MySQL 8 方言生成 SQL（CHANGE REPLICATION SOURCE TO、
+        #   caching_sha2 等），在 MariaDB 上全部报错 ⇒ 复制与自愈长期失效且极难定位。
+        #   故以 SELECT VERSION() 为准，向导里选的形态只作兜底。
+        try:
+            cur.execute("SELECT VERSION()")
+            _real_version = (cur.fetchone() or [None])[0]
+        except Exception:
+            pass
     finally:
         conn.close()
-    node_type = cfg.get("node_type", "mariadb-docker")
-    mysql_version = cfg.get("tgt_version") or None
+    node_type = cfg.get("node_type") or "mariadb-docker"
+    mysql_version = _real_version or cfg.get("tgt_version") or None
+    if _real_version:
+        _is_maria = "mariadb" in str(_real_version).lower()
+        if _is_maria and node_type in ("docker", "mysql8", "mysql8-docker"):
+            node_type = "mariadb-docker" if str(node_type).endswith("docker") else "mariadb"
+        elif (not _is_maria) and node_type in ("mariadb", "mariadb-docker"):
+            node_type = "mysql8-docker" if str(node_type).endswith("docker") else "mysql8"
     # 复用已有集群：避免把目标节点从原集群拽出（BUG-001）
     existing = query("SELECT cluster_id FROM nodes WHERE ip=%s AND port=%s",
                     (tgt_host, tgt_port))
@@ -2186,6 +2285,17 @@ def check_lag(task, skip_acct=False):
                     "并【重启 MariaDB】，再回第三步重跑「建立桥接」。\n"
                     "【方案② 不方便重启源库】走停写迁移：源库停写 → 只跑「数据种子」→ "
                     "勾选下方「源库已停写」跳过追平 → 直接停桥切换。"
+                    % (cfg["src_host"], cfg["src_port"]))
+        elif "SSL" in le.upper() or "2026" in le:
+            # 专项：SSL 握手类失败（典型的 "SSL connection error: SSL is required,
+            # but the server does not support it"，errno 2026）。它与账号口令完全无关，
+            # 笼统提示「口令/授权不对」会把排错带偏（v2.4.0 实测就是这样误导的）。
+            hint = ("复制通道被建成了「要求 SSL」，但源库 %s:%s 未启用 SSL"
+                    "（have_ssl=DISABLED）⇒ IO 线程握手失败(2026)。\n"
+                    "请重跑第三步「建立桥接」：新版会以 MASTER_SSL=0 重建通道"
+                    "（内网复制无需 TLS）。\n"
+                    "若确实要加密复制，请先在源库启用 SSL（配置 ssl_cert/ssl_key 并重启），"
+                    "再重跑「建立桥接」。"
                     % (cfg["src_host"], cfg["src_port"]))
         elif not acct_ok:
             hint = ("复制账号 %s 从管理端连源库 %s:%s 失败：%s。"
