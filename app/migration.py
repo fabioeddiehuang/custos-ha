@@ -28,7 +28,7 @@ import urllib.error
 import pymysql
 from datetime import datetime
 
-from .db import query, execute
+from .db import query, execute, get_setting
 from . import crypto
 from .config import get_mgmt_host, NODE_AGENT_PORT, NODE_AGENT_TOKEN, NODE_AGENT_TIMEOUT
 from .ha_client import connect, ensure_ha_creds
@@ -2120,13 +2120,49 @@ def cutover(task):
     # 桥接已在上面 STOP REPLICA + RESET REPLICA ALL 停掉，可解除迁移锁定，
     # 把目标交还给 monitor 正常接管（否则该集群的拓扑维护会一直被跳过）。
     unlock_target(tgt_host, tgt_port)
+    # ⚠ 物理通道（mariabackup copy-back）的固有后果：数据是【直接替换数据目录】落地的，
+    #   **完全不经过 binlog** ⇒ 同集群其余节点（如 213）永远复制不到这批数据；
+    #   更隐蔽的是 copy-back 还会把源库 GTID 集合（如 0-21-47）写进目标的
+    #   gtid_current_pos，从库连上后直接"继承"该 GTID ⇒ SHOW REPLICA STATUS 显示
+    #   IO/SQL=Yes、Seconds_Behind_Master=0（看起来已追平），**但库/表根本不存在**
+    #   （v2.4.0 实测：203 有 piyaotest 47 张表，213 连库都没有，复制却显示健康）。
+    #   故物理通道切换后，必须把同集群其余节点【在线重建】一次（逻辑全量 + 重链复制）。
+    peers = []
+    try:
+        rows = query("SELECT ip, port FROM nodes WHERE cluster_id=%s AND NOT (ip=%s AND port=%s)",
+                     (cluster_id, tgt_host, tgt_port))
+        peers = [(r["ip"], int(r["port"])) for r in (rows or [])]
+    except Exception:
+        peers = []
+    rebuilt = []
+    if (cfg.get("channel") == "physical") and peers:
+        if str(get_setting("AUTO_REBUILD_AFTER_MIGRATION", "1")).strip() == "1":
+            try:
+                from . import rebuild as _rebuild
+                for h, p in peers:
+                    try:
+                        _rebuild.start_rebuild(cluster_id, h, p, actor="auto:migration-physical")
+                        rebuilt.append("%s:%s" % (h, p))
+                    except Exception as _e:
+                        print("[migration] 自动重建 %s:%s 失败：%s" % (h, p, _e))
+            except Exception as _e:
+                print("[migration] 加载 rebuild 模块失败：%s" % _e)
     if reused:
         note = ("已停桥、对齐凭证并登记进 Custos（沿用既有集群，新主不会被移出）；"
                 "请在外部手动切换 VIP")
     else:
         note = ("已停桥、对齐凭证并登记进 Custos，monitor 将自动提升新主；"
                 "请在外部手动切换 VIP")
-    return {"ok": True, "cluster_id": cluster_id, "reused_cluster": reused, "note": note}
+    if (cfg.get("channel") == "physical") and peers:
+        note += ("。⚠ 物理通道恢复的数据不经 binlog，同集群其余节点 %s 不会自动获得数据："
+                 "已%s。请在「节点」页确认其重建完成（大库耗时较长）。"
+                 % ("、".join("%s:%s" % (h, p) for h, p in peers),
+                    ("自动触发在线重建：" + "、".join(rebuilt)) if rebuilt
+                    else "请对其手动执行「从库在线重建」"))
+    return {"ok": True, "cluster_id": cluster_id, "reused_cluster": reused, "note": note,
+            "peers_need_rebuild": ["%s:%s" % (h, p) for h, p in peers]
+            if cfg.get("channel") == "physical" else [],
+            "peers_rebuild_started": rebuilt}
 
 
 def _align_target_creds(cluster_id, cfg):
