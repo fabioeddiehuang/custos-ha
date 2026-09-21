@@ -217,15 +217,23 @@ def _dump_database(conn, cur, w, db, with_data: bool,
     # 单独开一个连接专供数据流式导出，避免与上面的元数据游标争用同一连接。
     # v2.3.2：若调用方传入 data_conn（一致性快照事务连接），则**复用它**——
     # 每个库各自开连接会让各库落在不同时点的快照上，跨库数据依旧不一致。
+    # 关键：传入的 data_conn 由调用方（run_backup）统一提交/关闭，**绝不可在此关闭**，
+    # 否则第一个库导出完就关掉共享快照连接，后续库的 SSCursor 建在已关闭连接上抛异常，
+    # 被逐个表的 except 吞掉 -> 只写结构不写数据（"只备份了空表"）。
     sconn = None
+    _own_sconn = False
     if with_data:
         if data_conn is not None:
             sconn = data_conn
         else:
-            try:
-                sconn = _conn(cid, host, port) if (cid is not None) else conn
-            except Exception as e:
-                w(f"-- 数据导出连接建立失败（仅跳过数据，结构仍会导出）：{e}\n")
+            if cid is not None:
+                try:
+                    sconn = _conn(cid, host, port)
+                    _own_sconn = True
+                except Exception as e:
+                    w(f"-- 数据导出连接建立失败（仅跳过数据，结构仍会导出）：{e}\n")
+            else:
+                sconn = conn
 
     # ---- 基表 ----
     cur.execute(
@@ -334,7 +342,8 @@ def _dump_database(conn, cur, w, db, with_data: bool,
         except Exception as e:
             w(f"-- {rtype} {db}.{name} 导出失败: {e}\n")
 
-    if sconn is not None and sconn is not conn:
+    # 仅关闭【本函数自行创建】的数据连接；传入的 data_conn（共享一致性快照）由调用方统一处理。
+    if _own_sconn and sconn is not None and sconn is not conn:
         try:
             sconn.close()
         except Exception:
