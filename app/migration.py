@@ -7,7 +7,7 @@
      · 复制建立：CHANGE MASTER TO ... MASTER_USE_GTID=slave_pos   （MariaDB GTID 语义）
      · GTID 体系：gtid_domain_id / gtid_current_pos / gtid_slave_pos / @@gtid_strict_mode
      · 客户端：mariadb-dump / mariadb（10.5+），降级 mysqldump / mysql
-     · 物理备份：mariabackup（MariaDB 官方物理备份工具）
+     · 物理备份：mariabackup（MariaDB 版，非 Percona xtrabackup）
 
 关键时序（已在代码层确认，见 monitor.py / failover.py）：
    Custos 的 ensure_topology 每周期都会对「当前主」执行 promote_to_master
@@ -229,19 +229,11 @@ def probe_source(cfg):
 
 def recommend_channel(probe, channel_pref=None):
     size_gb = (probe.get("size_mb") or 0) / 1024.0
-    flavor = (probe.get("flavor") or "mariadb")
     if channel_pref in ("logical", "physical"):
         chosen = channel_pref
     else:
         chosen = "physical" if size_gb >= SIZE_THRESHOLD_GB else "logical"
     if chosen == "physical":
-        # 物理通道（mariabackup）仅 MariaDB 源可用：目标恒为 Custos MariaDB，
-        # 跨引擎物理备份不可行（MySQL 8 起无 .frm；capabilities 也已把 physical 置 False）。
-        if flavor != "mariadb":
-            chosen = "logical"
-            reason = ("源端为 %s，物理通道（mariabackup）仅支持 MariaDB 源；已改推逻辑通道（通用模式）。"
-                      % ("MySQL" if flavor == "mysql" else flavor))
-            return {"channel": chosen, "reason": reason, "size_gb": round(size_gb, 2)}
         reason = ("数据量 %.1f GB ≥ 阈值 %d GB，推荐物理通道（mariabackup 恢复更快，适合大库）"
                   % (size_gb, SIZE_THRESHOLD_GB))
     else:
@@ -466,7 +458,7 @@ def seed_logical(task):
     """
     cfg = task["config"]
     src = (cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"])
-    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"])
+    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
     databases = [d for d in (cfg.get("databases") or []) if d and not d.startswith("#")]
     if not databases:
         raise ValueError("没有可迁移的用户库（仅系统库，无需迁移）")
@@ -637,7 +629,7 @@ def precheck(task_id):
         return cur.fetchall()
 
     src = connect(cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"], timeout=8)
-    tgt = connect(cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"], timeout=8)
+    tgt = connect(cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"], timeout=8)
     try:
         # ① 源账号建复制账号权限预检（桥接会在源建 repl@'%'，需 CREATE USER + GRANT OPTION）
         try:
@@ -753,7 +745,7 @@ def precheck(task_id):
         finally:
             # 无论成败都清理 scratch schema
             try:
-                c2 = connect(cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"], timeout=8)
+                c2 = connect(cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"], timeout=8)
                 try:
                     cur = c2.cursor()
                     for d in databases:
@@ -773,17 +765,6 @@ def precheck(task_id):
             "findings": findings, "trial": trial,
             "capabilities": {k: cap[k] for k in ("same_engine", "cross_engine", "pipeline",
                                                  "bridge", "physical")}}
-
-
-def _tgt_user(cfg):
-    """目标库账号：默认 root。
-
-    旧任务配置里没有 tgt_user 字段（历史上目标端写死 root），这里 or "root" 保持兼容；
-    新任务由向导「目标账号」写入。注意：目标端若填非 root，桥接/注册节点/切换/收尾等
-    步骤需要 SUPER/CREATE USER/REPLICATION SLAVE 等全局权限，否则会在对应步骤失败
-    （见 audit_target_privileges 的分层提示）。
-    """
-    return cfg.get("tgt_user") or "root"
 
 
 def _tgt_datadir(cfg):
@@ -920,13 +901,6 @@ def _ssh_creds(cfg, use_src_cred):
     return cfg.get("tgt_ssh_user") or "root", cfg.get("tgt_ssh_pass") or ""
 
 
-def _ssh_port(cfg, use_src_cred):
-    """源端用 src_ssh_port，目标端用 tgt_ssh_port，默认 22（生产环境 SSH 端口未必是 22）。"""
-    if use_src_cred:
-        return int(cfg.get("src_ssh_port") or 22)
-    return int(cfg.get("tgt_ssh_port") or 22)
-
-
 def _ssh_connect_failed(cp):
     """SSH 是否「连不上 / 认证失败」（而非命令本身执行失败）。用于决定是否退回 agent-exec。"""
     if cp is None or cp.returncode == 0:
@@ -973,7 +947,7 @@ def _ssh_opt_string(cfg, host, use_src_cred):
     "command not found: <host>"）。
     """
     user, pwd = _ssh_creds(cfg, use_src_cred)
-    ssh = "ssh -p %d -o StrictHostKeyChecking=no -o ConnectTimeout=15" % _ssh_port(cfg, use_src_cred)
+    ssh = "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15"
     if pwd:
         return "sshpass -p %s rsync -az --delete -e %s" % (_sh_quote(pwd), _sh_quote(ssh))
     return "rsync -az --delete -e %s" % _sh_quote(ssh)
@@ -1000,8 +974,8 @@ def _ssh_run(cfg, host, script, use_src_cred, node_type=None):
     node_type 用于判断是否为容器节点（agent-exec 仅对容器节点可靠）。返回 subprocess.CompletedProcess。
     """
     user, pwd = _ssh_creds(cfg, use_src_cred)
-    base = ["ssh", "-p", str(_ssh_port(cfg, use_src_cred)), "-o", "StrictHostKeyChecking=no",
-            "-o", "BatchMode=no", "-o", "ConnectTimeout=15", "%s@%s" % (user, host)]
+    base = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=no",
+            "-o", "ConnectTimeout=15", "%s@%s" % (user, host)]
     cp = None
     try:
         if pwd:
@@ -1389,7 +1363,7 @@ def _wait_target_ready(cfg, timeout=None):
     """
     timeout = timeout or _TGT_READY_TIMEOUT
     cands = [(cfg.get("src_user") or "root", cfg.get("src_pass") or ""),
-             (_tgt_user(cfg), cfg.get("tgt_root_pass") or "")]
+             ("root", cfg.get("tgt_root_pass") or "")]
     t0 = time.time()
     last = None
     while time.time() - t0 < timeout:
@@ -1452,7 +1426,7 @@ def _assert_physical_compatible(cfg):
     sf, sv = _sql_version(cfg["src_host"], int(cfg["src_port"]),
                           [(cfg.get("src_user") or "root", cfg.get("src_pass") or "")])
     tf, tv = _sql_version(cfg["tgt_host"], int(cfg["tgt_port"]),
-                          [(_tgt_user(cfg), cfg.get("tgt_root_pass") or ""),
+                          [("root", cfg.get("tgt_root_pass") or ""),
                            (cfg.get("src_user") or "root", cfg.get("src_pass") or "")])
     if sf == "mysql" or tf == "mysql":
         side = "源库" if sf == "mysql" else "目标库"
@@ -1713,7 +1687,7 @@ def bridge(task):
     use_src = bool(acct.get("used_src_creds"))
     m_user = cfg["src_user"] if use_src else cfg["repl_user"]
     m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
-    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"])
+    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
     # 建桥接前先自检：用复制账号从管理端连一次源库，口令/授权不对立刻暴露，
     # 否则要等目标 IO 线程报 Access denied 才被发现（且只在仪表盘看得到）。
     try:
@@ -1787,7 +1761,7 @@ def verify(task, deep=False):
     """
     cfg = task["config"]
     src = (cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"])
-    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"])
+    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
     databases = cfg.get("databases") or []
     s_conn = connect(*src, timeout=8)
     t_conn = connect(*tgt, timeout=8)
@@ -1917,17 +1891,16 @@ def _replica_status(tgt):
         conn.close()
 
 
-def _register_target_node(cluster_id, host, port, root_pass, node_type, mysql_version,
-                          root_user="root"):
+def _register_target_node(cluster_id, host, port, root_pass, node_type, mysql_version):
     """把已装好的目标节点登记进 Custos（插入 nodes/hosts），不重新生成部署文件。"""
     server_id = node_gen.get_next_server_id()
     host_compose = f"/home/docker/{host}"
     execute(
         "INSERT INTO nodes (ip,port,root_user,root_pass,server_id,compose_path,cluster_id,node_type,mysql_version) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-        "ON DUPLICATE KEY UPDATE port=%s,root_user=%s,root_pass=%s,server_id=%s,compose_path=%s,cluster_id=%s,node_type=%s,mysql_version=%s",
-        (host, port, root_user, crypto.encrypt(root_pass), server_id, host_compose, cluster_id, node_type, mysql_version,
-         port, root_user, crypto.encrypt(root_pass), server_id, host_compose, cluster_id, node_type, mysql_version),
+        "VALUES (%s,%s,'root',%s,%s,%s,%s,%s,%s) "
+        "ON DUPLICATE KEY UPDATE port=%s,root_pass=%s,server_id=%s,compose_path=%s,cluster_id=%s,node_type=%s,mysql_version=%s",
+        (host, port, crypto.encrypt(root_pass), server_id, host_compose, cluster_id, node_type, mysql_version,
+         port, crypto.encrypt(root_pass), server_id, host_compose, cluster_id, node_type, mysql_version),
     )
     execute(
         "INSERT INTO hosts (host,port,role,status,initial_role,cluster_id) "
@@ -1947,7 +1920,7 @@ def cutover(task):
     cfg = task["config"]
     tgt_host = cfg["tgt_host"]
     tgt_port = int(cfg["tgt_port"])
-    tgt = (tgt_host, tgt_port, _tgt_user(cfg), cfg["tgt_root_pass"])
+    tgt = (tgt_host, tgt_port, "root", cfg["tgt_root_pass"])
     conn = connect(*tgt, timeout=8)
     try:
         cur = conn.cursor()
@@ -1973,8 +1946,7 @@ def cutover(task):
     # 登记节点 + 主机（此刻才让 ensure_topology 提升新主、挂第二节点）。
     # 若目标已在某集群，这里只是原地更新 203 一条记录，不改其它节点（213/33 等）归属。
     _register_target_node(cluster_id, tgt_host, tgt_port, cfg["tgt_root_pass"],
-                         node_type, mysql_version,
-                         root_user=_tgt_user(cfg))
+                         node_type, mysql_version)
     # 桥接已在上面 STOP REPLICA + RESET REPLICA ALL 停掉，可解除迁移锁定，
     # 把目标交还给 monitor 正常接管（否则该集群的拓扑维护会一直被跳过）。
     unlock_target(tgt_host, tgt_port)
@@ -1998,9 +1970,9 @@ def _align_target_creds(cluster_id, cfg):
     manager_ip = get_mgmt_host() or "127.0.0.1"
     sql = node_gen.render_fix_node_creds_sql_mariadb(
         creds["ha_user"], creds["ha_pass"], creds["repl_user"], creds["repl_pass"],
-        _tgt_user(cfg), cfg["tgt_root_pass"], manager_ip, int(cfg["tgt_port"]),
+        "root", cfg["tgt_root_pass"], manager_ip, int(cfg["tgt_port"]),
     )
-    conn = connect(cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"], timeout=8)
+    conn = connect(cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"], timeout=8)
     try:
         cur = conn.cursor()
         for stmt in sql.split(";"):
@@ -2057,7 +2029,7 @@ def check_lag(task, skip_acct=False):
     skip_acct=True 时跳过「复制账号自检」（用于高频追踪采样，避免反复连源库）。
     """
     cfg = task["config"]
-    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"])
+    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg["tgt_root_pass"])
     try:
         repl = _replica_status(tgt)
     except Exception as e:
@@ -2249,79 +2221,6 @@ def audit_source_privileges(cfg):
         conn.close()
 
 
-def audit_target_privileges(cfg):
-    """目标库账号「分层权限体检」——把"能导数据"和"能接管"分开讲清楚。
-
-    为什么要分层（用户明确要求：不能啰嗦，但要说清，且给出「建议 root」）：
-      目标端各阶段对权限的要求【完全不同】——只做数据导入时 CREATE/INSERT 就够，
-      但"桥接追平 / 注册为 Custos 节点 / 提升新主 / 收尾置只读"都需要全局级权限
-      （REPLICATION SLAVE、CREATE USER+GRANT ALL、SUPER，MariaDB 10.11+ 还需
-      READ_ONLY ADMIN）。若不做分层，用户填个非 root 跑到第 4 步才炸，等于白跑一轮。
-
-    返回 levels：每一项 = 一个迁移阶段是否可用 + 缺什么，前端按"可用/不可用"分层展示。
-    """
-    host, port = cfg["tgt_host"], int(cfg["tgt_port"])
-    user = _tgt_user(cfg)
-    pwd = cfg.get("tgt_root_pass") or ""
-    conn = connect(host, port, user, pwd, timeout=8)
-    try:
-        cur = conn.cursor()
-        who = ""
-        try:
-            cur.execute("SELECT CURRENT_USER()")
-            r = cur.fetchone()
-            who = r[0] if r else ""
-        except Exception:
-            pass
-        grants = ""
-        try:
-            cur.execute("SHOW GRANTS FOR CURRENT_USER()")
-            grants = "\n".join(str(x[0]) for x in (cur.fetchall() or []))
-        except Exception:
-            grants = ""
-        g = (grants or "").upper()
-        has_all = ("ALL PRIVILEGES" in g) or ("GRANT ALL" in g)
-
-        def _has(p):
-            return has_all or (p in g)
-
-        def _ok(sql):
-            try:
-                cur.execute(sql)
-                cur.fetchone()
-                return True
-            except Exception:
-                return False
-
-        # 只读探测：能否建库（导入前提）
-        create_ok = _has("CREATE") or _has("ALL PRIVILEGES")
-        insert_ok = _has("INSERT") or _has("ALL PRIVILEGES")
-        repl_ok = _has("REPLICATION SLAVE")
-        create_user_ok = _has("CREATE USER")
-        super_ok = _has("SUPER")
-        # MariaDB 10.11+ 提升主库需 READ_ONLY ADMIN（见 mariadb_matrix.py）
-        ro_admin_ok = _has("READ_ONLY ADMIN") or _has("SUPER")
-
-        levels = [
-            {"stage": "数据导入", "ok": bool(create_ok and insert_ok),
-             "need": "CREATE、INSERT（能建库建表写数据）"},
-            {"stage": "桥接追平", "ok": bool(repl_ok),
-             "need": "REPLICATION SLAVE"},
-            {"stage": "注册为 Custos 节点", "ok": bool(create_user_ok and has_all),
-             "need": "CREATE USER + GRANT ALL（建 ha_monitor / 复制账号等）"},
-            {"stage": "提升新主 / 停桥切换", "ok": bool(super_ok and ro_admin_ok),
-             "need": "SUPER（MariaDB 10.11+ 还需 READ_ONLY ADMIN）"},
-        ]
-        missing = [l["stage"] for l in levels if not l["ok"]]
-        return {"ok": True, "user": who or user, "is_root": (user or "root") == "root",
-                "levels": levels, "missing": missing,
-                "advice": "建议 root" if missing else "权限齐全"}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    finally:
-        conn.close()
-
-
 def plan_binlog_enable(cfg):
     """源库未开 binlog 时，用已有的 root 连接把「开启方案」的准备工作做到位。
 
@@ -2369,7 +2268,7 @@ def plan_binlog_enable(cfg):
     tgt_sid = None
     try:
         if cfg.get("tgt_host"):
-            tc = connect(cfg["tgt_host"], int(cfg.get("tgt_port") or 3306), _tgt_user(cfg),
+            tc = connect(cfg["tgt_host"], int(cfg.get("tgt_port") or 3306), "root",
                          cfg.get("tgt_root_pass") or "", timeout=5)
             try:
                 tcur = tc.cursor()

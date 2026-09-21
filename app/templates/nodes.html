@@ -173,7 +173,7 @@
 
 <!-- 添加节点 modal -->
 <div class="overlay" id="addOverlay" onclick="if(event.target===this)closeAddNode()">
-  <div class="modal wide">
+  <div class="modal">
     <header><b>＋ 添加节点</b><span class="close" onclick="closeAddNode()">×</span></header>
     <div class="body">
       <form method="post" action="/nodes/add" class="grid2">
@@ -190,8 +190,8 @@
         <label>节点类型
           <select name="node_type" id="nodeType" onchange="onNodeTypeChange()">
             <option value="docker" selected>MySQL（容器化 MySQL + keepalived 客户端）</option>
-            <option value="mariadb">MariaDB（裸机全量安装；可与原容器 MariaDB 同集群混部）</option>
-            <option value="mariadb-docker">MariaDB（容器化，官方镜像首选；可与原裸机 MariaDB 同集群混部）</option>
+            <option value="mariadb">MariaDB 裸机（全量安装，脱离宝塔，独立数据库）</option>
+            <option value="mariadb-docker">MariaDB 容器版（官方镜像，老系统/免装环境首选）</option>
           </select>
         </label>
         <label>MySQL 版本<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=自动探测）"></label>
@@ -204,7 +204,7 @@
           </select>
         </label>
         <div id="mariadbTip" class="full" style="display:none;padding:10px 12px;border:1px dashed rgba(96,165,250,.45);border-radius:10px;background:rgba(37,99,235,.14);font-size:13px;color:#93c5fd;">
-          <strong>MariaDB 节点部署流程（全量安装）：</strong>生成后目录内含 <code class="mono">Install-ha-mariadb-Node.sh</code>（唯一全量安装脚本，自包含）、<code class="mono">Uninstall-mariadb-Node.sh</code>、<code class="mono">my.cnf</code>、<code class="mono">init_mariadb.sql</code>。推荐顺序 ——
+          <strong>MariaDB 节点部署流程（全量安装，脱离宝塔）：</strong>生成后目录内含 <code class="mono">Install-ha-mariadb-Node.sh</code>（唯一全量安装脚本，自包含）、<code class="mono">Uninstall-mariadb-Node.sh</code>、<code class="mono">my.cnf</code>、<code class="mono">init_mariadb.sql</code>。推荐顺序 ——
           ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/ha-node/&lt;本机IP&gt;/</code>），并把 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 放到同一目录（脚本会优先用本地包，跳过下载）；
           ② 执行 <code class="mono">sudo bash Install-ha-mariadb-Node.sh</code>（自动：解压 → 初始化 → 落盘 my.cnf → systemd 启动 → 跑 init/fix SQL → 起 keepalived）；
           ③ 各节点都装好后，管理器自动建复制、选主、漂移 VIP。

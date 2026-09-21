@@ -350,7 +350,7 @@ CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED VIA mysql_native_password USING 
 GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
-log "root 密码已设置（localhost + 127.0.0.1 + '%' 远程，便于内网远程连接）"
+log "root 密码已设置（localhost + 127.0.0.1 + '%' 远程，便于内网 Navicat 连接）"
 
 # ---------- 6.5) 客户端工具软链 + socket 软链（使 `mysql -uroot -p` 直接可用） ----------
 log "创建客户端软链与 socket 软链..."

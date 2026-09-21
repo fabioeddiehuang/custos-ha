@@ -9,7 +9,7 @@
 #       业务经 VIP 写入必报：
 #         1290 - The MariaDB server is running with the --read-only=ON option
 #       且排障时日志里一片空白（错误全被 2>/dev/null 吞掉），极难定位。
-# 这正是「切到某节点为主后，客户端建库报 1290」的真凶：该节点的
+# 这正是「切到某节点为主后，Navicat 建库报 1290」的真凶：该节点的
 # ha_check.conf 里 LOCAL_PASS 与实际账号脱节（密码漂移），置可写静默失败。
 #
 # 现在的策略：

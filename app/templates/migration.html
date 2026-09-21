@@ -108,41 +108,6 @@
   /* 向导表单：字段两列网格，更像分步表单 */
   .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 18px}
   @media (max-width:680px){ .form-grid{grid-template-columns:1fr} }
-  /* ===== 第1步：源 → 目标 流向布局 ===== */
-  .acct-title{font-size:14px;font-weight:700;color:var(--text);margin:0 0 10px}
-  .mig-flow{display:grid;grid-template-columns:1fr 108px 1fr;gap:14px;align-items:start}
-  .mf-col{border:1px solid var(--border);border-radius:12px;padding:14px;background:var(--surface-2)}
-  .mf-hd{font-size:13px;font-weight:700;color:var(--text);margin-bottom:10px;
-    display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  .mf-role{font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;
-    background:var(--surface-3);color:var(--muted)}
-  .mf-arrow{display:flex;flex-direction:column;align-items:center;justify-content:center;
-    gap:6px;padding-top:46px;color:var(--primary)}
-  .mf-arrow .mf-line{width:100%;height:3px;border-radius:3px;
-    background:linear-gradient(90deg,var(--primary),var(--accent,#0ABAB5))}
-  .mf-arrow .mf-ico{font-size:16px;line-height:1;color:var(--primary)}
-  .mf-arrow .mf-txt{font-size:11.5px;color:var(--muted);white-space:nowrap}
-  /* 窄屏：改为上下堆叠，箭头转竖向 */
-  @media (max-width:860px){
-    .mig-flow{grid-template-columns:1fr}
-    .mf-arrow{padding-top:0;flex-direction:row}
-    .mf-arrow .mf-line{width:60px;height:3px}
-    .mf-arrow .mf-ico{transform:rotate(90deg)}
-  }
-  /* 检测结果：两端并排 */
-  .probe-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  @media (max-width:680px){ .probe-grid{grid-template-columns:1fr} }
-  .probe-card{border:1px solid var(--border);border-radius:12px;padding:12px 14px;background:var(--surface-2)}
-  .probe-card h5{margin:0 0 8px;font-size:13px;color:var(--text)}
-  .priv-line{font-size:12px;line-height:1.85;color:var(--muted)}
-  .priv-line b{color:var(--text)}
-  /* 迁移范围 */
-  .scope-row{display:flex;gap:18px;margin-top:8px;flex-wrap:wrap}
-  .mf-radio{display:inline-flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none}
-  .mf-radio input{width:15px;height:15px;cursor:pointer}
-  /* 高级选项折叠块 */
-  .adv-box{border:1px solid var(--border);border-radius:12px;padding:10px 14px;background:var(--surface-2)}
-  .adv-box > summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--text)}
   .step-head{display:flex;align-items:center;gap:10px;margin-bottom:4px}
   .step-head .num{width:24px;height:24px;border-radius:7px;background:var(--primary-light,#e7f0ff);
     color:var(--primary);font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center}
@@ -161,6 +126,7 @@
 <div class="toolbar">
   <strong style="font-size:15px;color:var(--text)">数据迁移向导</strong>
   <span class="spacer"></span>
+  <span class="badge sky">既有 MariaDB 集群 → Custos 托管集群</span>
   <button class="btn" onclick="location.reload()">⟳ 刷新</button>
 </div>
 
@@ -178,7 +144,7 @@
   <div class="wz-track"></div>
   <div class="wz-fill" id="wzFill"></div>
   <div class="wz-step on" data-step="1"><span class="idx">1</span><div><div class="t">录入源</div><div class="s">连接并探测</div></div></div>
-  <div class="wz-step" data-step="2"><span class="idx">2</span><div><div class="t">目标与任务</div><div class="s">填节点建任务</div></div></div>
+  <div class="wz-step" data-step="2"><span class="idx">2</span><div><div class="t">目标与通道</div><div class="s">选策略建任务</div></div></div>
   <div class="wz-step" data-step="3"><span class="idx">3</span><div><div class="t">执行迁移</div><div class="s">种子/桥接/校验</div></div></div>
   <div class="wz-step" data-step="4"><span class="idx">4</span><div><div class="t">停桥切换</div><div class="s">cutover</div></div></div>
   <div class="wz-step" data-step="5"><span class="idx">5</span><div><div class="t">收尾工作</div><div class="s">cleanup</div></div></div>
@@ -187,165 +153,121 @@
 <div id="wzGuide" style="margin:10px 0;padding:10px 12px;border:1px solid var(--border,var(--surface-3));border-radius:8px;background:var(--surface-2,rgba(127,127,127,.06))"></div>
 
 <div class="card" id="step1">
-  <div class="step-head"><span class="num">1</span><h3>填写源库与目标账号</h3></div>
-
-  <div class="acct-title">账号</div>
-  <div class="mig-flow">
-    <div class="mf-col">
-      <div class="mf-hd">源库 <span class="mf-role">被迁移</span></div>
-      <div class="field"><label>地址</label><input id="srcHost" placeholder="如 10.20.30.177"></div>
-      <div class="field"><label>端口</label><input id="srcPort" value="3306"></div>
-      <div class="field"><label>账号</label><input id="srcUser" value="root"></div>
-      <div class="field"><label>密码</label><input id="srcPass" type="password"></div>
+  <div class="step-head"><span class="num">1</span><h3>录入源 MariaDB 集群（主库）</h3></div>
+  <div class="mig-type" id="migTypeBar">
+    <span class="mt-lbl">迁移类型</span>
+    <div class="seg">
+      <button class="seg-btn on" data-type="general" onclick="setMigType('general')">通用模式（逻辑通道）</button>
+      <button class="seg-btn" data-type="advanced" onclick="setMigType('advanced')">高级模式（热备）</button>
     </div>
-
-    <div class="mf-arrow" aria-hidden="true">
-      <span class="mf-txt">迁移至</span>
-      <div class="mf-line"></div>
-      <span class="mf-ico">▶</span>
-    </div>
-
-    <div class="mf-col">
-      <div class="mf-hd">目标 <span class="mf-role">新主</span></div>
-      <div class="field"><label>地址</label><input id="tgtHost" placeholder="如 10.20.30.33" onblur="autoTarget()"></div>
-      <div class="field"><label>端口</label><input id="tgtPort" value="3307">
-        <div class="field-hint">填地址后自动识别，可改。</div></div>
-      <div class="field"><label>账号</label><input id="tgtUser" value="root"></div>
-      <div class="field"><label>密码</label><input id="tgtRoot" type="password"></div>
-    </div>
+    <div class="mt-hint" id="migTypeHint">适合大多数兼容版本：操作简单、无需额外配置，自动走逻辑通道。</div>
   </div>
-  <div class="bk-note"><b>建议两端都用 root。</b>非 root 也能用，但权限决定能走到哪一步：源库需 SELECT/PROCESS/REPLICATION CLIENT；目标库非 root 通常只能完成「数据导入」，桥接追平与切换需要更高权限——检测后会逐项列出。</div>
-
+  <div class="form-grid">
+    <div class="field"><label>源主库地址</label><input id="srcHost" placeholder="如 10.0.0.11"></div>
+    <div class="field"><label>端口</label><input id="srcPort" value="3306"></div>
+    <div class="field"><label>账号</label><input id="srcUser" value="root"></div>
+    <div class="field"><label>密码</label><input id="srcPass" type="password"></div>
+  </div>
   <div class="btn-row">
-    <button class="btn btn-primary" onclick="doProbe()">🔍 检测两端</button>
+    <button class="btn btn-primary" onclick="doProbe()">🔍 探测源集群</button>
   </div>
-
   <div id="probeBox" style="margin-top:14px;display:none">
-    <div class="probe-grid">
-      <div class="probe-card">
-        <h5>源库</h5>
-        <div class="kv" id="probeInfo"></div>
-        <div id="privBox" style="margin-top:8px;display:none">
-          <div style="font-size:12px;font-weight:600;margin-bottom:4px">权限体检</div>
-          <div id="privList" class="priv-line"></div>
-        </div>
-      </div>
-      <div class="probe-card">
-        <h5>目标</h5>
-        <div class="kv" id="tgtProbeInfo"></div>
-        <div id="tgtPrivBox" style="margin-top:8px;display:none">
-          <div style="font-size:12px;font-weight:600;margin-bottom:4px">可用范围</div>
-          <div id="tgtPrivList" class="priv-line"></div>
-        </div>
-      </div>
-    </div>
-
+    <div class="kv" id="probeInfo"></div>
     <div id="probeWarn" class="bk-note" style="display:none;margin-top:10px"></div>
     <div id="binlogPlan" style="display:none;margin-top:10px">
-      <div style="font-size:13px;font-weight:600;margin-bottom:6px">开启 binlog 的可执行方案</div>
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px">开启 binlog 的可执行方案（已用源库 root 自动探测生成）</div>
       <pre id="binlogSnippet" class="logbox" style="white-space:pre-wrap;margin:0"></pre>
       <div id="binlogSteps" class="bk-note" style="margin-top:8px"></div>
       <div id="binlogNote" style="color:var(--muted);font-size:12px;margin-top:6px"></div>
     </div>
-
-    <div style="margin-top:14px;font-size:13px;font-weight:600;color:var(--text)">迁移范围</div>
-    <div class="scope-row">
-      <label class="mf-radio"><input type="radio" name="dbScope" value="all" checked onchange="toggleScope()"> 全部用户库</label>
-      <label class="mf-radio"><input type="radio" name="dbScope" value="part" onchange="toggleScope()"> 指定库</label>
+    <div style="margin-top:10px;font-size:13px;color:var(--text);font-weight:600">可迁移用户库（排除系统库 / Custos 库）</div>
+    <div class="db-grid" id="dbGrid" style="margin-top:6px"></div>
+    <div class="field" style="margin-top:10px"><label>仅迁移选中库（留空=全部用户库）</label><input id="dbFilter" placeholder="逗号分隔，如 app_db,order_db"></div>
+    <div id="privBox" style="margin-top:10px;display:none">
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px">源账号权限体检</div>
+      <div id="privList" style="font-size:12px;line-height:1.7"></div>
     </div>
-    <div id="dbPick" style="display:none">
-      <div class="db-grid" id="dbGrid" style="margin-top:6px"></div>
-      <div class="field" style="margin-top:8px"><label>仅迁移选中库（留空=全部用户库）</label>
-        <input id="dbFilter" placeholder="逗号分隔，如 app_db,order_db"></div>
-    </div>
-
-    <div id="methodBox" style="display:none;margin-top:14px">
-      <div style="font-size:13px;font-weight:600;color:var(--text)">迁移方式（按检测结果推荐，可改）</div>
-      <div class="chan-grid" id="chanGrid" style="margin-top:8px">
-        <div class="chan" data-chan="logical" onclick="selChan('logical')">
-          <h4>通用模式 <span class="tag" id="tagA">推荐</span></h4>
-          <p>逻辑通道：导出用户库再导入，跨版本最安全，适合中少量数据。</p>
-        </div>
-        <div class="chan" data-chan="physical" onclick="selChan('physical')">
-          <h4>高级模式 <span class="tag" id="tagB">大库/高速</span></h4>
-          <p>物理热备：mariabackup 备份恢复，适合大库。仅 MariaDB → MariaDB（源须为 MariaDB，MySQL 源请用「通用模式」），支持跨版本升级，不能降级。</p>
-        </div>
-      </div>
-      <div class="kv" id="recInfo" style="margin-top:8px"></div>
-    </div>
-
     <div class="btn-row">
-      <button class="btn btn-primary" onclick="goStep2()">下一步：填写目标节点 →</button>
+      <button class="btn btn-primary" onclick="goStep2()">下一步：配置目标 →</button>
     </div>
   </div>
 </div>
 
 <div class="card" id="step2" style="display:none">
-  <div class="step-head"><span class="num">2</span><h3>目标节点与任务</h3></div>
-
-  <div id="modeSummary" class="bk-note">检测结果：尚未检测，请先在第 1 步点「检测两端」。</div>
-  <div id="methodSummary" class="bk-note" style="margin-top:12px">已选迁移方式：<b id="methodSummaryTxt">—</b></div>
-
-  <!-- 通用/高级都必填：节点形态决定后续如何登记与恢复 -->
-  <div class="acct-title" style="margin-top:16px">目标信息</div>
+  <div class="step-head"><span class="num">2</span><h3>目标 Custos 节点与迁移通道</h3></div>
   <div class="form-grid">
+    <div class="field"><label>目标节点地址</label><input id="tgtHost" placeholder="如 10.0.0.21">
+      <div class="field-hint">即「新主」所在的 Custos 节点 IP；须已部署 MariaDB 12.3.3 且管理器能连上它。</div></div>
+    <div class="field"><label>目标端口</label><input id="tgtPort" value="3306">
+      <div class="field-hint">目标 MariaDB 监听端口，默认 3306。</div></div>
+    <div class="field"><label>目标 root 密码</label><input id="tgtRoot" type="password">
+      <div class="field-hint">即新主（目标节点）的数据库 root 密码。</div></div>
     <div class="field"><label>目标节点形态</label>
       <select id="tgtType">
-        <option value="" disabled selected>请选择节点形态</option>
-        <option value="mariadb-docker">容器化 MariaDB</option>
-        <option value="mariadb">裸机 MariaDB</option>
+        <option value="" disabled selected>请选择节点形态（目标须 MariaDB 12.3.3）</option>
+        <option value="mariadb-docker">容器化 MariaDB（mariadb-docker）</option>
+        <option value="mariadb">裸机 MariaDB（mariadb）</option>
       </select>
-    </div>
-    <div class="field"><label>源端形态</label>
-      <select id="srcType">
-        <option value="mariadb-docker">容器化 MariaDB</option>
-        <option value="mariadb">裸机 MariaDB</option>
-      </select>
+      <div class="field-hint">目标 MariaDB 是运行在容器里，还是直接装在该节点上（裸机）。</div>
     </div>
   </div>
-
-  <!-- 高级模式专属：先账号（SSH），再逐步选项 -->
+  <!-- 以下为「物理通道 B」专属字段，逻辑通道 A 时隐藏（DESIGN-002/003） -->
   <div id="bOnly" style="display:none">
-    <div class="acct-title" style="margin-top:16px">账号</div>
-    <div class="form-grid">
-      <div class="field"><label>源机 ssh账号</label><input id="srcSshUser" placeholder="root"></div>
-      <div class="field"><label>源机 ssh密码</label><input id="srcSshPass" type="password"></div>
-      <div class="field"><label>源机 ssh端口</label><input id="srcSshPort" value="22" style="width:90px"></div>
-      <div class="field"><label>目标机 ssh账号</label><input id="tgtSshUser" placeholder="root"></div>
-      <div class="field"><label>目标机 ssh密码</label><input id="tgtSshPass" type="password"></div>
-      <div class="field"><label>目标机 ssh端口</label><input id="tgtSshPort" value="22" style="width:90px"></div>
+    <div class="field"><label>目标版本（SELECT VERSION() 原文）</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input id="tgtVer" placeholder="如 12.3.3-MariaDB" style="flex:1">
+        <button class="btn" type="button" onclick="probeTarget()">探测目标版本</button>
+      </div>
+      <div class="field-hint">到目标节点执行 <code>SELECT VERSION();</code>，把返回的原文整串粘入（如 12.3.3-MariaDB）。</div>
     </div>
-    <div class="bk-note">管理器默认不给节点下发公钥，SSH 密码留空不会自动走密钥，会直接失败。若目标是 Custos 纳管节点，也可到「节点管理」点「重新生成」启用 agent-exec 免 SSH。</div>
-
-    <div class="acct-title" style="margin-top:16px">目标信息（续）</div>
-    <div class="form-grid">
-      <div class="field"><label>目标版本</label>
-        <div style="display:flex;gap:8px;align-items:center">
-          <input id="tgtVer" placeholder="如 12.3.3-MariaDB" style="flex:1">
-          <button class="btn" type="button" onclick="probeTarget()">探测</button>
-        </div>
-      </div>
-      <div class="field"><label>目标数据目录（选填）</label>
-        <input id="tgtData" placeholder="留空自动探测">
-        <div class="field-hint">留空即可自动探测。</div>
-      </div>
+    <div class="field"><label>目标数据目录（可选，物理通道 B 用）</label>
+      <input id="tgtData" placeholder="如 /data/custos-ha/mariadb12（容器）或 /data/custos-ha/mariadb（裸机）">
+      <div class="field-hint"><b>留空即可自动探测</b>：容器目标用 docker inspect 实测挂载源；裸机目标依次用 Custos 安装状态文件、<b>运行中的 mysqld/mariadbd 进程</b>、systemd 服务单元（mariadb-ha / mariadb / mysqld / mysql 等都会枚举匹配）、my.cnf 逐级兜底 —— 标准包管理、tarball 编译、Custos 安装都能命中。仅当自动探测不到时才需手动填写。</div>
     </div>
-
-    <details class="adv-box" style="margin-top:14px">
-      <summary>高级选项（选填）</summary>
-      <div class="bk-note" style="margin-top:8px">以下高级选项仅「非标准安装」才需填写；留空将自动探测源端 my.cnf 路径与数据目录。</div>
-      <div class="form-grid" style="margin-top:10px">
-        <div class="field"><label>源端 my.cnf 路径</label>
-          <input id="srcCnf" placeholder="留空自动探测">
-        </div>
-        <div class="field"><label>源端数据目录</label>
-          <input id="srcData" placeholder="留空自动探测">
-        </div>
-      </div>
-    </details>
+    <div style="margin-top:10px;font-size:12px;color:var(--muted)">以下两项为「物理通道 B」源端路径（非标安装才需填）：位置因人而异，探测不到时必须显式指定，否则 mariabackup 找不到。</div>
+    <div class="field"><label>源端 my.cnf 路径（可选，物理通道 B 用）</label>
+      <input id="srcCnf" placeholder="如 /etc/mysql/my.cnf 或 /data/mariadb/my.cnf">
+      <div class="field-hint">源 MariaDB 的配置文件路径。<b>裸机源</b>留空时会自动采用运行中进程的 <code>--defaults-file</code>；容器源留空（自动读取容器内自带配置）。</div>
+    </div>
+    <div class="field"><label>源端数据目录（可选，物理通道 B 用）</label>
+      <input id="srcData" placeholder="如 /var/lib/mysql 或 /data/mariadb/data">
+      <div class="field-hint">源 MariaDB 的真实数据目录。<b>裸机源</b>留空时按上面同样的方式自动探测；<b>容器源</b>留空（实测容器 /var/lib/mysql 的宿主机挂载源）。</div>
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--muted)">物理通道 B 还需源端形态与源机 SSH 访问：备份 / prepare 在<b>源节点本地</b>执行（mariabackup 只能读本地 datadir，无法备份远程），故管理器需经 SSH 到源机操作。</div>
+    <div class="field"><label>源端形态（物理通道 B 用）</label>
+      <select id="srcType">
+        <option value="mariadb-docker">容器化 MariaDB（mariadb-docker）</option>
+        <option value="mariadb">裸机 MariaDB（mariadb）</option>
+      </select>
+      <div class="field-hint">源 MariaDB 是容器化还是裸机，决定备份/prepare 的执行方式（docker exec 还是 SSH 直连）。</div>
+    </div>
+    <div class="field"><label>源机 SSH 账号（默认 root）</label><input id="srcSshUser" placeholder="默认 root">
+      <div class="field-hint">管理器经 SSH 到源机执行 mariabackup 用的账号；留空默认 root。</div></div>
+    <div class="field"><label>源机 SSH 密码（通常必填）</label><input id="srcSshPass" type="password">
+      <div class="field-hint">必填的是该机器<b>宿主机 root 的 SSH 密码</b>（不是数据库密码）。管理器默认不给节点下发公钥，<b>留空不会自动走密钥，会直接报「无法 SSH 到源机」</b>；除非你已自行配置免密。</div></div>
+    <div style="margin-top:10px;font-size:12px;color:var(--muted)">目标端（新主）同样需在本机执行 docker / mariabackup / copy-back：管理器经 SSH 到目标机（账号/密码，默认 root）操作。若该节点是 <b>Custos 纳管节点</b>且不方便给 SSH，可到「节点管理」对该节点点「重新生成」重新下发节点包，节点 agent 会提供 /exec 免 SSH 通道（即 agent-exec）。</div>
+    <div class="field"><label>目标机 SSH 账号（默认 root）</label><input id="tgtSshUser" placeholder="默认 root">
+      <div class="field-hint">管理器经 SSH 到目标机执行 copy-back 用的账号；留空默认 root。</div></div>
+    <div class="field"><label>目标机 SSH 密码（通常必填）</label><input id="tgtSshPass" type="password">
+      <div class="field-hint">该机器<b>宿主机 root 的 SSH 密码</b>（不是数据库密码）。留空仅在「该节点已由 Custos 纳管并通过「节点管理→重新生成」启用 agent-exec」时才可免填；源库等外部机器无 agent，必须填。</div></div>
   </div>
 
-  <div class="field" style="margin-top:16px"><label>迁移任务名称</label><input id="taskName" value="数据库迁移"></div>
+  <div id="chanLabel" style="margin-top:12px;font-size:13px;color:var(--text);font-weight:600">迁移通道（系统已按数据量推荐，可覆盖）</div>
+  <div class="chan-grid" id="chanGrid" style="margin-top:8px">
+    <div class="chan" data-chan="logical" onclick="selChan('logical')">
+      <h4>A 逻辑通道 <span class="tag" id="tagA">通用/干净</span></h4>
+      <p>仅导出用户库（排除系统库），跨版本最安全，适合中少量数据。默认推荐。</p>
+    </div>
+    <div class="chan" data-chan="physical" onclick="selChan('physical')">
+      <h4>B 物理通道 <span class="tag" id="tagB">大库/高速</span></h4>
+      <p>mariabackup 热备+恢复，适合 TB 级大库。基于 mariabackup，<b>仅 MariaDB → MariaDB</b>；
+         <b>支持跨版本</b>（实测 10.11 → 12.3 跑通，启动自动升级），但<b>不能降级</b>（高版本备份无法恢复到低版本）。
+         MySQL 请用 A 逻辑通道（MySQL 5.7 ⇄ MariaDB 支持；MySQL 8.0+ → MariaDB 不支持）。</p>
+    </div>
+  </div>
+  <div class="kv" id="recInfo" style="margin-top:8px"></div>
+
+  <div class="field" style="margin-top:12px"><label>迁移任务名称</label><input id="taskName" value="MariaDB 迁移"></div>
   <div class="btn-row">
     <button class="btn" onclick="setStep(1)">← 上一步</button>
     <button class="btn btn-primary" onclick="createTask()">✓ 创建迁移任务并继续</button>
@@ -469,8 +391,8 @@
   <div class="modal">
     <h3>确认执行停桥切换？</h3>
     <p>1. 目标停止从源复制（STOP REPLICA）并清除桥接通道。</p>
-    <p>2. 目标节点登记进 Custos 并<b>纳入托管</b>（沿用既有集群，新主不会被移出集群），monitor 自动提升新主、接管其高可用(HA)。</p>
-    <p>3. <b>VIP 需你在外部手动切换</b>（本场景 Custos 不接管 VIP）。</p>
+    <p>2. 目标节点登记进 Custos（<b>沿用既有集群，新主不会被移出集群</b>），monitor 自动提升新主、接管 HA。</p>
+    <p>3. <b>VIP 需你在外部手动切换</b>（Custos 不自动接管本场景 VIP）。</p>
     <p>4. 操作前请确认校验步骤已通过、复制已追平（SHOW REPLICA STATUS 的 Seconds_Behind_Master≈0）。</p>
     <div class="acts">
       <button class="btn" onclick="hideCutover()">取消</button>
@@ -523,18 +445,9 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-/* 地址示例 IP：默认不显示 192.168.1.x（用户要求），改用随机 10.x.x.x 示例 */
-(function(){
-  const rnd = () => Math.floor(Math.random()*254)+1;
-  const ip  = () => "10."+rnd()+"."+rnd()+"."+rnd();
-  const a = $("srcHost"), b = $("tgtHost");
-  if(a) a.placeholder = "如 "+ip();
-  if(b) b.placeholder = "如 "+ip();
-})();
 // mode: "bridge" = 源库已开 binlog，可桥接追平；"stopwrite" = 源库未开 binlog，只能停写迁移。
 // 由第一步探测的 gtid_ready(即 @@log_bin) 自动判定，无需用户选择。
-let STATE = { probe:null, tgtProbe:null, channel:"logical", taskId:null, dbs:[],
-              lagOk:false, mode:"bridge" };
+let STATE = { probe:null, channel:"logical", taskId:null, dbs:[], lagOk:false, mode:"bridge", migType:"general" };
 
 function setStep(n){
   for (let i=1;i<=5;i++){
@@ -546,9 +459,6 @@ function setStep(n){
   const f = $("wzFill");
   if(f){ f.style.width = ((n-1)/(5-1)*92) + "%"; }
   updateGuide(n);
-  // 切步后回到页面顶部：此前停在页面中段，用户看不到新步骤的开头（实测反馈）
-  try{ window.scrollTo({top:0, behavior:"smooth"}); }
-  catch(e){ try{ window.scrollTo(0,0); }catch(e2){} }
 }
 
 /* ---- 迁移流程指引（让用户随时知道：走到哪一步 / 用哪种方式迁 / 接下来做什么）----
@@ -566,40 +476,27 @@ function guideInfo(n){
               : "先确认源库已停写（可用「停写检测」辅助判断），再勾选确认并执行切换。",
     5: "回收源端复制账号并把源库置为只读暖备；不想改动源库可直接完成。",
   })[n] || "";
-  const probed = !!(STATE.probe);
   return {
-    // ⚠ 未检测前不能下结论：STATE.mode 初值是 bridge，过去会先显示"桥接追平"并断言
-    //   "源库已开启 binlog"，而此时根本没检测过（用户质疑过这点）。
-    way: !probed ? "待检测" : (bridge ? "桥接追平" : "停写迁移"),
-    wayNote: !probed
-      ? "尚未检测：请在第 1 步点「检测两端」，系统会依据 @@log_bin 判定能否桥接追平。"
-      : (bridge
-        ? "已检测到 @@log_bin=ON：目标会持续追平原库增量，切换前可验证追平，数据不会丢。"
-        : "已检测到 @@log_bin=OFF：无法建立复制桥接，只能先让业务停写、再做一次性拷贝。"),
+    way: bridge ? "桥接追平" : "停写迁移",
+    wayNote: bridge
+      ? "源库已开启 binlog：目标会持续追平原库的增量，切换前可以验证追平，数据不会丢。"
+      : "源库未开启 binlog：无法建立复制桥接，只能先让业务停写、再做一次性拷贝，切换依赖你确认源库已停写。",
     next: next,
   };
 }
 function updateGuide(n){
   const el = $("wzGuide"); if(!el) return;
   const g = guideInfo(n);
-  // 第1步不显示「迁移方式/已检测」：第2步的 modeSummary 已展示，避免重复与歧义
-  const showWay = (n !== 1);
   const wayCls = (STATE.mode === "bridge")
     ? "background:rgba(46,204,113,.15);color:var(--ok,#2ecc71)"
     : "background:rgba(230,162,60,.18);color:var(--warn,#e6a23c)";
-  let html =
+  el.innerHTML =
     '<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:6px">'
-    + '<b style="font-size:13px">当前：第 ' + n + ' 步</b>';
-  if(showWay){
-    html += '<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;'
-      + 'font-weight:600;' + wayCls + '">迁移方式：' + g.way + '</span>';
-  }
-  html += '</div>';
-  if(showWay){
-    html += '<div style="font-size:12px;color:var(--muted);line-height:1.6">' + g.wayNote + '</div>';
-  }
-  html += '<div style="font-size:12px;line-height:1.6;margin-top:4px"><b>接下来：</b>' + g.next + '</div>';
-  el.innerHTML = html;
+    + '<b style="font-size:13px">当前：第 ' + n + ' 步</b>'
+    + '<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;'
+    + 'font-weight:600;' + wayCls + '">迁移方式：' + g.way + '</span></div>'
+    + '<div style="font-size:12px;color:var(--muted);line-height:1.6">' + g.wayNote + '</div>'
+    + '<div style="font-size:12px;line-height:1.6;margin-top:4px"><b>接下来：</b>' + g.next + '</div>';
 }
 function markStepDone(n){ const s=document.querySelector('.wz-step[data-step="'+n+'"]'); if(s){s.classList.remove('on');s.classList.add('done');} }
 function markStepErr(n){ const s=document.querySelector('.wz-step[data-step="'+n+'"]'); if(s){s.classList.add('err');} }
@@ -613,29 +510,33 @@ async function doProbe(){
   const body = { src_host:$("srcHost").value.trim(), src_port:+$("srcPort").value||3306,
     src_user:$("srcUser").value.trim()||"root", src_pass:$("srcPass").value };
   const b = await postJSON("/api/migration/probe", body);
-  if(!b.ok){ alert("源库探测失败: "+b.error); return; }
+  if(!b.ok){ alert("探测失败: "+b.error); return; }
   STATE.probe = b;
-  // ⚠ 检测结论必须带上【依据】：此前只给一句话结论（且未探测就先断言"已开启 binlog"），
-  //   用户无从判断。这里直接把判定所依据的变量值写出来。
   $("probeInfo").innerHTML =
-    "版本 <b>"+b.version+"</b> · 类型 <b>"+(b.flavor==='mysql'?'MySQL':'MariaDB')+"</b> · 数据量 <b>"+(b.size_mb/1024).toFixed(2)+" GB</b><br>"+
-    "@@log_bin = <b>"+(b.log_bin!=null?b.log_bin:(b.gtid_ready?"ON":"OFF"))+"</b>"+
-    " · gtid_domain_id <b>"+(b.gtid_domain_id??"-")+"</b><br>"+
-    "用户库 <b>"+b.databases.length+"</b> 个";
+    "版本: <b>"+b.version+"</b> · 数据量: <b>"+(b.size_mb/1024).toFixed(2)+" GB</b> · "+
+    "GTID: "+(b.gtid_ready?"已开启":"未开启")+" · domain_id: "+b.gtid_domain_id+"<br>"+
+    "用户库数量: "+b.databases.length;
   STATE.dbs = b.databases;
   // 自动判定迁移模式：源库开 binlog ⇒ 桥接追平；未开 ⇒ 只能停写迁移（无法桥接）。
   STATE.mode = b.gtid_ready ? "bridge" : "stopwrite";
   const warn = $("probeWarn");
   if(STATE.mode === "stopwrite"){
     warn.style.display = "block";
-    warn.innerHTML =
-      "⚠ <b>源库未开启 binlog</b>：无法建立复制桥接（强行桥接时 IO 线程会报 " +
-      "<code>1236 'Binary log is not open'</code>），已自动切换为【停写迁移】。<br>" +
-      "请先停止业务写入源库，再执行数据种子；第四步勾选「源库已停写」后即可切换。<br>" +
-      "· <b>若希望桥接追平</b>：在源库 my.cnf 的 [mysqld] 加 " +
-      "<code>server_id=&lt;非0唯一值&gt;</code>、<code>log_bin=/path/to/mysql-bin</code>、" +
-      "<code>binlog_format=ROW</code> 并<b>重启数据库</b>，重新探测即自动切回桥接模式；<br>" +
-      "· <b>若不便重启源库</b>：按停写迁移走 —— 先让业务停止写入源库，再执行数据种子。";
+    if(STATE.migType === "general"){
+      warn.innerHTML =
+        "⚠ <b>源库未开启 binlog</b>：无法桥接追平，已自动切换为【停写迁移】。<br>" +
+        "请先停止业务写入源库，再执行数据种子；第四步勾选「源库已停写」后即可切换。";
+    }else{
+      warn.innerHTML =
+        "⚠ <b>源库未开启 binlog（GTID 未开启）</b>：无法建立复制桥接" +
+        "（强行桥接时 IO 线程会直接报 <code>1236 'Binary log is not open'</code>）。<br>" +
+        "<b>已自动切换为【停写迁移】模式</b>：第三步将只跑「数据种子 + 一致性校验」（不建桥接），" +
+        "第四步需你勾选确认「源库已停写」后直接切换。<br>" +
+        "· <b>若希望桥接追平</b>：源库 my.cnf 的 [mysqld] 加 " +
+        "<code>server_id=&lt;非0唯一值&gt;</code>、<code>log_bin=/path/to/mysql-bin</code>、" +
+        "<code>binlog_format=ROW</code> 并<b>重启 MariaDB</b>，重新探测即自动切回桥接模式；<br>" +
+        "· <b>若不便重启源库</b>：按停写迁移走 —— 先让业务停止写入源库，再执行数据种子。";
+    }
   }else{
     warn.style.display = "none";
   }
@@ -680,110 +581,38 @@ async function doProbe(){
   }else{
     $("binlogPlan").style.display = "none";
   }
-  // 目标端同时检测（用户要求：第1步检测两端，第2步的推荐才有依据）
-  await probeTargetInfo();
   $("probeBox").style.display = "block";
-  updateModeSummary();
   // 预推荐通道
   const rec = await postJSON("/api/migration/recommend", {size_mb:b.size_mb});
-  if(rec.ok){ STATE.channel = rec.channel; $("recInfo").textContent = "推荐: "+(rec.channel==='physical'?'高级模式':'通用模式')+" — "+rec.reason; }
-  // 检测完成后，在第 1 步直接展示「按检测结果推荐的迁移方式」，用户可改再进第 2 步
-  const mb = $("methodBox"); if(mb){ mb.style.display = "block"; selChan(STATE.channel); }
-}
-
-/* 目标端探测：版本 + 账号「可用范围」分层（非 root 能用到哪一步） */
-async function probeTargetInfo(){
-  const box = $("tgtProbeInfo"), pbox = $("tgtPrivBox");
-  const host = ($("tgtHost") && $("tgtHost").value.trim()) || "";
-  if(!host){
-    box.innerHTML = '<span style="color:var(--muted)">未填写目标地址</span>';
-    pbox.style.display = "none"; return null;
-  }
-  const body = { tgt_host:host, tgt_port:+$("tgtPort").value||3307,
-                 tgt_user:($("tgtUser").value.trim()||"root"),
-                 tgt_root_pass:$("tgtRoot").value };
-  const r = await postJSON("/api/migration/probe_target", body);
-  if(!r.ok){
-    box.innerHTML = '<span style="color:var(--danger)">✗ 连接失败：'+(r.error||"")+'</span>';
-    pbox.style.display = "none";
-    STATE.tgtProbe = null; return null;
-  }
-  STATE.tgtProbe = r;
-  const pv = r.privileges || {};
-  box.innerHTML = "版本 <b>"+r.version+"</b><br>账号 <b>"+((pv.user)||body.tgt_user)+"</b>";
-  if(pv.ok){
-    pbox.style.display = "block";
-    $("tgtPrivList").innerHTML =
-      (pv.levels||[]).map(l =>
-        (l.ok ? "✅ " : "❌ ") + l.stage +
-        (l.ok ? "" : "　<span style='color:var(--muted)'>需 " + l.need + "</span>")
-      ).join("<br>") +
-      (pv.missing && pv.missing.length ? "<br><b>建议 root</b>" : "<br>✅ 全部阶段可用");
-  } else {
-    pbox.style.display = "none";
-  }
-  return r;
-}
-
-/* 第2步顶部摘要：把两端检测结论摆出来，作为"推荐哪种模式"的凭据 */
-function updateModeSummary(){
-  const el = $("modeSummary"); if(!el) return;
-  const p = STATE.probe, t = STATE.tgtProbe;
-  if(!p){ el.textContent = "检测结果：尚未检测，请先在第 1 步点「检测两端」。"; return; }
-  el.innerHTML =
-    "源库 <b>"+(p.version||"-")+"</b>　数据量 <b>"+(p.size_mb/1024).toFixed(2)+" GB</b>　"+
-    "binlog <b>"+(p.gtid_ready?"已开启":"未开启")+"</b>" +
-    (t ? "　→　目标 <b>"+(t.version||"-")+"</b>"
-       : "　→　目标 <b style='color:var(--danger)'>未连通</b>") +
-    "　·　" + (p.gtid_ready ? "可桥接追平" : "只能停写迁移");
-}
-
-/* 填了目标地址就自动带出端口/形态（用户要求自动化，不要手填） */
-async function autoTarget(){
-  const host = ($("tgtHost") && $("tgtHost").value.trim()) || "";
-  if(!host) return;
-  const r = await postJSON("/api/migration/target_hint", {ip:host});
-  if(r && r.ok){
-    if(r.port) $("tgtPort").value = r.port;
-    if(r.node_type && r.node_type !== "docker"){
-      const sel = $("tgtType"); if(sel) sel.value = r.node_type;
-    }
-  }
-}
-
-/* 迁移范围：全部用户库 / 指定库 */
-function toggleScope(){
-  const el = document.querySelector('input[name="dbScope"]:checked');
-  const v = el ? el.value : "all";
-  const pick = $("dbPick"); if(pick) pick.style.display = (v === "part") ? "block" : "none";
-  if(v === "all"){ const f = $("dbFilter"); if(f) f.value = ""; }
+  if(rec.ok){ STATE.channel = rec.channel; $("recInfo").textContent = "推荐通道: "+(rec.channel==='physical'?'B 物理':'A 逻辑')+" — "+rec.reason; }
 }
 
 function goStep2(){
   setStep(2);
   selChan(STATE.channel);
 }
-/* 迁移方式分流（第2步）：通用模式=逻辑通道 / 高级模式=物理热备。
-   注：原先的「迁移类型」分段控件放在第 1 步、却控制第 2 步的元素，点它屏幕上毫无变化，
-   且与「迁移方式（桥接/停写）」中文近似，造成误解 —— 已移除，职责并入本步的模式卡片。 */
+/* 迁移类型：通用（逻辑通道，简单）/ 高级（热备，开放参数与路径自由度） */
+function setMigType(type){
+  STATE.migType = type;
+  document.querySelectorAll('#migTypeBar .seg-btn').forEach(b=>b.classList.toggle('on', b.dataset.type===type));
+  const adv = (type === "advanced");
+  // 通用：强制逻辑通道、隐藏通道选择与高级字段（无多余注解，简单）
+  // 高级：显示通道选择 + 版本/数据目录/源端路径等高级字段
+  $("chanLabel").style.display = adv ? "block" : "none";
+  $("chanGrid").style.display  = adv ? "grid"  : "none";
+  $("recInfo").style.display   = adv ? "block" : "none";
+  $("bOnly").style.display     = adv ? "block" : "none";
+  $("migTypeHint").textContent = adv
+    ? "适合有数据库运维能力者：可自选热备（物理）通道，并配置版本、数据目录、源端路径等参数。"
+    : "适合大多数兼容版本：操作简单、无需额外配置，自动走逻辑通道。";
+  if(!adv){ STATE.channel = "logical"; }
+  else { STATE.channel = "physical"; selChan("physical"); }
+}
+
 function selChan(c){
-  // MySQL 源：物理通道（mariabackup）不可用于非 MariaDB 源，拦截误选
-  if(c === "physical" && STATE.probe && STATE.probe.flavor && STATE.probe.flavor !== "mariadb"){
-    alert("物理通道（mariabackup）仅支持 MariaDB 源；当前探测到的源端为 "
-          + (STATE.probe.flavor === "mysql" ? "MySQL" : "非 MariaDB")
-          + "，请使用「通用模式」（逻辑通道）。");
-    return;
-  }
   STATE.channel = c;
   document.querySelectorAll('.chan').forEach(el=>el.classList.toggle('sel', el.dataset.chan===c));
   const bOnly = $("bOnly"); if(bOnly) bOnly.style.display = (c==='physical') ? 'block' : 'none';
-  // 推荐徽标跟着所选模式走
-  const tagA = $("tagA"), tagB = $("tagB");
-  if(tagA) { tagA.textContent = (c==='logical') ? '已选' : '通用'; tagA.className = 'tag' + (c==='logical' ? ' rec' : ''); }
-  if(tagB) { tagB.textContent = (c==='physical') ? '已选' : '大库/高速'; tagB.className = 'tag' + (c==='physical' ? ' rec' : ''); }
-  updateModeSummary();
-  const ms = $("methodSummaryTxt");
-  if(ms) ms.textContent = (c==='physical' ? '高级模式（物理热备）' : '通用模式（逻辑通道）');
 }
 
 async function createTask(){
@@ -810,15 +639,12 @@ async function createTask(){
     }
   }
   const body = {
-    name:$("taskName").value.trim()||"数据库迁移",
+    name:$("taskName").value.trim()||"MariaDB 迁移",
     src_host:$("srcHost").value.trim(), src_port:+$("srcPort").value||3306,
     src_user:$("srcUser").value.trim()||"root", src_pass:$("srcPass").value,
     src_gtid: !!(STATE.probe && STATE.probe.gtid_ready),
-    tgt_host:$("tgtHost").value.trim(), tgt_port:+$("tgtPort").value||3307,
+    tgt_host:$("tgtHost").value.trim(), tgt_port:+$("tgtPort").value||3306,
     tgt_root_pass:$("tgtRoot").value,     tgt_version:$("tgtVer").value.trim(),
-    // 目标库账号（新增，默认 root）：非 root 仅能保证「数据导入」，
-    // 桥接/注册节点/切换需更高权限，已在第 1 步检测里分层提示。
-    tgt_user:($("tgtUser").value.trim()||"root"),
     node_type:$("tgtType").value, channel:STATE.channel,
     tgt_datadir:$("tgtData").value.trim()||null,
     src_my_cnf:$("srcCnf").value.trim()||null,
@@ -828,8 +654,6 @@ async function createTask(){
     src_ssh_pass:$("srcSshPass").value||null,
     tgt_ssh_user:$("tgtSshUser").value.trim()||null,
     tgt_ssh_pass:$("tgtSshPass").value||null,
-    src_ssh_port: parseInt($("srcSshPort").value,10)||22,
-    tgt_ssh_port: parseInt($("tgtSshPort").value,10)||22,
     // 产品线决定 dump 工具与 GTID 参数（两者互斥）；size_mb 用于真实百分比进度
     src_flavor:(STATE.probe&&STATE.probe.flavor)||"mariadb",
     src_major:(STATE.probe&&STATE.probe.major)||0,
@@ -1392,11 +1216,11 @@ function showDoneModal(how, failed){
       + '否则新旧库同时被写入会造成数据错乱。';
   $("doneTitle").textContent = cleaned ? "✓ 迁移完成（已收尾回收）" : "✓ 迁移完成（已跳过收尾）";
   $("doneBody").innerHTML = warn
-    + '<div>数据已迁移到目标集群，目标已<b>纳入 Custos 托管</b>（monitor 已提升新主并接管其 HA）。</div>'
+    + '<div>数据已迁移到目标集群，目标已由 Custos 接管（monitor 已提升新主并纳管 HA）。</div>'
     + '<div style="margin-top:10px;font-weight:600">接下来请你做：</div>'
     + '<div style="margin-top:4px">'
     + '① <b>在外部手动切换 VIP</b>：把业务访问入口指向新集群 —— '
-    + '本场景 Custos <b>不会</b>接管 VIP，这一步必须由你完成。<br>'
+    + 'Custos <b>不会</b>自动接管本场景的 VIP，这一步必须由你完成。<br>'
     + '② <b>验证业务</b>：确认应用读写正常；建议先灰度放量、观察一段时间再全量切换。<br>'
     + srcState + '<br>'
     + '④ 本任务记录保留在「历史迁移」中，可随时查看详情或删除。'
@@ -1475,19 +1299,12 @@ async function runCleanup(){
 // 探测目标版本并自动填充（DESIGN-003）
 async function probeTarget(){
   const host = $("tgtHost").value.trim();
-  if(!host){ alert("请先在第 1 步填写目标地址与密码"); return; }
+  if(!host){ alert("请先填写目标节点地址与 root 密码"); return; }
   const b = await postJSON("/api/migration/probe_target",
-    {tgt_host:host, tgt_port:+$("tgtPort").value||3307,
-     tgt_user:($("tgtUser").value.trim()||"root"), tgt_root_pass:$("tgtRoot").value});
+    {tgt_host:host, tgt_port:+$("tgtPort").value||3306, tgt_root_pass:$("tgtRoot").value});
   if(!b.ok){ alert("探测失败: "+b.error); return; }
   if($("tgtVer")) $("tgtVer").value = b.version || "";
-  // 顺带刷新第 1 步的目标卡片（版本/可用范围），保持两处一致
-  await probeTargetInfo();
-  const pv = b.privileges || {};
-  const tail = (pv.ok && pv.missing && pv.missing.length)
-    ? "\n\n注意：该账号不可用阶段 → " + pv.missing.join("、") + "（建议 root）"
-    : "";
-  alert("目标版本: " + (b.version || "未知") + tail);
+  alert("目标版本: " + (b.version || "未知"));
 }
 
 // 历史迁移任务相关函数（showHistory / hideHistory / openDetail / resumeTask 等）
@@ -1531,8 +1348,7 @@ async function boot(){
       $("resumeBanner").style.display = "block";
     }
   }catch(e){ /* 检测失败不阻塞首屏 */ }
-  // 初始迁移方式：默认通用模式（高级字段在 selChan 里按模式显隐）
-  selChan(STATE.channel || "logical");
+  setMigType(STATE.migType || "general");   // 应用初始类型：通用默认隐藏高级字段/通道选择
   setStep(1);
 }
 function resumeFromBanner(){ const id=_bootTaskId; dismissResume(); if(id) resumeTask(id); }

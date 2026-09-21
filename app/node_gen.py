@@ -1909,7 +1909,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             if src.exists():
                 _write(d / MARIADB_NODE_CONF_DIR / "scripts" / "Uninstall-mariadb-docker-Node.sh", src.read_text(), mode=0o755)
         else:
-            # 裸机 MariaDB：完全独立安装，由 Install 脚本全量安装 tarball。
+            # 裸机 MariaDB：完全独立安装（脱离宝塔），由 Install 脚本全量安装 tarball。
             # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
             my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=server_id)
             _write(d / MARIADB_NODE_CONF_DIR / "conf" / "my.cnf", my_cnf, mode=0o644)

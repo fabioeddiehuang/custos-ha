@@ -2483,7 +2483,7 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         #  - 127.0.0.1 的 root 供 keepalived 的 check_mysql_master.sh 本机 TCP 探活使用
         #    （安装脚本按当时密码建过它，节点 root 口令一旦变更就会漂移 → 探活 1045
         #     → VIP 不上浮，故自愈必须把它刷成节点当前 root 口令）；
-        #  - root@'%' 用于内网数据库客户端/其它主机远程连接（用户要求可远程登录）。
+        #  - root@'%' 用于内网 Navicat/其它主机远程连接（用户要求可远程登录）。
         # manager_ip 为空时跳过该条，但 root@'%' 始终创建（便于内网运维）。
         root_targets = []
         if manager_ip:
