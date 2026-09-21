@@ -299,6 +299,52 @@ var _p = location.pathname;
   }
   applyTheme(getStoredTheme());
 })();
+
+/* ===== 全局弹出层：统一的关闭方式 =====
+   用户要求：任何弹出层都必须能关掉。这里统一补三种方式（全站生效）：
+     ① 右上角 ✕（自动注入到每个 .modal，无需各页面手写）
+     ② 按 ESC 关闭最上层弹窗
+     ③ 点击遮罩空白处关闭（点击弹窗内容区不关闭，避免误触）
+   动态插入的弹窗可调用 window.__initModals() 补一次。 */
+(function(){
+  function initModals(){
+    try{
+      document.querySelectorAll('.modal').forEach(function(m){
+        if(m.querySelector('.modal-x, .close')) return;
+        var x = document.createElement('button');
+        x.className = 'modal-x'; x.type = 'button';
+        x.setAttribute('aria-label', '关闭');
+        x.textContent = '×';
+        x.addEventListener('click', function(){
+          var host = m.closest ? m.closest('.modal-mask, .overlay') : null;
+          if(host) host.classList.remove('show');
+          else m.style.display = 'none';
+        });
+        m.insertBefore(x, m.firstChild);
+      });
+      document.querySelectorAll('.modal-mask').forEach(function(mask){
+        if(mask.dataset.gClose === '1') return;
+        mask.dataset.gClose = '1';
+        mask.addEventListener('click', function(e){
+          if(e.target === mask) mask.classList.remove('show');
+        });
+      });
+    }catch(e){}
+  }
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape'){
+      var open = document.querySelectorAll('.modal-mask.show, .overlay.show');
+      if(open && open.length) open[open.length - 1].classList.remove('show');
+    }
+  });
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', initModals);
+  } else {
+    initModals();
+  }
+  setTimeout(initModals, 400);
+  window.__initModals = initModals;
+})();
 </script>
 </body>
 </html>

@@ -155,7 +155,7 @@
 
 <!-- ===== v2.3.3 维护模式 modal ===== -->
 <div class="overlay" id="maintOverlay" onclick="if(event.target===this)closeMaint()">
-  <div class="modal">
+  <div class="modal wide">
     <header><b>维护模式 · <span id="maintCName"></span></b><span class="close" onclick="closeMaint()">×</span></header>
     <div class="body">
       <div id="maintCurrent" style="display:none;background:rgba(124,45,82,.16);border:1px solid #7C2D52;color:#f5d0e0;border-radius:8px;padding:10px 12px;margin-bottom:12px">
@@ -225,7 +225,7 @@
 
 <!-- ===== 新增集群 modal ===== -->
 <div class="overlay" id="createOverlay" onclick="if(event.target===this)closeCreate()">
-  <div class="modal">
+  <div class="modal wide">
     <header><b>＋ 新增集群</b><span class="close" onclick="closeCreate()">×</span></header>
     <div class="body">
       <form method="post" action="/clusters" class="grid2">
@@ -238,10 +238,10 @@
         <label>节点类型（部署形态）
           <select name="node_type">
             <option value="docker" selected>MySQL（容器化 MySQL + keepalived）</option>
-            <option value="mariadb">MariaDB（裸机全量安装，脱离宝塔）</option>
-            <option value="mariadb-docker">MariaDB 容器版（官方镜像，老系统/免装环境首选）</option>
+            <option value="mariadb">MariaDB（裸机全量安装；可与原容器 MariaDB 同集群混部）</option>
+            <option value="mariadb-docker">MariaDB（容器化，官方镜像首选；可与原裸机 MariaDB 同集群混部）</option>
           </select>
-          <span class="hint">按引擎族校验：两种 MariaDB 形态可混部；MySQL 与 MariaDB 禁止混部</span>
+          <span class="hint">按引擎族校验：MySQL 与 MariaDB 禁止混部；MariaDB 各形态（容器 / 裸机）可混部</span>
         </label>
         <label>MySQL 版本（可选）<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0"></label>
         <label>HA 监控账号<input name="ha_user" placeholder="ha_monitor"></label>

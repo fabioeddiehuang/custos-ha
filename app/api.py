@@ -2776,26 +2776,59 @@ async def api_migration_probe(request: Request, user=Depends(auth_required)):
 @app.post("/api/migration/recommend")
 async def api_migration_recommend(request: Request, user=Depends(auth_required)):
     b = await _json_body(request)
-    probe = {"size_mb": float(b.get("size_mb", 0))}
+    probe = {"size_mb": float(b.get("size_mb", 0)), "flavor": b.get("flavor") or "mariadb"}
     return _json_ok(_migration.recommend_channel(probe, b.get("channel_pref") or None))
 
 
 @app.post("/api/migration/probe_target")
 async def api_migration_probe_target(request: Request, user=Depends(auth_required)):
-    """探测目标 MariaDB 版本（SELECT VERSION()），用于自动填充目标版本（DESIGN-003）。"""
+    """探测目标 MariaDB：版本 + 账号分层权限（用于"非 root 能用到哪一步"的提示）。"""
     b = await _json_body(request)
+    cfg = {
+        "tgt_host": b.get("tgt_host", ""),
+        "tgt_port": int(b.get("tgt_port", 3306)),
+        "tgt_user": b.get("tgt_user") or "root",
+        "tgt_root_pass": b.get("tgt_root_pass", ""),
+    }
     try:
-        conn = connect(b.get("tgt_host", ""), int(b.get("tgt_port", 3306)),
-                       "root", b.get("tgt_root_pass", ""), timeout=8)
+        conn = connect(cfg["tgt_host"], cfg["tgt_port"],
+                       cfg["tgt_user"], cfg["tgt_root_pass"], timeout=8)
         try:
             cur = conn.cursor()
             cur.execute("SELECT VERSION()")
             ver = cur.fetchone()[0]
         finally:
             conn.close()
-        return _json_ok({"ok": True, "version": ver})
+        try:
+            priv = _migration.audit_target_privileges(cfg)
+        except Exception:
+            priv = {"ok": False}
+        return _json_ok({"ok": True, "version": ver, "privileges": priv})
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/migration/target_hint")
+async def api_migration_target_hint(request: Request, user=Depends(auth_required)):
+    """按目标 IP 自动给出端口/形态，省去手填（用户要求：自动化，不要手动点）。
+
+    优先取 nodes 表里该 IP 登记的端口与形态；未登记则回退系统默认 NODE_PORT（3307）。
+    """
+    b = await _json_body(request)
+    ip = (b.get("ip") or "").strip()
+    default_port = int(get_setting("NODE_PORT") or 3307)
+    if not ip:
+        return _json_ok({"ok": True, "known": False, "port": default_port, "node_type": ""})
+    try:
+        rows = query("SELECT port, node_type FROM nodes WHERE ip=%s", (ip,))
+        if rows:
+            r = rows[0]
+            return _json_ok({"ok": True, "known": True,
+                             "port": int(r.get("port") or default_port),
+                             "node_type": r.get("node_type") or ""})
+    except Exception:
+        pass
+    return _json_ok({"ok": True, "known": False, "port": default_port, "node_type": ""})
 
 
 @app.post("/api/migration/create")
@@ -2821,6 +2854,9 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
             "tgt_host": b.get("tgt_host", ""),
             "tgt_port": int(b.get("tgt_port", 3306)),
             "tgt_root_pass": b.get("tgt_root_pass", ""),
+            # 目标库账号：默认 root。填非 root 时仅能完成「数据导入」，
+            # 桥接/注册节点/切换/收尾需要更高权限（见 audit_target_privileges 分层提示）。
+            "tgt_user": b.get("tgt_user") or "root",
             "tgt_version": b.get("tgt_version", ""),
             "node_type": node_type,
             "databases": databases,
@@ -2842,6 +2878,9 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
             # 目标端 SSH 账号/密码（物理通道 B 在目标节点本地跑 docker/mariabackup/copy-back 用）
             "tgt_ssh_user": b.get("tgt_ssh_user") or "root",
             "tgt_ssh_pass": b.get("tgt_ssh_pass") or "",
+            # SSH 端口（生产环境未必是 22），源/目标各自独立
+            "src_ssh_port": int(b.get("src_ssh_port", 22) or 22),
+            "tgt_ssh_port": int(b.get("tgt_ssh_port", 22) or 22),
             # 物理通道目标数据目录（留空则按 node_type 推导）
             "tgt_datadir": b.get("tgt_datadir") or "",
         }

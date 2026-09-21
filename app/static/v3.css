@@ -156,6 +156,11 @@ textarea{resize:vertical;min-height:64px}
 .overlay{position:fixed;inset:0;background:rgba(2,6,16,.66);backdrop-filter:blur(2px);display:none;z-index:50}
 .overlay.show{display:flex;align-items:center;justify-content:center}
 .modal{background:var(--surface);border:1px solid var(--border);border-radius:14px;width:min(880px,92vw);max-height:86vh;display:flex;flex-direction:column;overflow:hidden}
+/* 宽版弹窗（.overlay 家族：新增集群 / 添加节点 / 维护模式 / 配置密码 等表单弹窗）：
+   显式锁定 880px 宽版，并补齐 box-shadow，使其与下方 .modal-mask 统一规范视觉一致。 */
+.overlay .modal{width:min(880px,92vw);box-shadow:var(--shadow)}
+/* 表单弹窗宽屏变体：新增集群 / 添加节点 / 维护模式 等按钮触发的表单，套 .modal.wide 使用更大宽度。 */
+.modal.wide{width:min(1080px,94vw);max-height:90vh}
 .modal.full{width:96vw;height:94vh;max-height:none}
 .modal.full .body{flex:1;display:flex;flex-direction:column;min-height:0}
 .modal.full .term{flex:1;height:auto;min-height:0}
@@ -417,3 +422,20 @@ nav.side .nav1 .caret{margin-left:auto}
 /* 侧栏品牌位：改用 SVG Logo 后不再铺渐变底色，只保留尺寸与投影 */
 .brand .logo{width:28px;height:28px;border-radius:8px;background:none;display:inline-flex;align-items:center;justify-content:center;filter:drop-shadow(0 4px 10px rgba(10,186,181,.35))}
 .brand .logo svg{width:28px;height:28px;display:block}
+
+/* ===== 全局弹出层统一规范（所有页面共用） =====
+   目标：任何 .modal-mask / .modal 都具备一致外观与【确定的关闭方式】：
+   右上角 ✕（由 base.html 自动注入）、ESC、点击遮罩空白处。
+   长内容弹窗限高并整体滚动，保证底部按钮永远可达（不会被挤出可视区）。 */
+.modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;
+  align-items:center;justify-content:center;z-index:200}
+.modal-mask.show{display:flex}
+.modal-mask .modal{position:relative;width:460px;max-width:92vw;background:var(--surface,#fff);
+  border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:var(--shadow);
+  max-height:88vh;overflow:auto}
+.modal h3{margin:0 0 10px;color:var(--text);padding-right:30px}
+.modal p{font-size:13px;color:var(--muted);line-height:1.7;margin:6px 0}
+.modal .acts{display:flex;gap:10px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}
+.modal-x{position:absolute;top:10px;right:12px;border:0;background:transparent;
+  font-size:20px;line-height:1;color:var(--muted);cursor:pointer;padding:2px 8px;border-radius:8px}
+.modal-x:hover{color:var(--text);background:var(--surface-3)}
