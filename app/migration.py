@@ -1506,6 +1506,11 @@ def seed_physical(task):
     # 就是这个原因，排查被严重误导）。故先置 None，finally 判空跳过。
     dd = src_dd = staging = src_staging = None
     try:
+        # 迁移锁：从 seed 起就锁定目标节点，覆盖整个迁移（含 copy-back 停实例、桥接追平），
+        # 避免 monitor 在恢复/桥接期间误判节点离线/数据分叉，或去动该节点
+        # （failover.ensure_topology 对「当前主被锁定」的集群整轮跳过）。锁带 6h 自动释放保险丝；
+        # cutover 成功会显式 unlock_target。
+        lock_target(cfg["tgt_host"], int(cfg["tgt_port"]))
         # 0) 兼容性门禁：物理通道只能 MariaDB→MariaDB，且不能降级恢复（实测 VERSION() 判定）。
         #    放在最前面，避免用户等完一整套备份/传输才拿到一个看不懂的错。
         _assert_physical_compatible(cfg)
@@ -1513,6 +1518,8 @@ def seed_physical(task):
         #      （先验证 SSH/docker 连通性，确保下方 docker inspect 探测挂载源时 SSH 已可用）
         _check_node_mb(snt, cfg["src_host"], int(cfg["src_port"]), cfg, use_src_cred=True)
         _check_node_mb(nt, cfg["tgt_host"], int(cfg["tgt_port"]), cfg, use_src_cred=False)
+        _tick(task, 3, stage="解析源/目标数据目录（宿主机路径）…",
+              log="物理通道前置校验通过，开始解析数据目录")
         # 1) 解析源/目标数据目录（宿主机路径）
         #    docker 节点：容器 /var/lib/mysql 的真实宿主机挂载源【必须实测】，不能依赖硬编码默认
         #    （1panel 等安装的数据目录并不在 /data/custos-ha/mariadb12）。探测不到就显式报错，
@@ -1562,30 +1569,41 @@ def seed_physical(task):
         staging = _mig_staging_path_tgt(nt, dd, task["id"])      # 目标机暂存：必须在 datadir 之外
         src_staging = _mig_staging_path(snt, src_dd, task["id"]) # 源机暂存（容器节点须在 datadir 内）
         # 1) 源节点热备（读源本地 datadir；--host 仅用于连接源做协调，不读远端文件）
+        _tick(task, 8, stage="① 源节点 mariabackup 热备中（耗时取决于数据量，请耐心等待；"
+                      "进度条将在备份结束后推进）", log="开始备份源节点数据目录（mariabackup）")
         bk = _remote_mb(snt, cfg["src_host"], cfg, "backup", src_staging,
                         src=src, src_data_dir=src_dd, mb_bin=src_mb, src_my_cnf=src_my_cnf)
         if bk.returncode != 0:
             raise RuntimeError("源节点 mariabackup 备份失败: " + _tail(bk.stderr))
+        _tick(task, 40, stage="① 源节点备份完成，正在 prepare（回放 redo 日志，使其一致）",
+              log="源节点 mariabackup 备份完成")
         # 2) 源节点 prepare（回放 redo，使其一致）
         pr = _remote_mb(snt, cfg["src_host"], cfg, "prepare", src_staging, mb_bin=src_mb)
         if pr.returncode != 0:
             raise RuntimeError("源节点 mariabackup prepare 失败: " + _tail(pr.stderr))
+        _tick(task, 52, stage="② 正在拉取备份到管理器（rsync 中转）", log="prepare 完成，开始拉取备份")
         # 3) 拉取源机暂存 → 管理器中转 → 推到目标机暂存
         pull = _rsync_pull(cfg, cfg["src_host"], src_staging + "/", relay)
         if pull.returncode != 0:
             raise RuntimeError("拉取源备份失败(rsync): " + _tail(pull.stderr))
+        _tick(task, 66, stage="③ 正在推送备份到目标节点（rsync）", log="已拉取到管理器，开始推送")
         push = _rsync_push(cfg, relay, cfg["tgt_host"], staging + "/")
         if push.returncode != 0:
             raise RuntimeError("推送备份到目标失败(rsync): " + _tail(push.stderr))
+        _tick(task, 80, stage="④ 目标节点 copy-back 恢复中（停实例→恢复→授权→启动）",
+              log="已推送到目标节点，开始 copy-back 恢复")
         # 4) 目标节点 copy-back（停实例→恢复→授权→启动）
         cb = _remote_mb(nt, cfg["tgt_host"], cfg, "copyback", staging, datadir=dd,
                         mb_bin=tgt_mb, svc_unit=tgt_unit)
         if cb.returncode != 0:
             raise RuntimeError("目标节点 copy-back 失败: " + _tail(cb.stderr))
+        _tick(task, 95, stage="④ copy-back 完成，等待目标实例就绪（跨版本升级可能需约 1 分钟）",
+              log="copy-back 完成，等待目标实例就绪")
         # 4.1) 等目标实例就绪：copy-back 完成时容器刚 docker start，entrypoint 可能仍在
         #      mariadb-upgrade（跨大版本实测约 1 分钟），此时端口不可达；不等就进桥接会
         #      Connection refused，被误判成迁移失败（实测）。
         _wait_target_ready(cfg)
+        _tick(task, 100, stage="物理恢复完成，可继续执行「建立桥接」", log="目标实例就绪，物理种子完成")
     finally:
         shutil.rmtree(relay, ignore_errors=True)
         # 清理远端暂存目录：源节点容器暂存放在 datadir 内的 .custos_mig_staging_*（不清理会被
@@ -1653,6 +1671,29 @@ def is_target_locked(host, port):
             _MIG_LOCKS.pop(key, None)
             return False
         return True
+
+
+def is_node_migrating(host, port):
+    """该节点是否正处于迁移中（目标被锁定，或存在指向它的进行中迁移任务）。
+
+    供 monitor 正确展示「迁移中」状态、避免把 seed/桥接/追平期的节点误判为离线/数据分叉。
+    优先用内存锁（快），并兜底查 running 任务（覆盖锁未设的窗口，如 seed 刚开始瞬间）。
+    """
+    if is_target_locked(host, port):
+        return True
+    try:
+        rows = query("SELECT config FROM migration_tasks WHERE status='running'")
+        for r in rows:
+            try:
+                cfg = json.loads(r.get("config") or "{}")
+            except Exception:
+                continue
+            if (str(cfg.get("tgt_host")) == str(host)
+                    and int(cfg.get("tgt_port") or 0) == int(port)):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _check_source_binlog(cfg):
@@ -1920,6 +1961,8 @@ def _replica_status(tgt):
 def _register_target_node(cluster_id, host, port, root_pass, node_type, mysql_version,
                           root_user="root"):
     """把已装好的目标节点登记进 Custos（插入 nodes/hosts），不重新生成部署文件。"""
+    # mysql_version 可能为 SELECT VERSION() 原文，截断到 48 与列宽一致，防 1406。
+    mysql_version = (mysql_version or None) and mysql_version[:48]
     server_id = node_gen.get_next_server_id()
     host_compose = f"/home/docker/{host}"
     execute(

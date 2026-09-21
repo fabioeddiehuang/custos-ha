@@ -80,6 +80,9 @@
   @keyframes pbarStripes{from{background-position:0 0}to{background-position:14px 0}}
   .pbar.indet .pbar-in{width:40%!important;animation:pbarSlide 1.3s ease-in-out infinite}
   @keyframes pbarSlide{0%{margin-left:-40%}100%{margin-left:100%}}
+  /* 主执行进度条（progBar）活动态/不确定态：长任务进度不动也要看出「活着」 */
+  #progBar.active{background-image:linear-gradient(90deg,rgba(255,255,255,.35) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.35) 50%,rgba(255,255,255,.35) 75%,transparent 75%,transparent)!important;background-size:22px 22px;animation:pbarStripes .8s linear infinite}
+  #progBar.indet{width:40%!important;margin-left:-40%;animation:pbarSlide 1.4s ease-in-out infinite}
   .dot-live{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok,#2ecc71);margin-right:5px;vertical-align:middle;animation:dotPulse 1.2s ease-in-out infinite}
   @keyframes dotPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(.7)}}
   .stall{font-size:11.5px;color:var(--warn,#e6a23c);margin-left:6px}
@@ -111,6 +114,7 @@
   /* ===== 第1步：源 → 目标 流向布局 ===== */
   .acct-title{font-size:14px;font-weight:700;color:var(--text);margin:0 0 10px}
   .mig-flow{display:grid;grid-template-columns:1fr 108px 1fr;gap:14px;align-items:start}
+  .mig-flow.two{grid-template-columns:1fr 1fr}
   .mf-col{border:1px solid var(--border);border-radius:12px;padding:14px;background:var(--surface-2)}
   .mf-hd{font-size:13px;font-weight:700;color:var(--text);margin-bottom:10px;
     display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -125,6 +129,7 @@
   /* 窄屏：改为上下堆叠，箭头转竖向 */
   @media (max-width:860px){
     .mig-flow{grid-template-columns:1fr}
+    .mig-flow.two{grid-template-columns:1fr}
     .mf-arrow{padding-top:0;flex-direction:row}
     .mf-arrow .mf-line{width:60px;height:3px}
     .mf-arrow .mf-ico{transform:rotate(90deg)}
@@ -287,17 +292,17 @@
   <div id="methodSummary" class="bk-note" style="margin-top:12px">已选迁移方式：<b id="methodSummaryTxt">—</b></div>
 
   <!-- 通用/高级都必填：节点形态决定后续如何登记与恢复 -->
-  <div class="acct-title" style="margin-top:16px">目标信息</div>
+  <div class="acct-title" style="margin-top:16px">节点形态（源端 → 目标节点）</div>
   <div class="form-grid">
-    <div class="field"><label>目标节点形态</label>
-      <select id="tgtType">
-        <option value="" disabled selected>请选择节点形态</option>
+    <div class="field"><label>源端形态</label>
+      <select id="srcType">
         <option value="mariadb-docker">容器化 MariaDB</option>
         <option value="mariadb">裸机 MariaDB</option>
       </select>
     </div>
-    <div class="field"><label>源端形态</label>
-      <select id="srcType">
+    <div class="field"><label>目标节点形态</label>
+      <select id="tgtType">
+        <option value="" disabled selected>请选择节点形态</option>
         <option value="mariadb-docker">容器化 MariaDB</option>
         <option value="mariadb">裸机 MariaDB</option>
       </select>
@@ -306,14 +311,20 @@
 
   <!-- 高级模式专属：先账号（SSH），再逐步选项 -->
   <div id="bOnly" style="display:none">
-    <div class="acct-title" style="margin-top:16px">账号</div>
-    <div class="form-grid">
-      <div class="field"><label>源机 ssh账号</label><input id="srcSshUser" placeholder="root"></div>
-      <div class="field"><label>源机 ssh密码</label><input id="srcSshPass" type="password"></div>
-      <div class="field"><label>源机 ssh端口</label><input id="srcSshPort" value="22" style="width:90px"></div>
-      <div class="field"><label>目标机 ssh账号</label><input id="tgtSshUser" placeholder="root"></div>
-      <div class="field"><label>目标机 ssh密码</label><input id="tgtSshPass" type="password"></div>
-      <div class="field"><label>目标机 ssh端口</label><input id="tgtSshPort" value="22" style="width:90px"></div>
+    <div class="acct-title" style="margin-top:16px">账号（SSH，源端与目标端分别填写）</div>
+    <div class="mig-flow two">
+      <div class="mf-col">
+        <div class="mf-hd">源机 <span class="mf-role">被迁移</span></div>
+        <div class="field"><label>ssh 账号</label><input id="srcSshUser" placeholder="root"></div>
+        <div class="field"><label>ssh 密码</label><input id="srcSshPass" type="password"></div>
+        <div class="field"><label>ssh 端口</label><input id="srcSshPort" value="22" style="width:90px"></div>
+      </div>
+      <div class="mf-col">
+        <div class="mf-hd">目标机 <span class="mf-role">新主</span></div>
+        <div class="field"><label>ssh 账号</label><input id="tgtSshUser" placeholder="root"></div>
+        <div class="field"><label>ssh 密码</label><input id="tgtSshPass" type="password"></div>
+        <div class="field"><label>ssh 端口</label><input id="tgtSshPort" value="22" style="width:90px"></div>
+      </div>
     </div>
     <div class="bk-note">管理器默认不给节点下发公钥，SSH 密码留空不会自动走密钥，会直接失败。若目标是 Custos 纳管节点，也可到「节点管理」点「重新生成」启用 agent-exec 免 SSH。</div>
 
@@ -875,7 +886,15 @@ let _logLen = 0;
 function setProg(pct, stage){
   const w = $("progWrap"); if(w) w.style.display = "block";
   const p = Math.max(0, Math.min(100, pct|0));
-  const bar = $("progBar"); if(bar) bar.style.width = p + "%";
+  const bar = $("progBar");
+  if(bar){
+    bar.style.width = p + "%";
+    // 长任务进度长时间不动时也要让用户看出「还活着」：
+    // 0% 用不确定态（滑块往复），>0% 用条纹活动态，100% 复原为实色。
+    if(p <= 0){ bar.classList.add("indet"); bar.classList.remove("active"); }
+    else if(p >= 100){ bar.classList.remove("indet", "active"); }
+    else { bar.classList.remove("indet"); bar.classList.add("active"); }
+  }
   const pc = $("progPct");  if(pc)  pc.textContent = p + "%";
   if(stage){ const s = $("progStage"); if(s) s.textContent = stage; }
 }

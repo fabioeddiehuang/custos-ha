@@ -134,6 +134,8 @@
             {% elif h.repl_state == 'repl_fork' %}
               <span class="pill down" title="复制线程正常但上游并非当前主库：正从幽灵/旧主拉数据，存在静默数据分叉，管理器将自动重指">● 数据分叉</span>
               {% if h.upstream %}<div class="repl-link">← {{ h.upstream }}(非当前主)</div>{% endif %}
+            {% elif h.repl_state == 'migrating' %}
+              <span class="pill" style="color:var(--accent,#0ABAB5);border-color:var(--accent,#0ABAB5)">● 迁移中</span>
             {% elif h.repl_state == 'offline' %}
               <span class="pill down">● 离线</span>
             {% else %}

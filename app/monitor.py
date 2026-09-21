@@ -736,6 +736,12 @@ def _probe_all():
     clusters = list_clusters()
     if not clusters:
         return  # 尚未创建任何集群，空闲等待
+    # 迁移中节点识别（延迟导入避免循环依赖）：迁移目标在 seed/桥接/追平期间
+    # 应显示「迁移中」而非离线/数据分叉，且不发状态类告警。
+    try:
+        from . import migration as _migration
+    except Exception:
+        _migration = None
     # 收集所有探活任务（跨集群），统一并发执行
     tasks = []  # (cid, cluster_name, host, port, creds, cur_key)
     for cl in clusters:
@@ -798,6 +804,15 @@ def _probe_all():
             is_master = ((host, port) == cur_key) and (st.get("mode") != "slave")
             # 节点半同步状态：主库看 master_status，从库看 slave_status
             semi = st.get("semi_master_status") if is_master else st.get("semi_slave_status")
+            # 迁移目标节点：seed/桥接/追平期间显示「迁移中」而非离线/数据分叉，且跳过
+            # 状态类告警（离线/复制中断/数据分叉）。seed 起始已 lock_target，monitor 的
+            # 拓扑维护也会跳过该集群，故此处只需修正卡片语义，不真正探活状态。
+            if _migration is not None and _migration.is_node_migrating(host, port):
+                _mig_st = dict(st, alive=True)  # 显示用：不计入离线，避免误导
+                _update_host({"host": host, "port": port, "cluster_id": cid},
+                             _mig_st, is_master, repl_state="migrating")
+                cache_by_cid[cid][key] = (_mig_st, is_master)
+                continue
             # 卡死预标记：供 repl_state 落库（独立 key 计数，不与下方自愈块耦合）
             if not is_master:
                 # 主库 binlog 已清理（1236）：无法自愈，状态直接标为「需重建」

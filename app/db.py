@@ -322,6 +322,13 @@ def init_schema():
                 c.execute("ALTER TABLE nodes MODIFY mysql_version varchar(48) DEFAULT NULL")
             except Exception:
                 pass
+            # clusters.mysql_version 同样可能写入 SELECT VERSION() 原文（迁移 cutover 经
+            # create_cluster 写入 tgt_version），原 varchar(16) 会触发 1406 Data too long；
+            # 与 nodes 一并扩容到 48（写入侧再兜底截断）。
+            try:
+                c.execute("ALTER TABLE clusters MODIFY mysql_version varchar(48) DEFAULT NULL")
+            except Exception:
+                pass
             # ---- v2.3.3：维护模式窗口表 ----
             # scope=cluster 抑制整个集群的自动切换与状态告警；scope=node 只覆盖单个节点。
             # end_at 为 NULL 表示不限时（必须手动结束）；到期由查询时 purge 兜底。

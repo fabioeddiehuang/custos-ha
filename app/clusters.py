@@ -38,6 +38,10 @@ def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=N
     vrid = vrid or VRID
     if vip_port is None:
         vip_port = VIP_PORT
+    # mysql_version 可能传入 SELECT VERSION() 原文（如 12.3.3-MariaDB-...），
+    # 截断到 48 字符，避免超列宽（与 db 列定义一致，双重保险）。
+    if mysql_version and len(mysql_version) > 48:
+        mysql_version = mysql_version[:48]
     # 直接取 execute() 返回的 lastrowid：LAST_INSERT_ID() 是连接级的，
     # 而 get_conn() 每次返回新连接，另开连接查询会稳定拿到 0，
     # 导致「创建成功却跳转 /clusters/0 → 集群不存在」的假失败。
