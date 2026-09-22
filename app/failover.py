@@ -695,6 +695,10 @@ def _migration_locked(host, port):
         return False
 
 
+# 因迁移锁而跳过复制维护的节点（仅用于日志去重，避免每个监控周期刷同一条）
+_TOPO_LOCK_SKIPPED = set()
+
+
 def ensure_topology(cluster_id):
     """保证每台存活的'非当前主'库都是当前主的从库（用于切后对齐 + 旧主恢复重入）。"""
     cur_h, cur_p = get_current_master(cluster_id)
@@ -788,7 +792,16 @@ def ensure_topology(cluster_id):
         # 从库断开主库、追平检测失败（issue #3/#4）。当前主已被 _locked 保护，这里再补一道闸，
         # 覆盖「目标在复用集群里是从节点」的情况（此时它并非当前主，_locked 不会命中）。
         if _migration_locked(h["host"], int(h["port"])):
+            # 必须可见：否则节点「一直没有主从」时，运维完全看不出是被迁移锁挡住的。
+            _k = (h["host"], int(h["port"]))
+            if _k not in _TOPO_LOCK_SKIPPED:
+                _TOPO_LOCK_SKIPPED.add(_k)
+                print("[topology] 跳过 %s:%s 的复制维护：该节点被判定为迁移中"
+                      "（残留的迁移锁或执行中任务）。若迁移早已结束，请用"
+                      "「解锁迁移锁」(POST /api/migration/unlock) 清理后即自动恢复。"
+                      % (h["host"], h["port"]))
             continue
+        _TOPO_LOCK_SKIPPED.discard((h["host"], int(h["port"])))
         ru, rp = node_root(h["host"], cluster_id)
         st = get_status(h["host"], int(h["port"]), creds["ha_user"], creds["ha_pass"], ru, rp)
         # 已是当前主的从库且运行正常 -> 跳过

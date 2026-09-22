@@ -1916,6 +1916,35 @@ def force_clear_node(host, port, clear_tasks=True):
     return info
 
 
+def _has_live_migration_task(host, port):
+    """是否存在指向该节点、且【确实有后台线程在跑】的迁移任务。
+
+    为什么必须同时校验内存集合 _RUNNING：migration_tasks.status='running' 只是数据库
+    记录，管理器重启 / 线程异常退出后记录会残留成【孤儿任务】。若只认 status，节点会被
+    永久判定为「迁移中」，而 failover.ensure_topology 会跳过迁移中节点的复制维护，
+    结果是【该节点再也建不上主从】（2026-09-23「容器版 MariaDB 无法主从」的根因）。
+    _RUNNING 是内存集合、随线程启动写入、重启即空，正好等价于"真的在跑"。
+    """
+    try:
+        rows = query("SELECT id, config FROM migration_tasks WHERE status='running'")
+    except Exception:
+        return False
+    for r in rows:
+        try:
+            if int(r.get("id")) not in _RUNNING:
+                continue          # 孤儿任务：没有活线程，不算数
+        except (TypeError, ValueError):
+            continue
+        try:
+            cfg = json.loads(r.get("config") or "{}")
+        except Exception:
+            continue
+        if (str(cfg.get("tgt_host")) == str(host)
+                and int(cfg.get("tgt_port") or 0) == int(port)):
+            return True
+    return False
+
+
 def is_target_locked(host, port):
     """目标是否处于迁移锁定中 —— 由 failover.ensure_topology 调用。
 
@@ -1944,12 +1973,16 @@ def is_target_locked(host, port):
                 return True
     except Exception:
         pass
-    # 兜底②：仍有指向该节点的「执行中」迁移任务 ⇒ 任务全生命周期内始终锁定，
+    # 兜底②：仍有指向该节点、且【确实有活线程在跑】的迁移任务 ⇒ 任务期间始终锁定，
     #   杜绝第3步→第4步间隔超过 6h、锁过期后 monitor 的 ensure_topology 把桥接通道
     #   清掉（RESET REPLICA ALL）导致追平检测永远「复制通道已清除」（issue #3/#4 的延续）。
-    #   任务完成后 is_node_migrating 即返回 False，monitor 自动接管，无需手动解锁。
+    #
+    # ⚠ 这里【绝不能】调用 is_node_migrating()：它反过来会调 is_target_locked()，
+    #   二者互相递归 → RecursionError → 被下面的 except 吞掉 ⇒ 整个兜底静默失效。
+    # ⚠ 且必须要求任务「真有活线程」：只认 status='running' 会让管理器重启/线程异常
+    #   留下的孤儿任务把节点永久锁死 → ensure_topology 永久跳过 → 再也建不上主从。
     try:
-        if is_node_migrating(host, port):
+        if _has_live_migration_task(host, port):
             return True
     except Exception:
         pass
@@ -1964,19 +1997,9 @@ def is_node_migrating(host, port):
     """
     if is_target_locked(host, port):
         return True
-    try:
-        rows = query("SELECT config FROM migration_tasks WHERE status='running'")
-        for r in rows:
-            try:
-                cfg = json.loads(r.get("config") or "{}")
-            except Exception:
-                continue
-            if (str(cfg.get("tgt_host")) == str(host)
-                    and int(cfg.get("tgt_port") or 0) == int(port)):
-                return True
-    except Exception:
-        pass
-    return False
+    # 覆盖「锁还没落库」的窗口（如 seed 刚开始的瞬间）。
+    # 注意：只认【有活线程】的任务，孤儿 running 任务不再让节点永远显示/停留在迁移中。
+    return _has_live_migration_task(host, port)
 
 
 def _check_source_binlog(cfg):
