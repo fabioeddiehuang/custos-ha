@@ -367,6 +367,7 @@
   <div id="preBox" class="logbox" style="display:none"></div>
   <div id="runBanner" style="display:none;padding:10px 12px;border-radius:8px;margin:8px 0;font-size:12px;line-height:1.6;background:rgba(230,162,60,.12);color:var(--warn,#e6a23c)"></div>
   <div id="execList"></div>
+  <div id="catchupBox" class="bk-note" style="display:none;margin-top:10px"></div>
   <div style="margin-top:10px">
     <div style="display:flex;gap:10px;align-items:flex-start">
       <input type="checkbox" id="deepVerifyChk" style="margin-top:2px;flex:0 0 auto;width:16px;height:16px">
@@ -578,6 +579,8 @@ function setStep(n){
       }
     }
   }
+  // 第3步：启动「数据追平中」实时进度轮询；离开第3步则停止，避免无意义轮询
+  if(n===3){ startCatchupPoll(); } else { stopCatchupPoll(); }
   // 切步后回到页面顶部：此前停在页面中段，用户看不到新步骤的开头（实测反馈）
   try{ window.scrollTo({top:0, behavior:"smooth"}); }
   catch(e){ try{ window.scrollTo(0,0); }catch(e2){} }
@@ -1394,6 +1397,34 @@ async function runLagCheck(){
   // 若首次采样后仍未结束（还在追平），启动周期追踪
   if(_lagTracking) _lagTimer = setInterval(()=>_lagSample(false), LAG_TRACK_INTERVAL_MS);
 }
+
+/* 第3步桥接后的「数据追平中」实时进度（issue #2）：让数据同步过程可视化，
+   不再只是按钮瞬间变「完成」。复用 /lag 接口，仅展示、不改动任何节点。 */
+let _catchupTimer = null;
+async function refreshCatchup(){
+  const box = $("catchupBox"); if(!box || !STATE.taskId) return;
+  const b = await postJSON("/api/migration/"+STATE.taskId+"/lag", {skip_acct:true});
+  if(!b || b.ok === false){ box.style.display = "none"; return; }
+  // 尚未建立桥接 / 通道未就绪：不展示，避免干扰第3步操作
+  if(!b.caught_up && b.seconds_behind == null && !b.io_running){
+    box.style.display = "none"; return;
+  }
+  box.style.display = "block";
+  if(b.caught_up){
+    box.innerHTML = "✓ <b>数据已追平</b>：目标与源库复制延迟 ≈ 0 秒，可进入第 4 步停桥切换。";
+  }else{
+    const sb = (b.seconds_behind == null) ? "未知" : (b.seconds_behind + " 秒");
+    box.innerHTML = "🔄 <b>数据追平中</b>：目标正在从源库持续同步增量数据，当前复制延迟 "
+      + sb + "（IO=" + (b.io_running||"?") + " / SQL=" + (b.sql_running||"?") + "）。"
+      + "请等待延迟归零后再切换，避免带差切换丢数据。";
+  }
+}
+function startCatchupPoll(){
+  stopCatchupPoll();
+  refreshCatchup();
+  if(STATE.mode === "bridge"){ _catchupTimer = setInterval(refreshCatchup, 3000); }
+}
+function stopCatchupPoll(){ if(_catchupTimer){ clearInterval(_catchupTimer); _catchupTimer = null; } }
 
 /* 跳过收尾直接完成：不回收源端账号、不把源库置只读，源库保持原状。 */
 async function skipCleanup(){

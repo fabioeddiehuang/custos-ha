@@ -784,6 +784,11 @@ def ensure_topology(cluster_id):
             continue
         if h["status"] != "up":
             continue
+        # 迁移目标节点（seed/桥接/追平期）：不要动它的复制通道，否则桥接被 RESET、
+        # 从库断开主库、追平检测失败（issue #3/#4）。当前主已被 _locked 保护，这里再补一道闸，
+        # 覆盖「目标在复用集群里是从节点」的情况（此时它并非当前主，_locked 不会命中）。
+        if _migration_locked(h["host"], int(h["port"])):
+            continue
         ru, rp = node_root(h["host"], cluster_id)
         st = get_status(h["host"], int(h["port"]), creds["ha_user"], creds["ha_pass"], ru, rp)
         # 已是当前主的从库且运行正常 -> 跳过

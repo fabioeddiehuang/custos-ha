@@ -26,7 +26,7 @@ import threading
 import urllib.request
 import urllib.error
 import pymysql
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .db import query, execute, get_setting
 from . import crypto
@@ -1708,40 +1708,86 @@ def seed_physical(task):
 #
 # 对策：桥接期间锁定目标节点，让 ensure_topology 整轮跳过，不再干扰。
 # ---------------------------------------------------------------------------
-_MIG_LOCKS = {}            # "ip:port" -> 过期时间戳（monotonic）
+_MIG_LOCKS = {}            # "ip:port" -> 过期时间戳（monotonic），内存快路径
 _MIG_LOCK_TTL = 6 * 3600   # 保险丝：极端情况下忘记解锁也能自动恢复（6 小时）
 _mig_lock = threading.Lock()
+_MIG_LOCK_DB_TTL = _MIG_LOCK_TTL  # 持久锁保险丝（秒），与内存 TTL 对齐
+
+
+def _ensure_locks_table():
+    """迁移锁持久化表：抗管理器重建/重启（内存锁重启即失，会导致 monitor 清掉桥接通道）。
+
+    仅在首次访问时创建，失败静默（退化回内存锁，不阻断主流程）。
+    """
+    try:
+        execute("CREATE TABLE IF NOT EXISTS migration_locks ("
+                "host VARCHAR(64) NOT NULL, port INT NOT NULL, "
+                "expires DATETIME NOT NULL, PRIMARY KEY (host, port))")
+    except Exception:
+        pass
 
 
 def lock_target(host, port):
-    """锁定迁移目标节点：暂停 monitor 对它（作为当前主）的拓扑维护。"""
+    """锁定迁移目标节点：暂停 monitor 对它（作为当前主）的拓扑维护。
+
+    同时写入内存与持久表 —— 后者保证管理器重建/重启后锁定不丢失，
+    否则 ensure_topology 会立刻 RESET REPLICA ALL 把桥接通道清掉（issue #3/#4 根因）。
+    """
     if not host:
         return
+    host, port = str(host), int(port)
     with _mig_lock:
-        _MIG_LOCKS["%s:%d" % (host, int(port))] = time.monotonic() + _MIG_LOCK_TTL
+        _MIG_LOCKS["%s:%d" % (host, port)] = time.monotonic() + _MIG_LOCK_TTL
+    try:
+        _ensure_locks_table()
+        execute("REPLACE INTO migration_locks (host, port, expires) VALUES (%s,%s,"
+                " DATE_ADD(NOW(), INTERVAL %s SECOND))", (host, port, _MIG_LOCK_DB_TTL))
+    except Exception:
+        pass
 
 
 def unlock_target(host, port):
     """解除锁定（停桥之后交还 monitor 接管）。"""
     if not host:
         return
+    host, port = str(host), int(port)
     with _mig_lock:
-        _MIG_LOCKS.pop("%s:%d" % (host, int(port)), None)
+        _MIG_LOCKS.pop("%s:%d" % (host, port), None)
+    try:
+        execute("DELETE FROM migration_locks WHERE host=%s AND port=%s", (host, port))
+    except Exception:
+        pass
 
 
 def is_target_locked(host, port):
-    """目标是否处于迁移锁定中 —— 由 failover.ensure_topology 调用。"""
+    """目标是否处于迁移锁定中 —— 由 failover.ensure_topology 调用。
+
+    内存命中优先（快）；未命中（含管理器刚重启、内存锁丢失）回退持久表，
+    避免重启后 monitor 把桥接通道清掉导致从库断开主库 / 追平检测失败（issue #3/#4）。
+    """
     if not host:
         return False
-    key = "%s:%d" % (host, int(port))
+    host, port = str(host), int(port)
+    key = "%s:%d" % (host, port)
     with _mig_lock:
         exp = _MIG_LOCKS.get(key)
-        if exp is None:
-            return False
-        if time.monotonic() > exp:  # 保险丝到期自动释放
+        if exp is not None:
+            if time.monotonic() <= exp:
+                return True
             _MIG_LOCKS.pop(key, None)
-            return False
-        return True
+    try:
+        _ensure_locks_table()
+        rows = query("SELECT expires FROM migration_locks WHERE host=%s AND port=%s",
+                    (host, port))
+        if rows:
+            exp_db = rows[0].get("expires")
+            if exp_db and exp_db > datetime.now():
+                with _mig_lock:  # 命中后回填内存，减少后续 DB 访问
+                    _MIG_LOCKS[key] = time.monotonic() + _MIG_LOCK_TTL
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def is_node_migrating(host, port):
