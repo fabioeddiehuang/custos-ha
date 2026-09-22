@@ -796,6 +796,12 @@ def api_node_rebuild(cluster_id: int = Form(...), host: str = Form(...),
         task = rebuild.start_rebuild(cluster_id, host, port, actor=str(user))
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    # 节点重建会抹掉数据：若它曾是迁移目标，残留的迁移锁/running 任务会让仪表盘
+    # 永久显示「迁移中」并让 failover 跳过该节点拓扑维护 —— 顺手清掉（失败不影响重建）。
+    try:
+        _migration.force_clear_node(host, port, clear_tasks=True)
+    except Exception:
+        pass
     return _json_ok({"ok": True, "task": task})
 
 
@@ -3017,6 +3023,29 @@ def api_migration_delete(task_id: int, user=Depends(auth_required)):
 def api_migration_cleanup_stale(user=Depends(auth_required)):
     """清理卡死/陈旧的执行中任务（无后台线程在跑的 running 记录）。"""
     return _json_ok(_migration.cleanup_stale_running_tasks())
+
+
+@app.post("/api/migration/unlock")
+async def api_migration_unlock(request: Request, user=Depends(auth_required)):
+    """强制解除某节点的迁移锁（及可选清理指向它的 running 任务）。
+
+    用于节点被重装/重建后，管理后台仍残留「迁移中」状态的场景。等价于对管理库
+    执行 DELETE FROM migration_locks / migration_tasks，但无需手敲 SQL。默认同时
+    清理指向该节点的 running 任务（重装后这些任务已无意义）。
+
+    body: {"host": "192.168.1.203", "port": 3307, "clear_tasks": true}
+    """
+    b = await _json_body(request)
+    host = (b.get("host") or "").strip()
+    port = int(b.get("port") or 0)
+    clear_tasks = b.get("clear_tasks", True)
+    if not host or not port:
+        return _json_ok({"ok": False, "error": "host 与 port 必填"})
+    try:
+        info = _migration.force_clear_node(host, port, clear_tasks=bool(clear_tasks))
+        return _json_ok({"ok": True, **info})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
 # ==================================================================

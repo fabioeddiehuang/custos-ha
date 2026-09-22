@@ -1855,6 +1855,51 @@ def unlock_target(host, port):
         pass
 
 
+def force_clear_node(host, port, clear_tasks=True):
+    """强制清除某节点的迁移残留状态（锁 + 可选的 running 任务）。
+
+    场景：节点被重装/重建后，迁移锁（migration_locks）与指向它的 running 任务行
+    仍残留，导致仪表盘永久显示「迁移中」，且 failover.ensure_topology 持续跳过该
+    节点拓扑维护。本函数提供代码级一键清理，免手敲 SQL（等价于对管理库执行
+    DELETE FROM migration_locks / migration_tasks）。
+
+    ⚠ 仅应在确认该节点已不可作为迁移目标（如已重装、迁移线程必死）时调用，
+    否则可能中断一个仍在正常运行的迁移。
+    """
+    host, port = str(host), int(port)
+    info = {"unlocked": False, "tasks_deleted": 0}
+    # 1) 清锁（内存 + 持久表）
+    if is_target_locked(host, port):
+        unlock_target(host, port)
+        info["unlocked"] = True
+    # 2) 清指向该节点的 running 任务（并清内存集合，避免孤儿线程干扰 cleanup_stale）
+    if clear_tasks:
+        try:
+            rows = query("SELECT id, config FROM migration_tasks WHERE status='running'")
+            dead = []
+            for r in rows:
+                try:
+                    cfg = json.loads(r.get("config") or "{}")
+                except Exception:
+                    continue
+                if (str(cfg.get("tgt_host")) == host
+                        and int(cfg.get("tgt_port") or 0) == port):
+                    dead.append(int(r["id"]))
+            if dead:
+                execute("DELETE FROM migration_tasks WHERE id IN %s", (tuple(dead),))
+                for tid in dead:
+                    _RUNNING.discard(tid)
+                    _REP.pop(tid, None)
+                    _CANCEL.discard(tid)
+                    _STEP_HB.pop(tid, None)
+                    _STEP_PROCS.pop(tid, None)
+                    _FORCE_TS.pop(tid, None)
+                info["tasks_deleted"] = len(dead)
+        except Exception as e:
+            info["task_error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
 def is_target_locked(host, port):
     """目标是否处于迁移锁定中 —— 由 failover.ensure_topology 调用。
 
