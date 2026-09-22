@@ -388,8 +388,15 @@
   </div>
   <div id="lagBox" class="logbox" style="margin-top:8px;display:none"></div>
   <div id="fixBridgeWrap" style="display:none;margin-top:8px">
+    <div class="bk-note warn" style="margin:0 0 8px">复制通道已被清除（常见于 monitor 周期性维护或管理器重启）。点「重建桥接」可自动重建源→目标的复制通道，不必回到第 3 步。</div>
     <div class="btn-row">
-      <button class="btn" onclick="backToBridge()">← 返回第三步，重跑「建立桥接」</button>
+      <button class="btn btn-primary" onclick="rebuildBridge()">🔧 重建桥接（自动恢复复制通道）</button>
+      <button class="btn" onclick="backToBridge()">← 返回第三步重跑桥接</button>
+    </div>
+  </div>
+  <div id="lagHealWrap" style="display:none;margin-top:8px">
+    <div class="btn-row">
+      <button class="btn" onclick="migHeal()">🔧 修复复制（SQL/IO 线程停止时尝试自愈）</button>
     </div>
   </div>
   <div class="bk-note" id="noLagBox" style="margin-top:10px">
@@ -1222,6 +1229,23 @@ function backToBridge(){
   setStep(3);
 }
 
+// 第4步：复制通道被清除（monitor 周期维护 / 管理器重启）时，直接重跑「建立桥接」恢复通道，
+// 不必回到第3步。桥接幂等、支持重复执行；提交后稍候自动重跑追平检测查看结果。
+async function rebuildBridge(){
+  if(!STATE.taskId){ alert("请先打开迁移任务。"); return; }
+  if(!confirm("确认重建桥接复制通道？\n\n将对目标节点重跑「建立桥接」（STOP/CHANGE MASTER/START REPLICA），"
+    + "用于复制通道被清除、或源端复制账号被覆盖后的恢复。")) return;
+  try{
+    const b = await postJSON("/api/migration/"+STATE.taskId+"/step", {step:"bridge", deep:false});
+    if(b && b.ok){
+      alert("✅ 已提交重建桥接，稍候自动重新检测追平…");
+      setTimeout(runLagCheck, 3500);
+    } else {
+      alert("提交失败：" + (b && (b.error||b.msg) || "未知"));
+    }
+  }catch(e){ alert("请求失败: "+e); }
+}
+
 // 「源库已停写」跳过追平：显式勾选 + 危险确认后才解锁切换
 function toggleNoLag(){
   const chk = $("noLagChk");
@@ -1286,15 +1310,41 @@ function _lagFinish(b, ok, elapsed){
   ].filter(Boolean).join("\n");
   STATE.lagOk = !!ok;
   $("fixBridgeWrap").style.display = (!ok && b.need_bridge) ? "block" : "none";
+  // 复制线程（SQL/IO）停止、但通道仍存在时，给出「修复复制」自愈入口
+  $("lagHealWrap").style.display = (!ok && !b.need_bridge
+      && (b.sql_running !== "Yes" || b.io_running !== "Yes")) ? "block" : "none";
   if(ok){
     $("lagState").className = "st ok"; $("lagState").textContent = "已追平";
     $("cutBtn").disabled = false; $("cutBtn").textContent = "⚠ 执行停桥切换";
   }else{
     $("lagState").className = "st err"; $("lagState").textContent = "未追平";
     $("cutBtn").disabled = true;
-    const tail = b.need_bridge ? (b.hint||"") : "请等待目标追平后再检测，确认追平后才允许停桥切换。";
+    const tail = b.need_bridge ? (b.hint||"")
+      : (b.sql_running !== "Yes" || b.io_running !== "Yes")
+        ? "复制线程已停止，请点击下方「🔧 修复复制」尝试自愈，或到目标节点手动 START REPLICA / 处理复制错误后再检测。"
+        : "请等待目标追平后再检测，确认追平后才允许停桥切换。";
     alert("尚未追平：" + (b.reason||"") + "\n\n" + tail);
   }
+}
+
+// 迁移目标复制自愈：目标(从库) SQL/IO 线程因复制错误(如 1133/冲突)停止时，
+// 调 /api/migration/{id}/heal（heal_replication 跳过冲突事务/补建缺失账号/重启线程），
+// 自愈后自动重跑追平检测。
+async function migHeal(){
+  if(!STATE.taskId){ alert("请先打开迁移任务。"); return; }
+  if(!confirm("确认对目标节点执行复制自愈？\n\n"
+    + "将尝试：跳过冲突事务 / 补建复制重放缺失的账号 / 重启复制线程。\n"
+    + "用于 SQL/IO 线程因复制错误停止（如 1133）的场景。")) return;
+  try{
+    const b = await postJSON("/api/migration/" + STATE.taskId + "/heal", {});
+    if(b && b.ok){
+      alert("✅ 复制自愈成功：" + (b.msg || ""));
+      runLagCheck();   // 自愈后自动重新检测追平
+    } else {
+      alert("自愈失败：" + (b && (b.error || b.msg) || "未知错误")
+        + "\n\n若仍失败，请到目标节点执行 SHOW REPLICA STATUS\\G 查看 Last_SQL_Error 后手动处理。");
+    }
+  }catch(e){ alert("自愈请求失败: " + e); }
 }
 
 async function _lagSample(isFirst){
@@ -1302,7 +1352,9 @@ async function _lagSample(isFirst){
   let b;
   try{
     // 仅首次做「复制账号自检」（会连源库）；高频追踪时跳过，避免反复连老主
-    b = await postJSON("/api/migration/"+STATE.taskId+"/lag", {skip_acct: !isFirst});
+    // 仅首次（手动点击「追平检测」时）触发 auto_heal：自动重建丢失的桥接 / 自愈停掉的线程；
+    // 高频追踪采样（isFirst=false）不触发，避免反复重建。
+    b = await postJSON("/api/migration/"+STATE.taskId+"/lag", {skip_acct: !isFirst, auto_heal: isFirst});
   }catch(e){
     _lagFinish({reason:"检测请求失败："+e}, false, elapsed); return;
   }

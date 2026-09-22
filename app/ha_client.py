@@ -2357,6 +2357,28 @@ def ensure_connect_creds(host, port, ha_user, ha_pass, root_user, root_pass,
             pass
 
 
+# 节点 binlog 保留目标值（2026-09-22）：7 天保留 / 单文件上限 256M
+_RETENTION_DAYS = 7
+_RETENTION_SEC = 7 * 24 * 3600  # 604800，MySQL 8.0 侧使用
+_MAX_BINLOG_SIZE = 268435456    # 256M
+# binlog 总体积硬上限（20GB，对齐告警阈值 BINLOG_SIZE_ALERT_MB 默认值）：
+# 「按天保留」只保证时间有界，写入量突增时体积仍可能撑爆 /data；只有 ≥11.4 才有该变量。
+_BINLOG_TOTAL_SIZE_CAP = 20 * 1024 * 1024 * 1024
+
+
+def _as_int(v):
+    """把 MySQL 返回值安全转 int。
+
+    MariaDB 的 expire_logs_days 形如 '10.000000'，直接 int() 会 ValueError ——
+    一旦发生在 try/except 里就会变成又一次静默失败，故统一走 int(float())。
+    """
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+# 已告警过的节点：避免因权限/变量缺失导致每周期刷同一条 warning
+_BINLOG_RETENTION_WARNED = set()
+
 def ensure_ha_creds(host, port, root_user, root_pass,
                     ha_user, ha_pass, repl_user, repl_pass,
                     app_user="", app_pass="", manager_ip="", manager_subnet=None,
@@ -2609,6 +2631,60 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             except Exception as _se:
                 import logging as _lg
                 _lg.getLogger(__name__).warning("运行时开启半同步失败: %s", _se)
+
+        # binlog 清理参数在线兜底（2026-09-22）：节点 my.cnf 已写入保留参数，但已部署且在运行的
+        # 节点不会因 my.cnf 变更自动重读 ⇒ 每周期 SET GLOBAL 兜底，避免「复制 binlog 无限累积
+        # 撑爆 /data」（历史版本未设导致磁盘告警）。
+        # ⚠ 兜底语义：只在「永不过期(0)」时才介入 —— 0 才是本次磁盘告警的根因；
+        #   已配置保留期的节点（实测 12.3.3 多为 10 天）保持原值，不擅自缩短其 PITR 窗口。
+        # ⚠ 必须按 flavor 分流：MySQL 8.0 默认 binlog_expire_logs_seconds=2592000(30 天)，
+        #   二者运行时互斥（不能同时非 0），直接 SET GLOBAL expire_logs_days 会被 3683 拒绝；
+        #   MariaDB 则相反，两个变量互为别名（改一个另一个自动跟随）。
+        # ⚠ 失败绝不能静默：一旦静默，节点重启后即退回「永不过期」，根治措施失效且无人知晓。
+        try:
+            if flavour == F_MYSQL8:
+                cur.execute("SELECT @@GLOBAL.binlog_expire_logs_seconds")
+                _sec = (cur.fetchone() or (None,))[0]
+                # MySQL 默认已是 30 天(2592000)，只有被显式清零(0=永不过期)才需要兜底；
+                # 已配置保留期的节点保持原值，不擅自缩短其 PITR 窗口。
+                if _as_int(_sec) == 0:
+                    # MySQL 8.0：两者互斥，必须先把 expire_logs_days 归零才能设 seconds
+                    cur.execute("SET GLOBAL expire_logs_days = 0")
+                    cur.execute("SET GLOBAL binlog_expire_logs_seconds = %d" % _RETENTION_SEC)
+            else:
+                cur.execute("SELECT @@GLOBAL.expire_logs_days")
+                _eld = (cur.fetchone() or (None,))[0]
+                # 只兜底「永不过期(0)」：实测在跑的 12.3.3 节点多为 10 天，强行改成 7 天
+                # 等于静默缩短既有的 PITR 窗口 —— 0 才是本次磁盘告警的根因，只修它。
+                if _as_int(_eld) == 0:
+                    cur.execute("SET GLOBAL expire_logs_days = %d" % _RETENTION_DAYS)
+            cur.execute("SELECT @@GLOBAL.max_binlog_size")
+            _mbs = (cur.fetchone() or (None,))[0]
+            if (_as_int(_mbs) or 0) > _MAX_BINLOG_SIZE:
+                cur.execute("SET GLOBAL max_binlog_size = %d" % _MAX_BINLOG_SIZE)
+            # MariaDB >= 11.4：给 binlog 总体积设硬上限 —— 按天保留只保证「时间」有界，
+            # 写入量突增时仍可能撑爆 /data，这才是真正兜住磁盘的那道闸。
+            # 实测环境同时存在 10.11/11.0 节点，那些版本无此变量（报 1193）属预期，静默跳过；
+            # >= 11.4 上则由 slave_connections_needed_for_purge(默认 1) 保证不会删掉
+            # 已连从库尚未应用的日志。
+            if flavour != F_MYSQL8:
+                try:
+                    cur.execute("SELECT @@GLOBAL.max_binlog_total_size")
+                    _cap = _as_int((cur.fetchone() or (None,))[0])
+                    if _cap is not None and _cap != _BINLOG_TOTAL_SIZE_CAP:
+                        cur.execute(
+                            "SET GLOBAL max_binlog_total_size = %d" % _BINLOG_TOTAL_SIZE_CAP)
+                except Exception:
+                    # < 11.4 无此变量（已实测），非故障，不刷 warning
+                    pass
+        except Exception as _be:
+            _k = (host, port)
+            if _k not in _BINLOG_RETENTION_WARNED:
+                _BINLOG_RETENTION_WARNED.add(_k)
+                import logging as _blg
+                _blg.getLogger(__name__).warning(
+                    "节点 %s:%s 设置 binlog 保留参数失败，复制 binlog 可能无限累积撑爆磁盘: %s",
+                    host, port, _be)
 
     cur = conn.cursor()
     used = used_for_connect

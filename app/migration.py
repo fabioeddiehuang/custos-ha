@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 from .db import query, execute, get_setting
 from . import crypto
 from .config import get_mgmt_host, NODE_AGENT_PORT, NODE_AGENT_TOKEN, NODE_AGENT_TIMEOUT
-from .ha_client import connect, ensure_ha_creds
+from .ha_client import connect, ensure_ha_creds, heal_replication
 from .clusters import create_cluster, get_cluster_creds
 from . import node_gen
 from .config import (get_mgmt_host, get_manager_public_ip,
@@ -402,8 +402,11 @@ def _sql_lit(s):
     return str(s).replace("\\", "\\\\").replace("'", "\\'")
 
 
+MIG_REPL_USER = "custos_mig_repl"
+
+
 def _ensure_source_repl_account(task):
-    """在【源】MariaDB 上创建最小权限复制账号（迁移完 cleanup 可回收）。
+    """在【源】MariaDB 上创建最小权限复制账号（迁移完 cleanup 可回收），用专属用户名 MIG_REPL_USER。
 
     降级策略：若源连接账号无 CREATE USER 权限（桥接会报 1227），则不再建专用账号，
     改为**直接用源连接账号本身**作为复制账号（前提是源账号允许从目标主机连入，
@@ -413,7 +416,7 @@ def _ensure_source_repl_account(task):
     conn = connect(cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"], timeout=8)
     try:
         cur = conn.cursor()
-        u, p = _sql_lit(cfg["repl_user"]), _sql_lit(cfg["repl_pass"])
+        u, p = MIG_REPL_USER, _sql_lit(cfg["repl_pass"])
         try:
             # ⚠ 关键坑（实测坐实）：CREATE USER IF NOT EXISTS 在用户【已存在】时
             #   **不会更新口令**。迁移反复重装后，源库残留旧的 replication 账号（旧口令），
@@ -1941,6 +1944,15 @@ def is_target_locked(host, port):
                 return True
     except Exception:
         pass
+    # 兜底②：仍有指向该节点的「执行中」迁移任务 ⇒ 任务全生命周期内始终锁定，
+    #   杜绝第3步→第4步间隔超过 6h、锁过期后 monitor 的 ensure_topology 把桥接通道
+    #   清掉（RESET REPLICA ALL）导致追平检测永远「复制通道已清除」（issue #3/#4 的延续）。
+    #   任务完成后 is_node_migrating 即返回 False，monitor 自动接管，无需手动解锁。
+    try:
+        if is_node_migrating(host, port):
+            return True
+    except Exception:
+        pass
     return False
 
 
@@ -2026,7 +2038,7 @@ def bridge(task):
     _ensure_target_accounts(cfg, stage="bridge")
     acct = _ensure_source_repl_account(task)  # 源端复制账号（最小权限，必要时降级复用源账号）
     use_src = bool(acct.get("used_src_creds"))
-    m_user = cfg["src_user"] if use_src else cfg["repl_user"]
+    m_user = cfg["src_user"] if use_src else MIG_REPL_USER
     m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
     tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"])
     # 建桥接前先自检：用复制账号从管理端连一次源库，口令/授权不对立刻暴露，
@@ -2437,8 +2449,8 @@ def cleanup(task):
         # ❗此前两项都 try/except 静默吞掉，非 root 账号时会「谎报成功」：
         #   界面显示已收尾，实际账号没回收、老主也没置只读。故逐项记录并如实上报。
         try:
-            cur.execute(f"DROP USER IF EXISTS '{cfg['repl_user']}'@'%'")
-            done.append("已回收源端复制账号 '%s'@'%%'" % cfg["repl_user"])
+            cur.execute(f"DROP USER IF EXISTS '{MIG_REPL_USER}'@'%'")
+            done.append("已回收源端复制账号 '%s'@'%%'" % MIG_REPL_USER)
         except Exception as e:
             failed.append("回收复制账号失败：%s（需 CREATE USER 权限）" % e)
         try:
@@ -2464,7 +2476,7 @@ def cleanup(task):
 LAG_CAUGHT_UP_SEC = 0
 
 
-def check_lag(task, skip_acct=False):
+def check_lag(task, skip_acct=False, auto_heal=False):
     """停桥切换前的「追平检测」：确认目标已从源追平，避免带差切换导致数据丢失。
 
     纯只读，不改动任何节点。返回 caught_up 供前端放行「执行停桥切换」按钮。
@@ -2476,6 +2488,18 @@ def check_lag(task, skip_acct=False):
         repl = _replica_status(tgt)
     except Exception as e:
         return {"ok": False, "caught_up": False, "error": f"{type(e).__name__}: {e}"}
+    steps = task.get("steps") or {}
+    bridge_done = (steps.get("bridge") or {}).get("status") == "done"
+    cutover_done = (steps.get("cutover") or {}).get("status") == "done"
+    # —— 自动自愈①：复制通道丢失（monitor 清桥接 / 管理器重启）⇒ 自动重跑桥接重建 ——
+    # 仅手动「追平检测」触发（auto_heal=True），高频追踪不触发，避免反复重建。
+    if auto_heal and repl.get("note") and not cutover_done and bridge_done:
+        try:
+            bridge(task)
+            repl = _replica_status(tgt)
+        except Exception as e_heal:
+            repl = repl or {}
+            repl["heal_error"] = "重建桥接失败：" + str(e_heal)
     if repl.get("note"):
         # 目标上没有复制通道。仅回一句“不存在”会让人不知道下一步做什么，
         # 故用任务步骤状态区分三种情况，分别给出可操作指引。
@@ -2494,8 +2518,10 @@ def check_lag(task, skip_acct=False):
                     "若你的源库已停写、不需要追平增量，可勾选下方「源库已停写」跳过本检测。")
         else:
             why = "复制通道已清除"
-            hint = ("需要重做【第三步 → 「建立桥接」】这一步（桥接执行过，但目标上的复制通道现在不存在）。"
-                    "回到第三步重跑「建立桥接」即可重建通道。"
+            heal_tip = ("本次「追平检测」已尝试自动重建桥接"
+                        + ("（失败：" + repl.get("heal_error", "") + "）" if repl.get("heal_error") else "，请稍后再次点击「追平检测」或点「重建桥接」。"))
+            hint = ("需要重建【源库 → 目标】的复制通道（桥接执行过，但目标上的复制通道现在不存在）。"
+                    + heal_tip +
                     "若目标已被登记进 Custos 集群，monitor 的 ensure_topology 会持续清掉该通道，"
                     "此时应新建迁移任务，而不是重跑桥接。")
         return {"ok": True, "caught_up": False, "io_running": None, "sql_running": None,
@@ -2516,7 +2542,7 @@ def check_lag(task, skip_acct=False):
     steps_prev = task.get("steps") or {}
     bres = (steps_prev.get("bridge") or {}).get("result") or {}
     use_src = bool(bres.get("used_src_creds"))
-    m_user = cfg["src_user"] if use_src else cfg["repl_user"]
+    m_user = cfg["src_user"] if use_src else MIG_REPL_USER
     m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
     # skip_acct：前端「追平追踪」每 2s 采样一次，若每次都连源库做账号自检，
     # 5 分钟就是上百次连接，对老主是无谓负担 ⇒ 仅首次采样做自检，后续跳过。
@@ -2530,9 +2556,32 @@ def check_lag(task, skip_acct=False):
         except Exception as e:
             acct_ok, acct_err = False, str(e)
 
+    # —— 自动自愈②：通道在、但 IO/SQL 线程停了（复制错误如 1133/1062/1146）⇒ heal_replication ——
+    if auto_heal and (not io_ok or not sql_ok):
+        try:
+            ok_h, msg_h = heal_replication(
+                cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg.get("tgt_root_pass") or "",
+                root_user="root", root_pass=cfg.get("tgt_root_pass") or "")
+            if ok_h:
+                repl = _replica_status(tgt)
+                io_raw = repl.get("io_running"); sql_raw = repl.get("sql_running")
+                io_ok = str(io_raw or "").lower() == "yes"
+                sql_ok = str(sql_raw or "").lower() == "yes"
+                sb = repl.get("seconds_behind"); last_err = repl.get("last_error")
+        except Exception:
+            pass
+
     hint = ""
     if not sql_ok:
         reason = "SQL 线程未运行（状态=%s，复制未工作）" % (sql_raw or "未知")
+        if last_err:
+            # 此前只报“状态=No”却把 Last_SQL_Error 吞掉，用户完全看不到线程为什么停。
+            # 追平检测是只读的，但必须把错误文本带出来，否则无法判断是 1133/冲突/还是手动停的。
+            reason += "；复制错误：" + str(last_err)[:300]
+        hint = ("目标复制 SQL 线程已停止（通常是复制重放某条事件出错，如 1133/1062/1146 等）。"
+                "可点击下方「🔧 修复复制」尝试自愈（跳过冲突事务 / 补建缺失账号），"
+                "或到目标节点执行 SHOW REPLICA STATUS\\G 查看 Last_SQL_Error 后手动处理，"
+                "再回来点「追平检测」。")
     elif not io_ok:
         le = str(last_err or "")
         if "1236" in le or "binary log is not open" in le.lower():

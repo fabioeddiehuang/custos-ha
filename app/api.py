@@ -2948,7 +2948,34 @@ async def api_migration_lag(task_id: int, request: Request, user=Depends(auth_re
         task = _migration.get_task(task_id)
         if not task:
             return _json_ok({"ok": False, "error": "任务不存在"})
-        return _json_ok(_migration.check_lag(task, skip_acct=bool(b.get("skip_acct"))))
+        return _json_ok(_migration.check_lag(task, skip_acct=bool(b.get("skip_acct")),
+                                            auto_heal=bool(b.get("auto_heal"))))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/migration/{task_id}/heal")
+def api_migration_heal(task_id: int, user=Depends(auth_required)):
+    """迁移目标的复制自愈：桥接阶段目标(从库)的 SQL/IO 线程因复制错误(如 1133/冲突)停止时，
+    用目标 root 账号调用 heal_replication 跳过冲突事务 / 补建缺失账号 / 重启线程，使其恢复追平。
+
+    与集群「修复复制」(POST /api/heal) 不同：迁移目标此刻尚未登记进 Custos 集群，
+    无法走集群自愈；这里直接用迁移任务记录里的目标地址与 root 口令连接目标节点。
+    """
+    try:
+        task = _migration.get_task(task_id)
+        if not task:
+            return _json_ok({"ok": False, "error": "任务不存在"})
+        cfg = task["config"]
+        host = cfg["tgt_host"]; port = int(cfg["tgt_port"])
+        root_pass = cfg.get("tgt_root_pass") or ""
+        if not root_pass:
+            return _json_ok({"ok": False,
+                             "error": "任务未记录目标 root 口令，无法连接目标自愈；"
+                                      "请到目标节点手动 START REPLICA / 处理复制错误。"})
+        ok, msg = heal_replication(host, port, "root", root_pass,
+                                  root_user="root", root_pass=root_pass)
+        return _json_ok({"ok": ok, "msg": msg})
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
