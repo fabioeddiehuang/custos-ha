@@ -294,6 +294,7 @@
       <select id="srcType">
         <option value="mariadb-docker">容器化 MariaDB</option>
         <option value="mariadb">裸机 MariaDB</option>
+        <option value="docker">容器化 MySQL</option>
       </select>
     </div>
     <div class="field"><label>目标节点形态</label>
@@ -301,57 +302,13 @@
         <option value="" disabled selected>请选择节点形态</option>
         <option value="mariadb-docker">容器化 MariaDB</option>
         <option value="mariadb">裸机 MariaDB</option>
+        <option value="docker">容器化 MySQL</option>
       </select>
     </div>
   </div>
 
-  <!-- 高级模式专属：先账号（SSH），再逐步选项 -->
-  <div id="bOnly" style="display:none">
-    <div class="acct-title" style="margin-top:16px">账号（SSH，源端与目标端分别填写）</div>
-    <div class="mig-flow two">
-      <div class="mf-col">
-        <div class="mf-hd">源机 <span class="mf-role">被迁移</span></div>
-        <div class="field"><label>ssh 账号</label><input id="srcSshUser" placeholder="root"></div>
-        <div class="field"><label>ssh 密码</label><input id="srcSshPass" type="password"></div>
-        <div class="field"><label>ssh 端口</label><input id="srcSshPort" value="22" style="width:90px"></div>
-      </div>
-      <div class="mf-col">
-        <div class="mf-hd">目标机 <span class="mf-role">新主</span></div>
-        <div class="field"><label>ssh 账号</label><input id="tgtSshUser" placeholder="root"></div>
-        <div class="field"><label>ssh 密码</label><input id="tgtSshPass" type="password"></div>
-        <div class="field"><label>ssh 端口</label><input id="tgtSshPort" value="22" style="width:90px"></div>
-      </div>
-    </div>
-    <div class="bk-note">管理器默认不给节点下发公钥，SSH 密码留空不会自动走密钥，会直接失败。若目标是 Custos 纳管节点，也可到「节点管理」点「重新生成」启用 agent-exec 免 SSH。</div>
-
-    <div class="acct-title" style="margin-top:16px">目标信息（续）</div>
-    <div class="form-grid">
-      <div class="field"><label>目标版本</label>
-        <div style="display:flex;gap:8px;align-items:center">
-          <input id="tgtVer" placeholder="如 12.3.3-MariaDB" style="flex:1">
-          <button class="btn" type="button" onclick="probeTarget()">探测</button>
-        </div>
-      </div>
-      <div class="field"><label>目标数据目录（选填）</label>
-        <input id="tgtData" placeholder="留空自动探测">
-        <div class="field-hint">留空即可自动探测。</div>
-      </div>
-    </div>
-
-    <details class="adv-box" style="margin-top:14px">
-      <summary>高级选项（选填）</summary>
-      <div class="bk-note" style="margin-top:8px">以下高级选项仅「非标准安装」才需填写；留空将自动探测源端 my.cnf 路径与数据目录。</div>
-      <div class="form-grid" style="margin-top:10px">
-        <div class="field"><label>源端 my.cnf 路径</label>
-          <input id="srcCnf" placeholder="留空自动探测">
-        </div>
-        <div class="field"><label>源端数据目录</label>
-          <input id="srcData" placeholder="留空自动探测">
-        </div>
-      </div>
-    </details>
-  </div>
-
+  <!-- 高级/物理（SSH + mariabackup）模式已砍掉：逻辑通道不依赖任何文件系统路径，
+       源/目标账号与连接信息已在第 1 步填写，无需在此重复或指定 my.cnf / 数据目录。 -->
   <div class="field" style="margin-top:16px"><label>迁移任务名称</label><input id="taskName" value="数据库迁移"></div>
   <div class="btn-row">
     <button class="btn" onclick="setStep(1)">← 上一步</button>
@@ -720,8 +677,10 @@ async function doProbe(){
   $("probeBox").style.display = "block";
   updateModeSummary();
   // 预推荐通道
+  // 高级/物理（SSH + mariabackup）模式已砍掉：无论后端推荐什么，统一收口为通用模式（逻辑通道）。
   const rec = await postJSON("/api/migration/recommend", {size_mb:b.size_mb});
-  if(rec.ok){ STATE.channel = rec.channel; $("recInfo").textContent = "推荐: "+(rec.channel==='physical'?'高级模式':'通用模式')+" — "+rec.reason; }
+  STATE.channel = "logical";
+  if(rec.ok){ $("recInfo").textContent = "推荐: 通用模式（逻辑通道） — "+(rec.reason||"已移除高级/物理模式"); }
   // 检测完成后，在第 1 步直接展示「按检测结果推荐的迁移方式」，用户可改再进第 2 步
   const mb = $("methodBox"); if(mb){ mb.style.display = "block"; selChan(STATE.channel); }
 }
@@ -802,23 +761,15 @@ function goStep2(){
    注：原先的「迁移类型」分段控件放在第 1 步、却控制第 2 步的元素，点它屏幕上毫无变化，
    且与「迁移方式（桥接/停写）」中文近似，造成误解 —— 已移除，职责并入本步的模式卡片。 */
 function selChan(c){
-  // MySQL 源：物理通道（mariabackup）不可用于非 MariaDB 源，拦截误选
-  if(c === "physical" && STATE.probe && STATE.probe.flavor && STATE.probe.flavor !== "mariadb"){
-    alert("物理通道（mariabackup）仅支持 MariaDB 源；当前探测到的源端为 "
-          + (STATE.probe.flavor === "mysql" ? "MySQL" : "非 MariaDB")
-          + "，请使用「通用模式」（逻辑通道）。");
-    return;
-  }
-  STATE.channel = c;
-  document.querySelectorAll('.chan').forEach(el=>el.classList.toggle('sel', el.dataset.chan===c));
-  const bOnly = $("bOnly"); if(bOnly) bOnly.style.display = (c==='physical') ? 'block' : 'none';
-  // 推荐徽标跟着所选模式走
-  const tagA = $("tagA"), tagB = $("tagB");
-  if(tagA) { tagA.textContent = (c==='logical') ? '已选' : '通用'; tagA.className = 'tag' + (c==='logical' ? ' rec' : ''); }
-  if(tagB) { tagB.textContent = (c==='physical') ? '已选' : '大库/高速'; tagB.className = 'tag' + (c==='physical' ? ' rec' : ''); }
+  // 高级/物理（SSH + mariabackup）模式已砍掉：仅保留通用模式（逻辑通道）。
+  // 任何非 logical 的选择都强制收口为 logical，杜绝走到已移除的 SSH/物理路径。
+  STATE.channel = "logical";
+  document.querySelectorAll('.chan').forEach(el=>el.classList.toggle('sel', el.dataset.chan==="logical"));
+  const tagA = $("tagA");
+  if(tagA) { tagA.textContent = '已选'; tagA.className = 'tag rec'; }
   updateModeSummary();
   const ms = $("methodSummaryTxt");
-  if(ms) ms.textContent = (c==='physical' ? '高级模式（物理热备）' : '通用模式（逻辑通道）');
+  if(ms) ms.textContent = '通用模式（逻辑通道）';
 }
 
 async function createTask(){
@@ -826,52 +777,23 @@ async function createTask(){
   const filter = $("dbFilter").value.trim();
   let databases = selected;
   if(filter){ databases = filter.split(",").map(s=>s.trim()).filter(Boolean); }
-  // 物理通道 B：管理器默认不给节点下发公钥，SSH 密码留空【不会】自动走密钥认证，
-  // 必然在第 3 步才报「无法 SSH 到源机/目标机」（实测踩过）。这里提前拦截，
-  // 并主动提议复用「数据库 root 密码」（多数部署两者相同），避免又白跑一趟。
-  if(STATE.channel === "physical"){
-    if(!$("srcSshPass").value){
-      if(confirm("「源机 SSH 密码」为空。\n\n管理器默认不给节点下发公钥，留空不会自动走密钥认证，物理迁移会在第 3 步报「无法 SSH 到源机」。\n\n是否用刚填的「源库 root 密码」作为源机 SSH 密码？\n（若源机 root 的 SSH 密码与其数据库密码不同，请点「取消」后手动填写）")){
-        $("srcSshPass").value = $("srcPass").value;
-      } else {
-        alert("已取消：请手动填写「源机 SSH 密码」（该机器宿主机 root 的 SSH 密码）后再执行。");
-        return;
-      }
-    }
-    if(!$("tgtSshPass").value){
-      if(confirm("「目标机 SSH 密码」为空。\n\n若目标节点已由 Custos 纳管、并在「节点管理」里点过「重新生成」启用了 agent-exec，可留空（免 SSH）；\n否则会在第 3 步报「无法 SSH 到目标机」。\n\n是否用刚填的「目标 root 密码」作为目标机 SSH 密码？")){
-        $("tgtSshPass").value = $("tgtRoot").value;
-      }
-    }
-  }
   const body = {
     name:$("taskName").value.trim()||"数据库迁移",
     src_host:$("srcHost").value.trim(), src_port:+$("srcPort").value||3306,
     src_user:$("srcUser").value.trim()||"root", src_pass:$("srcPass").value,
     src_gtid: !!(STATE.probe && STATE.probe.gtid_ready),
     tgt_host:$("tgtHost").value.trim(), tgt_port:+$("tgtPort").value||3307,
-    tgt_root_pass:$("tgtRoot").value,     tgt_version:$("tgtVer").value.trim(),
-    // 目标库账号（新增，默认 root）：非 root 仅能保证「数据导入」，
-    // 桥接/注册节点/切换需更高权限，已在第 1 步检测里分层提示。
+    tgt_root_pass:$("tgtRoot").value,
     tgt_user:($("tgtUser").value.trim()||"root"),
-    node_type:$("tgtType").value, channel:STATE.channel,
-    tgt_datadir:$("tgtData").value.trim()||null,
-    src_my_cnf:$("srcCnf").value.trim()||null,
-    src_data_dir:$("srcData").value.trim()||null,
+    node_type:$("tgtType").value, channel:"logical",
     src_type:$("srcType").value||null,
-    src_ssh_user:$("srcSshUser").value.trim()||null,
-    src_ssh_pass:$("srcSshPass").value||null,
-    tgt_ssh_user:$("tgtSshUser").value.trim()||null,
-    tgt_ssh_pass:$("tgtSshPass").value||null,
-    src_ssh_port: parseInt($("srcSshPort").value,10)||22,
-    tgt_ssh_port: parseInt($("tgtSshPort").value,10)||22,
-    // 产品线决定 dump 工具与 GTID 参数（两者互斥）；size_mb 用于真实百分比进度
     src_flavor:(STATE.probe&&STATE.probe.flavor)||"mariadb",
     src_major:(STATE.probe&&STATE.probe.major)||0,
-    tgt_flavor:"mariadb",
+    // 目标产品线跟随「目标节点形态」下拉：docker=MySQL，其余均为 MariaDB
+    tgt_flavor:(function(){ const t=$("tgtType").value; return t==="docker"?"mysql":"mariadb"; })(),
     size_mb:(STATE.probe&&STATE.probe.size_mb)||0, databases
   };
-  if(!$("tgtType").value){ alert("请选择目标节点形态（容器化 / 裸机 MariaDB）"); return; }
+  if(!$("tgtType").value){ alert("请选择目标节点形态（容器化/裸机 MariaDB 或容器化 MySQL）"); return; }
   const b = await postJSON("/api/migration/create", body);
   if(!b.ok){ alert("创建失败: "+b.error); return; }
   STATE.taskId = b.id;
@@ -1541,24 +1463,6 @@ async function runCleanup(){
     // 完成弹窗统一告知「已完成 + 下一步」，未完成项也在弹窗里如实列出
     showDoneModal("cleanup", failed);
   });
-}
-
-// 探测目标版本并自动填充（DESIGN-003）
-async function probeTarget(){
-  const host = $("tgtHost").value.trim();
-  if(!host){ alert("请先在第 1 步填写目标地址与密码"); return; }
-  const b = await postJSON("/api/migration/probe_target",
-    {tgt_host:host, tgt_port:+$("tgtPort").value||3307,
-     tgt_user:($("tgtUser").value.trim()||"root"), tgt_root_pass:$("tgtRoot").value});
-  if(!b.ok){ alert("探测失败: "+b.error); return; }
-  if($("tgtVer")) $("tgtVer").value = b.version || "";
-  // 顺带刷新第 1 步的目标卡片（版本/可用范围），保持两处一致
-  await probeTargetInfo();
-  const pv = b.privileges || {};
-  const tail = (pv.ok && pv.missing && pv.missing.length)
-    ? "\n\n注意：该账号不可用阶段 → " + pv.missing.join("、") + "（建议 root）"
-    : "";
-  alert("目标版本: " + (b.version || "未知") + tail);
 }
 
 // 历史迁移任务相关函数（showHistory / hideHistory / openDetail / resumeTask 等）

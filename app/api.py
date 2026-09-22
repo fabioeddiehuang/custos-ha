@@ -2839,7 +2839,7 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
         node_type = b.get("node_type") or ""
         if node_type not in ("mariadb", "mariadb-docker", "docker"):
             return _json_ok({"ok": False,
-                             "error": "请选择有效的目标节点形态（容器化 MariaDB / 裸机 MariaDB）"})
+                             "error": "请选择有效的目标节点形态（容器化 MariaDB / 裸机 MariaDB / 容器化 MySQL）"})
         databases = b.get("databases") or []
         if isinstance(databases, str):
             databases = [d.strip() for d in databases.split(",") if d.strip()]

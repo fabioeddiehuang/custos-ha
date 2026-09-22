@@ -641,6 +641,21 @@ def seed_logical(task):
         raise RuntimeError("逻辑导入失败（退出码 dump=%s load=%s）: %s"
                            % (p1.returncode, p2.returncode, detail))
 
+    # ── 防静默漏表 ────────────────────────────────────────────────────────
+    # 导入端（mysql/mariadb 客户端）批量执行时，若某张表的 CREATE TABLE 失败会
+    # 【继续往下走、且可能返回退出码 0】，于是部分表没建出来却报成功（实测 33→203
+    # 漏了 certd.pi_template / certd.sys_passkey 两张表）。这里强制对照源/目标
+    # 表清单；有缺表先单独补救一次，仍失败则硬报错，杜绝「数据没迁全还显示成功」。
+    _missing = _reconcile_seed_tables(src, tgt, databases)
+    if _missing:
+        _imp_err = (lerr or err2 or b"").decode(errors="replace")
+        _missing = _retry_missing_tables(task, cfg, src, tgt, databases, _missing)
+        if _missing:
+            _detail = "; ".join("%s.%s" % (d, t) for d, t in _missing)
+            raise RuntimeError(
+                "逻辑导入缺表且补救失败（源有、目标无）：%s\n导入端报错：%s"
+                % (_detail, _imp_err[:1500]))
+
     # 导入可能覆盖/重建 mysql 库（全库导入场景）⇒ 目标账号有被冲掉的风险，
     # 导入完成后立刻按集群凭证重建一次（幂等；未登记集群时自动跳过）。
     _acct = _ensure_target_accounts(cfg, stage="seed_logical")
@@ -651,6 +666,87 @@ def seed_logical(task):
             "accounts": _acct,
             "bytes": read_bytes, "src_gtid": src_gtid, "capabilities": {
                 k: cap[k] for k in ("same_engine", "cross_engine", "pipeline", "bridge")}}
+
+
+def _tbl_set(conn, db):
+    """取某库 BASE TABLE 集合（出错返回空集，不阻断对账）。"""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TABLE_NAME FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_TYPE='BASE TABLE'", (db,))
+        return set(x[0] for x in cur.fetchall())
+    except Exception:
+        return set()
+
+
+def _reconcile_seed_tables(src, tgt, databases):
+    """seed 后对照源/目标 BASE TABLE 清单，返回（库,表）缺表列表（源有、目标无）。"""
+    try:
+        sc = connect(*src, timeout=8)
+        tc = connect(*tgt, timeout=8)
+    except Exception as e:
+        print("[migration] 缺表对账连接失败（不阻断，交由既有校验）: %s" % e)
+        return []
+    missing = []
+    try:
+        for db in databases:
+            s = _tbl_set(sc, db); t = _tbl_set(tc, db)
+            for tbl in sorted(s - t):
+                missing.append((db, tbl))
+    finally:
+        for c in (sc, tc):
+            try: c.close()
+            except Exception: pass
+    return missing
+
+
+def _retry_missing_tables(task, cfg, src, tgt, databases, missing):
+    """对仍缺失的表单独重新导出+导入一次（绕开首次批量流里被吞掉的单表错误）。
+    返回补救后依旧缺失的（库,表）列表。若根因是 DDL 不兼容（如 DATA DIRECTORY/
+    TABLESPACE 路径在目标不存在），补救同样会失败，此时由上层抛出并附带导入端报错。"""
+    by_db = {}
+    for db, tbl in missing:
+        by_db.setdefault(db, []).append(tbl)
+    src_flavor = cfg.get("src_flavor") or "mariadb"
+    try:
+        dump, cli, dialect = resolve_client_tools(src_flavor)
+    except Exception as e:
+        print("[migration] 缺表补救工具解析失败: %s" % e)
+        return missing
+    tgt_dialect = tool_dialect(cli)
+    for db, tbls in by_db.items():
+        try:
+            dump_args = ([dump, "-h", src[0], "-P", str(src[1]), "-u", src[2]]
+                         + _pw_arg(src[3]) + [
+                             "--single-transaction", "--hex-blob",
+                             "--default-character-set=utf8mb4", "--skip-lock-tables",
+                             "--databases", db, "--tables"] + tbls
+                         + dump_gtid_args(dialect, want_gtid=False) + ssl_args(dialect))
+            load_args = ([cli, "-h", tgt[0], "-P", str(tgt[1]), "-u", tgt[2]]
+                         + _pw_arg(tgt[3]) + ssl_args(tgt_dialect))
+            p1 = subprocess.Popen(dump_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            p2 = subprocess.Popen(load_args, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            data = p1.stdout.read()
+            p1.stdout.close()
+            try: p1.wait(timeout=300)
+            except Exception: pass
+            try:
+                p2.stdin.write(data); p2.stdin.close()
+            except Exception as e:
+                print("[migration] 缺表补救写入失败 %s: %s" % (db, e))
+            try: p2.wait(timeout=300)
+            except Exception: pass
+            if p1.returncode != 0:
+                print("[migration] 缺表补救导出失败 %s.%s: %s"
+                      % (db, ",".join(tbls), (p1.stderr.read() or b"").decode(errors="replace")[:300]))
+            if p2.returncode != 0:
+                print("[migration] 缺表补救导入失败 %s.%s: %s"
+                      % (db, ",".join(tbls), (p2.stderr.read() or b"").decode(errors="replace")[:300]))
+        except Exception as e:
+            print("[migration] 缺表补救异常 %s: %s" % (db, e))
+    return _reconcile_seed_tables(src, tgt, databases)
 
 
 # ---------------------------------------------------------------------------
