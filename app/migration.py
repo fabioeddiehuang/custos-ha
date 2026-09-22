@@ -125,10 +125,23 @@ def get_task(tid):
 
 def list_tasks():
     rows = query(
-        "SELECT id, name, channel, status, progress, stage, created_at, updated_at "
+        "SELECT id, name, channel, status, progress, stage, created_at, updated_at, config "
         "FROM migration_tasks ORDER BY id DESC"
     )
-    return rows
+    # 顺带把目标节点地址带出，供前端「解锁迁移锁」按钮直接调用 /api/migration/unlock
+    # （迁移锁按 host:port 定位，列表不返回则前端只能手动填）。
+    out = []
+    for r in rows:
+        item = dict(r)
+        cfg = {}
+        try:
+            cfg = json.loads(item.get("config") or "{}")
+        except Exception:
+            pass
+        item["tgt_host"] = cfg.get("tgt_host") or ""
+        item["tgt_port"] = int(cfg.get("tgt_port") or 0)
+        out.append(item)
+    return out
 
 
 def delete_task(tid):

@@ -70,6 +70,7 @@
     <div id="detailBody"></div>
     <div class="acts">
       <button class="btn danger" onclick="detailDelete()">删除任务</button>
+      <button class="btn" onclick="unlockDetail()">🔓 解锁迁移锁</button>
       <button class="btn" onclick="closeDetail()">关闭</button>
       <button class="btn btn-primary" onclick="detailResume()">回到向导</button>
     </div>
@@ -82,6 +83,50 @@ const $ = (id) => document.getElementById(id);
 function postJSON(url, body){
   return fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})})
     .then(r => r.json().catch(() => ({ok:false, error:"非JSON响应"})));
+}
+
+// ---- 解锁迁移锁：强制清除某节点的迁移锁 + 残留 running 任务 ----
+// 与迁移向导顶部「解锁迁移锁」按钮效果一致；此处按任务记录里的目标地址调用。
+async function unlockHost(host, port){
+  host = (host||"").toString().trim();
+  port = parseInt(port)||3307;
+  if(!host){
+    alert("该任务没有记录目标节点地址，无法解锁。请改用迁移向导顶部的「解锁迁移锁」并手动填写目标地址。");
+    return;
+  }
+  const msg = "确认强制解除该节点的迁移锁？\n\n"
+    + "节点：" + host + ":" + port + "\n"
+    + "将清除该节点的迁移锁，并清理指向它的 running 迁移任务"
+    + "（重装/重建后这些任务已无意义，且会让仪表盘永久显示「迁移中」）。\n\n"
+    + "⚠ 仅在该节点已确认不再作为迁移目标时使用；若仍有正常迁移在跑，请勿点击。";
+  if(!confirm(msg)) return;
+  try{
+    const b = await postJSON("/api/migration/unlock", {host, port, clear_tasks:true});
+    if(b && b.ok){
+      const parts = [];
+      if(b.unlocked) parts.push("迁移锁已清除");
+      if(b.tasks_deleted) parts.push("清理 running 任务 " + b.tasks_deleted + " 个");
+      if(b.task_error) parts.push("（任务清理提示: " + b.task_error + "）");
+      alert("✅ 解锁成功：" + (parts.join("；") || "无需处理"));
+      loadHistory();
+    } else {
+      alert("解锁失败: " + (b && b.error || "未知错误"));
+    }
+  }catch(e){ alert("解锁请求失败: " + e); }
+}
+
+// 从详情任务数据里取出目标地址（config 是 DB 里的 JSON 字符串）
+function _detailTgt(){
+  let cfg = _detailData && _detailData.config;
+  if(typeof cfg === "string"){ try{ cfg = JSON.parse(cfg); }catch(e){ cfg = {}; } }
+  cfg = cfg || {};
+  return { host: cfg.tgt_host || "", port: parseInt(cfg.tgt_port)||0 };
+}
+async function unlockDetail(){
+  const {host, port} = _detailTgt();
+  await unlockHost(host, port);
+  closeDetail();
+  loadHistory();
 }
 function statusLabel(s){ return ({draft:"草稿",running:"执行中",error:"失败",done:"完成"})[s] || s; }
 function statusClass(s){ return ({draft:"m",running:"b",error:"r",done:"g"})[s] || "m"; }
@@ -174,6 +219,7 @@ function renderHistory(list){
       <td class="acts-cell">
         ${canResume?`<button class="mini-btn" onclick="resumeTask(${t.id})">继续</button>`:""}
         <button class="mini-btn" onclick="openDetail(${t.id})">详情</button>
+        ${t.tgt_host?`<button class="mini-btn" onclick="unlockHost('${escapeHtml(t.tgt_host)}', ${t.tgt_port||0})">解锁</button>`:""}
         ${canDelete?`<button class="mini-btn danger" onclick="deleteTask(${t.id}, ${isRunning})">删除</button>`:""}
       </td>
     </tr>`;

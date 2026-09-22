@@ -166,6 +166,7 @@
 <div class="toolbar">
   <strong style="font-size:15px;color:var(--text)">数据迁移向导</strong>
   <span class="spacer"></span>
+  <button class="btn" onclick="unlockMigration()" title="强制解除某节点的迁移锁与残留任务（节点重装/重建后卡在「迁移中」时使用）">🔓 解锁迁移锁</button>
   <button class="btn" onclick="location.reload()">⟳ 刷新</button>
 </div>
 
@@ -599,6 +600,38 @@ function markStepErr(n){ const s=document.querySelector('.wz-step[data-step="'+n
 async function postJSON(url, body){
   const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})});
   try { return await r.json(); } catch(e){ return {ok:false, error:"非JSON响应"}; }
+}
+
+// ---- 解锁迁移锁：强制清除某节点的迁移锁 + 残留 running 任务 ----
+// 场景：节点被重装/重建后，管理后台仍残留「迁移中」状态（锁 + 指向它的 running 任务），
+// 导致仪表盘永久显示「迁移中」并让 failover 跳过该节点拓扑维护。一键清理免手敲 SQL。
+async function unlockMigration(){
+  const host = ($("tgtHost") && $("tgtHost").value.trim()) || "";
+  const port = +($("tgtPort") && $("tgtPort").value) || 3307;
+  if(!host){
+    alert("请先在向导里填写目标节点地址（第 1 步「目标 - 地址」），再点解锁。");
+    return;
+  }
+  const msg = "确认强制解除该节点的迁移锁？\n\n"
+    + "节点：" + host + ":" + port + "\n"
+    + "将清除该节点的迁移锁，并清理指向它的 running 迁移任务"
+    + "（重装/重建后这些任务已无意义，且会让仪表盘永久显示「迁移中」）。\n\n"
+    + "⚠ 仅在该节点已确认不再作为迁移目标时使用；若仍有正常迁移在跑，请勿点击。";
+  if(!confirm(msg)) return;
+  try{
+    const b = await postJSON("/api/migration/unlock", {host, port, clear_tasks:true});
+    if(b && b.ok){
+      const parts = [];
+      if(b.unlocked) parts.push("迁移锁已清除");
+      if(b.tasks_deleted) parts.push("清理 running 任务 " + b.tasks_deleted + " 个");
+      if(b.task_error) parts.push("（任务清理提示: " + b.task_error + "）");
+      alert("✅ 解锁成功：" + (parts.join("；") || "无需处理"));
+      if($("runBanner")) $("runBanner").style.display = "none";
+      if(typeof loadHistory === "function") loadHistory();
+    } else {
+      alert("解锁失败: " + (b && b.error || "未知错误"));
+    }
+  }catch(e){ alert("解锁请求失败: " + e); }
 }
 
 async function doProbe(){
