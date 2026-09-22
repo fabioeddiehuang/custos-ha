@@ -1072,19 +1072,27 @@ function renderVerify(r){
        + (r.deep ? '<th style="padding:4px 6px">内容校验</th>' : '')
        + '<th style="padding:4px 6px">结果</th></tr></thead><tbody>';
     for(const t of rows){
-      const bad = !t.rows_ok;
+      const isLag = !!t.lag;
+      const bad = !t.rows_ok && !isLag;
       const ck = (t.ck_ok === true) ? '一致' : (t.ck_ok === false ? '有差异' : (t.ck_note ? '不可用' : '-'));
       const rs = (t.rows_src === null || t.rows_src === undefined) ? '-' : t.rows_src;
       const rt = (t.rows_tgt === null || t.rows_tgt === undefined) ? '-' : t.rows_tgt;
+      const resTxt = isLag ? '追平中（行数暂不一致）' : (bad ? '不一致' : '一致');
+      const resColor = bad ? 'var(--danger)' : (isLag ? 'var(--warn,#e6a23c)' : 'var(--ok,#2ecc71)');
       h += '<tr style="border-top:1px solid var(--surface-3)">'
          + '<td style="padding:4px 6px;font-family:monospace">' + t.db + '.' + t.table + '</td>'
          + '<td style="padding:4px 6px">' + rs + '</td>'
          + '<td style="padding:4px 6px">' + rt + '</td>'
          + (r.deep ? '<td style="padding:4px 6px">' + ck + '</td>' : '')
-         + '<td style="padding:4px 6px;color:' + (bad ? 'var(--danger)' : 'var(--ok,#2ecc71)') + '">'
-         + (bad ? '不一致' : '一致') + (t.note ? '（' + t.note + '）' : '') + '</td></tr>';
+         + '<td style="padding:4px 6px;color:' + resColor + '">'
+         + resTxt + (t.note && !isLag ? '（' + t.note + '）' : '') + '</td></tr>';
     }
     h += '</tbody></table></div>';
+  }
+  if(r.lag_diffs && r.lag_diffs.length){
+    h += '<div style="font-size:12px;color:var(--warn,#e6a23c);margin-top:6px;line-height:1.6">'
+       + '⚠ ' + r.lag_diffs.length + ' 张表仍在复制追平中（行数暂不一致），属复制延迟而非数据不一致；'
+       + '待复制延迟归零后复测即可，不影响切换。</div>';
   }
   if(r.deep){
     const c = r.checksum || {};

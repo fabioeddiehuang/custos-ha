@@ -2114,8 +2114,13 @@ def verify(task, deep=False):
     databases = cfg.get("databases") or []
     s_conn = connect(*src, timeout=8)
     t_conn = connect(*tgt, timeout=8)
-    tables, missing, diffs = [], [], []
+    tables, missing, diffs, lag_diffs = [], [], [], []
     ck_checked = ck_mismatch = ck_unsupported = 0
+    # 复制状态提前取：桥接模式下目标是【仍在追平的活从库】，COUNT(*) 与 CHECKSUM
+    # 在不同时刻读取会受复制延迟影响；据此把「行数瞬时差 1 行」区分成
+    # 「复制追平中（非数据不一致）」还是「真正的行数不一致」，避免误报（根治反复出现的
+    # "行数不一致但内容校验全一致" 自相矛盾提示）。
+    repl = _replica_status(tgt)
     try:
         for db in databases:
             def _tables(conn, dbname):
@@ -2180,12 +2185,42 @@ def verify(task, deep=False):
     finally:
         s_conn.close(); t_conn.close()
 
-    # 复制状态（MariaDB：SHOW REPLICA STATUS，兼容 Replica_/Slave_ 两种列名）
-    repl = _replica_status(tgt)
+    # ---- 行数差异归因：区分「复制追平中（瞬时延迟）」与「真正的行数不一致」 ----
+    # 桥接模式目标为活从库：复制仍在追平，COUNT(*) 在两个时刻读到不同行数属正常，
+    # 不应报成数据不一致。判定逻辑：
+    #   ① 开了内容级校验且 CHECKSUM 一致 ⇒ 内容完全相同，行数差必为瞬时读取竞态 ⇒ 非差异；
+    #   ② 复制健康且在追平（SQL 线程 Running、无错误、延迟非 0）⇒ 行数差是复制延迟 ⇒ 追平中；
+    #   ③ 其余（已追平却仍差 / 复制中断报错）⇒ 真正的行数不一致。
+    sql_running = (repl or {}).get("sql_running")
+    repl_err = (repl or {}).get("last_error")
+    sbm = (repl or {}).get("seconds_behind")
+    healthy_lag = (sql_running == "Yes") and (not repl_err) and (sbm not in (0, None))
+    real_diffs = []
+    for d in diffs:
+        t = next((x for x in tables if x["db"] == d["db"] and x["table"] == d["table"]), None)
+        if t and deep and t.get("ck_ok") is True:
+            # CHECKSUM 已证明内容一致 ⇒ 行数差是读取竞态，撤销差异标记（根治核心）
+            t["rows_ok"] = True
+            t["note"] = "内容校验(CHECKSUM)已通过，行数瞬时差异系复制延迟，非数据不一致"
+            continue
+        if healthy_lag:
+            # 复制健康追平中 ⇒ 行数差为延迟导致，标记「追平中」而非失败
+            if t:
+                t["lag"] = True
+                t["note"] = "复制追平中，行数暂不一致（复制延迟，非数据不一致，待延迟归零后复测即可）"
+            lag_diffs.append(d)
+            continue
+        real_diffs.append(d)
+    diffs = real_diffs
+
     ok_n = sum(1 for t in tables if t["rows_ok"])
     consistent = (not diffs) and (not missing)
     if consistent:
-        summary = "已校验 %d 张表，行数全部一致" % ok_n
+        if lag_diffs:
+            summary = ("已校验 %d 张表，行数全部一致；%d 张表复制追平中（行数暂不一致，"
+                       "待复制延迟归零后复测即可）" % (ok_n, len(lag_diffs)))
+        else:
+            summary = "已校验 %d 张表，行数全部一致" % ok_n
     else:
         summary = ("共 %d 张表：%d 张一致，%d 张行数不一致，%d 张目标缺失"
                    % (len(tables) + len(missing), ok_n, len(diffs), len(missing)))
@@ -2200,6 +2235,7 @@ def verify(task, deep=False):
         "tables_ok": ok_n,
         "diffs": diffs,
         "missing": missing,
+        "lag_diffs": lag_diffs,
         "consistent": consistent,
         "tables": tables,
         "checksum": {"enabled": bool(deep), "checked": ck_checked,
