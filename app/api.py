@@ -2886,7 +2886,7 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
         }
         task = {
             "name": b.get("name") or "未命名迁移",
-            "channel": b.get("channel", "logical"),
+            "channel": "logical",  # 2.4.1 起仅通用模式；高级模式（物理）已取消
             "status": "draft",
             "config": cfg,
             "steps": {},

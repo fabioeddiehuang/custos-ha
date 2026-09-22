@@ -236,7 +236,7 @@ def recommend_channel(probe, channel_pref=None):
     if channel_pref in ("logical", "physical"):
         chosen = channel_pref
     else:
-        chosen = "physical" if size_gb >= SIZE_THRESHOLD_GB else "logical"
+        chosen = "logical"  # 2.4.1 起取消高级模式（物理通道），仅保留通用模式（逻辑通道）
     if chosen == "physical":
         # 物理通道（mariabackup）仅 MariaDB 源可用：目标恒为 Custos MariaDB，
         # 跨引擎物理备份不可行（MySQL 8 起无 .frm；capabilities 也已把 physical 置 False）。
@@ -3017,7 +3017,7 @@ def _execute_step(task_id, step, opts=None):
             if not cap["physical"]:
                 raise RuntimeError("物理通道不支持跨产品线迁移（MySQL 8 起元数据改用全局数据字典，"
                                    "MariaDB 无法读取其数据目录），请改用逻辑通道。")
-            return seed_physical(task)
+            return seed_logical(task)  # 2.4.1 起高级模式已取消，物理任务降级为逻辑通道
         return seed_logical(task)
     if step == "bridge":
         if not cap["bridge"]:

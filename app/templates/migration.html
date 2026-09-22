@@ -265,15 +265,11 @@
     </div>
 
     <div id="methodBox" style="display:none;margin-top:14px">
-      <div style="font-size:13px;font-weight:600;color:var(--text)">迁移方式（按检测结果推荐，可改）</div>
+      <div style="font-size:13px;font-weight:600;color:var(--text)">迁移方式：通用模式（逻辑通道）</div>
       <div class="chan-grid" id="chanGrid" style="margin-top:8px">
-        <div class="chan" data-chan="logical" onclick="selChan('logical')">
-          <h4>通用模式 <span class="tag" id="tagA">推荐</span></h4>
+        <div class="chan sel" data-chan="logical" onclick="selChan('logical')">
+          <h4>通用模式 <span class="tag rec" id="tagA">已选</span></h4>
           <p>逻辑通道：导出用户库再导入，跨版本最安全，适合中少量数据。</p>
-        </div>
-        <div class="chan" data-chan="physical" onclick="selChan('physical')">
-          <h4>高级模式 <span class="tag" id="tagB">大库/高速</span></h4>
-          <p>物理热备：mariabackup 备份恢复，适合大库。仅 MariaDB → MariaDB（源须为 MariaDB，MySQL 源请用「通用模式」），支持跨版本升级，不能降级。</p>
         </div>
       </div>
       <div class="kv" id="recInfo" style="margin-top:8px"></div>
@@ -1593,7 +1589,7 @@ async function resumeTask(tid){
   }catch(e){ alert("加载任务失败: "+e); return; }
   if(!j || j.ok===false){ alert("任务不存在或加载失败"); return; }
   STATE.taskId = tid;
-  STATE.channel = j.channel || "logical";
+  STATE.channel = (j.channel && j.channel !== "physical") ? j.channel : "logical";  // 高级模式已取消，残留物理任务降级为通用模式
   const cfg = j.config || {};
   STATE.mode = cfg.src_gtid ? "bridge" : "stopwrite";
   markStepDone(1); markStepDone(2);
@@ -1711,7 +1707,7 @@ function renderHistory(list){
       <td class="sel-col"><input type="checkbox" class="hist-sel" value="${t.id}" onchange="updateSelInfo()"></td>
       <td>${t.id}</td>
       <td>${escapeHtml(t.name||"")}</td>
-      <td>${t.channel==="physical"?"B 物理":"A 逻辑"}</td>
+      <td>${"通用模式"}</td>
       <td><span class="mbadge ${statusClass(t.status)}">${statusLabel(t.status)}</span></td>
       <td>${progressCell(t)}</td>
       <td class="muted">${escapeHtml(t.stage||"")}${progStall(t.id, t.progress||0)}</td>
@@ -1845,7 +1841,7 @@ function renderDetail(j){
   $("detailTitle").textContent = "任务 #"+j.id+" · "+(j.name||"");
   $("detailBody").innerHTML =
     '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;font-size:12.5px">'+
-      '<span>通道：'+(j.channel==="physical"?"B 物理":"A 逻辑")+'</span>'+
+      '<span>通道：'+"通用模式"+'</span>'+
       '<span>状态：<span class="mbadge '+statusClass(j.status)+'">'+statusLabel(j.status)+'</span></span>'+
       '<span>创建：'+escapeHtml(j.created_at||"")+'</span>'+
       '<span>更新：'+escapeHtml(j.updated_at||"")+'</span>'+
