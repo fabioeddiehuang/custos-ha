@@ -1,6 +1,6 @@
 # Custos
 
-> 当前版本：**v2.4.0**（数据迁移向导：MariaDB↔MariaDB + MySQL 5.7→MariaDB）
+> 当前版本：**v2.4.1**（数据迁移向导：MariaDB↔MariaDB + MySQL↔MariaDB（含 MySQL 目标）；节点类型规范名重命名）
 > 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)；**v2.3 起**每个版本的独立规划见 [`doc/releases/`](./doc/releases/)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
 

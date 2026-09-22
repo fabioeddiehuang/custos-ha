@@ -1,0 +1,330 @@
+{% extends "base.html" %}
+{% block title %}集群接管向导{% endblock %}
+{% block page_title %}集群接管向导{% endblock %}
+{% block content %}
+<style>
+  .wz-steps{display:flex;gap:0;margin:18px 0 26px;flex-wrap:wrap}
+  .wz-step{position:relative;flex:1;min-width:120px;text-align:center;color:var(--muted);font-size:13px}
+  .wz-step .dot{width:30px;height:30px;border-radius:50%;margin:0 auto 7px;display:flex;
+    align-items:center;justify-content:center;background:var(--surface);border:2px solid var(--border);
+    font-weight:700;color:var(--muted)}
+  .wz-step.active .dot{background:var(--accent,#0ABAB5);border-color:var(--accent,#0ABAB5);color:#06222a}
+  .wz-step.done .dot{background:var(--primary);border-color:var(--primary);color:#fff}
+  .wz-step:not(:last-child)::after{content:"";position:absolute;top:15px;left:60%;width:80%;height:2px;
+    background:var(--border);z-index:-1}
+  .wz-step.active:not(:last-child)::after,.wz-step.done:not(:last-child)::after{background:var(--accent,#0ABAB5)}
+  .card{padding:20px}
+  .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 18px}
+  .field{display:flex;flex-direction:column;gap:6px}
+  .field label{font-size:12.5px;color:var(--muted)}
+  .field input,.field select{padding:9px 11px;border:1px solid var(--border);border-radius:9px;
+    background:var(--bg);color:var(--text);font-size:14px}
+  .field .hint{font-size:11.5px;color:var(--muted);opacity:.8}
+  .row-actions{margin-top:18px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .btn-primary{background:var(--accent,#0ABAB5);color:#06222a;border:none;padding:10px 18px;
+    border-radius:9px;font-weight:700;cursor:pointer}
+  .btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text);padding:10px 16px;
+    border-radius:9px;cursor:pointer}
+  .btn-danger{background:transparent;border:1px solid var(--primary);color:var(--primary);padding:10px 16px;
+    border-radius:9px;cursor:pointer}
+  .result{margin-top:22px;display:none}
+  .kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 18px;font-size:13px}
+  .kv b{color:var(--muted);font-weight:600;margin-right:6px}
+  .pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;border:1px solid var(--border)}
+  .pill.ok{color:#19b36b;border-color:#19b36b} .pill.bad{color:var(--primary);border-color:var(--primary)}
+  .pill.warn{color:#f0a020;border-color:#f0a020} .pill.mut{color:var(--muted)}
+  table.tbl{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}
+  table.tbl th,table.tbl td{padding:8px 10px;border-bottom:1px solid var(--border);text-align:left}
+  table.tbl th{color:var(--muted);font-weight:600}
+  .sec-title{margin:22px 0 10px;font-size:15px;font-weight:700;color:var(--text)}
+  .err{color:var(--primary);font-size:13px;margin-top:10px}
+  .mode-btns{display:flex;gap:10px}
+  .mode-btns label{padding:8px 14px;border:1px solid var(--border);border-radius:9px;cursor:pointer;font-size:13px}
+  .mode-btns input{display:none}
+  .mode-btns label.on{border-color:var(--accent,#0ABAB5);background:var(--accent-light,#0ABAB514);color:var(--accent,#0ABAB5)}
+  .progress{height:10px;background:var(--border);border-radius:6px;overflow:hidden;margin-top:10px}
+  .progress > i{display:block;height:100%;background:var(--accent,#0ABAB5);width:0;transition:width .3s}
+  .step-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border)}
+  .step-row .sname{font-size:13.5px;flex:1}
+  .step-row .sst{font-size:12px}
+</style>
+
+<div class="card">
+  <div class="wz-steps">
+    <div class="wz-step active" id="s1"><div class="dot">1</div>连接旧主</div>
+    <div class="wz-step" id="s2"><div class="dot">2</div>能力评估</div>
+    <div class="wz-step" id="s3"><div class="dot">3</div>部署接管</div>
+    <div class="wz-step" id="s4"><div class="dot">4</div>切换 VIP</div>
+    <div class="wz-step" id="s5"><div class="dot">5</div>完成</div>
+  </div>
+
+  <p style="color:var(--muted);font-size:13px;margin:0 0 16px">
+    把既有的非 Custos MySQL/MariaDB 集群纳入托管并配置 Custos VIP。<strong>仅支持同版本接管</strong>
+    （MariaDB↔MariaDB / MySQL↔MySQL，禁混），且要求已开启 GTID、未使用 Galera/组复制。
+    模式 A：新建干净 Custos 集群作目标，追平后接管 VIP（复用迁移）；模式 B：就地纳管旧节点。
+  </p>
+
+  <div class="form-grid">
+    <div class="field"><label>旧集群主库地址</label><input id="oldHost" placeholder="如 10.20.30.10"></div>
+    <div class="field"><label>端口</label><input id="oldPort" value="3306"></div>
+    <div class="field"><label>管理员账号</label><input id="oldUser" value="root"></div>
+    <div class="field"><label>密码</label><input id="oldPass" type="password"></div>
+    <div class="field"><label>接管模式</label>
+      <div class="mode-btns" id="modeBtns">
+        <label class="on"><input type="radio" name="mode" value="A" checked> A 平行新建+切换</label>
+        <label><input type="radio" name="mode" value="B"> B 原地纳管</label>
+      </div>
+      <span class="hint">A 需先在「集群管理」建一个干净 Custos 目标集群；B 由接管新建集群并就地纳管。</span>
+    </div>
+    <div class="field"><label>任务名称</label><input id="taskName" placeholder="如 接管-生产主库"></div>
+    <div class="field"><label>SSH 端口（旧节点，默认22）</label><input id="oldSshPort" value="22"></div>
+    <div class="field"><label>SSH 用户（默认root）</label><input id="oldSshUser" value="root"></div>
+    <div class="field"><label>SSH 密码</label><input id="oldSshPass" type="password" placeholder="用于推送 sidecar（接管初期旧节点无 agent）"></div>
+  </div>
+
+  <div class="row-actions">
+    <button class="btn-primary" id="probeBtn" onclick="doProbe()">探测旧集群</button>
+    <span id="probeMsg" class="hint"></span>
+  </div>
+  <div id="probeErr" class="err"></div>
+</div>
+
+<div class="card result" id="resultCard">
+  <div class="sec-title">① 集群发现</div>
+  <div class="kv" id="discKv"></div>
+
+  <div class="sec-title">② 接管可行性评估</div>
+  <div id="capBox"></div>
+
+  <div class="sec-title">③ 服务器开关审计</div>
+  <table class="tbl" id="setTbl">
+    <thead><tr><th>开关</th><th>当前值</th><th>状态</th><th>说明 / 缺失动作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="sec-title">④ 节点清单与接管参数</div>
+  <p class="hint">旧主 + 发现的从库自动列出；请补全每台节点的 SSH 凭据（用于推送 Custos sidecar）。从库账号/密码默认沿用旧主凭据。</p>
+  <table class="tbl" id="nodeTbl">
+    <thead><tr><th>角色</th><th>地址</th><th>端口</th><th>SSH用户</th><th>SSH密码</th><th>SSH端口</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="form-grid" style="margin-top:14px">
+    <div class="field" id="paramA"><label>目标 Custos 集群</label><select id="targetCluster"></select>
+      <span class="hint">模式 A：选一个已建好的干净 Custos 目标集群。</span></div>
+    <div class="field" id="paramB" style="display:none"><label>新建 Custos VIP（接管用）</label><input id="newVip" placeholder="如 192.0.2.10">
+      <span class="hint">模式 B：接管新建的 Custos 集群所用 VIP（与旧集群同网段空闲 IP）。</span></div>
+  </div>
+
+  <div class="row-actions">
+    <button class="btn-primary" id="createBtn" onclick="createTask()">创建接管任务</button>
+    <span id="createMsg" class="hint"></span>
+  </div>
+</div>
+
+<div class="card result" id="execCard" style="display:none">
+  <div class="sec-title">接管执行</div>
+  <div class="progress"><i id="progBar"></i></div>
+  <div id="stageTxt" class="hint" style="margin-top:6px"></div>
+  <div id="stepList"></div>
+  <div class="row-actions" style="margin-top:16px">
+    <button class="btn-primary" id="runBtn" onclick="runNextStep()">执行下一步</button>
+    <button class="btn-ghost" id="flipBtn" onclick="doFlip()" style="display:none">翻转 VIP</button>
+    <button class="btn-danger" id="undoBtn" onclick="doUndo()">撤销接管</button>
+    <span id="execMsg" class="hint"></span>
+  </div>
+  <div id="execLog" class="err" style="white-space:pre-wrap"></div>
+</div>
+
+<script>
+let PROBE = null, TASK_ID = null, STEPS = [];
+
+document.getElementById('modeBtns').addEventListener('change', function(e){
+  document.querySelectorAll('#modeBtns label').forEach(function(l){ l.classList.remove('on'); });
+  e.target.closest('label').classList.add('on');
+  const m = e.target.value;
+  document.getElementById('paramA').style.display = m==='A'?'':'none';
+  document.getElementById('paramB').style.display = m==='B'?'':'none';
+});
+
+async function api(url, body){
+  const r = await fetch(url, {method: body?'POST':'GET',
+    headers:{"Content-Type":"application/json","Accept":"application/json"},
+    body: body?JSON.stringify(body):undefined});
+  return await r.json();
+}
+
+async function doProbe(){
+  const msg = document.getElementById('probeMsg');
+  const err = document.getElementById('probeErr');
+  msg.textContent = '探测中…'; err.textContent = '';
+  const body = {
+    old_host: document.getElementById('oldHost').value.trim(),
+    old_port: parseInt(document.getElementById('oldPort').value||'3306',10),
+    old_user: document.getElementById('oldUser').value.trim(),
+    old_pass: document.getElementById('oldPass').value,
+  };
+  if(!body.old_host){ err.textContent = '请填写旧集群主库地址'; msg.textContent=''; return; }
+  try{
+    const res = await api('/api/takeover/probe', body);
+    if(!res.ok){ err.textContent = '探测失败：' + (res.error||'未知错误'); msg.textContent=''; return; }
+    PROBE = res;
+    msg.textContent = '探测完成';
+    renderDiscovery(res);
+    renderSettings(res.settings||[]);
+    renderCapabilities(await api('/api/takeover/capabilities', {probe: res}));
+    renderNodes(res);
+    if(document.querySelector('input[name=mode]:checked').value==='A') loadClusters();
+    document.getElementById('resultCard').style.display = 'block';
+  }catch(e){ err.textContent = '请求异常：'+e.message; msg.textContent=''; }
+}
+
+function renderDiscovery(p){
+  const fam = p.family==='mariadb'?'MariaDB':'MySQL';
+  const gtid = p.family==='mariadb' ? ('domain_id='+(p.gtid_domain_id??'—')) : ('gtid_mode='+(p.gtid_mode??'—'));
+  const reps = (p.replicas||[]).map(function(r){ return r.host+':'+r.port; }).join('，') || '无（单节点）';
+  document.getElementById('discKv').innerHTML =
+    `<div><b>版本</b>${p.version||'—'}</div><div><b>引擎族</b>${fam}</div>`+
+    `<div><b>GTID</b>${gtid}</div><div><b>server_id</b>${p.server_id??'—'}</div>`+
+    `<div><b>log_bin</b>${p.log_bin??'—'}</div><div><b>Galera(wsrep)</b>${p.wsrep_on??'—'}</div>`+
+    `<div style="grid-column:1/3"><b>发现从库(${p.replica_count||0})</b>${reps}</div>`;
+}
+
+function renderSettings(list){
+  const tb = document.querySelector('#setTbl tbody');
+  tb.innerHTML = list.map(function(s){
+    let st = s.ok===null?'<span class="pill mut">— 自管</span>':(s.ok?'<span class="pill ok">✓ 满足</span>':'<span class="pill bad">✗ 缺失</span>');
+    return `<tr><td>${s.var}</td><td>${s.current??'—'}</td><td>${st}</td>`+
+           `<td>${s.desc}${s.ok===false?'<br><span class="hint">→ '+s.action+'</span>':''}</td></tr>`;
+  }).join('');
+}
+
+async function renderCapabilities(c){
+  const box = document.getElementById('capBox');
+  let html='';
+  if(c.checks){
+    html+='<div class="kv">';
+    html+=`<div><b>Galera/组复制</b>${(c.checks.galera?'<span class="pill ok">通过</span>':'<span class="pill bad">拒绝</span>')}</div>`;
+    html+=`<div><b>GTID 已启用</b>${(c.checks.gtid?'<span class="pill ok">通过</span>':'<span class="pill bad">未满足</span>')}</div>`;
+    html+=`<div><b>引擎族</b>${c.checks.family||'—'}</div><div><b>外部 HA</b><span class="pill warn">待 SSH 复核</span></div>`;
+    html+='</div>';
+  }
+  (c.reasons||[]).forEach(function(r){ html+=`<div class="pill bad" style="margin:4px 4px 0 0">✗ ${r}</div>`; });
+  (c.warnings||[]).forEach(function(w){ html+=`<div class="pill warn" style="margin:4px 4px 0 0">⚠ ${w}</div>`; });
+  box.innerHTML = html;
+  document.getElementById('createBtn').disabled = !c.ok;
+  if(!c.ok) document.getElementById('createMsg').textContent='存在阻断项，请先修复后再创建任务';
+}
+
+function renderNodes(p){
+  const tb = document.querySelector('#nodeTbl tbody');
+  const rows = [{host:p.host??document.getElementById('oldHost').value.trim(), port:p.port??3306, master:true}]
+    .concat((p.replicas||[]).map(function(r){ return {host:r.host, port:r.port, master:false}; }));
+  tb.innerHTML = rows.map(function(r,i){
+    return `<tr><td>${r.master?'<span class="pill ok">主库</span>':'<span class="pill mut">从库</span>'}</td>`+
+      `<td>${r.host}</td><td>${r.port}</td>`+
+      `<td><input id="nu${i}" value="${document.getElementById('oldSshUser').value.trim()||'root'}"></td>`+
+      `<td><input id="np${i}" type="password" placeholder="SSH密码"></td>`+
+      `<td><input id="nport${i}" value="${document.getElementById('oldSshPort').value.trim()||'22'}" style="width:70px"></td></tr>`;
+  }).join('');
+  window._nodeRows = rows;
+}
+
+async function loadClusters(){
+  try{
+    const r = await api('/api/clusters');
+    const sel = document.getElementById('targetCluster');
+    sel.innerHTML = '<option value="">— 选择目标集群 —</option>' +
+      (r.clusters||[]).map(function(c){ return `<option value="${c.id}">${c.name} (${c.vip||''})</option>`; }).join('');
+  }catch(e){ document.getElementById('targetCluster').innerHTML='<option value="">集群接口不可用，请手填 ID</option>'; }
+}
+
+async function createTask(){
+  const msg = document.getElementById('createMsg');
+  msg.textContent='创建中…';
+  const mode = document.querySelector('input[name=mode]:checked').value;
+  const nodes = (window._nodeRows||[]).map(function(r,i){
+    return {host:r.host, port:parseInt(r.port,10), is_master:r.master,
+      user:document.getElementById('oldUser').value.trim(),
+      pass:document.getElementById('oldPass').value,
+      ssh_user:document.getElementById('nu'+i).value.trim()||'root',
+      ssh_pass:document.getElementById('np'+i).value,
+      ssh_port:parseInt(document.getElementById('nport'+i).value||'22',10)};
+  });
+  const body = Object.assign({}, PROBE, {
+    name: document.getElementById('taskName').value.trim()||'未命名接管',
+    mode: mode,
+    old_ssh_port: parseInt(document.getElementById('oldSshPort').value||'22',10),
+    old_ssh_user: document.getElementById('oldSshUser').value.trim()||'root',
+    old_ssh_pass: document.getElementById('oldSshPass').value,
+    nodes: nodes,
+    old_family: PROBE.family,
+    old_version: PROBE.version,
+  });
+  if(mode==='A') body.target_cluster_id = parseInt(document.getElementById('targetCluster').value||'0',10)||null;
+  else body.new_vip = document.getElementById('newVip').value.trim();
+  try{
+    const res = await api('/api/takeover/create', body);
+    if(!res.ok){ msg.textContent='创建失败'; return; }
+    TASK_ID = res.task_id;
+    STEPS = mode==='A'?['prepare_target','seed','bridge','verify','cutover','vip']
+                       :['register','deploy_sidecar','takeover_repl','vip'];
+    msg.textContent='已创建接管任务 #'+TASK_ID;
+    document.getElementById('execCard').style.display='block';
+    renderSteps({});
+  }catch(e){ msg.textContent='请求异常：'+e.message; }
+}
+
+function renderSteps(steps){
+  const list = document.getElementById('stepList');
+  list.innerHTML = STEPS.map(function(s,i){
+    const st = (steps[s]||{}).status;
+    const badge = st==='done'?'<span class="pill ok">✓ 完成</span>':(st==='error'?'<span class="pill bad">✗ 失败</span>':'<span class="pill mut">待执行</span>');
+    return `<div class="step-row"><span class="sname">${i+1}. ${stepLabel(s)}</span><span class="sst">${badge}</span></div>`;
+  }).join('');
+  document.getElementById('runBtn').style.display = STEPS.every(function(s){return (steps[s]||{}).status==='done';})?'none':'';
+  document.getElementById('flipBtn').style.display = STEPS.includes('vip') && (steps['vip']||{}).status==='done'?'none':'none';
+}
+
+function stepLabel(s){
+  return {prepare_target:'准备目标集群',seed:'数据种子/迁移',bridge:'建立桥接',verify:'一致性校验',
+    cutover:'停桥切换',register:'登记+建集群+部署',deploy_sidecar:'部署 sidecar',takeover_repl:'接管复制/切换',vip:'翻转 VIP'}[s]||s;
+}
+
+let _cur = 0;
+async function runNextStep(){
+  const steps = await (await fetch('/api/takeover/'+TASK_ID+'/status')).json();
+  const st = steps.task?steps.task.steps:{};
+  const next = STEPS.find(function(s){ return !(st[s]&&st[s].status==='done'); });
+  if(!next){ document.getElementById('runBtn').style.display='none'; return; }
+  document.getElementById('execMsg').textContent='执行 '+stepLabel(next)+'…';
+  const r = await api('/api/takeover/'+TASK_ID+'/start_step', {step:next});
+  if(!r.ok){ document.getElementById('execMsg').textContent='启动失败：'+(r.error||''); return; }
+  poll();
+}
+
+async function poll(){
+  const iv = setInterval(async function(){
+    const j = await (await fetch('/api/takeover/'+TASK_ID+'/status')).json();
+    const t = j.task||{};
+    document.getElementById('progBar').style.width=(t.progress||0)+'%';
+    document.getElementById('stageTxt').textContent=t.stage||'';
+    renderSteps(t.steps||{});
+    document.getElementById('execLog').textContent=t.log||'';
+    if(t.status==='done'||t.status==='error'){ clearInterval(iv); document.getElementById('execMsg').textContent=t.status==='done'?'接管完成':'执行出错'; }
+  }, 2500);
+}
+
+async function doFlip(){
+  const r = await api('/api/takeover/'+TASK_ID+'/flip');
+  document.getElementById('execMsg').textContent = r.ok?'VIP 翻转指令已下发':'翻转失败：'+(r.error||'');
+  poll();
+}
+
+async function doUndo(){
+  if(!confirm('确认撤销接管？将卸载 sidecar、删除 Custos 账号并注销登记（旧集群数据保留）。')) return;
+  const r = await api('/api/takeover/'+TASK_ID+'/undo');
+  document.getElementById('execMsg').textContent = r.ok?'已撤销接管':'撤销失败：'+(r.error||'');
+  document.getElementById('execLog').textContent=(r.logs||[]).join('\n');
+}
+</script>
+{% endblock %}

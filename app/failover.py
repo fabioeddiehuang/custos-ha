@@ -701,10 +701,13 @@ def ensure_topology(cluster_id):
     creds = load_creds(cluster_id)
     if not creds["ha_user"]:
         return
-    # 迁移锁定：当前主正在作为迁移目标追平源库，整轮跳过本集群拓扑维护，
-    # 否则会 RESET REPLICA ALL 把桥接通道清掉（根因见 _migration_locked 注释）。
-    if cur_h and _migration_locked(cur_h, cur_p):
-        return
+    # 迁移锁定：当前主正在作为迁移【目标】追平源库（桥接中）。
+    # ⚠ 只跳过「对它执行 promote_to_master」（那会 STOP REPLICA + RESET REPLICA ALL
+    #   把桥接通道清掉，根因见 _migration_locked 注释），**绝不整轮跳过本集群**：
+    #   否则同集群其余从库（如 213 → 新主 203）在此期间既挂不上、也没人修，
+    #   表现为 213 的 IO 线程长期 1045 Access denied / Connecting 却无人自愈
+    #   （v2.4.0 追平测试实测：账号被 copy-back 冲掉后，正因整轮跳过而彻底失去修复机会）。
+    _locked = bool(cur_h and _migration_locked(cur_h, cur_p))
     # 先自愈：确保各节点 gtid_mode=ON / server_id 唯一，否则后续 make_slave_of 会因
     # gtid_mode=OFF 反复失败（裸机 my.cnf 片段被覆盖时尤为常见）。SET PERSIST 持久化，
     # 已达标则为空操作。
@@ -727,16 +730,33 @@ def ensure_topology(cluster_id):
             cur_h, cur_p = (preferred[0]["host"], int(preferred[0]["port"])) if preferred \
                 else (up[0]["host"], int(up[0]["port"]))
         set_current_master(cluster_id, cur_h, cur_p)
-        # 首次选主后同样要尊重迁移锁定（目标可能刚被登记、桥接尚未停）
-        if _migration_locked(cur_h, cur_p):
-            return
+        # 首次选主后同样要尊重迁移锁定：只跳过 promote，不整轮 return（见上方说明）
+        _locked = _locked or bool(_migration_locked(cur_h, cur_p))
     # 确保被指定为主库的 MySQL 实际可写（read_only=OFF），否则 keepalived VIP 检查不通过
     ru, rp = node_root(cur_h, cluster_id)
     # 用 promote_to_master：不仅置可写，还清空残留复制通道，
     # 避免主库被 monitor 误判为 slave / 形成环形复制。
     # 注意：此处失败绝不能再「可忽略」——主库若仍是 read_only=ON，
     # keepalived 检查脚本会判定本机只读而放弃 VIP，导致 VIP 永不绑定。
-    ok, perr = promote_to_master(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], ru, rp)
+    # ⚠ 迁移桥接期（_locked）绝不能 promote：那会清掉 203→177 的桥接通道。
+    #   此时只把主库置为可写（不清复制通道），保证 VIP 判断不受影响。
+    if _locked:
+        _pk = ("mig_locked", cluster_id, cur_h, int(cur_p))
+        if time.monotonic() - _TOPO_AT.get(_pk, 0.0) >= 300:
+            _TOPO_AT[_pk] = time.monotonic()
+            print(f"[topology] 主库 {cur_h}:{cur_p} 处于迁移桥接期：跳过 promote"
+                  f"（避免清除桥接通道），其余节点照常维护")
+        try:
+            ok, perr = set_read_only(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"],
+                                     False, ru, rp)
+        except Exception as _e:
+            # 桥接期目标账号可能刚被 copy-back 冲掉（ha_monitor 不存在）⇒ 连不上属预期，
+            # 绝不能让异常冒泡打断本轮其余节点的维护。
+            ok, perr = False, str(_e)
+        if not ok:
+            perr = "桥接期仅置可写失败（不影响桥接）：%s" % perr
+    else:
+        ok, perr = promote_to_master(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], ru, rp)
     if not ok:
         errmsg = (f"提升主库 {cur_h}:{cur_p} 为可写失败（VIP 将无法绑定到该节点，请检查账号权限/连接）：{perr}")
         print(f"[topology][严重] {errmsg}")

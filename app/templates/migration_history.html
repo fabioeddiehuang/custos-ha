@@ -166,7 +166,7 @@ function renderHistory(list){
       <td class="sel-col"><input type="checkbox" class="hist-sel" value="${t.id}" onchange="updateSelInfo()"></td>
       <td>${t.id}</td>
       <td>${escapeHtml(t.name||"")}</td>
-      <td>${t.channel==="physical"?"B 物理":"A 逻辑"}</td>
+      <td>${"通用模式"}</td>
       <td><span class="mbadge ${statusClass(t.status)}">${statusLabel(t.status)}</span></td>
       <td>${progressCell(t)}</td>
       <td class="muted">${escapeHtml(t.stage||"")}${progStall(t.id, t.progress||0)}</td>
@@ -310,7 +310,7 @@ function renderDetail(j){
   $("detailTitle").textContent = "任务 #"+j.id+" · "+(j.name||"");
   $("detailBody").innerHTML =
     '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;font-size:12.5px">'+
-      '<span>通道：'+(j.channel==="physical"?"B 物理":"A 逻辑")+'</span>'+
+      '<span>通道：'+"通用模式"+'</span>'+
       '<span>状态：<span class="mbadge '+statusClass(j.status)+'">'+statusLabel(j.status)+'</span></span>'+
       '<span>创建：'+escapeHtml(j.created_at||"")+'</span>'+
       '<span>更新：'+escapeHtml(j.updated_at||"")+'</span>'+

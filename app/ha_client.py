@@ -1108,6 +1108,13 @@ def set_read_only(host, port, user, password, on=True, root_user="root", root_pa
     conn = connect_robust(host, port, user, password, root_user, root_pass)
     try:
         cur = conn.cursor()
+        # MySQL 8.0 专有：super_read_only=ON 会强制 read_only=ON 且【拒绝】直接关 read_only
+        # （关只读必须先关 super_read_only）；开只读则一并开，保证从库彻底只读。
+        # MariaDB 无该变量，语句报错属正常，忽略即可（不影响后一句 read_only）。
+        try:
+            cur.execute("SET GLOBAL super_read_only=%s", (1 if on else 0,))
+        except Exception:
+            pass
         cur.execute("SET GLOBAL read_only=%s", (1 if on else 0,))
         return True, None
     except Exception as e:

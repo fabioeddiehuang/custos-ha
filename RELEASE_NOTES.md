@@ -1,6 +1,6 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> 当前版本：**v2.4.0**（镜像标签 `custos-server:v2.4.0`）
+> 当前版本：**v2.4.1**（镜像标签 `custos-server:v2.4.1`）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
 > 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
 
@@ -32,8 +32,18 @@
 | v2.3.9 | 重构 | 节点部署目录结构归整（配置/脚本/agent 分目录）；`custosctl node prepare` 自检；`.env` 去密（SECRET_KEY→`data/secret_key`，WEB_PASS/MGMT_MYSQL_PASS→compose，`.env` 纳入 git） |
 | v2.3.10 | 修复 | 凭证加密改为**默认关闭**（`CRED_ENCRYPTION`，零密钥依赖）；密钥持久化 + 解密钥匙串回退；修 ENC1 密文当复制口令导致复制集体瘫痪（1470）；`_repoint_slave` 返回值契约与假成功；`custosctl node install` 支持容器 MySQL/MariaDB |
 | v2.4.0 | 功能 | 数据迁移向导（MariaDB↔MariaDB + MySQL 5.7→MariaDB）；能力矩阵门禁；引擎方言适配；迁移前兼容性预检（dry-run） |
+| v2.4.1 | 修复/增强 | 节点类型规范名重命名（mysql8→mysql、mysql8-docker→mysql-docker，docker 降别名，默认 mariadb-docker）；迁移向导放开 MySQL 源/目标（逻辑通道支持 MySQL→MySQL）；旧集群接管 A/B 缺陷修正；迁移追平 bug 根治（bridge SSL / 物理通道账号冲刷 / 锁定仅跳 promote） |
 
 ---
+
+## v2.4.1 详细变更
+
+### v2.4.1 · 节点类型规范名重命名 + 迁移向导放开 MySQL + 接管/追平缺陷修正
+本期为 2.4.0 的缺陷修正与增强版，覆盖三大块：
+1. **节点类型规范名重命名（方案 B）**：`mysql8`→`mysql`、`mysql8-docker`→`mysql-docker`，原 `docker` 降级为历史别名（→`mysql-docker`），统一经 `normalize_node_type` 归一；默认部署形态翻为 `mariadb-docker`；存量 `node_type='docker'` 行靠别名兼容、不改库；引擎 flavour 常量 `F_MYSQL8` 保持不变。
+2. **迁移向导放开 MySQL**：源/目标形态下拉放开 `mysql`/`mysql-docker`，`tgt_flavor` 按目标形态推导（修正此前写死 mariadb 导致 MySQL→MySQL 逻辑迁移被 refused）；约束（设计内）：MySQL 目标仅逻辑通道、bridge 仅 MariaDB→MariaDB、MySQL 8.0+→MariaDB 源仍 refused。
+3. **接管与追平缺陷修正**：接管 A/B 模式设计内修正；bridge 走 `detect_flavour + change_replication_sql`（MariaDB 带 `MASTER_SSL=0`）；物理通道 copy-back 后补齐目标账号；迁移锁定改为仅跳过 promote。
+> 已知遗留：接管/裸机 MySQL 脚本端到端真机回归尚未完成；迁移基线需回归。详见 [`doc/releases/v2.4.1.md`](./doc/releases/v2.4.1.md)。
 
 ## v2.3.x 详细变更
 

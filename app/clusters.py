@@ -24,7 +24,7 @@ def get_cluster(cluster_id):
 
 def create_cluster(name, ha_user=None, ha_pass=None, repl_user=None, repl_pass=None,
                    app_user=None, app_pass=None, vip=None, vip_prefix=None,
-                   interface=None, vrid=None, vip_port=None, node_type="docker",
+                   interface=None, vrid=None, vip_port=None, node_type="mariadb-docker",
                    mysql_version=None):
     name = (name or "").strip() or "未命名集群"
     ha_user = ha_user or "ha_monitor"
@@ -73,7 +73,7 @@ def validate_node_version(cluster_id, node_type, mysql_version):
     c = get_cluster(cluster_id)
     if not c:
         return
-    exist_type = c.get("node_type") or "docker"
+    exist_type = c.get("node_type") or "mariadb-docker"
     exist_family = node_family(exist_type)
     new_family = node_family(node_type) if node_type else exist_family
     if node_type and exist_family != new_family:

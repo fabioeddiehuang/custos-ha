@@ -88,6 +88,13 @@
           <a href="/migration/history" data-path="/migration/history">历史迁移</a>
         </div>
       </div>
+      <div class="nav-group" id="navTakeoverGroup">
+        <a class="nav1" href="/takeover" data-path="/takeover"><span class="ic">⤓</span>集群接管<span class="caret" onclick="toggleTakeover(event)">▶</span></a>
+        <div class="sub" id="takeoverSub">
+          <a href="/takeover" data-path="/takeover">接管向导</a>
+          <a href="/takeover/history" data-path="/takeover/history">接管历史</a>
+        </div>
+      </div>
       <a class="nav1" href="/alerts" data-path="/alerts"><span class="ic">✦</span>告警中心</a>
       <a class="nav1" href="/settings" data-path="/settings"><span class="ic">⚙</span>系统设置</a>
     </nav>
@@ -170,6 +177,17 @@ var _p = location.pathname;
         a.classList.toggle('active', (p===_p) || (_p.indexOf(p)===0 && p!=='/migration'));
       });
     }
+    // 集群接管子菜单（接管向导 / 接管历史）
+    var tg = document.getElementById('navTakeoverGroup'), ts = document.getElementById('takeoverSub');
+    if(tg && ts && _p.indexOf('/takeover')===0){
+      tg.classList.add('open');
+      var tg1 = tg.querySelector('.nav1'); if(tg1) tg1.classList.add('open');
+      ts.classList.add('show');
+      ts.querySelectorAll('a[data-path]').forEach(function(a){
+        var p = a.dataset.path;
+        a.classList.toggle('active', (p===_p) || (_p.indexOf(p)===0 && p!=='/takeover'));
+      });
+    }
     var t = document.getElementById('pageTitle');
     // 模板已指定标题时不覆盖（如「集群管理-集群名」）
     if(act && t && !t.textContent.trim()){ t.textContent = act.textContent.replace('▶','').trim(); }
@@ -186,6 +204,13 @@ var _p = location.pathname;
   window.toggleMigration = function(e){
     if(e){ e.stopPropagation(); e.preventDefault(); }
     var g = document.getElementById('navMigrationGroup'), s = document.getElementById('migrationSub');
+    if(g){ g.classList.toggle('open'); var g1 = g.querySelector('.nav1'); if(g1) g1.classList.toggle('open'); }
+    if(s) s.classList.toggle('show');
+  };
+
+  window.toggleTakeover = function(e){
+    if(e){ e.stopPropagation(); e.preventDefault(); }
+    var g = document.getElementById('navTakeoverGroup'), s = document.getElementById('takeoverSub');
     if(g){ g.classList.toggle('open'); var g1 = g.querySelector('.nav1'); if(g1) g1.classList.toggle('open'); }
     if(s) s.classList.toggle('show');
   };

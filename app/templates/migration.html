@@ -265,15 +265,11 @@
     </div>
 
     <div id="methodBox" style="display:none;margin-top:14px">
-      <div style="font-size:13px;font-weight:600;color:var(--text)">迁移方式（按检测结果推荐，可改）</div>
+      <div style="font-size:13px;font-weight:600;color:var(--text)">迁移方式：通用模式（逻辑通道）</div>
       <div class="chan-grid" id="chanGrid" style="margin-top:8px">
-        <div class="chan" data-chan="logical" onclick="selChan('logical')">
-          <h4>通用模式 <span class="tag" id="tagA">推荐</span></h4>
+        <div class="chan sel" data-chan="logical" onclick="selChan('logical')">
+          <h4>通用模式 <span class="tag rec" id="tagA">已选</span></h4>
           <p>逻辑通道：导出用户库再导入，跨版本最安全，适合中少量数据。</p>
-        </div>
-        <div class="chan" data-chan="physical" onclick="selChan('physical')">
-          <h4>高级模式 <span class="tag" id="tagB">大库/高速</span></h4>
-          <p>物理热备：mariabackup 备份恢复，适合大库。仅 MariaDB → MariaDB（源须为 MariaDB，MySQL 源请用「通用模式」），支持跨版本升级，不能降级。</p>
         </div>
       </div>
       <div class="kv" id="recInfo" style="margin-top:8px"></div>
@@ -298,6 +294,8 @@
       <select id="srcType">
         <option value="mariadb-docker">容器化 MariaDB</option>
         <option value="mariadb">裸机 MariaDB</option>
+        <option value="mysql-docker">容器化 MySQL</option>
+        <option value="mysql">裸机 MySQL</option>
       </select>
     </div>
     <div class="field"><label>目标节点形态</label>
@@ -305,6 +303,8 @@
         <option value="" disabled selected>请选择节点形态</option>
         <option value="mariadb-docker">容器化 MariaDB</option>
         <option value="mariadb">裸机 MariaDB</option>
+        <option value="mysql-docker">容器化 MySQL</option>
+        <option value="mysql">裸机 MySQL</option>
       </select>
     </div>
   </div>
@@ -557,6 +557,31 @@ function setStep(n){
   const f = $("wzFill");
   if(f){ f.style.width = ((n-1)/(5-1)*92) + "%"; }
   updateGuide(n);
+  // ⚠ 第三步的「数据种子 / 建立桥接 / 一致性校验」三行独立执行按钮，原本只在
+  //   createTask() 里构建一次。两种常见路径会让它【从未渲染】而变成空白：
+  //     ① 从历史任务「继续」恢复时若三步都已 done ⇒ 直接落在第四步（land=4），
+  //        buildExecList() 不会执行；
+  //     ② 随后点第四步的「← 上一步：返回校验」或追平失败提示里的「返回第三步重跑桥接」
+  //        ⇒ 只切到第三步，列表依旧是空的 ⇒ 用户看不到任何【执行】按钮（实测反馈）。
+  //   故每次进入第三步都确保列表已渲染，并按任务真实步骤状态回显（支持直接重跑桥接）。
+  if(n===3){
+    const box = $("execList");
+    if(box && !box.querySelector(".run-row")){
+      buildExecList();
+      if(STATE.taskId){
+        fetch("/api/migration/"+STATE.taskId+"/status",
+              {headers:{"Accept":"application/json"}, cache:"no-store"})
+          .then(function(r){ return r.json(); })
+          .then(function(j){
+            if(!j || j.ok===false) return;
+            refreshStepStatuses(j.steps||{});
+            // 若任务仍在后台跑（典型：刷新/恢复后又点了执行），立刻接上进度跟随
+            if(j.status==="running") startResumePoll();
+          })
+          .catch(function(){});
+      }
+    }
+  }
   // 切步后回到页面顶部：此前停在页面中段，用户看不到新步骤的开头（实测反馈）
   try{ window.scrollTo({top:0, behavior:"smooth"}); }
   catch(e){ try{ window.scrollTo(0,0); }catch(e2){} }
@@ -750,14 +775,23 @@ function updateModeSummary(){
 }
 
 /* 填了目标地址就自动带出端口/形态（用户要求自动化，不要手填） */
+// 把历史别名归一到规范名：docker/mysql8/mysql8-docker → mysql-docker/mysql
+function normNodeType(v){
+  if(!v) return "";
+  const m = {"docker":"mysql-docker","mysql8":"mysql","mysql8-docker":"mysql-docker"};
+  return m[v] || v;
+}
+
 async function autoTarget(){
   const host = ($("tgtHost") && $("tgtHost").value.trim()) || "";
   if(!host) return;
   const r = await postJSON("/api/migration/target_hint", {ip:host});
   if(r && r.ok){
     if(r.port) $("tgtPort").value = r.port;
-    if(r.node_type && r.node_type !== "docker"){
-      const sel = $("tgtType"); if(sel) sel.value = r.node_type;
+    if(r.node_type){
+      const nt = normNodeType(r.node_type);
+      const sel = $("tgtType");
+      if(sel && sel.querySelector('option[value="'+nt+'"]')) sel.value = nt;
     }
   }
 }
@@ -844,10 +878,10 @@ async function createTask(){
     // 产品线决定 dump 工具与 GTID 参数（两者互斥）；size_mb 用于真实百分比进度
     src_flavor:(STATE.probe&&STATE.probe.flavor)||"mariadb",
     src_major:(STATE.probe&&STATE.probe.major)||0,
-    tgt_flavor:"mariadb",
+    tgt_flavor:(($("tgtType").value==="mysql"||$("tgtType").value==="mysql-docker")?"mysql":"mariadb"),
     size_mb:(STATE.probe&&STATE.probe.size_mb)||0, databases
   };
-  if(!$("tgtType").value){ alert("请选择目标节点形态（容器化 / 裸机 MariaDB）"); return; }
+  if(!$("tgtType").value){ alert("请选择目标节点形态（容器化 / 裸机 MariaDB 或 MySQL）"); return; }
   const b = await postJSON("/api/migration/create", body);
   if(!b.ok){ alert("创建失败: "+b.error); return; }
   STATE.taskId = b.id;
@@ -1568,7 +1602,7 @@ async function resumeTask(tid){
   }catch(e){ alert("加载任务失败: "+e); return; }
   if(!j || j.ok===false){ alert("任务不存在或加载失败"); return; }
   STATE.taskId = tid;
-  STATE.channel = j.channel || "logical";
+  STATE.channel = (j.channel && j.channel !== "physical") ? j.channel : "logical";  // 高级模式已取消，残留物理任务降级为通用模式
   const cfg = j.config || {};
   STATE.mode = cfg.src_gtid ? "bridge" : "stopwrite";
   markStepDone(1); markStepDone(2);
@@ -1686,7 +1720,7 @@ function renderHistory(list){
       <td class="sel-col"><input type="checkbox" class="hist-sel" value="${t.id}" onchange="updateSelInfo()"></td>
       <td>${t.id}</td>
       <td>${escapeHtml(t.name||"")}</td>
-      <td>${t.channel==="physical"?"B 物理":"A 逻辑"}</td>
+      <td>${"通用模式"}</td>
       <td><span class="mbadge ${statusClass(t.status)}">${statusLabel(t.status)}</span></td>
       <td>${progressCell(t)}</td>
       <td class="muted">${escapeHtml(t.stage||"")}${progStall(t.id, t.progress||0)}</td>
@@ -1820,7 +1854,7 @@ function renderDetail(j){
   $("detailTitle").textContent = "任务 #"+j.id+" · "+(j.name||"");
   $("detailBody").innerHTML =
     '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;font-size:12.5px">'+
-      '<span>通道：'+(j.channel==="physical"?"B 物理":"A 逻辑")+'</span>'+
+      '<span>通道：'+"通用模式"+'</span>'+
       '<span>状态：<span class="mbadge '+statusClass(j.status)+'">'+statusLabel(j.status)+'</span></span>'+
       '<span>创建：'+escapeHtml(j.created_at||"")+'</span>'+
       '<span>更新：'+escapeHtml(j.updated_at||"")+'</span>'+

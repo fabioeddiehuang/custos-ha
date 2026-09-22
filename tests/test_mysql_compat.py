@@ -153,6 +153,26 @@ def test_default_auth_plugin():
     assert mc.default_auth_plugin(None, node_type="docker") == "mysql_native_password"
 
 
+def test_node_type_canonical_and_aliases():
+    # 规范名保持不变
+    assert mc.normalize_node_type("mysql") == "mysql"
+    assert mc.normalize_node_type("mysql-docker") == "mysql-docker"
+    # 历史别名归一化到规范名（v2.4.1 重命名）
+    assert mc.normalize_node_type("mysql8") == "mysql"
+    assert mc.normalize_node_type("mysql8-docker") == "mysql-docker"
+    assert mc.normalize_node_type("docker") == "mysql-docker"
+    # 引擎族判定（含别名）
+    assert mc.is_mysql_node("docker") is True
+    assert mc.is_mysql_node("mysql8-docker") is True
+    assert mc.is_mysql_node("mysql") is True
+    assert mc.is_mysql_node("mysql-docker") is True
+    assert mc.is_mysql_node("mariadb") is False
+    # flavour 桥接（归一化后）
+    assert mc.flavour_from_node_type("mysql") == mc.F_MYSQL8
+    assert mc.flavour_from_node_type("mysql-docker") == mc.F_MYSQL8
+    assert mc.flavour_from_node_type("docker") == mc.F_MYSQL8
+
+
 def test_identify_clause_mariadb_uses_using_password():
     m = mc.identify_clause("mysql_native_password", "pw", mariadb=True)
     assert "IDENTIFIED VIA mysql_native_password USING PASSWORD('pw')" in m
