@@ -686,8 +686,8 @@ def _reconcile_seed_tables(src, tgt, databases):
         sc = connect(*src, timeout=8)
         tc = connect(*tgt, timeout=8)
     except Exception as e:
-        print("[migration] 缺表对账连接失败（不阻断，交由既有校验）: %s" % e)
-        return []
+        # ⚠ 不再静默 return []：连接异常曾被吞成「无缺失」，导致数据没迁全却判定成功。
+        raise RuntimeError("缺表对账无法连接源/目标库，无法确认数据完整性: %s" % e)
     missing = []
     try:
         for db in databases:
