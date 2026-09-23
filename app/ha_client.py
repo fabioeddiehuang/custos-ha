@@ -328,6 +328,32 @@ def is_gtid_purged_error(err):
     )
 
 
+def is_gtid_missing_error(err):
+    """复制 IO 错误是否为「主库 binlog 缺失从库所请求的 GTID」类 1236（主库 GTID 序列有空洞）。
+
+    典型文本（MariaDB）：
+      Got fatal error 1236 from master when reading data from binary log:
+      'The binlog on the master is missing the GTID 1-1-12 requested by the slave
+       (even though both a prior and a subsequent sequence number does exist),
+       and GTID strict mode is enabled'
+
+    与 is_gtid_purged_error（binlog 被清理 / 从库状态过旧）**不是一回事**：
+    此处主库前后序列号都在、只缺中间一个 ⇒ 主库 GTID 序列存在「空洞」。
+    典型成因：多节点 server_id / gtid_domain_id 撞车，各自产生同编号但内容不同的事务；
+    或源端曾跳过事务后再被提升为主库。
+
+    ⚠ 这类空洞补不回 binlog，且 MySQL 语义的 heal_io_gtid_gap（依赖 Source_UUID /
+      Executed_Gtid_Set / SET GTID_NEXT）在 MariaDB 上取不到 source_uuid、会直接
+      「无法确定源端标识，跳过」，故不能指望它自愈。唯一稳妥解法是从主库全量重建从库。
+    """
+    e = (err or "").lower()
+    if not e:
+        return False
+    return ("missing the gtid" in e and "requested by the slave" in e) or \
+           ("binlog on the master is missing" in e) or \
+           ("missing the gtid" in e and "strict mode" in e)
+
+
 def heal_io_gtid_gap(slave_host, slave_port, ha_user, ha_pass,
                      slave_root_user="root", slave_root_pass="",
                      master_host=None, master_port=None,
@@ -1551,37 +1577,32 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                             cur.execute(stop_replication_sql(flavour))
                             cur.execute(reset_replica_sql(flavour))
                             cur.execute("RESET MASTER")
+                            # 【回归 2.2.20 行为 2026-09-24】复制起点的设定：
+                            # 2.4.x 曾先后改为「对齐主库当前位点」和「用自有 GTID 作起点」，两者在
+                            # 已应用集(gtid_slave_pos)为空时都会**跳过本节点缺失的事务** ⇒ 复制
+                            # IO/SQL 全 Yes、延迟 0，数据却永久不一致（100 复用旧 data 始终不一致
+                            # 的根因）。2.2.20 的做法更简单也更可靠：
+                            #   已应用集为空 ⇒ **不设置**起点，保持为空 ⇒ 从库从头完整重放主库
+                            #   binlog，数据必然完整。重放不会因建账号冲突，因为安装脚本用的都是
+                            #   CREATE USER IF NOT EXISTS / CREATE DATABASE IF NOT EXISTS。
+                            # 仅当已应用集非空且确实分叉时，才对齐主库当前位点以避免 1236。
+                            # 若主库早期 binlog 已清理，重放会报 1236，由上层自动全量克隆兜底。
                             if _slave_gt and _master_gt:
                                 cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
                                 if bool((cur.fetchone() or [0])[0]):
                                     # 已应用集为主库子集：保留以免从头重放报 1062
                                     cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
                                 else:
-                                    # 已应用集也分叉：旧实现对齐到主库当前位置以跳过重放避免 1236，
-                                    # 但那会一并跳过本节点缺失的增量 ⇒ 复制 IO/SQL 正常而数据永久
-                                    # 不一致。改用自有 GTID（RESET MASTER 之前记录，即它真实拥有的
-                                    # 数据）作起点：主库还留着这段 binlog 就从此处续传补齐，
-                                    # 已清理则报 1236，由上层自动全量克隆兜底。
-                                    cur.execute("SET GLOBAL gtid_slave_pos=%s", (_own_gt or _master_gt,))
-                                    print("[gtid] %s:%s 已应用集分叉：gtid_slave_pos 设为自有 GTID %s"
-                                          "（而非主库当前 %s）" % (host, port, _own_gt, _master_gt))
+                                    # 已应用集也分叉：对齐到主库当前位置，跳过重放避免 1236（2.2.20 行为）
+                                    cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
+                                    print("[gtid] %s:%s 已应用集分叉，gtid_slave_pos 已对齐主库当前 %s" % (host, port, _master_gt))
                             elif _slave_gt:
                                 cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
                             elif _master_gt:
-                                # 【修复 2026-09-24】本节点「曾为源」且 gtid_slave_pos 为空
-                                # —— 典型是原主库带着旧 data 重新入集群（100 复用旧 data 的场景）。
-                                # 旧实现直接对齐到【主库当前位点】，等于宣称「本节点已拥有主库全部
-                                # 历史」，主库便不再下发它缺失的那段增量 ⇒ 复制 IO/SQL 全 Yes、
-                                # 延迟 0，但数据永久不一致。这正是「188/88 复用旧 data 正常、
-                                # 唯独原主库 100 始终不一致」的机制：188/88 是纯从库，gtid_slave_pos
-                                # 非空且为主库子集 ⇒ 走上面的『保留』分支正常续传；而原主库没有已
-                                # 应用集，就落到本分支被静默跳过。
-                                # 正确起点是本节点 RESET MASTER 之前记录的【自有 GTID _own_gt】
-                                # （那才是它真实拥有的数据）：主库若有这段 binlog 即从此处续传、
-                                # 补齐缺失的增量；若已清理则报 1236，由上层自动全量克隆兜底。
-                                cur.execute("SET GLOBAL gtid_slave_pos=%s", (_own_gt or _master_gt,))
-                                print("[gtid] %s:%s 无已应用集：gtid_slave_pos 设为自有 GTID %s"
-                                      "（而非主库当前 %s），避免跳过缺失的增量" % (host, port, _own_gt, _master_gt))
+                                # 已应用集为空（原主库带旧 data 重入 / 全新安装）：
+                                # 保持 gtid_slave_pos 为空 ⇒ 从头完整重放主库 binlog，保证数据完整。
+                                print("[gtid] %s:%s 已应用集为空：保持 gtid_slave_pos 为空，"
+                                      "从头完整重放主库 binlog（2.2.20 行为）" % (host, port))
                         except Exception as e2:
                             print("[gtid] 分叉重建失败(可忽略，继续常规重链): %s" % e2)
                     elif not _pos_ok:

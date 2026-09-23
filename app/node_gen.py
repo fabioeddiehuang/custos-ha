@@ -1864,6 +1864,19 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     manager_public_ip = get_manager_public_ip()
     manager_subnet = get_manager_docker_subnet_wildcard()
     server_id = get_next_server_id()
+    # 【修复 2026-09-24】server_id 必须与该节点自身的 GTID 历史保持一致。
+    # 同一节点(ip+port)重新生成配置时若换成新的 server_id，其 data 目录里原有的
+    # GTID（domain / server 取自旧 server_id）会与新 domain 混杂，主从随即报
+    #   1236 '... missing the GTID x-y-N requested by the slave
+    #         (even though both a prior and a subsequent sequence number does exist)'
+    # —— 即主库 binlog 出现「空洞」。故已存在的节点一律复用原 server_id，
+    #    只有在首次添加（nodes 表无记录）时才分配新的。
+    try:
+        _rows = query("SELECT server_id FROM nodes WHERE ip=%s AND port=%s", (ip, int(port)))
+        if _rows and _rows[0].get("server_id"):
+            server_id = int(_rows[0]["server_id"])
+    except Exception:
+        pass
     node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
     peers = _peer_ips(ip, cluster_id)
     # MariaDB 两种形态（裸机 / 容器 host 网络）的 keepalived 容器都在 host 网络，

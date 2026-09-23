@@ -8,7 +8,8 @@ from .ha_client import (set_read_only, promote_to_master, make_slave_of,
                         parse_gtid_set, fix_node_mysql_params, ensure_ha_creds,
                         ensure_connect_creds,
                         heal_anonymous_gtid_io, is_read_only,
-                        connect_robust, is_gtid_purged_error)
+                        connect_robust, is_gtid_purged_error,
+                        is_gtid_missing_error)
 import time
 import threading
 import os
@@ -120,8 +121,8 @@ def _replica_needs_full_clone(st):
     low = err.lower()
     if sql != "Yes" and ("1146" in err or "doesn't exist" in low or "does not exist" in low):
         return True, "从库缺失表（SQL 线程 1146），binlog 重放无法补齐"
-    if io != "Yes" and is_gtid_purged_error(err):
-        return True, "主库 binlog 已清理（IO 线程 1236），需全量克隆"
+    if io != "Yes" and (is_gtid_purged_error(err) or is_gtid_missing_error(err)):
+        return True, "主库 binlog 缺失/已清理所请求的 GTID（IO 线程 1236），需全量克隆"
     return False, ""
 
 
