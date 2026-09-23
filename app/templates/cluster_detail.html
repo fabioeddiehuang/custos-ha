@@ -124,8 +124,39 @@
       <label class="auto-row" title="主库压力持续超阈值（Threads_running ≥ 50 或 行锁等待 ≥ 50 次/周期）且连续 3 个周期成立时，自动把压力最低的从库提为主"><span>压力切换</span><label class="switch"><input type="checkbox" id="swPrsFo" {% if pressure_failover %}checked{% endif %} onchange="toggleAuto('PRESSURE_FAILOVER_ENABLED', this)"><span class="slider"></span></label></label>
     </div>
   </div>
-  <span class="spacer"></span><span class="badge ok">复制正常</span>
+  <span class="spacer"></span>
+  <!-- 集群数据一致性徽章（2026-09-23 新增，替换原先写死的「复制正常」）。
+       旧实现此处是静态 <span class="badge ok">复制正常</span>，与真实状态无关 —— 于是
+       「刚校验出差异」与「页面显示正常」可以同时成立，用户无从判断哪个库可信。
+       现在由【最近一次校验结论】驱动：存在未处置差异时，页面不允许显示正常。 -->
+  <span class="badge" id="csBadge" title="集群数据一致性状态（来自最近一次校验结论）">一致性：未校验</span>
 </div>
+<script>
+// 一致性徽章刷新（既有页面加载时调用，也在每次校验完成后调用）
+function refreshCsBadge(){
+  var el = document.getElementById('csBadge'); if(!el) return;
+  var cid = {{ cluster.id }};
+  fetch('/api/consistency/last?cluster_id='+cid,{credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(j){
+      if(!j || !j.ok || !j.has){
+        el.className='badge'; el.textContent='一致性：未校验';
+        el.title='尚未做过一致性校验，无法判断各节点数据是否一致（更多操作 → 行数比对 / 校验和比对）';
+        return;
+      }
+      var v=j.verdict||'';
+      if(v==='inconsistent'){ el.className='badge down'; el.textContent='⚠ 数据不一致 '+(j.diffs||0)+' 处'; }
+      else if(v==='inconclusive'){ el.className='badge warn'; el.textContent='一致性：未获结论'; }
+      else if(v==='repl_broken'){ el.className='badge down'; el.textContent='一致性：复制异常·无法判定'; }
+      else if(v==='partial'){ el.className='badge warn'; el.textContent='一致性：覆盖不全（'+(j.skipped||0)+' 张未校验）'; }
+      else { el.className='badge ok'; el.textContent='一致性：已确认一致'; }
+      el.title=(j.verdict_text||'')+'\n权威副本（基准）：'+(j.master||'')
+              +'\n最后一次校验：'+(j.ts||'')+'\n覆盖：'+(j.coverage_text||'');
+    })
+    .catch(function(){});
+}
+refreshCsBadge();
+</script>
 
 <!-- 集群概要 -->
 <div class="cd-summary">
@@ -963,22 +994,50 @@
       .then(function(j){
         var b = document.getElementById('csBody'); if(!b) return;
         if(!j.ok){ b.innerHTML = '<div style="color:#ff6b6b;">校验失败：'+(j.error||'未知')+'</div>'; return; }
-        var h = '<div style="color:#9fb0d0;margin-bottom:10px;">模式：'+(j.mode==='checksum'?'校验和（精确）':'行数（轻量）')
-          + '　主库：'+j.master+'　已比对表：'+j.checked+'　从库：'+(j.slaves||[]).join('、')+'</div>';
+        // ===== 结论优先（2026-09-23 重写）=====
+        // 旧实现只把「模式/主库/已比对表」与一张差异表堆在一起，而且「✓ 未发现差异」在
+        // 覆盖不全、或从库根本没追平时也照常显示 —— 用户无法回答「到底哪个库是完整的」，
+        // 正是本次生产事故的核心困扰。现在先把话说清楚：权威副本是谁、结论是什么、
+        // 覆盖是否完整、哪些候选差异【没有】被确认。
+        var v = j.verdict||'', vt = j.verdict_text||'';
+        var vHead = v==='inconsistent' ? '⚠ 判定：存在数据不一致'
+                  : v==='consistent'   ? '✓ 判定：覆盖范围内已确认一致'
+                  : v==='partial'      ? '⚠ 判定：覆盖不全，不能认定一致'
+                  : v==='repl_broken'  ? '⚠ 判定：复制异常，无法比对'
+                  : '⚠ 判定：未获结论（不构成数据问题）';
+        var vStyle = v==='inconsistent' ? 'background:#ff6b6b18;border:1px solid #ff6b6b66;color:#ffb3b3'
+                   : v==='consistent'   ? 'background:#22d3ee14;border:1px solid #22d3ee55;color:#9fe8e4'
+                   : 'background:#ffb02014;border:1px solid #ffb02055;color:#ffd479';
+        var h = '<div style="padding:12px 14px;border-radius:8px;margin-bottom:10px;'+vStyle+'">'
+          + '<div style="font-weight:700;font-size:14px;">'+vHead+'</div>'
+          + '<div style="margin-top:6px;">'+esc(vt)+'</div></div>';
+        h += '<div style="color:#9fb0d0;margin-bottom:10px;">'
+          + '模式：'+(j.mode==='checksum'?'校验和（精确）':'行数（轻量）')
+          + '　<b style="color:#cfe;">权威副本（基准）= 当前主库 '+esc(j.master)+'</b>'
+          + '　'+esc(j.coverage_text||('已比对 '+j.checked+' 张表'))
+          + '<br>校验时间：'+esc(j.ts||'')+'　从库：'+esc((j.slaves||[]).join('、'))+'</div>';
+        (j.notes||[]).forEach(function(n){
+          h += '<div style="padding:8px 12px;border-radius:8px;background:#ffb02010;border:1px solid #ffb02040;'
+             + 'margin-bottom:8px;color:#ffd479;">ⓘ '+esc(n)+'</div>';
+        });
         var dw = j.divergence_windows||{};
         for(var k in dw){
           var w = dw[k];
           if(w && w.last_interrupted_ts){
             h += '<div style="padding:8px 12px;border-radius:8px;background:#ffb02014;border:1px solid #ffb02044;margin-bottom:8px;color:#ffd479;">'
-              + '⏱ 从库 '+k+' 复制最近一次异常于 '+w.last_interrupted_ts+'（基于监控快照）—— 该时段内从库独有行可能是真实业务写入，处置前请先导出回灌主库。</div>';
+              + '⏱ 从库 '+esc(k)+' 复制最近一次异常于 '+esc(w.last_interrupted_ts)+'（基于监控快照）—— 该时段内从库独有行可能是真实业务写入，处置前请先导出回灌主库。</div>';
           }
         }
         var d = j.diffs||[];
         if(!d.length){
-          h += '<div style="padding:14px;border-radius:8px;background:#22d3ee14;border:1px solid #22d3ee33;">✓ 未发现差异</div>';
+          // 只有「覆盖完整 + 复制正常」才允许出现 ✓；否则必须明说本次没得出结论，
+          // 否则用户会把「没判定」读成「数据一致」（本次生产事故的核心误导之一）。
+          h += (v==='consistent')
+            ? '<div style="padding:14px;border-radius:8px;background:#22d3ee14;border:1px solid #22d3ee33;">✓ 未发现差异</div>'
+            : '<div style="padding:14px;border-radius:8px;background:#ffb02014;border:1px solid #ffb02044;color:#ffd479;">本次未发现【已确认】差异，但结论不是「一致」——原因见上方判定说明。</div>';
         } else {
           h += '<div style="padding:10px 12px;border-radius:8px;background:#ff6b6b14;border:1px solid #ff6b6b44;margin-bottom:10px;">'
-            + '⚠ 发现 '+d.length+' 处差异（<span style="color:#ff6b6b;">红=从库独有孤儿行，疑似真实写入</span>；<span style="color:#ffb020;">黄=从库缺失</span>）</div>'
+            + '⚠ 发现 '+d.length+' 处<b>已确认</b>差异（<span style="color:#ff6b6b;">红=从库独有孤儿行，疑似真实写入，需回灌主库</span>；<span style="color:#ffb020;">黄=从库缺失</span>）</div>'
             + '<table class="tbl" style="width:100%;font-size:12px;"><thead><tr>'
             + '<th>从库</th><th>表</th><th>主库值</th><th>从库值</th><th>分类</th><th>说明</th><th>操作</th></tr></thead><tbody>';
           for(var i=0;i<d.length && i<200;i++){
@@ -987,19 +1046,42 @@
             var badge = cat==='orphan' ? '<span style="color:#ff6b6b;font-weight:600;">从库独有·孤儿</span>'
                       : cat==='missing' ? '<span style="color:#ffb020;">从库缺失</span>'
                       : cat==='content' ? '<span style="color:#ff944d;">内容差异</span>'
-                      : '<span style="color:#9fb0d0;">'+(x.kind||'')+'</span>';
-            var ops = '<button class="btn btn-sm btn-ghost" onclick="csRowDiff('+cid+',\''+x.host+'\','+x.port+',\''+x.table+'\')">展开</button>';
-            if(cat==='orphan') ops += ' <button class="btn btn-sm" onclick="csExport('+cid+',\''+x.host+'\','+x.port+',\''+x.table+'\')">导出差异</button>';
-            h += '<tr><td class="mono">'+x.host+':'+x.port+'</td><td class="mono">'+x.table+'</td>'
-              + '<td class="mono">'+x.master+'</td><td class="mono">'+x.slave+'</td>'
+                      : cat==='table_extra' ? '<span style="color:#ff6b6b;font-weight:600;">从库多表</span>'
+                      : cat==='table_missing' ? '<span style="color:#ffb020;">从库缺表</span>'
+                      : cat==='unreachable' ? '<span style="color:#ff6b6b;">连不上</span>'
+                      : cat==='read_error' ? '<span style="color:#ffb020;">读取失败</span>'
+                      : '<span style="color:#9fb0d0;">'+esc(x.kind||'')+'</span>';
+            // 「展开/导出」只对表内差异有意义（缺表/连不上时没有行可展开）
+            var ops = '—';
+            if(cat!=='table_extra' && cat!=='table_missing' && cat!=='unreachable'){
+              ops = '<button class="btn btn-sm btn-ghost" onclick="csRowDiff('+cid+',\''+x.host+'\','+x.port+',\''+x.table+'\')">展开</button>';
+              if(cat==='orphan') ops += ' <button class="btn btn-sm" onclick="csExport('+cid+',\''+x.host+'\','+x.port+',\''+x.table+'\')">导出差异</button>';
+            }
+            h += '<tr><td class="mono">'+esc(x.host+':'+x.port)+'</td><td class="mono">'+esc(x.table)+'</td>'
+              + '<td class="mono">'+esc(x.master)+'</td><td class="mono">'+esc(x.slave)+'</td>'
               + '<td>'+badge+'</td>'
-              + '<td>'+(x.note||'')+(x.window_hint?'<br><span style="color:#ffd479;">'+x.window_hint+'</span>':'')+'</td>'
+              + '<td>'+esc(x.note||'')+(x.window_hint?'<br><span style="color:#ffd479;">'+esc(x.window_hint)+'</span>':'')+'</td>'
               + '<td>'+ops+'</td></tr>';
           }
           h += '</tbody></table>';
           if(d.length>200) h += '<div style="color:#9fb0d0;margin-top:8px;">（仅显示前 200 条）</div>';
         }
+        // 未获结论的候选差异单列一区：它们【不是】数据问题，但也不能被藏起来。
+        var tr = j.transient||[];
+        if(tr.length){
+          h += '<div style="margin-top:16px;font-weight:600;color:#9fb0d0;">候选差异（未确认 —— 可能是采样时差或从库未追平，<b>不构成</b>数据不一致结论）</div>'
+            + '<table class="tbl" style="width:100%;font-size:12px;margin-top:6px;"><thead><tr>'
+            + '<th>从库</th><th>表</th><th>原因</th></tr></thead><tbody>';
+          for(var k2=0;k2<tr.length && k2<50;k2++){
+            h += '<tr><td class="mono">'+esc(tr[k2].host+':'+tr[k2].port)+'</td>'
+              + '<td class="mono">'+esc(tr[k2].table)+'</td>'
+              + '<td style="color:#9fb0d0;">'+esc(tr[k2].reason||tr[k2].note||'')+'</td></tr>';
+          }
+          h += '</tbody></table>';
+        }
         b.innerHTML = h;
+        // 结论出来了，页面徽章立即跟上 —— 杜绝「弹窗说有不一致、页面还显示正常」
+        try{ refreshCsBadge(); }catch(e){}
       })
       .catch(function(e){ var b=document.getElementById('csBody'); if(b) b.innerHTML='请求失败：'+e; });
   }

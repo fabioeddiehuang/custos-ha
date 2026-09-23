@@ -756,28 +756,51 @@ def api_collect_state(user=Depends(auth_required)):
 
 @app.post("/api/consistency/check")
 def api_consistency_check(cluster_id: int = Form(...), mode: str = Form("rows"),
+                          wait_sec: int = Form(-1),
                           user=Depends(auth_required)):
     """主从数据一致性校验（纯只读）。
 
     mode=rows     比对各业务表行数（轻量，可定期跑）
     mode=checksum CHECKSUM TABLE 逐表比对（较重，能发现行数相同但内容不同）
+
+    wait_sec：候选差异复核前，等待从库追平的秒数上限（-1 = 用模块默认）。
+    结论会持久化（consistency.save_result）——集群页据此显示最近一次结论徽章，
+    使「有未处置差异」与「页面显示正常」不可能同时成立。
     """
     try:
-        res = consistency.check_consistency(cluster_id, mode)
+        res = consistency.check_consistency(
+            cluster_id, mode, wait_sec=(None if int(wait_sec) < 0 else int(wait_sec)))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    if res.get("ok"):
+        res["result_id"] = consistency.save_result(cluster_id, res)
+    return _json_ok(res)
+
+
+@app.get("/api/consistency/last")
+def api_consistency_last(cluster_id: int = 0, user=Depends(auth_required)):
+    """最近一次一致性校验结论（集群页徽章/横幅用；从未校验过返回 has=False）。
+
+    为什么必须持久化：校验结论原本只活在一个弹窗里，刷新即丢 —— 于是「刚校验出 2 处差异」
+    与「页面显示复制正常」可以同时成立，用户无从判断哪个库可信。
+    """
+    try:
+        res = consistency.last_result(int(cluster_id))
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
     return _json_ok(res)
 
 
-
 @app.get("/api/consistency/check")
 def api_consistency_check_get(cluster_id: int = 0, mode: str = "rows",
                               user=Depends(auth_required)):
-    """GET 形式的一致性校验（便于前端/脚本直接调用）。"""
+    """GET 形式的一致性校验（便于前端/脚本直接调用）。结论同样持久化。"""
     try:
         res = consistency.check_consistency(cluster_id, mode)
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    if res.get("ok"):
+        res["result_id"] = consistency.save_result(cluster_id, res)
     return _json_ok(res)
 
 
