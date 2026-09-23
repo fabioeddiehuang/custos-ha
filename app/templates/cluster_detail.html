@@ -965,19 +965,36 @@
         if(!j.ok){ b.innerHTML = '<div style="color:#ff6b6b;">校验失败：'+(j.error||'未知')+'</div>'; return; }
         var h = '<div style="color:#9fb0d0;margin-bottom:10px;">模式：'+(j.mode==='checksum'?'校验和（精确）':'行数（轻量）')
           + '　主库：'+j.master+'　已比对表：'+j.checked+'　从库：'+(j.slaves||[]).join('、')+'</div>';
+        var dw = j.divergence_windows||{};
+        for(var k in dw){
+          var w = dw[k];
+          if(w && w.last_interrupted_ts){
+            h += '<div style="padding:8px 12px;border-radius:8px;background:#ffb02014;border:1px solid #ffb02044;margin-bottom:8px;color:#ffd479;">'
+              + '⏱ 从库 '+k+' 复制最近一次异常于 '+w.last_interrupted_ts+'（基于监控快照）—— 该时段内从库独有行可能是真实业务写入，处置前请先导出回灌主库。</div>';
+          }
+        }
         var d = j.diffs||[];
         if(!d.length){
           h += '<div style="padding:14px;border-radius:8px;background:#22d3ee14;border:1px solid #22d3ee33;">✓ 未发现差异</div>';
         } else {
           h += '<div style="padding:10px 12px;border-radius:8px;background:#ff6b6b14;border:1px solid #ff6b6b44;margin-bottom:10px;">'
-            + '⚠ 发现 '+d.length+' 处差异</div>'
+            + '⚠ 发现 '+d.length+' 处差异（<span style="color:#ff6b6b;">红=从库独有孤儿行，疑似真实写入</span>；<span style="color:#ffb020;">黄=从库缺失</span>）</div>'
             + '<table class="tbl" style="width:100%;font-size:12px;"><thead><tr>'
-            + '<th>从库</th><th>表</th><th>主库值</th><th>从库值</th><th>说明</th></tr></thead><tbody>';
+            + '<th>从库</th><th>表</th><th>主库值</th><th>从库值</th><th>分类</th><th>说明</th><th>操作</th></tr></thead><tbody>';
           for(var i=0;i<d.length && i<200;i++){
             var x=d[i];
+            var cat=x.category||'';
+            var badge = cat==='orphan' ? '<span style="color:#ff6b6b;font-weight:600;">从库独有·孤儿</span>'
+                      : cat==='missing' ? '<span style="color:#ffb020;">从库缺失</span>'
+                      : cat==='content' ? '<span style="color:#ff944d;">内容差异</span>'
+                      : '<span style="color:#9fb0d0;">'+(x.kind||'')+'</span>';
+            var ops = '<button class="btn btn-sm btn-ghost" onclick="csRowDiff('+cid+',\''+x.host+'\','+x.port+',\''+x.table+'\')">展开</button>';
+            if(cat==='orphan') ops += ' <button class="btn btn-sm" onclick="csExport('+cid+',\''+x.host+'\','+x.port+',\''+x.table+'\')">导出差异</button>';
             h += '<tr><td class="mono">'+x.host+':'+x.port+'</td><td class="mono">'+x.table+'</td>'
               + '<td class="mono">'+x.master+'</td><td class="mono">'+x.slave+'</td>'
-              + '<td>'+(x.note||'')+'</td></tr>';
+              + '<td>'+badge+'</td>'
+              + '<td>'+(x.note||'')+(x.window_hint?'<br><span style="color:#ffd479;">'+x.window_hint+'</span>':'')+'</td>'
+              + '<td>'+ops+'</td></tr>';
           }
           h += '</tbody></table>';
           if(d.length>200) h += '<div style="color:#9fb0d0;margin-top:8px;">（仅显示前 200 条）</div>';
@@ -987,6 +1004,82 @@
       .catch(function(e){ var b=document.getElementById('csBody'); if(b) b.innerHTML='请求失败：'+e; });
   }
   function closeCs(){ var ov=document.getElementById('csOverlay'); if(ov) ov.style.display='none'; }
+
+  // ---- abc：行级差异下钻（展开主键 + 两侧值）----
+  function csRowDiff(cid, host, port, table){
+    var ov=document.getElementById('csOverlay'), box=document.getElementById('csBox');
+    if(ov) ov.style.display='flex';
+    var b=document.getElementById('csBody'); if(!b) return;
+    b.innerHTML='正在展开行级差异（'+host+':'+port+' '+table+'）…';
+    var fd=new FormData();
+    fd.append('cluster_id',cid); fd.append('host',host); fd.append('port',port); fd.append('table',table);
+    fetch('/api/consistency/row_diff',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(j){
+        if(!j.ok){ b.innerHTML='<div style="color:#ff6b6b;">展开失败：'+(j.error||'未知')+'</div>'; return; }
+        var h='<div style="margin-bottom:8px;color:#9fb0d0;">主键：'+(j.pk_cols||[]).join(', ')
+          +'　主库 '+j.master_count+' 行 / 从库 '+j.slave_count+' 行'
+          + (j.truncated?'（仅展开前若干行，完整请以导出为准）':'')+'</div>';
+        var mk=function(rows,title,color){
+          if(!rows||!rows.length) return '';
+          var s='<div style="font-weight:600;color:'+color+';margin:10px 0 4px;">'+title+'（'+rows.length+'）</div><div style="max-height:240px;overflow:auto;">';
+          s+='<table class="tbl" style="width:100%;font-size:11px;"><thead><tr>';
+          (j.columns||[]).forEach(function(c){ s+='<th>'+c+'</th>'; });
+          s+='</tr></thead><tbody>';
+          rows.forEach(function(r){ s+='<tr>'; (j.columns||[]).forEach(function(c){ s+='<td class="mono">'+(r[c]===null?'NULL':r[c])+'</td>'; }); s+='</tr>'; });
+          s+='</tbody></table></div>';
+          return s;
+        };
+        h+=mk(j.only_in_master,'仅在主库（从库缺失）','#ffb020');
+        h+=mk(j.only_in_slave,'仅在从库（孤儿·疑似真实写入）','#ff6b6b');
+        b.innerHTML=h;
+      }).catch(function(e){ var bb=document.getElementById('csBody'); if(bb) bb.innerHTML='请求失败：'+e; });
+  }
+  // ---- d：导出差异（回灌主库 SQL + 以主库为准收敛 SQL），并落 quarantine ----
+  function csExport(cid, host, port, table){
+    var ov=document.getElementById('csOverlay'), box=document.getElementById('csBox');
+    if(ov) ov.style.display='flex';
+    var b=document.getElementById('csBody'); if(!b) return;
+    b.innerHTML='正在生成差异处置 SQL（'+host+':'+port+' '+table+'）…';
+    var fd=new FormData();
+    fd.append('cluster_id',cid); fd.append('host',host); fd.append('port',port); fd.append('table',table);
+    fetch('/api/consistency/export',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(j){
+        if(!j.ok){ b.innerHTML='<div style="color:#ff6b6b;">导出失败：'+(j.error||'未知')+'</div>'; return; }
+        if(!j.orphan_rows || !j.orphan_rows.length){
+          b.innerHTML='<div style="padding:12px;border-radius:8px;background:#22d3ee14;border:1px solid #22d3ee33;">该表无非主库侧独有的孤儿行，无需导出。</div>';
+          return;
+        }
+        var h='<div style="color:#ffd479;margin-bottom:8px;">⚠ 从库独有 '+j.orphan_rows.length+' 行，疑似分裂窗口内的真实写入。<b>推荐先回灌主库</b>，不要直接以主库为准删除。</div>';
+        h+='<div style="font-weight:600;margin:8px 0 4px;">① 回灌当前主库（推荐，零丢失，复制自然下发）：</div>'
+          +'<textarea readonly style="width:100%;height:140px;font-size:11px;background:#0a1020;color:#cfe;padding:8px;border-radius:6px;">'+(j.remaster_sql||'')+'</textarea>';
+        h+='<div style="font-weight:600;margin:8px 0 4px;">② 以主库为准收敛（危险，已存入回收表可一键回灌）：</div>'
+          +'<textarea readonly style="width:100%;height:120px;font-size:11px;background:#0a1020;color:#cfe;padding:8px;border-radius:6px;">'+(j.converge_sql||'')+'</textarea>';
+        h+='<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">'
+          +'<button class="btn" onclick="csDownload('+JSON.stringify(j.remaster_sql)+','+JSON.stringify(j.converge_sql)+')">下载 SQL</button>'
+          +'<button class="btn btn-primary" onclick="csRemaster('+JSON.stringify(j.recycle_id)+')">一键回灌主库</button>'
+          +'</div>';
+        if(j.recycle_id) h+='<div style="color:#9fb0d0;margin-top:6px;">回收表 ID：'+j.recycle_id+'（回灌前这些行已安全留存，可随时取回）</div>';
+        b.innerHTML=h;
+      }).catch(function(e){ var bb=document.getElementById('csBody'); if(bb) bb.innerHTML='请求失败：'+e; });
+  }
+  function csDownload(remaster_sql, converge_sql){
+    var txt = (remaster_sql||'') + "\n\n" + (converge_sql||'');
+    var blob = new Blob([txt], {type:'text/plain'});
+    var a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'custos_divergent_rows.sql'; a.click();
+  }
+  function csRemaster(recycle_id){
+    if(recycle_id===null||recycle_id===undefined){ alert('无回收记录'); return; }
+    if(!confirm('确定把回收表中的从库独有行回灌到【当前主库】吗？\n\n这将把这些行 INSERT 回主库，由复制自然下发到各节点（救回真实写入）。')) return;
+    var fd=new FormData(); fd.append('recycle_id', recycle_id);
+    fetch('/api/consistency/remaster',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(j){
+        if(!j.ok){ alert('回灌失败：'+(j.error||'未知')); return; }
+        alert('已回灌主库 '+(j.applied||0)+' 行。复制将自动下发到各节点。');
+        var b=document.getElementById('csBody'); if(b) b.innerHTML='<div style="color:#22d3ee;">✓ 已回灌主库 '+(j.applied||0)+' 行。</div>';
+      }).catch(function(e){ alert('请求失败：'+e); });
+  }
+
   function csToggleFull(){
     var b=document.getElementById('csBox'); if(!b) return;
     if(b.style.width==='96vw'){ b.style.width='min(860px,92vw)'; b.style.maxHeight='82vh'; }

@@ -1327,6 +1327,44 @@ def purge_binlog_before(host, port, user, password, dt_str, root_user="root", ro
             pass
 
 
+# ---- vip-guard fencing 状态（2026-09-23 新增）----
+# _FENCE_FIRST_SEEN: 记录「自认主但无法自愈」节点首次被发现的时间，用于宽限期计时。
+# 宽限期内仅高优告警（吸收网络抖动/瞬时 root 口令失效）；超宽限仍不可纠正则 read_only=ON
+# 封写（管不住就别让它写），杜绝静默分叉。管理器重启会重置（下一周期重新计时，可接受）。
+import os as _os
+import time as _time
+_VIPGUARD_FENCE_GRACE = float(_os.environ.get("VIPGUARD_FENCE_GRACE", "60"))  # 秒
+_FENCE_FIRST_SEEN = {}
+
+
+def _fence_readonly(host, port, user, password, root_user="root", root_pass=""):
+    """分裂态封写：SET GLOBAL read_only=ON（MySQL 同步 super_read_only）。
+
+    返回 (ok, err)。优先用 root 连接（避免 ha_monitor 缺 READ_ONLY ADMIN）。
+    仅在「节点自认主但非当前主、且就地纠正失败」的分裂态调用——正常主库/从库不会触发。
+    """
+    conn = connect_robust(host, port, user, password, root_user, root_pass)
+    if conn is None:
+        return False, "无法连接节点(ha_monitor/root 均失败)"
+    try:
+        cur = conn.cursor()
+        flavour = detect_flavour(cur)
+        try:
+            if flavour == F_MYSQL8:
+                cur.execute("SET GLOBAL super_read_only=ON")
+            cur.execute("SET GLOBAL read_only=ON")
+            return True, None
+        except Exception as e:
+            # MariaDB 可能需 READ_ONLY ADMIN；MySQL 需 SUPER / SYSTEM_VARIABLES_ADMIN。
+            # 若 root 都失败，说明 root 口令失效或账号权限不足，必须告警暴露。
+            return False, "%s: %s" % (type(e).__name__, e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def make_slave_of(host, port, user, password, master_host, master_port,
                   repl_user, repl_pass, root_user="root", root_pass=""):
     """把本节点改造为 master_host 的从库（GTID 自动定位）。
@@ -1405,36 +1443,51 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                       f"放行重挂载为 {_target} 的从库以恢复复制。")
                 _self_m = False
             else:
-                _fixed = False
-                _ferr = ""
-                try:
-                    # 与会话内其它写入保持一致：ha_local 是节点本地状态表，绝不进 binlog，
-                    # 否则该写入会被复制到从库、并可能在从库上报 1062 卡死复制线程。
-                    cur.execute("SET SESSION sql_log_bin=0")
-                    cur.execute(
-                        "REPLACE INTO ha_local.state (k, v) VALUES ('current_master', %s)",
-                        (_target,))
-                    _fixed = True
-                except Exception as _e_fix:
-                    _ferr = "%s: %s" % (type(_e_fix).__name__, _e_fix)
-                finally:
-                    try:
-                        cur.execute("SET SESSION sql_log_bin=1")
-                    except Exception:
-                        pass
+                # ⚠ 就地纠正复用 set_local_master_flag_ex（2026-09-23 修复）：
+                #   它内部会先自检 `SET SESSION sql_log_bin=0`，ha_monitor 缺 BINLOG ADMIN
+                #   时自动回退 root 连接（root 恒为 ALL PRIVILEGES）—— 与状态推送器行为对齐。
+                #   此前这里只用当前连接（ha_monitor）手写 REPLACE，而 ha_monitor 按
+                #   _ensure_local_state_grant 仅授 ha_local.* 的 SELECT/INSERT/UPDATE/
+                #   DELETE/CREATE，**没有 BINLOG ADMIN** ⇒ MariaDB >= 10.5.2 上
+                #   `SET SESSION sql_log_bin=0` 必被 1227 拒绝 ⇒ 自愈必然失败（已实测）。
+                #   后果：守卫永久拒绝降级，回归的旧主既不入集群又保持可写，且 keepalived
+                #   按其过期记录仍把 VIP 绑在它身上 ⇒ 业务写入造成静默分叉；只能等推送器
+                #   最长 PUSH_MAX_INTERVAL=300s 才解开，那时分叉已成事实。
+                _ok_fix, _ferr = set_local_master_flag_ex(
+                    host, port, user, password, _target, root_user, root_pass)
+                _fixed = bool(_ok_fix)
                 if _fixed:
                     print(f"[vip-guard] {host}:{port} 本地 current_master 已由 {_rec!r} "
                           f"就地纠正为 {_target}（自愈），继续挂载为从库。")
+                    _FENCE_FIRST_SEEN.pop("%s:%s" % (host, port), None)
                     _self_m = False
                 else:
                     print(f"[vip-guard] {host}:{port} 就地纠正本地 current_master 失败：{_ferr}")
+                    # ---- 宽限期后 fencing（2026-09-23 新增）----
+                    # 就地纠正失败 => 节点处于「自认主但非当前主、且无法自愈」的分裂态，
+                    # 保持可写会继续产生静默分叉。策略：首次发现仅高优告警（宽限期吸收抖动），
+                    # 超宽限仍未自愈则 read_only=ON 封写（管不住就别让它写）。
+                    _fk = "%s:%s" % (host, port)
+                    _now = _time.time()
+                    _FENCE_FIRST_SEEN.setdefault(_fk, _now)
+                    _fenced, _ferr_fence = False, ""
+                    if _now - _FENCE_FIRST_SEEN[_fk] >= _VIPGUARD_FENCE_GRACE:
+                        _fenced, _ferr_fence = _fence_readonly(
+                            host, port, user, password, root_user, root_pass)
+                        if not _fenced:
+                            print(f"[vip-guard] {_fk} fencing 失败：{_ferr_fence}")
         if _self_m and not _addr_eq(_target, host, port):
             msg = (f"[vip-guard] 拒绝把 {host}:{port} 改造为从库：其本机 ha_local.state 仍记录 "
                    f"current_master={_rec!r}（keepalived 据此把 VIP 绑在该节点），与本次要挂载的"
                    f"主库 {_target} 不一致，且就地纠正该记录也未成功。已跳过本次重指向并保留其"
-                   f"可写状态，避免业务经 VIP 写入报 1290。请检查该节点 ha_local 库与 "
-                   f"ha_monitor 账号权限（需 BINLOG ADMIN 及 ha_local 库的 "
-                   f"SELECT/INSERT/UPDATE/CREATE），以及到该节点的网络连通性。")
+                   f"可写状态，避免业务经 VIP 写入报 1290。"
+                   f"【就地纠正的真实错误】{_ferr or '（未提供）'}。"
+                   f"请检查：① 该节点 ha_local 库权限；② ha_monitor 是否缺 BINLOG ADMIN"
+                   f"（MariaDB >= 10.5.2 执行 SET SESSION sql_log_bin 必需）；"
+                   f"③ 管理端记录的该节点 root 口令是否有效（缺 BINLOG ADMIN 时靠它回退）；"
+                   f"④ 到该节点的网络连通性。"
+                   f"{(chr(91) + '已触发 fencing：已将该节点 read_only=ON 封写，避免继续静默分叉' + chr(93)) if _fenced else '[宽限期内：尚未封写，将在超限后自动 fencing]'}"
+                   f"{(chr(32) + 'fencing 失败：' + _ferr_fence) if (_fenced is False and _ferr_fence) else ''}。")
             print(msg)
             try:
                 from .alerts import send_alert   # 局部导入，避免模块级循环依赖

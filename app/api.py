@@ -781,6 +781,49 @@ def api_consistency_check_get(cluster_id: int = 0, mode: str = "rows",
     return _json_ok(res)
 
 
+
+@app.post("/api/consistency/row_diff")
+def api_consistency_row_diff(cluster_id: int = Form(...), host: str = Form(...),
+                            port: int = Form(...), table: str = Form(...),
+                            user=Depends(auth_required)):
+    """展开某张差异表的行级差异（主键 + 两侧值）。table 形如 'db.tbl'。"""
+    try:
+        if "." in table:
+            schema, tbl = table.split(".", 1)
+        else:
+            return _json_ok({"ok": False, "error": "表名需含库名（db.tbl）"})
+        res = consistency.row_diff(cluster_id, host, port, schema, tbl)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok(res)
+
+
+@app.post("/api/consistency/export")
+def api_consistency_export(cluster_id: int = Form(...), host: str = Form(...),
+                          port: int = Form(...), table: str = Form(...),
+                          user=Depends(auth_required)):
+    """生成差异处置 SQL 并落 quarantine（卷内回收表，可一键回灌主库）。"""
+    try:
+        if "." in table:
+            schema, tbl = table.split(".", 1)
+        else:
+            return _json_ok({"ok": False, "error": "表名需含库名（db.tbl）"})
+        res = consistency.export_divergent_rows(cluster_id, host, port, schema, tbl)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok(res)
+
+
+@app.post("/api/consistency/remaster")
+def api_consistency_remaster(recycle_id: int = Form(...), user=Depends(auth_required)):
+    """把回收表中的从库独有行回灌到当前主库（救回分裂窗口内的真实写入）。"""
+    try:
+        res = consistency.remaster_from_recycle(recycle_id)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok(res)
+
+
 @app.post("/api/node/rebuild")
 def api_node_rebuild(cluster_id: int = Form(...), host: str = Form(...),
                      port: int = Form(...), user=Depends(auth_required)):
