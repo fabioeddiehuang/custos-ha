@@ -1551,6 +1551,16 @@ def make_slave_of(host, port, user, password, master_host, master_port,
         # 已应用位点续传、重放主库其余 domain 最终一致）。仅当 gtid_slave_pos 本身也非子集
         # （极少见：从库应用过主库没有的事务）才把 gtid_slave_pos 对齐到主库当前位置跳过重放。
         try:
+            # MariaDB 不支持 GTID_SUBSET / GTID_SUBTRACT（12.3.3 实测报
+            # 1305 FUNCTION GTID_SUBSET does not exist）。下面这套分叉检测一执行到
+            # GTID_SUBSET 就抛异常、被 except 静默吞掉 ⇒ 在 MariaDB 上**从未真正生效**。
+            # 但「gtid_slave_pos 为空」时不会调用 GTID_SUBSET，反而会走到 RESET MASTER +
+            # 设置起点的分支 ⇒ 原主库（100）被跳过历史、数据永久不一致。
+            # 2.2.20 的实际效果恒为「不做任何特殊处理」的最简路径，这正是它稳定的原因。
+            # 与其依赖「抛异常被吞」这种偶然行为，不如显式跳过：MariaDB 的 GTID 自动定位
+            # (MASTER_USE_GTID=slave_pos) 本身即可正确定位位点，无需这套 MySQL 语义逻辑。
+            if flavour == F_MARIADB:
+                raise RuntimeError("MariaDB 不支持 GTID_SUBSET，显式跳过分叉检测")
             cur.execute("SELECT @@gtid_slave_pos, @@gtid_binlog_pos")
             _sr = cur.fetchone() or [None, None]
             _slave_gt = _sr[0] or ""

@@ -997,10 +997,12 @@ def ensure_topology(cluster_id):
             continue
         _TOPO_AT[_rk] = time.monotonic()
         # ---- 重挂载前预检：从库是否缺主库的业务库（重装/空库的典型特征）----
-        # 这类节点绝不能直接 make_slave_of：其 GTID 分叉处理会把 gtid_slave_pos
-        # 对齐到主库当前位点、从而**跳过全部历史建表事务**（100 曾为主库时必走该分支），
-        # 结果是「复制 IO/SQL 都 Yes，但库表全无」，主库一写存量表就 1146 ——
-        # 这正是「重装多少次都无法同步」的机制。故先克隆数据，再谈复制。
+        # 这类节点现在虽已能靠「从头完整重放主库 binlog」补齐（make_slave_of 已回归
+        # 2.2.20 行为：已应用集为空时不再设起点、不跳过历史），但仍受两个限制：
+        #   ① 依赖主库 binlog 保留期，早期 binlog 一旦被清理就永远补不齐（1236）；
+        #   ② 大库重放耗时不可控，期间复制长期处于追平态。
+        # 故缺库时直接走全量克隆（主库 dump → 从库 restore），确定性与耗时都更可控，
+        # 且后续若主库 binlog 不完整也照样能一致。克隆完再建立复制。
         _missing_dbs = _slave_missing_master_dbs(cluster_id, h, cur_h, cur_p, creds)
         if _missing_dbs:
             _maybe_auto_full_clone(
