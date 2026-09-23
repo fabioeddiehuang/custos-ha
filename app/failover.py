@@ -166,11 +166,54 @@ def _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
             pass
 
 
-def _maybe_auto_full_clone(cluster_id, h, cur_h, cur_p, creds):
-    """重指向失败后，判断并自动触发全量克隆（复用重建逻辑）。
+def _slave_missing_master_dbs(cluster_id, h, cur_h, cur_p, creds):
+    """返回从库**缺失**的主库业务库清单（空列表=不缺）。
 
-    仅当：① 复制中断属『缺表 / 主库 binlog 已清理』(binlog 重放补救不了)；
-          ② 从库无孤儿写入（GTID 是主库的子集，克隆不丢数据）；
+    用于识别「重装/空库」节点：它缺的不只是数据，连库结构都没有。
+    这类节点绝不能走「GTID 对齐到主库当前位点」的重挂载路径 —— 那会跳过全部
+    历史建表事务，表现为复制 IO/SQL 都 Yes、一遇主库对存量表的写入就 1146。
+    ha_local 是节点本地状态库（不参与复制），排除在比较之外。
+    """
+    host, port = h["host"], int(h["port"])
+    sys_dbs = {"information_schema", "mysql", "performance_schema", "sys", "ha_local"}
+    sru, srp = node_root(host, cluster_id)
+    mru, mrp = node_root(cur_h, cluster_id)
+    sconn = connect_robust(host, port, creds["ha_user"], creds["ha_pass"], sru, srp)
+    if sconn is None:
+        return []
+    try:
+        mconn = connect_robust(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], mru, mrp)
+        if mconn is None:
+            return []
+        try:
+            with sconn.cursor() as sc:
+                sc.execute("SHOW DATABASES")
+                s_dbs = {r[0] for r in sc.fetchall()} - sys_dbs
+            with mconn.cursor() as mc:
+                mc.execute("SHOW DATABASES")
+                m_dbs = {r[0] for r in mc.fetchall()} - sys_dbs
+        finally:
+            try:
+                mconn.close()
+            except Exception:
+                pass
+    except Exception:
+        return []
+    finally:
+        try:
+            sconn.close()
+        except Exception:
+            pass
+    return sorted(m_dbs - s_dbs)
+
+
+def _maybe_auto_full_clone(cluster_id, h, cur_h, cur_p, creds, force_reason=None):
+    """判断并自动触发全量克隆（复用重建逻辑）。
+
+    触发条件二选一：
+      ① force_reason 非空：调用方已判定存在「数据缺口」（如重装后缺主库的业务库）；
+      ② 否则：复制中断属『缺表 / 主库 binlog 已清理』(binlog 重放补救不了)。
+    且必须通过安全闸门：从库无孤儿写入（GTID 是主库的子集，克隆不丢数据）。
     才自动调 start_rebuild。否则维持原『告警降级』，转人工（导出孤儿行回灌主库）。
     """
     if not AUTO_FULL_CLONE:
@@ -181,12 +224,15 @@ def _maybe_auto_full_clone(cluster_id, h, cur_h, cur_p, creds):
     key = (int(cluster_id), host, port)
     if time.monotonic() - _AUTO_CLONE_AT.get(key, 0.0) < _AUTO_CLONE_COOLDOWN:
         return
-    ru, rp = node_root(host, cluster_id)
-    st = get_status(host, port, creds["ha_user"], creds["ha_pass"], ru, rp)
-    needs, why = _replica_needs_full_clone(st)
-    if not needs:
-        _warn_repoint(host, port, f"{host}:{port} 重指向失败（非克隆类错误，交既有自愈）")
-        return
+    if force_reason:
+        needs, why = True, force_reason
+    else:
+        ru, rp = node_root(host, cluster_id)
+        st = get_status(host, port, creds["ha_user"], creds["ha_pass"], ru, rp)
+        needs, why = _replica_needs_full_clone(st)
+        if not needs:
+            _warn_repoint(host, port, f"{host}:{port} 重指向失败（非克隆类错误，交既有自愈）")
+            return
     # 安全闸门：从库有主库没有的写入 → 克隆会覆盖丢失，禁止自动克隆
     if not _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
         _AUTO_CLONE_AT[key] = time.monotonic()
@@ -949,6 +995,18 @@ def ensure_topology(cluster_id):
         if time.monotonic() - _TOPO_AT.get(_rk, 0.0) < TOPO_REPAIR_INTERVAL:
             continue
         _TOPO_AT[_rk] = time.monotonic()
+        # ---- 重挂载前预检：从库是否缺主库的业务库（重装/空库的典型特征）----
+        # 这类节点绝不能直接 make_slave_of：其 GTID 分叉处理会把 gtid_slave_pos
+        # 对齐到主库当前位点、从而**跳过全部历史建表事务**（100 曾为主库时必走该分支），
+        # 结果是「复制 IO/SQL 都 Yes，但库表全无」，主库一写存量表就 1146 ——
+        # 这正是「重装多少次都无法同步」的机制。故先克隆数据，再谈复制。
+        _missing_dbs = _slave_missing_master_dbs(cluster_id, h, cur_h, cur_p, creds)
+        if _missing_dbs:
+            _maybe_auto_full_clone(
+                cluster_id, h, cur_h, cur_p, creds,
+                force_reason=("从库缺失主库业务库 %s（重装/空库特征）：无法靠 binlog 重放补齐，"
+                              "需全量克隆" % "、".join(_missing_dbs)))
+            continue
         was_stale_master = is_stale_master(st)
         ok, _rmsg = _repoint_slave(cluster_id, h, cur_h, cur_p, creds)
         if ok:

@@ -1557,13 +1557,31 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                                     # 已应用集为主库子集：保留以免从头重放报 1062
                                     cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
                                 else:
-                                    # 已应用集也分叉：对齐到主库当前位置，跳过重放避免 1236
-                                    cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
-                                    print("[gtid] %s:%s 已应用集分叉，gtid_slave_pos 已对齐主库当前 %s" % (host, port, _master_gt))
+                                    # 已应用集也分叉：旧实现对齐到主库当前位置以跳过重放避免 1236，
+                                    # 但那会一并跳过本节点缺失的增量 ⇒ 复制 IO/SQL 正常而数据永久
+                                    # 不一致。改用自有 GTID（RESET MASTER 之前记录，即它真实拥有的
+                                    # 数据）作起点：主库还留着这段 binlog 就从此处续传补齐，
+                                    # 已清理则报 1236，由上层自动全量克隆兜底。
+                                    cur.execute("SET GLOBAL gtid_slave_pos=%s", (_own_gt or _master_gt,))
+                                    print("[gtid] %s:%s 已应用集分叉：gtid_slave_pos 设为自有 GTID %s"
+                                          "（而非主库当前 %s）" % (host, port, _own_gt, _master_gt))
                             elif _slave_gt:
                                 cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
                             elif _master_gt:
-                                cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
+                                # 【修复 2026-09-24】本节点「曾为源」且 gtid_slave_pos 为空
+                                # —— 典型是原主库带着旧 data 重新入集群（100 复用旧 data 的场景）。
+                                # 旧实现直接对齐到【主库当前位点】，等于宣称「本节点已拥有主库全部
+                                # 历史」，主库便不再下发它缺失的那段增量 ⇒ 复制 IO/SQL 全 Yes、
+                                # 延迟 0，但数据永久不一致。这正是「188/88 复用旧 data 正常、
+                                # 唯独原主库 100 始终不一致」的机制：188/88 是纯从库，gtid_slave_pos
+                                # 非空且为主库子集 ⇒ 走上面的『保留』分支正常续传；而原主库没有已
+                                # 应用集，就落到本分支被静默跳过。
+                                # 正确起点是本节点 RESET MASTER 之前记录的【自有 GTID _own_gt】
+                                # （那才是它真实拥有的数据）：主库若有这段 binlog 即从此处续传、
+                                # 补齐缺失的增量；若已清理则报 1236，由上层自动全量克隆兜底。
+                                cur.execute("SET GLOBAL gtid_slave_pos=%s", (_own_gt or _master_gt,))
+                                print("[gtid] %s:%s 无已应用集：gtid_slave_pos 设为自有 GTID %s"
+                                      "（而非主库当前 %s），避免跳过缺失的增量" % (host, port, _own_gt, _master_gt))
                         except Exception as e2:
                             print("[gtid] 分叉重建失败(可忽略，继续常规重链): %s" % e2)
                     elif not _pos_ok:
