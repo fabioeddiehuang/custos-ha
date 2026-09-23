@@ -7,9 +7,11 @@ from .ha_client import (set_read_only, promote_to_master, make_slave_of,
                         heal_replication, heal_io_gtid_gap, get_gtid_executed,
                         parse_gtid_set, fix_node_mysql_params, ensure_ha_creds,
                         ensure_connect_creds,
-                        heal_anonymous_gtid_io, is_read_only)
+                        heal_anonymous_gtid_io, is_read_only,
+                        connect_robust, is_gtid_purged_error)
 import time
 import threading
+import os
 from .alerts import send_alert
 from .clusters import get_cluster_creds
 
@@ -64,6 +66,19 @@ _PUSH_WARN_AT = {}
 _FAILOVER_LOCK = threading.Lock()
 _LAST_FAILOVER_TS = {}
 
+# ===== 自动全量克隆（重装/重入从库自愈补强，2026-09-23）=====
+# 旧实现：ensure_topology 只会 make_slave_of（RESET SLAVE + CHANGE MASTER）重指复制，
+# 从不克隆数据。重装出来的空从库靠 GTID 从主库最早保留的 binlog 重放补齐；一旦主库
+# binlog 被清理（expire=0 那段事故），从库永远缺更早创建的表 → SQL 线程 1146 卡死，
+# 且 IO/SQL 自愈对其无效（heal_replication 拒绝跳过「会让数据永久不一致」的缺表错误）。
+# 故：重指向失败且属「缺表 / 主库 binlog 已清理」这类 binlog 重放不可自愈的缺口时，
+# 自动触发全量克隆（复用 rebuild.start_rebuild：主库 dump → 从库 restore → 对齐 GTID）。
+# 安全闸门：从库若存在主库没有的写入（孤儿数据，GTID 超前），克隆会覆盖丢失 → 禁止
+# 自动克隆，转人工（一致性校验导出孤儿行回灌主库）。可用 CUSTOS_AUTO_FULL_CLONE=0 关闭。
+AUTO_FULL_CLONE = os.environ.get("CUSTOS_AUTO_FULL_CLONE", "1") != "0"
+_AUTO_CLONE_COOLDOWN = 3600  # 同一节点两次自动克隆最短间隔（秒），避免重建风暴
+_AUTO_CLONE_AT = {}
+
 
 def _failover_guarded(func):
     """串行化所有故障切换（自动/手动统一互斥），避免并发切换造成 split-brain / 双主。
@@ -86,6 +101,120 @@ def _warn_repoint(host, port, msg):
     if now - _repoint_fail_ts.get(key, 0) > _REPOINT_WARN_COOLDOWN:
         print(f"[failover] {msg}")
         _repoint_fail_ts[key] = now
+
+
+def _replica_needs_full_clone(st):
+    """复制中断是否『binlog 重放无法自愈、必须全量克隆』。返回 (needs, reason)。
+
+    - SQL 线程 1146（表不存在）：从库缺表，主库建表前的 binlog 已清理，重放永远补不出
+      → 必须全量克隆。
+    - IO 线程 1236 且为主库 binlog 已清理（is_gtid_purged_error）：同样必须全量克隆。
+    - 其余（1007/1062 幂等冲突、匿名事务、账号漂移等）由既有 heal 覆盖，不触发克隆。
+    """
+    if not st:
+        return False, ""
+    io = st.get("slave_io") or ""
+    sql = st.get("slave_sql") or ""
+    err = str(st.get("error") or st.get("slave_sql_err")
+              or st.get("slave_io_err") or "")
+    low = err.lower()
+    if sql != "Yes" and ("1146" in err or "doesn't exist" in low or "does not exist" in low):
+        return True, "从库缺失表（SQL 线程 1146），binlog 重放无法补齐"
+    if io != "Yes" and is_gtid_purged_error(err):
+        return True, "主库 binlog 已清理（IO 线程 1236），需全量克隆"
+    return False, ""
+
+
+def _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
+    """True = 从库所有已提交事务主库都有（自动克隆不会丢数据）。
+
+    安全闸门用：从库有孤儿写入（其 GTID 不是主库的子集）时返回 False，禁止自动克隆。
+    """
+    host, port = h["host"], int(h["port"])
+    sru, srp = node_root(host, cluster_id)
+    mru, mrp = node_root(cur_h, cluster_id)
+    sconn = connect_robust(host, port, creds["ha_user"], creds["ha_pass"], sru, srp)
+    if sconn is None:
+        return True  # 连不上则保守放行，交给既有自愈，不阻断拓扑
+    try:
+        mconn = connect_robust(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], mru, mrp)
+        if mconn is None:
+            return True
+        try:
+            with sconn.cursor() as sc, mconn.cursor() as mc:
+                sc.execute("SELECT @@gtid_slave_pos, @@gtid_binlog_pos")
+                s = sc.fetchone() or [None, None]
+                s_gt = (s[0] or "") or (s[1] or "")
+                mc.execute("SELECT @@gtid_binlog_pos")
+                m_gt = (mc.fetchone() or [None])[0] or ""
+            if not s_gt or not m_gt:
+                return True
+            with sconn.cursor() as sc:
+                sc.execute("SELECT GTID_SUBSET(%s, %s)", (s_gt, m_gt))
+                return bool((sc.fetchone() or [0])[0])
+        finally:
+            try:
+                mconn.close()
+            except Exception:
+                pass
+    except Exception:
+        return True
+    finally:
+        try:
+            sconn.close()
+        except Exception:
+            pass
+
+
+def _maybe_auto_full_clone(cluster_id, h, cur_h, cur_p, creds):
+    """重指向失败后，判断并自动触发全量克隆（复用重建逻辑）。
+
+    仅当：① 复制中断属『缺表 / 主库 binlog 已清理』(binlog 重放补救不了)；
+          ② 从库无孤儿写入（GTID 是主库的子集，克隆不丢数据）；
+    才自动调 start_rebuild。否则维持原『告警降级』，转人工（导出孤儿行回灌主库）。
+    """
+    if not AUTO_FULL_CLONE:
+        _warn_repoint(h["host"], h["port"],
+                      f"{h['host']}:{h['port']} 重指向失败（自动全量克隆已关闭）")
+        return
+    host, port = h["host"], int(h["port"])
+    key = (int(cluster_id), host, port)
+    if time.monotonic() - _AUTO_CLONE_AT.get(key, 0.0) < _AUTO_CLONE_COOLDOWN:
+        return
+    ru, rp = node_root(host, cluster_id)
+    st = get_status(host, port, creds["ha_user"], creds["ha_pass"], ru, rp)
+    needs, why = _replica_needs_full_clone(st)
+    if not needs:
+        _warn_repoint(host, port, f"{host}:{port} 重指向失败（非克隆类错误，交既有自愈）")
+        return
+    # 安全闸门：从库有主库没有的写入 → 克隆会覆盖丢失，禁止自动克隆
+    if not _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
+        _AUTO_CLONE_AT[key] = time.monotonic()
+        msg = (f"节点 {host}:{port} 复制中断（{why}），但检测到该节点存在主库没有的写入"
+               f"（孤儿数据）：自动全量克隆会覆盖丢失，已暂停自动重建。"
+               f"请先「一致性校验 → 导出孤儿行回灌主库」，再手动重建；"
+               f"或确认数据可丢弃后在节点页点「重建」。")
+        print(f"[topology][安全] {msg}")
+        try:
+            send_alert("自动重建被安全闸门拦截", msg, cluster_id=cluster_id)
+        except Exception:
+            pass
+        return
+    # 触发自动全量克隆（后台线程，复用 rebuild.start_rebuild）
+    _AUTO_CLONE_AT[key] = time.monotonic()
+    try:
+        from .rebuild import start_rebuild
+        tid = start_rebuild(cluster_id, host, port, actor="auto-topology")
+        print(f"[topology] 节点 {host}:{port} 命中需全量克隆（{why}），"
+              f"已自动触发在线重建 task={tid}")
+        try:
+            send_alert("从库自动全量克隆",
+                       f"节点 {host}:{port} 因「{why}」自动从主库 {cur_h}:{cur_p} 全量重建（task={tid}）。",
+                       cluster_id=cluster_id)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[topology] 自动重建触发失败 {host}:{port}: {e}")
 
 
 def load_creds(cluster_id=None):
@@ -830,7 +959,10 @@ def ensure_topology(cluster_id):
                 send_alert("节点重新加入集群", msg)
             print(f"[topology] {msg}")
         else:
-            _warn_repoint(h['host'], h['port'], f"{h['host']}:{h['port']} 重指向失败")
+            # 重指向失败：若属 binlog 重放不可自愈的缺口（缺表/主库 binlog 已清理），
+            # 自动触发全量克隆（复用重建逻辑），把「重装从库只重指不克隆」的缺口补上；
+            # 从库有孤儿写入时由安全闸门拦截、转人工（导出孤儿行回灌主库）。
+            _maybe_auto_full_clone(cluster_id, h, cur_h, cur_p, creds)
         # 自愈：从库 IO 报「匿名事务」1236（主库 binlog 含 gtid_mode=OFF 时期写入的匿名事务，
         # AUTO_POSITION=1 无法复制）。清理主库 binlog 后从库续传。每次重指向后都查一次。
         try:
