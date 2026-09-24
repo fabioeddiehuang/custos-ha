@@ -26,12 +26,12 @@ import threading
 import urllib.request
 import urllib.error
 import pymysql
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .db import query, execute, get_setting
 from . import crypto
 from .config import get_mgmt_host, NODE_AGENT_PORT, NODE_AGENT_TOKEN, NODE_AGENT_TIMEOUT
-from .ha_client import connect, ensure_ha_creds
+from .ha_client import connect, ensure_ha_creds, heal_replication
 from .clusters import create_cluster, get_cluster_creds
 from . import node_gen
 from .config import (get_mgmt_host, get_manager_public_ip,
@@ -126,10 +126,23 @@ def get_task(tid):
 
 def list_tasks():
     rows = query(
-        "SELECT id, name, channel, status, progress, stage, created_at, updated_at "
+        "SELECT id, name, channel, status, progress, stage, created_at, updated_at, config "
         "FROM migration_tasks ORDER BY id DESC"
     )
-    return rows
+    # 顺带把目标节点地址带出，供前端「解锁迁移锁」按钮直接调用 /api/migration/unlock
+    # （迁移锁按 host:port 定位，列表不返回则前端只能手动填）。
+    out = []
+    for r in rows:
+        item = dict(r)
+        cfg = {}
+        try:
+            cfg = json.loads(item.get("config") or "{}")
+        except Exception:
+            pass
+        item["tgt_host"] = cfg.get("tgt_host") or ""
+        item["tgt_port"] = int(cfg.get("tgt_port") or 0)
+        out.append(item)
+    return out
 
 
 def delete_task(tid):
@@ -390,8 +403,23 @@ def _sql_lit(s):
     return str(s).replace("\\", "\\\\").replace("'", "\\'")
 
 
+# 迁移桥接在【源库】上创建复制账号时使用的专属用户名。
+# ⚠ 绝不能与 Custos 集群自有的 'replication' 账号同名：源库通常是 Custos 受管节点，
+#   monitor 每个周期跑 ensure_ha_creds 会把 'replication'@'%'（及更具体的 host 变体，
+#   如 'replication'@'192.168.1.%'）口令重置回集群库存值，并因「host 更具体者优先」
+#   把迁移用的同名账号遮蔽 ⇒ 目标(从库) IO 线程 Access denied、复制永远起不来
+#   （"从库连不上主库 / SQL 线程未运行" 的根因，且每轮 monitor 必炸一次）。
+#   用专属名后 Custos 永不会管理它，彻底避开口令覆盖与 host 遮蔽。
+MIG_REPL_USER = "custos_mig_repl"
+
+
 def _ensure_source_repl_account(task):
     """在【源】MariaDB 上创建最小权限复制账号（迁移完 cleanup 可回收）。
+
+    用专属用户名 MIG_REPL_USER（custos_mig_repl），**绝不**复用集群自有的 'replication'：
+    源库通常是 Custos 受管节点，monitor 每周期 ensure_ha_creds 会把 'replication' 系列账号
+    口令重置回集群库存值，并因「host 更具体者优先」遮蔽迁移同名账号 ⇒ 目标 IO 线程
+    Access denied、复制永远起不来。专属名 Custos 永不管，规避此坑。
 
     降级策略：若源连接账号无 CREATE USER 权限（桥接会报 1227），则不再建专用账号，
     改为**直接用源连接账号本身**作为复制账号（前提是源账号允许从目标主机连入，
@@ -401,10 +429,10 @@ def _ensure_source_repl_account(task):
     conn = connect(cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"], timeout=8)
     try:
         cur = conn.cursor()
-        u, p = _sql_lit(cfg["repl_user"]), _sql_lit(cfg["repl_pass"])
+        u, p = MIG_REPL_USER, _sql_lit(cfg["repl_pass"])
         try:
             # ⚠ 关键坑（实测坐实）：CREATE USER IF NOT EXISTS 在用户【已存在】时
-            #   **不会更新口令**。迁移反复重装后，源库残留旧的 replication 账号（旧口令），
+            #   **不会更新口令**。迁移反复重装后，源库残留旧的同名账号（旧口令），
             #   而新任务生成了新口令 ⇒ 该语句静默跳过、不报错、也不触发下面的降级分支，
             #   于是目标拿着新口令连源 → "Access denied ... (using password: YES)"、
             #   IO 线程永远起不来（追平检测报「IO 线程未运行」）。
@@ -642,6 +670,21 @@ def seed_logical(task):
         raise RuntimeError("逻辑导入失败（退出码 dump=%s load=%s）: %s"
                            % (p1.returncode, p2.returncode, detail))
 
+    # ── 防静默漏表 ────────────────────────────────────────────────────────
+    # 导入端（mysql/mariadb 客户端）批量执行时，若某张表的 CREATE TABLE 失败会
+    # 【继续往下走、且可能返回退出码 0】，于是部分表没建出来却报成功。这里强制对照
+    # 源/目标表清单；有缺表先单独补救一次，仍失败则硬报错，杜绝「数据没迁全还显示成功」。
+    # 实测 2.4.0（33→203）曾静默漏掉 certd 两张表；2.4.1 初版缺失本段导致更大范围漏表。
+    _missing = _reconcile_seed_tables(src, tgt, databases)
+    if _missing:
+        _imp_err = (lerr or err2 or b"").decode(errors="replace")
+        _missing = _retry_missing_tables(task, cfg, src, tgt, databases, _missing)
+        if _missing:
+            _detail = "; ".join("%s.%s" % (d, t) for d, t in _missing)
+            raise RuntimeError(
+                "逻辑导入缺表且补救失败（源有、目标无）：%s\n导入端报错：%s"
+                % (_detail, _imp_err[:1500]))
+
     # 导入可能覆盖/重建 mysql 库（全库导入场景）⇒ 目标账号有被冲掉的风险，
     # 导入完成后立刻按集群凭证重建一次（幂等；未登记集群时自动跳过）。
     _acct = _ensure_target_accounts(cfg, stage="seed_logical")
@@ -652,6 +695,90 @@ def seed_logical(task):
             "accounts": _acct,
             "bytes": read_bytes, "src_gtid": src_gtid, "capabilities": {
                 k: cap[k] for k in ("same_engine", "cross_engine", "pipeline", "bridge")}}
+
+
+def _tbl_set(conn, db):
+    """取某库 BASE TABLE 集合（出错返回空集，不阻断对账）。"""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TABLE_NAME FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_TYPE='BASE TABLE'", (db,))
+        return set(x[0] for x in cur.fetchall())
+    except Exception:
+        return set()
+
+
+def _reconcile_seed_tables(src, tgt, databases):
+    """seed 后对照源/目标 BASE TABLE 清单，返回（库,表）缺表列表（源有、目标无）。
+
+    ⚠ 连接失败时【显式报错】而非静默返回 []：此前曾因连接异常被吞成「无缺失」，
+    导致数据没迁全却被判定成功。无法对账就必须让上层失败，绝不能再静默放行。
+    """
+    try:
+        sc = connect(*src, timeout=8)
+        tc = connect(*tgt, timeout=8)
+    except Exception as e:
+        raise RuntimeError("缺表对账无法连接源/目标库，无法确认数据完整性: %s" % e)
+    missing = []
+    try:
+        for db in databases:
+            s = _tbl_set(sc, db); t = _tbl_set(tc, db)
+            for tbl in sorted(s - t):
+                missing.append((db, tbl))
+    finally:
+        for c in (sc, tc):
+            try: c.close()
+            except Exception: pass
+    return missing
+
+
+def _retry_missing_tables(task, cfg, src, tgt, databases, missing):
+    """对仍缺失的表单独重新导出+导入一次（绕开首次批量流里被吞掉的单表错误）。
+    返回补救后依旧缺失的（库,表）列表。若根因是 DDL 不兼容（如 DATA DIRECTORY/
+    TABLESPACE 路径在目标不存在），补救同样会失败，此时由上层抛出并附带导入端报错。"""
+    by_db = {}
+    for db, tbl in missing:
+        by_db.setdefault(db, []).append(tbl)
+    src_flavor = cfg.get("src_flavor") or "mariadb"
+    try:
+        dump, cli, dialect = resolve_client_tools(src_flavor)
+    except Exception as e:
+        print("[migration] 缺表补救工具解析失败: %s" % e)
+        return missing
+    tgt_dialect = tool_dialect(cli)
+    for db, tbls in by_db.items():
+        try:
+            dump_args = ([dump, "-h", src[0], "-P", str(src[1]), "-u", src[2]]
+                         + _pw_arg(src[3]) + [
+                             "--single-transaction", "--hex-blob",
+                             "--default-character-set=utf8mb4", "--skip-lock-tables",
+                             "--databases", db, "--tables"] + tbls
+                         + dump_gtid_args(dialect, want_gtid=False) + ssl_args(dialect))
+            load_args = ([cli, "-h", tgt[0], "-P", str(tgt[1]), "-u", tgt[2]]
+                         + _pw_arg(tgt[3]) + ssl_args(tgt_dialect))
+            p1 = subprocess.Popen(dump_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            p2 = subprocess.Popen(load_args, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            data = p1.stdout.read()
+            p1.stdout.close()
+            try: p1.wait(timeout=300)
+            except Exception: pass
+            if p1.returncode != 0:
+                print("[migration] 缺表补救导出失败 %s.%s: %s"
+                      % (db, ",".join(tbls), (p1.stderr.read() or b"").decode(errors="replace")[:300]))
+            try:
+                p2.stdin.write(data); p2.stdin.close()
+            except Exception as e:
+                print("[migration] 缺表补救写入失败 %s: %s" % (db, e))
+            try: p2.wait(timeout=300)
+            except Exception: pass
+            if p2.returncode != 0:
+                print("[migration] 缺表补救导入失败 %s.%s: %s"
+                      % (db, ",".join(tbls), (p2.stderr.read() or b"").decode(errors="replace")[:300]))
+        except Exception as e:
+            print("[migration] 缺表补救异常 %s: %s" % (db, e))
+    return _reconcile_seed_tables(src, tgt, databases)
 
 
 # ---------------------------------------------------------------------------
@@ -1709,40 +1836,173 @@ def seed_physical(task):
 #
 # 对策：桥接期间锁定目标节点，让 ensure_topology 整轮跳过，不再干扰。
 # ---------------------------------------------------------------------------
-_MIG_LOCKS = {}            # "ip:port" -> 过期时间戳（monotonic）
+_MIG_LOCKS = {}            # "ip:port" -> 过期时间戳（monotonic），内存快路径
 _MIG_LOCK_TTL = 6 * 3600   # 保险丝：极端情况下忘记解锁也能自动恢复（6 小时）
 _mig_lock = threading.Lock()
+_MIG_LOCK_DB_TTL = _MIG_LOCK_TTL  # 持久锁保险丝（秒），与内存 TTL 对齐
+
+
+def _ensure_locks_table():
+    """迁移锁持久化表：抗管理器重建/重启（内存锁重启即失，会导致 monitor 清掉桥接通道）。
+
+    仅在首次访问时创建，失败静默（退化回内存锁，不阻断主流程）。
+    """
+    try:
+        execute("CREATE TABLE IF NOT EXISTS migration_locks ("
+                "host VARCHAR(64) NOT NULL, port INT NOT NULL, "
+                "expires DATETIME NOT NULL, PRIMARY KEY (host, port))")
+    except Exception:
+        pass
 
 
 def lock_target(host, port):
-    """锁定迁移目标节点：暂停 monitor 对它（作为当前主）的拓扑维护。"""
+    """锁定迁移目标节点：暂停 monitor 对它（作为当前主）的拓扑维护。
+
+    同时写入内存与持久表 —— 后者保证管理器重建/重启后锁定不丢失，
+    否则 ensure_topology 会立刻 RESET REPLICA ALL 把桥接通道清掉（issue #3/#4 根因）。
+    """
     if not host:
         return
+    host, port = str(host), int(port)
     with _mig_lock:
-        _MIG_LOCKS["%s:%d" % (host, int(port))] = time.monotonic() + _MIG_LOCK_TTL
+        _MIG_LOCKS["%s:%d" % (host, port)] = time.monotonic() + _MIG_LOCK_TTL
+    try:
+        _ensure_locks_table()
+        execute("REPLACE INTO migration_locks (host, port, expires) VALUES (%s,%s,"
+                " DATE_ADD(NOW(), INTERVAL %s SECOND))", (host, port, _MIG_LOCK_DB_TTL))
+    except Exception:
+        pass
 
 
 def unlock_target(host, port):
     """解除锁定（停桥之后交还 monitor 接管）。"""
     if not host:
         return
+    host, port = str(host), int(port)
     with _mig_lock:
-        _MIG_LOCKS.pop("%s:%d" % (host, int(port)), None)
+        _MIG_LOCKS.pop("%s:%d" % (host, port), None)
+    try:
+        execute("DELETE FROM migration_locks WHERE host=%s AND port=%s", (host, port))
+    except Exception:
+        pass
+
+
+def force_clear_node(host, port, clear_tasks=True):
+    """强制清除某节点的迁移残留状态（锁 + 可选的 running 任务）。
+
+    场景：节点被重装/重建后，迁移锁（migration_locks）与指向它的 running 任务行
+    仍残留，导致仪表盘永久显示「迁移中」，且 failover.ensure_topology 持续跳过该
+    节点拓扑维护。本函数提供代码级一键清理，免手敲 SQL（等价于对管理库执行
+    DELETE FROM migration_locks / migration_tasks）。
+
+    ⚠ 仅应在确认该节点已不可作为迁移目标（如已重装、迁移线程必死）时调用，
+    否则可能中断一个仍在正常运行的迁移。
+    """
+    host, port = str(host), int(port)
+    info = {"unlocked": False, "tasks_deleted": 0}
+    # 1) 清锁（内存 + 持久表）
+    if is_target_locked(host, port):
+        unlock_target(host, port)
+        info["unlocked"] = True
+    # 2) 清指向该节点的 running 任务（并清内存集合，避免孤儿线程干扰 cleanup_stale）
+    if clear_tasks:
+        try:
+            rows = query("SELECT id, config FROM migration_tasks WHERE status='running'")
+            dead = []
+            for r in rows:
+                try:
+                    cfg = json.loads(r.get("config") or "{}")
+                except Exception:
+                    continue
+                if (str(cfg.get("tgt_host")) == host
+                        and int(cfg.get("tgt_port") or 0) == port):
+                    dead.append(int(r["id"]))
+            if dead:
+                execute("DELETE FROM migration_tasks WHERE id IN %s", (tuple(dead),))
+                for tid in dead:
+                    _RUNNING.discard(tid)
+                    _REP.pop(tid, None)
+                    _CANCEL.discard(tid)
+                    _STEP_HB.pop(tid, None)
+                    _STEP_PROCS.pop(tid, None)
+                    _FORCE_TS.pop(tid, None)
+                info["tasks_deleted"] = len(dead)
+        except Exception as e:
+            info["task_error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
+def _has_live_migration_task(host, port):
+    """是否存在指向该节点、且【确实有后台线程在跑】的迁移任务。
+
+    为什么必须同时校验内存集合 _RUNNING：migration_tasks.status='running' 只是数据库
+    记录，管理器重启 / 线程异常退出后记录会残留成【孤儿任务】。若只认 status，节点会被
+    永久判定为「迁移中」，而 failover.ensure_topology 会跳过迁移中节点的复制维护，
+    结果是【该节点再也建不上主从】（2026-09-23「容器版 MariaDB 无法主从」的根因）。
+    _RUNNING 是内存集合、随线程启动写入、重启即空，正好等价于"真的在跑"。
+    """
+    try:
+        rows = query("SELECT id, config FROM migration_tasks WHERE status='running'")
+    except Exception:
+        return False
+    for r in rows:
+        try:
+            if int(r.get("id")) not in _RUNNING:
+                continue          # 孤儿任务：没有活线程，不算数
+        except (TypeError, ValueError):
+            continue
+        try:
+            cfg = json.loads(r.get("config") or "{}")
+        except Exception:
+            continue
+        if (str(cfg.get("tgt_host")) == str(host)
+                and int(cfg.get("tgt_port") or 0) == int(port)):
+            return True
+    return False
 
 
 def is_target_locked(host, port):
-    """目标是否处于迁移锁定中 —— 由 failover.ensure_topology 调用。"""
+    """目标是否处于迁移锁定中 —— 由 failover.ensure_topology 调用。
+
+    内存命中优先（快）；未命中（含管理器刚重启、内存锁丢失）回退持久表，
+    避免重启后 monitor 把桥接通道清掉导致从库断开主库 / 追平检测失败（issue #3/#4）。
+    """
     if not host:
         return False
-    key = "%s:%d" % (host, int(port))
+    host, port = str(host), int(port)
+    key = "%s:%d" % (host, port)
     with _mig_lock:
         exp = _MIG_LOCKS.get(key)
-        if exp is None:
-            return False
-        if time.monotonic() > exp:  # 保险丝到期自动释放
+        if exp is not None:
+            if time.monotonic() <= exp:
+                return True
             _MIG_LOCKS.pop(key, None)
-            return False
-        return True
+    try:
+        _ensure_locks_table()
+        rows = query("SELECT expires FROM migration_locks WHERE host=%s AND port=%s",
+                    (host, port))
+        if rows:
+            exp_db = rows[0].get("expires")
+            if exp_db and exp_db > datetime.now():
+                with _mig_lock:  # 命中后回填内存，减少后续 DB 访问
+                    _MIG_LOCKS[key] = time.monotonic() + _MIG_LOCK_TTL
+                return True
+    except Exception:
+        pass
+    # 兜底②：仍有指向该节点、且【确实有活线程在跑】的迁移任务 ⇒ 任务期间始终锁定，
+    #   杜绝第3步→第4步间隔超过 6h、锁过期后 monitor 的 ensure_topology 把桥接通道
+    #   清掉（RESET REPLICA ALL）导致追平检测永远「复制通道已清除」（issue #3/#4 的延续）。
+    #
+    # ⚠ 这里【绝不能】调用 is_node_migrating()：它反过来会调 is_target_locked()，
+    #   二者互相递归 → RecursionError → 被下面的 except 吞掉 ⇒ 整个兜底静默失效。
+    # ⚠ 且必须要求任务「真有活线程」：只认 status='running' 会让管理器重启/线程异常
+    #   留下的孤儿任务把节点永久锁死 → ensure_topology 永久跳过 → 再也建不上主从。
+    try:
+        if _has_live_migration_task(host, port):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def is_node_migrating(host, port):
@@ -1753,19 +2013,9 @@ def is_node_migrating(host, port):
     """
     if is_target_locked(host, port):
         return True
-    try:
-        rows = query("SELECT config FROM migration_tasks WHERE status='running'")
-        for r in rows:
-            try:
-                cfg = json.loads(r.get("config") or "{}")
-            except Exception:
-                continue
-            if (str(cfg.get("tgt_host")) == str(host)
-                    and int(cfg.get("tgt_port") or 0) == int(port)):
-                return True
-    except Exception:
-        pass
-    return False
+    # 覆盖「锁还没落库」的窗口（如 seed 刚开始的瞬间）。
+    # 注意：只认【有活线程】的任务，孤儿 running 任务不再让节点永远显示/停留在迁移中。
+    return _has_live_migration_task(host, port)
 
 
 def _check_source_binlog(cfg):
@@ -1827,7 +2077,7 @@ def bridge(task):
     _ensure_target_accounts(cfg, stage="bridge")
     acct = _ensure_source_repl_account(task)  # 源端复制账号（最小权限，必要时降级复用源账号）
     use_src = bool(acct.get("used_src_creds"))
-    m_user = cfg["src_user"] if use_src else cfg["repl_user"]
+    m_user = cfg["src_user"] if use_src else MIG_REPL_USER
     m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
     tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"])
     # 建桥接前先自检：用复制账号从管理端连一次源库，口令/授权不对立刻暴露，
@@ -1915,8 +2165,13 @@ def verify(task, deep=False):
     databases = cfg.get("databases") or []
     s_conn = connect(*src, timeout=8)
     t_conn = connect(*tgt, timeout=8)
-    tables, missing, diffs = [], [], []
+    tables, missing, diffs, lag_diffs = [], [], [], []
     ck_checked = ck_mismatch = ck_unsupported = 0
+    # 复制状态提前取：桥接模式下目标是【仍在追平的活从库】，COUNT(*) 与 CHECKSUM
+    # 在不同时刻读取会受复制延迟影响；据此把「行数瞬时差 1 行」区分成
+    # 「复制追平中（非数据不一致）」还是「真正的行数不一致」，避免误报（根治反复出现的
+    # "行数不一致但内容校验全一致" 自相矛盾提示）。
+    repl = _replica_status(tgt)
     try:
         for db in databases:
             def _tables(conn, dbname):
@@ -1981,12 +2236,42 @@ def verify(task, deep=False):
     finally:
         s_conn.close(); t_conn.close()
 
-    # 复制状态（MariaDB：SHOW REPLICA STATUS，兼容 Replica_/Slave_ 两种列名）
-    repl = _replica_status(tgt)
+    # ---- 行数差异归因：区分「复制追平中（瞬时延迟）」与「真正的行数不一致」 ----
+    # 桥接模式目标为活从库：复制仍在追平，COUNT(*) 在两个时刻读到不同行数属正常，
+    # 不应报成数据不一致。判定逻辑：
+    #   ① 开了内容级校验且 CHECKSUM 一致 ⇒ 内容完全相同，行数差必为瞬时读取竞态 ⇒ 非差异；
+    #   ② 复制健康且在追平（SQL 线程 Running、无错误、延迟非 0）⇒ 行数差是复制延迟 ⇒ 追平中；
+    #   ③ 其余（已追平却仍差 / 复制中断报错）⇒ 真正的行数不一致。
+    sql_running = (repl or {}).get("sql_running")
+    repl_err = (repl or {}).get("last_error")
+    sbm = (repl or {}).get("seconds_behind")
+    healthy_lag = (sql_running == "Yes") and (not repl_err) and (sbm not in (0, None))
+    real_diffs = []
+    for d in diffs:
+        t = next((x for x in tables if x["db"] == d["db"] and x["table"] == d["table"]), None)
+        if t and deep and t.get("ck_ok") is True:
+            # CHECKSUM 已证明内容一致 ⇒ 行数差是读取竞态，撤销差异标记（根治核心）
+            t["rows_ok"] = True
+            t["note"] = "内容校验(CHECKSUM)已通过，行数瞬时差异系复制延迟，非数据不一致"
+            continue
+        if healthy_lag:
+            # 复制健康追平中 ⇒ 行数差为延迟导致，标记「追平中」而非失败
+            if t:
+                t["lag"] = True
+                t["note"] = "复制追平中，行数暂不一致（复制延迟，非数据不一致，待延迟归零后复测即可）"
+            lag_diffs.append(d)
+            continue
+        real_diffs.append(d)
+    diffs = real_diffs
+
     ok_n = sum(1 for t in tables if t["rows_ok"])
     consistent = (not diffs) and (not missing)
     if consistent:
-        summary = "已校验 %d 张表，行数全部一致" % ok_n
+        if lag_diffs:
+            summary = ("已校验 %d 张表，行数全部一致；%d 张表复制追平中（行数暂不一致，"
+                       "待复制延迟归零后复测即可）" % (ok_n, len(lag_diffs)))
+        else:
+            summary = "已校验 %d 张表，行数全部一致" % ok_n
     else:
         summary = ("共 %d 张表：%d 张一致，%d 张行数不一致，%d 张目标缺失"
                    % (len(tables) + len(missing), ok_n, len(diffs), len(missing)))
@@ -2001,6 +2286,7 @@ def verify(task, deep=False):
         "tables_ok": ok_n,
         "diffs": diffs,
         "missing": missing,
+        "lag_diffs": lag_diffs,
         "consistent": consistent,
         "tables": tables,
         "checksum": {"enabled": bool(deep), "checked": ck_checked,
@@ -2202,8 +2488,8 @@ def cleanup(task):
         # ❗此前两项都 try/except 静默吞掉，非 root 账号时会「谎报成功」：
         #   界面显示已收尾，实际账号没回收、老主也没置只读。故逐项记录并如实上报。
         try:
-            cur.execute(f"DROP USER IF EXISTS '{cfg['repl_user']}'@'%'")
-            done.append("已回收源端复制账号 '%s'@'%%'" % cfg["repl_user"])
+            cur.execute(f"DROP USER IF EXISTS '{MIG_REPL_USER}'@'%'")
+            done.append("已回收源端复制账号 '%s'@'%%'" % MIG_REPL_USER)
         except Exception as e:
             failed.append("回收复制账号失败：%s（需 CREATE USER 权限）" % e)
         try:
@@ -2229,7 +2515,7 @@ def cleanup(task):
 LAG_CAUGHT_UP_SEC = 0
 
 
-def check_lag(task, skip_acct=False):
+def check_lag(task, skip_acct=False, auto_heal=False):
     """停桥切换前的「追平检测」：确认目标已从源追平，避免带差切换导致数据丢失。
 
     纯只读，不改动任何节点。返回 caught_up 供前端放行「执行停桥切换」按钮。
@@ -2241,6 +2527,18 @@ def check_lag(task, skip_acct=False):
         repl = _replica_status(tgt)
     except Exception as e:
         return {"ok": False, "caught_up": False, "error": f"{type(e).__name__}: {e}"}
+    steps = task.get("steps") or {}
+    bridge_done = (steps.get("bridge") or {}).get("status") == "done"
+    cutover_done = (steps.get("cutover") or {}).get("status") == "done"
+    # —— 自动自愈①：复制通道丢失（monitor 清桥接 / 管理器重启）⇒ 自动重跑桥接重建 ——
+    # 仅手动「追平检测」触发（auto_heal=True），高频追踪不触发，避免反复重建。
+    if auto_heal and repl.get("note") and not cutover_done and bridge_done:
+        try:
+            bridge(task)
+            repl = _replica_status(tgt)
+        except Exception as e_heal:
+            repl = repl or {}
+            repl["heal_error"] = "重建桥接失败：" + str(e_heal)
     if repl.get("note"):
         # 目标上没有复制通道。仅回一句“不存在”会让人不知道下一步做什么，
         # 故用任务步骤状态区分三种情况，分别给出可操作指引。
@@ -2259,8 +2557,10 @@ def check_lag(task, skip_acct=False):
                     "若你的源库已停写、不需要追平增量，可勾选下方「源库已停写」跳过本检测。")
         else:
             why = "复制通道已清除"
-            hint = ("需要重做【第三步 → 「建立桥接」】这一步（桥接执行过，但目标上的复制通道现在不存在）。"
-                    "回到第三步重跑「建立桥接」即可重建通道。"
+            heal_tip = ("本次「追平检测」已尝试自动重建桥接"
+                        + ("（失败：" + repl.get("heal_error", "") + "）" if repl.get("heal_error") else "，请稍后再次点击「追平检测」或点「重建桥接」。"))
+            hint = ("需要重建【源库 → 目标】的复制通道（桥接执行过，但目标上的复制通道现在不存在）。"
+                    + heal_tip +
                     "若目标已被登记进 Custos 集群，monitor 的 ensure_topology 会持续清掉该通道，"
                     "此时应新建迁移任务，而不是重跑桥接。")
         return {"ok": True, "caught_up": False, "io_running": None, "sql_running": None,
@@ -2281,7 +2581,7 @@ def check_lag(task, skip_acct=False):
     steps_prev = task.get("steps") or {}
     bres = (steps_prev.get("bridge") or {}).get("result") or {}
     use_src = bool(bres.get("used_src_creds"))
-    m_user = cfg["src_user"] if use_src else cfg["repl_user"]
+    m_user = cfg["src_user"] if use_src else MIG_REPL_USER
     m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
     # skip_acct：前端「追平追踪」每 2s 采样一次，若每次都连源库做账号自检，
     # 5 分钟就是上百次连接，对老主是无谓负担 ⇒ 仅首次采样做自检，后续跳过。
@@ -2295,9 +2595,32 @@ def check_lag(task, skip_acct=False):
         except Exception as e:
             acct_ok, acct_err = False, str(e)
 
+    # —— 自动自愈②：通道在、但 IO/SQL 线程停了（复制错误如 1133/1062/1146）⇒ heal_replication ——
+    if auto_heal and (not io_ok or not sql_ok):
+        try:
+            ok_h, msg_h = heal_replication(
+                cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg.get("tgt_root_pass") or "",
+                root_user="root", root_pass=cfg.get("tgt_root_pass") or "")
+            if ok_h:
+                repl = _replica_status(tgt)
+                io_raw = repl.get("io_running"); sql_raw = repl.get("sql_running")
+                io_ok = str(io_raw or "").lower() == "yes"
+                sql_ok = str(sql_raw or "").lower() == "yes"
+                sb = repl.get("seconds_behind"); last_err = repl.get("last_error")
+        except Exception:
+            pass
+
     hint = ""
     if not sql_ok:
         reason = "SQL 线程未运行（状态=%s，复制未工作）" % (sql_raw or "未知")
+        if last_err:
+            # 此前只报“状态=No”却把 Last_SQL_Error 吞掉，用户完全看不到线程为什么停。
+            # 追平检测是只读的，但必须把错误文本带出来，否则无法判断是 1133/冲突/还是手动停的。
+            reason += "；复制错误：" + str(last_err)[:300]
+        hint = ("目标复制 SQL 线程已停止（通常是复制重放某条事件出错，如 1133/1062/1146 等）。"
+                "可点击下方「🔧 修复复制」尝试自愈（跳过冲突事务 / 补建缺失账号），"
+                "或到目标节点执行 SHOW REPLICA STATUS\\G 查看 Last_SQL_Error 后手动处理，"
+                "再回来点「追平检测」。")
     elif not io_ok:
         le = str(last_err or "")
         if "1236" in le or "binary log is not open" in le.lower():

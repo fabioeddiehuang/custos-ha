@@ -328,6 +328,32 @@ def is_gtid_purged_error(err):
     )
 
 
+def is_gtid_missing_error(err):
+    """复制 IO 错误是否为「主库 binlog 缺失从库所请求的 GTID」类 1236（主库 GTID 序列有空洞）。
+
+    典型文本（MariaDB）：
+      Got fatal error 1236 from master when reading data from binary log:
+      'The binlog on the master is missing the GTID 1-1-12 requested by the slave
+       (even though both a prior and a subsequent sequence number does exist),
+       and GTID strict mode is enabled'
+
+    与 is_gtid_purged_error（binlog 被清理 / 从库状态过旧）**不是一回事**：
+    此处主库前后序列号都在、只缺中间一个 ⇒ 主库 GTID 序列存在「空洞」。
+    典型成因：多节点 server_id / gtid_domain_id 撞车，各自产生同编号但内容不同的事务；
+    或源端曾跳过事务后再被提升为主库。
+
+    ⚠ 这类空洞补不回 binlog，且 MySQL 语义的 heal_io_gtid_gap（依赖 Source_UUID /
+      Executed_Gtid_Set / SET GTID_NEXT）在 MariaDB 上取不到 source_uuid、会直接
+      「无法确定源端标识，跳过」，故不能指望它自愈。唯一稳妥解法是从主库全量重建从库。
+    """
+    e = (err or "").lower()
+    if not e:
+        return False
+    return ("missing the gtid" in e and "requested by the slave" in e) or \
+           ("binlog on the master is missing" in e) or \
+           ("missing the gtid" in e and "strict mode" in e)
+
+
 def heal_io_gtid_gap(slave_host, slave_port, ha_user, ha_pass,
                      slave_root_user="root", slave_root_pass="",
                      master_host=None, master_port=None,
@@ -1334,6 +1360,44 @@ def purge_binlog_before(host, port, user, password, dt_str, root_user="root", ro
             pass
 
 
+# ---- vip-guard fencing 状态（2026-09-23 新增）----
+# _FENCE_FIRST_SEEN: 记录「自认主但无法自愈」节点首次被发现的时间，用于宽限期计时。
+# 宽限期内仅高优告警（吸收网络抖动/瞬时 root 口令失效）；超宽限仍不可纠正则 read_only=ON
+# 封写（管不住就别让它写），杜绝静默分叉。管理器重启会重置（下一周期重新计时，可接受）。
+import os as _os
+import time as _time
+_VIPGUARD_FENCE_GRACE = float(_os.environ.get("VIPGUARD_FENCE_GRACE", "60"))  # 秒
+_FENCE_FIRST_SEEN = {}
+
+
+def _fence_readonly(host, port, user, password, root_user="root", root_pass=""):
+    """分裂态封写：SET GLOBAL read_only=ON（MySQL 同步 super_read_only）。
+
+    返回 (ok, err)。优先用 root 连接（避免 ha_monitor 缺 READ_ONLY ADMIN）。
+    仅在「节点自认主但非当前主、且就地纠正失败」的分裂态调用——正常主库/从库不会触发。
+    """
+    conn = connect_robust(host, port, user, password, root_user, root_pass)
+    if conn is None:
+        return False, "无法连接节点(ha_monitor/root 均失败)"
+    try:
+        cur = conn.cursor()
+        flavour = detect_flavour(cur)
+        try:
+            if flavour == F_MYSQL8:
+                cur.execute("SET GLOBAL super_read_only=ON")
+            cur.execute("SET GLOBAL read_only=ON")
+            return True, None
+        except Exception as e:
+            # MariaDB 可能需 READ_ONLY ADMIN；MySQL 需 SUPER / SYSTEM_VARIABLES_ADMIN。
+            # 若 root 都失败，说明 root 口令失效或账号权限不足，必须告警暴露。
+            return False, "%s: %s" % (type(e).__name__, e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def make_slave_of(host, port, user, password, master_host, master_port,
                   repl_user, repl_pass, root_user="root", root_pass=""):
     """把本节点改造为 master_host 的从库（GTID 自动定位）。
@@ -1412,36 +1476,51 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                       f"放行重挂载为 {_target} 的从库以恢复复制。")
                 _self_m = False
             else:
-                _fixed = False
-                _ferr = ""
-                try:
-                    # 与会话内其它写入保持一致：ha_local 是节点本地状态表，绝不进 binlog，
-                    # 否则该写入会被复制到从库、并可能在从库上报 1062 卡死复制线程。
-                    cur.execute("SET SESSION sql_log_bin=0")
-                    cur.execute(
-                        "REPLACE INTO ha_local.state (k, v) VALUES ('current_master', %s)",
-                        (_target,))
-                    _fixed = True
-                except Exception as _e_fix:
-                    _ferr = "%s: %s" % (type(_e_fix).__name__, _e_fix)
-                finally:
-                    try:
-                        cur.execute("SET SESSION sql_log_bin=1")
-                    except Exception:
-                        pass
+                # ⚠ 就地纠正复用 set_local_master_flag_ex（2026-09-23 修复）：
+                #   它内部会先自检 `SET SESSION sql_log_bin=0`，ha_monitor 缺 BINLOG ADMIN
+                #   时自动回退 root 连接（root 恒为 ALL PRIVILEGES）—— 与状态推送器行为对齐。
+                #   此前这里只用当前连接（ha_monitor）手写 REPLACE，而 ha_monitor 按
+                #   _ensure_local_state_grant 仅授 ha_local.* 的 SELECT/INSERT/UPDATE/
+                #   DELETE/CREATE，**没有 BINLOG ADMIN** ⇒ MariaDB >= 10.5.2 上
+                #   `SET SESSION sql_log_bin=0` 必被 1227 拒绝 ⇒ 自愈必然失败（已实测）。
+                #   后果：守卫永久拒绝降级，回归的旧主既不入集群又保持可写，且 keepalived
+                #   按其过期记录仍把 VIP 绑在它身上 ⇒ 业务写入造成静默分叉；只能等推送器
+                #   最长 PUSH_MAX_INTERVAL=300s 才解开，那时分叉已成事实。
+                _ok_fix, _ferr = set_local_master_flag_ex(
+                    host, port, user, password, _target, root_user, root_pass)
+                _fixed = bool(_ok_fix)
                 if _fixed:
                     print(f"[vip-guard] {host}:{port} 本地 current_master 已由 {_rec!r} "
                           f"就地纠正为 {_target}（自愈），继续挂载为从库。")
+                    _FENCE_FIRST_SEEN.pop("%s:%s" % (host, port), None)
                     _self_m = False
                 else:
                     print(f"[vip-guard] {host}:{port} 就地纠正本地 current_master 失败：{_ferr}")
+                    # ---- 宽限期后 fencing（2026-09-23 新增）----
+                    # 就地纠正失败 => 节点处于「自认主但非当前主、且无法自愈」的分裂态，
+                    # 保持可写会继续产生静默分叉。策略：首次发现仅高优告警（宽限期吸收抖动），
+                    # 超宽限仍未自愈则 read_only=ON 封写（管不住就别让它写）。
+                    _fk = "%s:%s" % (host, port)
+                    _now = _time.time()
+                    _FENCE_FIRST_SEEN.setdefault(_fk, _now)
+                    _fenced, _ferr_fence = False, ""
+                    if _now - _FENCE_FIRST_SEEN[_fk] >= _VIPGUARD_FENCE_GRACE:
+                        _fenced, _ferr_fence = _fence_readonly(
+                            host, port, user, password, root_user, root_pass)
+                        if not _fenced:
+                            print(f"[vip-guard] {_fk} fencing 失败：{_ferr_fence}")
         if _self_m and not _addr_eq(_target, host, port):
             msg = (f"[vip-guard] 拒绝把 {host}:{port} 改造为从库：其本机 ha_local.state 仍记录 "
                    f"current_master={_rec!r}（keepalived 据此把 VIP 绑在该节点），与本次要挂载的"
                    f"主库 {_target} 不一致，且就地纠正该记录也未成功。已跳过本次重指向并保留其"
-                   f"可写状态，避免业务经 VIP 写入报 1290。请检查该节点 ha_local 库与 "
-                   f"ha_monitor 账号权限（需 BINLOG ADMIN 及 ha_local 库的 "
-                   f"SELECT/INSERT/UPDATE/CREATE），以及到该节点的网络连通性。")
+                   f"可写状态，避免业务经 VIP 写入报 1290。"
+                   f"【就地纠正的真实错误】{_ferr or '（未提供）'}。"
+                   f"请检查：① 该节点 ha_local 库权限；② ha_monitor 是否缺 BINLOG ADMIN"
+                   f"（MariaDB >= 10.5.2 执行 SET SESSION sql_log_bin 必需）；"
+                   f"③ 管理端记录的该节点 root 口令是否有效（缺 BINLOG ADMIN 时靠它回退）；"
+                   f"④ 到该节点的网络连通性。"
+                   f"{(chr(91) + '已触发 fencing：已将该节点 read_only=ON 封写，避免继续静默分叉' + chr(93)) if _fenced else '[宽限期内：尚未封写，将在超限后自动 fencing]'}"
+                   f"{(chr(32) + 'fencing 失败：' + _ferr_fence) if (_fenced is False and _ferr_fence) else ''}。")
             print(msg)
             try:
                 from .alerts import send_alert   # 局部导入，避免模块级循环依赖
@@ -1505,19 +1584,32 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                             cur.execute(stop_replication_sql(flavour))
                             cur.execute(reset_replica_sql(flavour))
                             cur.execute("RESET MASTER")
+                            # 【回归 2.2.20 行为 2026-09-24】复制起点的设定：
+                            # 2.4.x 曾先后改为「对齐主库当前位点」和「用自有 GTID 作起点」，两者在
+                            # 已应用集(gtid_slave_pos)为空时都会**跳过本节点缺失的事务** ⇒ 复制
+                            # IO/SQL 全 Yes、延迟 0，数据却永久不一致（100 复用旧 data 始终不一致
+                            # 的根因）。2.2.20 的做法更简单也更可靠：
+                            #   已应用集为空 ⇒ **不设置**起点，保持为空 ⇒ 从库从头完整重放主库
+                            #   binlog，数据必然完整。重放不会因建账号冲突，因为安装脚本用的都是
+                            #   CREATE USER IF NOT EXISTS / CREATE DATABASE IF NOT EXISTS。
+                            # 仅当已应用集非空且确实分叉时，才对齐主库当前位点以避免 1236。
+                            # 若主库早期 binlog 已清理，重放会报 1236，由上层自动全量克隆兜底。
                             if _slave_gt and _master_gt:
                                 cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
                                 if bool((cur.fetchone() or [0])[0]):
                                     # 已应用集为主库子集：保留以免从头重放报 1062
                                     cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
                                 else:
-                                    # 已应用集也分叉：对齐到主库当前位置，跳过重放避免 1236
+                                    # 已应用集也分叉：对齐到主库当前位置，跳过重放避免 1236（2.2.20 行为）
                                     cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
                                     print("[gtid] %s:%s 已应用集分叉，gtid_slave_pos 已对齐主库当前 %s" % (host, port, _master_gt))
                             elif _slave_gt:
                                 cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
                             elif _master_gt:
-                                cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
+                                # 已应用集为空（原主库带旧 data 重入 / 全新安装）：
+                                # 保持 gtid_slave_pos 为空 ⇒ 从头完整重放主库 binlog，保证数据完整。
+                                print("[gtid] %s:%s 已应用集为空：保持 gtid_slave_pos 为空，"
+                                      "从头完整重放主库 binlog（2.2.20 行为）" % (host, port))
                         except Exception as e2:
                             print("[gtid] 分叉重建失败(可忽略，继续常规重链): %s" % e2)
                     elif not _pos_ok:
@@ -2364,6 +2456,28 @@ def ensure_connect_creds(host, port, ha_user, ha_pass, root_user, root_pass,
             pass
 
 
+# 节点 binlog 保留目标值（2026-09-22）：7 天保留 / 单文件上限 256M
+_RETENTION_DAYS = 7
+_RETENTION_SEC = 7 * 24 * 3600  # 604800，MySQL 8.0 侧使用
+_MAX_BINLOG_SIZE = 268435456    # 256M
+# binlog 总体积硬上限（20GB，对齐告警阈值 BINLOG_SIZE_ALERT_MB 默认值）：
+# 「按天保留」只保证时间有界，写入量突增时体积仍可能撑爆 /data；只有 ≥11.4 才有该变量。
+_BINLOG_TOTAL_SIZE_CAP = 20 * 1024 * 1024 * 1024
+
+
+def _as_int(v):
+    """把 MySQL 返回值安全转 int。
+
+    MariaDB 的 expire_logs_days 形如 '10.000000'，直接 int() 会 ValueError ——
+    一旦发生在 try/except 里就会变成又一次静默失败，故统一走 int(float())。
+    """
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+# 已告警过的节点：避免因权限/变量缺失导致每周期刷同一条 warning
+_BINLOG_RETENTION_WARNED = set()
+
 def ensure_ha_creds(host, port, root_user, root_pass,
                     ha_user, ha_pass, repl_user, repl_pass,
                     app_user="", app_pass="", manager_ip="", manager_subnet=None,
@@ -2616,6 +2730,60 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             except Exception as _se:
                 import logging as _lg
                 _lg.getLogger(__name__).warning("运行时开启半同步失败: %s", _se)
+
+        # binlog 清理参数在线兜底（2026-09-22）：节点 my.cnf 已写入保留参数，但已部署且在运行的
+        # 节点不会因 my.cnf 变更自动重读 ⇒ 每周期 SET GLOBAL 兜底，避免「复制 binlog 无限累积
+        # 撑爆 /data」（历史版本未设导致磁盘告警）。
+        # ⚠ 兜底语义：只在「永不过期(0)」时才介入 —— 0 才是本次磁盘告警的根因；
+        #   已配置保留期的节点（实测 12.3.3 多为 10 天）保持原值，不擅自缩短其 PITR 窗口。
+        # ⚠ 必须按 flavor 分流：MySQL 8.0 默认 binlog_expire_logs_seconds=2592000(30 天)，
+        #   二者运行时互斥（不能同时非 0），直接 SET GLOBAL expire_logs_days 会被 3683 拒绝；
+        #   MariaDB 则相反，两个变量互为别名（改一个另一个自动跟随）。
+        # ⚠ 失败绝不能静默：一旦静默，节点重启后即退回「永不过期」，根治措施失效且无人知晓。
+        try:
+            if flavour == F_MYSQL8:
+                cur.execute("SELECT @@GLOBAL.binlog_expire_logs_seconds")
+                _sec = (cur.fetchone() or (None,))[0]
+                # MySQL 默认已是 30 天(2592000)，只有被显式清零(0=永不过期)才需要兜底；
+                # 已配置保留期的节点保持原值，不擅自缩短其 PITR 窗口。
+                if _as_int(_sec) == 0:
+                    # MySQL 8.0：两者互斥，必须先把 expire_logs_days 归零才能设 seconds
+                    cur.execute("SET GLOBAL expire_logs_days = 0")
+                    cur.execute("SET GLOBAL binlog_expire_logs_seconds = %d" % _RETENTION_SEC)
+            else:
+                cur.execute("SELECT @@GLOBAL.expire_logs_days")
+                _eld = (cur.fetchone() or (None,))[0]
+                # 只兜底「永不过期(0)」：实测在跑的 12.3.3 节点多为 10 天，强行改成 7 天
+                # 等于静默缩短既有的 PITR 窗口 —— 0 才是本次磁盘告警的根因，只修它。
+                if _as_int(_eld) == 0:
+                    cur.execute("SET GLOBAL expire_logs_days = %d" % _RETENTION_DAYS)
+            cur.execute("SELECT @@GLOBAL.max_binlog_size")
+            _mbs = (cur.fetchone() or (None,))[0]
+            if (_as_int(_mbs) or 0) > _MAX_BINLOG_SIZE:
+                cur.execute("SET GLOBAL max_binlog_size = %d" % _MAX_BINLOG_SIZE)
+            # MariaDB >= 11.4：给 binlog 总体积设硬上限 —— 按天保留只保证「时间」有界，
+            # 写入量突增时仍可能撑爆 /data，这才是真正兜住磁盘的那道闸。
+            # 实测环境同时存在 10.11/11.0 节点，那些版本无此变量（报 1193）属预期，静默跳过；
+            # >= 11.4 上则由 slave_connections_needed_for_purge(默认 1) 保证不会删掉
+            # 已连从库尚未应用的日志。
+            if flavour != F_MYSQL8:
+                try:
+                    cur.execute("SELECT @@GLOBAL.max_binlog_total_size")
+                    _cap = _as_int((cur.fetchone() or (None,))[0])
+                    if _cap is not None and _cap != _BINLOG_TOTAL_SIZE_CAP:
+                        cur.execute(
+                            "SET GLOBAL max_binlog_total_size = %d" % _BINLOG_TOTAL_SIZE_CAP)
+                except Exception:
+                    # < 11.4 无此变量（已实测），非故障，不刷 warning
+                    pass
+        except Exception as _be:
+            _k = (host, port)
+            if _k not in _BINLOG_RETENTION_WARNED:
+                _BINLOG_RETENTION_WARNED.add(_k)
+                import logging as _blg
+                _blg.getLogger(__name__).warning(
+                    "节点 %s:%s 设置 binlog 保留参数失败，复制 binlog 可能无限累积撑爆磁盘: %s",
+                    host, port, _be)
 
     cur = conn.cursor()
     used = used_for_connect

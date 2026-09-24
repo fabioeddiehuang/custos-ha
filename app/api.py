@@ -758,26 +758,92 @@ def api_collect_state(user=Depends(auth_required)):
 
 @app.post("/api/consistency/check")
 def api_consistency_check(cluster_id: int = Form(...), mode: str = Form("rows"),
+                          wait_sec: int = Form(-1),
                           user=Depends(auth_required)):
     """主从数据一致性校验（纯只读）。
 
     mode=rows     比对各业务表行数（轻量，可定期跑）
     mode=checksum CHECKSUM TABLE 逐表比对（较重，能发现行数相同但内容不同）
+
+    wait_sec：候选差异复核前，等待从库追平的秒数上限（-1 = 用模块默认）。
+    结论会持久化（consistency.save_result）——集群页据此显示最近一次结论徽章，
+    使「有未处置差异」与「页面显示正常」不可能同时成立。
     """
     try:
-        res = consistency.check_consistency(cluster_id, mode)
+        res = consistency.check_consistency(
+            cluster_id, mode, wait_sec=(None if int(wait_sec) < 0 else int(wait_sec)))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    if res.get("ok"):
+        res["result_id"] = consistency.save_result(cluster_id, res)
+    return _json_ok(res)
+
+
+@app.get("/api/consistency/last")
+def api_consistency_last(cluster_id: int = 0, user=Depends(auth_required)):
+    """最近一次一致性校验结论（集群页徽章/横幅用；从未校验过返回 has=False）。
+
+    为什么必须持久化：校验结论原本只活在一个弹窗里，刷新即丢 —— 于是「刚校验出 2 处差异」
+    与「页面显示复制正常」可以同时成立，用户无从判断哪个库可信。
+    """
+    try:
+        res = consistency.last_result(int(cluster_id))
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
     return _json_ok(res)
 
 
-
 @app.get("/api/consistency/check")
 def api_consistency_check_get(cluster_id: int = 0, mode: str = "rows",
                               user=Depends(auth_required)):
-    """GET 形式的一致性校验（便于前端/脚本直接调用）。"""
+    """GET 形式的一致性校验（便于前端/脚本直接调用）。结论同样持久化。"""
     try:
         res = consistency.check_consistency(cluster_id, mode)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    if res.get("ok"):
+        res["result_id"] = consistency.save_result(cluster_id, res)
+    return _json_ok(res)
+
+
+
+@app.post("/api/consistency/row_diff")
+def api_consistency_row_diff(cluster_id: int = Form(...), host: str = Form(...),
+                            port: int = Form(...), table: str = Form(...),
+                            user=Depends(auth_required)):
+    """展开某张差异表的行级差异（主键 + 两侧值）。table 形如 'db.tbl'。"""
+    try:
+        if "." in table:
+            schema, tbl = table.split(".", 1)
+        else:
+            return _json_ok({"ok": False, "error": "表名需含库名（db.tbl）"})
+        res = consistency.row_diff(cluster_id, host, port, schema, tbl)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok(res)
+
+
+@app.post("/api/consistency/export")
+def api_consistency_export(cluster_id: int = Form(...), host: str = Form(...),
+                          port: int = Form(...), table: str = Form(...),
+                          user=Depends(auth_required)):
+    """生成差异处置 SQL 并落 quarantine（卷内回收表，可一键回灌主库）。"""
+    try:
+        if "." in table:
+            schema, tbl = table.split(".", 1)
+        else:
+            return _json_ok({"ok": False, "error": "表名需含库名（db.tbl）"})
+        res = consistency.export_divergent_rows(cluster_id, host, port, schema, tbl)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok(res)
+
+
+@app.post("/api/consistency/remaster")
+def api_consistency_remaster(recycle_id: int = Form(...), user=Depends(auth_required)):
+    """把回收表中的从库独有行回灌到当前主库（救回分裂窗口内的真实写入）。"""
+    try:
+        res = consistency.remaster_from_recycle(recycle_id)
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
     return _json_ok(res)
@@ -798,6 +864,12 @@ def api_node_rebuild(cluster_id: int = Form(...), host: str = Form(...),
         task = rebuild.start_rebuild(cluster_id, host, port, actor=str(user))
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    # 节点重建会抹掉数据：若它曾是迁移目标，残留的迁移锁/running 任务会让仪表盘
+    # 永久显示「迁移中」并让 failover 跳过该节点拓扑维护 —— 顺手清掉（失败不影响重建）。
+    try:
+        _migration.force_clear_node(host, port, clear_tasks=True)
+    except Exception:
+        pass
     return _json_ok({"ok": True, "task": task})
 
 
@@ -2956,7 +3028,34 @@ async def api_migration_lag(task_id: int, request: Request, user=Depends(auth_re
         task = _migration.get_task(task_id)
         if not task:
             return _json_ok({"ok": False, "error": "任务不存在"})
-        return _json_ok(_migration.check_lag(task, skip_acct=bool(b.get("skip_acct"))))
+        return _json_ok(_migration.check_lag(task, skip_acct=bool(b.get("skip_acct")),
+                                            auto_heal=bool(b.get("auto_heal"))))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/migration/{task_id}/heal")
+def api_migration_heal(task_id: int, user=Depends(auth_required)):
+    """迁移目标的复制自愈：桥接阶段目标(从库)的 SQL/IO 线程因复制错误(如 1133/冲突)停止时，
+    用目标 root 账号调用 heal_replication 跳过冲突事务 / 补建缺失账号 / 重启线程，使其恢复追平。
+
+    与集群「修复复制」(POST /api/heal) 不同：迁移目标此刻尚未登记进 Custos 集群，
+    无法走集群自愈；这里直接用迁移任务记录里的目标地址与 root 口令连接目标节点。
+    """
+    try:
+        task = _migration.get_task(task_id)
+        if not task:
+            return _json_ok({"ok": False, "error": "任务不存在"})
+        cfg = task["config"]
+        host = cfg["tgt_host"]; port = int(cfg["tgt_port"])
+        root_pass = cfg.get("tgt_root_pass") or ""
+        if not root_pass:
+            return _json_ok({"ok": False,
+                             "error": "任务未记录目标 root 口令，无法连接目标自愈；"
+                                      "请到目标节点手动 START REPLICA / 处理复制错误。"})
+        ok, msg = heal_replication(host, port, "root", root_pass,
+                                  root_user="root", root_pass=root_pass)
+        return _json_ok({"ok": ok, "msg": msg})
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
@@ -3031,6 +3130,29 @@ def api_migration_delete(task_id: int, user=Depends(auth_required)):
 def api_migration_cleanup_stale(user=Depends(auth_required)):
     """清理卡死/陈旧的执行中任务（无后台线程在跑的 running 记录）。"""
     return _json_ok(_migration.cleanup_stale_running_tasks())
+
+
+@app.post("/api/migration/unlock")
+async def api_migration_unlock(request: Request, user=Depends(auth_required)):
+    """强制解除某节点的迁移锁（及可选清理指向它的 running 任务）。
+
+    用于节点被重装/重建后，管理后台仍残留「迁移中」状态的场景。等价于对管理库
+    执行 DELETE FROM migration_locks / migration_tasks，但无需手敲 SQL。默认同时
+    清理指向该节点的 running 任务（重装后这些任务已无意义）。
+
+    body: {"host": "192.168.1.203", "port": 3307, "clear_tasks": true}
+    """
+    b = await _json_body(request)
+    host = (b.get("host") or "").strip()
+    port = int(b.get("port") or 0)
+    clear_tasks = b.get("clear_tasks", True)
+    if not host or not port:
+        return _json_ok({"ok": False, "error": "host 与 port 必填"})
+    try:
+        info = _migration.force_clear_node(host, port, clear_tasks=bool(clear_tasks))
+        return _json_ok({"ok": True, **info})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
 # ==================================================================

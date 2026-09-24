@@ -538,7 +538,7 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
         "log_slave_updates = ON\n"
         "relay_log = relay-bin\n"
         "relay_log_recovery = ON\n"
-        "binlog_format = ROW\n"
+        "binlog_format = ROW\n# binlog 清理：避免复制 binlog 无限累积撑爆 /data（历史版本未设导致磁盘告警）\nexpire_logs_days = 7\nmax_binlog_size = 256M\n"
         "read_only = ON\n"
         "# 复制/性能（与 docker 节点保持一致，避免单节点复制延迟累积）\n"
         "innodb_buffer_pool_size = 320M\n"
@@ -603,7 +603,7 @@ def render_mysql_my_cnf(server_id, port, data_dir=MYSQL_DOCKER_DATA_DIR, install
         "log_slave_updates = ON\n"
         "relay_log = relay-bin\n"
         "relay_log_recovery = ON\n"
-        "binlog_format = ROW\n"
+        "binlog_format = ROW\n# binlog 清理：避免复制 binlog 无限累积撑爆 /data（历史版本未设导致磁盘告警）\n# MySQL 8.0 必须用 binlog_expire_logs_seconds(7 天=604800s)：expire_logs_days 已废弃，\n# 且二者运行时互斥（binlog_expire_logs_seconds 默认 2592000 非 0 时 SET expire_logs_days 会被 3683 拒绝）\nbinlog_expire_logs_seconds = 604800\nmax_binlog_size = 256M\n"
         "binlog_row_image = FULL\n"
         # ⚠ 静态配置只写 read_only，**绝不能**写 super_read_only=ON：
         # super_read_only 会连 SUPER 用户（root）一起拒绝写入，导致安装脚本的
@@ -687,7 +687,7 @@ def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
         "log_slave_updates = ON\n"
         "relay_log = relay-bin\n"
         "relay_log_recovery = ON\n"
-        "binlog_format = ROW\n"
+        "binlog_format = ROW\n# binlog 清理：避免复制 binlog 无限累积撑爆 /data（历史版本未设导致磁盘告警）\nexpire_logs_days = 7\nmax_binlog_size = 256M\n"
         "read_only = ON\n"
         "# 复制/性能（与裸机 MariaDB 节点保持一致）\n"
         "# 缓冲池默认 512M（而非官方/裸机模板的 1G）：小内存主机（如 2G）用 1G 极易 OOM。\n"
@@ -1951,6 +1951,19 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     manager_public_ip = get_manager_public_ip()
     manager_subnet = get_manager_docker_subnet_wildcard()
     server_id = get_next_server_id()
+    # 【修复 2026-09-24】server_id 必须与该节点自身的 GTID 历史保持一致。
+    # 同一节点(ip+port)重新生成配置时若换成新的 server_id，其 data 目录里原有的
+    # GTID（domain / server 取自旧 server_id）会与新 domain 混杂，主从随即报
+    #   1236 '... missing the GTID x-y-N requested by the slave
+    #         (even though both a prior and a subsequent sequence number does exist)'
+    # —— 即主库 binlog 出现「空洞」。故已存在的节点一律复用原 server_id，
+    #    只有在首次添加（nodes 表无记录）时才分配新的。
+    try:
+        _rows = query("SELECT server_id FROM nodes WHERE ip=%s AND port=%s", (ip, int(port)))
+        if _rows and _rows[0].get("server_id"):
+            server_id = int(_rows[0]["server_id"])
+    except Exception:
+        pass
     node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
     peers = _peer_ips(ip, cluster_id)
     # MariaDB 两种形态（裸机 / 容器 host 网络）的 keepalived 容器都在 host 网络，

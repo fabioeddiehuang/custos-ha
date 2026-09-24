@@ -6,6 +6,11 @@ __pycache__/
 .env   # 含 SECRET_KEY 等敏感值，禁止打进镜像；运行时由 compose 注入环境变量
 data/
 generated_nodes/
+# 备份产物：docker-compose 把项目根 ./backups 挂到容器 /app/backups，运行时持续累积
+# 各库的 .sql.gz 全量备份（可达数百 MB ~ 数 GB）。若不排除，`COPY . .` 会把它们整体打进
+# 服务端镜像 —— 生产实测：本应 340MB 的镜像因此膨胀到 1.27GB，且 docker save 同为 1.2GB
+# （.sql.gz 已是压缩态，不会再变小）。
+backups/
 *.md
 .codebuddy/
 

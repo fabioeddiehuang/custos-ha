@@ -1,3 +1,39 @@
+# ---------------------------------------------------------------------------
+# 阶段 1（builder）：只为取得 mariadb-dump 二进制。
+#
+# 为什么需要它：Debian 把 mariadb-dump 放在完整包 mariadb-client 里，而该包硬依赖
+#   perl（perl + perl-modules-5.40 ≈ 55MB）。但 perl 只是「包依赖」——ldd 实测
+#   mariadb-dump 二进制本身【不依赖 perl】，其运行库（libssl/libcrypto/libz/
+#   libstdc++/libgcc/libzstd/libm）基础镜像均已具备，连 libmariadb 都不需要。
+# 做法：builder 里装完整包，最终镜像只 COPY /usr/bin/mariadb-dump 这一个可执行文件。
+#   ⇒ 去掉 perl，而迁移用的仍是【同一个二进制、同一条代码路径】，功能与行为零变化。
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim AS mysqlcli-dump
+RUN --mount=type=cache,id=custos-dumptool-apt,target=/var/cache/apt,sharing=locked \
+    set -e; \
+    tar cf /tmp/apt-src-bak.tar /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true; \
+    APT_OK=0; \
+    for M in mirrors.tencent.com/debian mirrors.tuna.tsinghua.edu.cn/debian \
+             mirrors.aliyun.com/debian repo.huaweicloud.com/debian; do \
+      H=$(echo "$M" | sed 's|/debian$||'); \
+      tar xf /tmp/apt-src-bak.tar -C / 2>/dev/null || true; \
+      sed -i "s|deb.debian.org|$H|g; s|security.debian.org|$H/debian-security|g" \
+          /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+      sed -i "s|deb.debian.org|$H|g; s|security.debian.org|$H/debian-security|g" \
+          /etc/apt/sources.list 2>/dev/null || true; \
+      if apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update \
+         && apt-get install -y --no-install-recommends mariadb-client; then APT_OK=1; break; fi; \
+    done; \
+    if [ "$APT_OK" != "1" ]; then \
+      tar xf /tmp/apt-src-bak.tar -C / 2>/dev/null || true; \
+      apt-get -o Acquire::Retries=3 update \
+        && apt-get install -y --no-install-recommends mariadb-client; \
+    fi; \
+    rm -rf /var/lib/apt/lists/* /tmp/apt-src-bak.tar
+
+# ---------------------------------------------------------------------------
+# 阶段 2：最终镜像（精简）
+# ---------------------------------------------------------------------------
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -36,17 +72,16 @@ RUN --mount=type=cache,id=custos-pip,target=/root/.cache/pip \
       pip install --timeout 120 --retries 10 -r requirements.txt; \
     fi
 
-# 数据迁移必须的客户端与编排工具：
-#   · mariadb-client —— 逻辑通道 A 的 mariadb-dump / mariadb（连远程源库导出/导入）。
-#   · openssh-client + rsync + sshpass —— 物理通道 B 的编排：管理器经 SSH 到【源/目标节点】
-#     执行 mariabackup（备份在源节点、copy-back 在目标节点，mariabackup 只能读本地 datadir，
-#     无法备份远程服务器，故管理器【不】预装 mariabackup，节点自带即可）。
-# ⚠ 注意：脱离了这些工具，/migration 页面能打开但一点即错，务必保留此层。
+# 数据迁移逻辑通道（通用模式）必须的客户端：
+#   · mariadb-dump —— 由上方 builder 阶段拷入（不带 perl，见阶段 1 说明）。
+#   · mariadb / mysql —— CLI（导入端），由 mariadb-client-core 提供（不含 perl）。
+# ⚠ 物理通道 B（mariabackup over SSH）已在 2.4.1 起取消（migration.py 强制 logical），
+#   故 openssh-client / rsync / sshpass 已从镜像移除 —— 它们仅服务于已停用的物理通道，
+#   删除后不影响任何受支持的迁移路径。
 #
-# apt：国内镜像源【优先】，官方源兜底 + BuildKit 缓存挂载（本层是全镜像最大的一层，约 150MB）：
-#   · 体积构成已实测：mariadb-client 65MB（mariadb-dump 在此包）+ perl 约 49MB（mariadb-client
-#     硬依赖 <perl:any>，无法剔除）+ openssh-client/rsync/sshpass 等。既然体积无法再砍，
-#     就只能砍掉"重复下载"：用缓存挂载把 .deb 归档留在宿主机，重跑时零下载。
+# apt：国内镜像源【优先】，官方源兜底 + BuildKit 缓存挂载。
+#   本层只装 mariadb-client-core（CLI 及其运行库，无 perl），mariadb-dump 由 builder 拷入：
+#   原方案装完整包 mariadb-client 会连带 perl（≈55MB）——实测完整包 371MB、本方案 215MB。
 #   · ⚠ 只缓存 /var/cache/apt（deb 归档），【绝不要缓存 /var/lib/apt/lists】：
 #     BuildKit 的缓存按【目标路径】共享，一旦缓存索引，不同基础镜像会互相复用对方的索引
 #     （例如 python:3.11-slim 从 bookworm 升到 trixie，或本镜像与节点镜像之间串味），
@@ -58,7 +93,7 @@ RUN --mount=type=cache,id=custos-pip,target=/root/.cache/pip \
 RUN --mount=type=cache,id=custos-server-apt,target=/var/cache/apt,sharing=locked \
     set -e; \
     tar cf /tmp/apt-src-bak.tar /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true; \
-    PKGS="mariadb-client openssh-client rsync sshpass"; \
+    PKGS="mariadb-client-core"; \
     apt_try() { \
       apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update \
         && apt-get install -y --no-install-recommends $PKGS; \
@@ -82,6 +117,12 @@ RUN --mount=type=cache,id=custos-server-apt,target=/var/cache/apt,sharing=locked
         && apt-get install -y --no-install-recommends $PKGS; \
     fi; \
     rm -rf /var/lib/apt/lists/* /tmp/apt-src-bak.tar
+
+# 从 builder 拷入 mariadb-dump（仅此一个可执行文件；其运行库基础镜像已具备，实测 ldd 无缺失）。
+COPY --from=mysqlcli-dump /usr/bin/mariadb-dump /usr/bin/mariadb-dump
+# 保留 Debian 同款别名 mysqldump → mariadb-dump、mysql → mariadb（与装完整包时【行为完全一致】，
+# 供 engine_adapter 在 mysql 方言下按名字查找；真实方言由 tool_dialect 实测 --help 参数决定）。
+RUN ln -sf /usr/bin/mariadb-dump /usr/bin/mysqldump && ln -sf /usr/bin/mariadb /usr/bin/mysql
 
 # 依赖装完后再引入随版本变化的元数据：LABEL 内含 ${VERSION}，
 # 若放在 pip 之前，每次升版都会使该层及其后所有层缓存失效 → 依赖被反复重装。
