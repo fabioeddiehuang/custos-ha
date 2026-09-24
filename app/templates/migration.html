@@ -185,9 +185,9 @@
   <div class="wz-fill" id="wzFill"></div>
   <div class="wz-step on" data-step="1"><span class="idx">1</span><div><div class="t">录入源</div><div class="s">连接并探测</div></div></div>
   <div class="wz-step" data-step="2"><span class="idx">2</span><div><div class="t">目标与任务</div><div class="s">填节点建任务</div></div></div>
-  <div class="wz-step" data-step="3"><span class="idx">3</span><div><div class="t">执行迁移</div><div class="s">种子/桥接/校验</div></div></div>
-  <div class="wz-step" data-step="4"><span class="idx">4</span><div><div class="t">停桥切换</div><div class="s">cutover</div></div></div>
-  <div class="wz-step" data-step="5"><span class="idx">5</span><div><div class="t">收尾工作</div><div class="s">cleanup</div></div></div>
+  <div class="wz-step" data-step="3"><span class="idx">3</span><div><div class="t">执行迁移</div><div class="s">导出并导入</div></div></div>
+  <div class="wz-step" data-step="4" style="display:none"><span class="idx">4</span><div><div class="t">停桥切换</div><div class="s">已移除</div></div></div>
+  <div class="wz-step" data-step="5" style="display:none"><span class="idx">5</span><div><div class="t">收尾工作</div><div class="s">已移除</div></div></div>
 </div>
 
 <div id="wzGuide" style="margin:10px 0;padding:10px 12px;border:1px solid var(--border,var(--surface-3));border-radius:8px;background:var(--surface-2,rgba(127,127,127,.06))"></div>
@@ -264,6 +264,11 @@
       <div class="field" style="margin-top:8px"><label>仅迁移选中库（留空=全部用户库）</label>
         <input id="dbFilter" placeholder="逗号分隔，如 app_db,order_db"></div>
     </div>
+    <div class="bk-note warn" style="margin-top:10px">
+      ⚠ <b>同名库将被整库替换</b>：若目标实例已存在与待迁库同名的库（如 test123），
+      迁移将<b>先删除目标中的该库，再整库导入</b>源库数据（保证数据完整、无脏数据残留）。
+      系统库（mysql/information_schema 等）与 Custos 管理库不会被迁移或删除。
+    </div>
 
     <div id="methodBox" style="display:none;margin-top:14px">
       <div style="font-size:13px;font-weight:600;color:var(--text)">迁移方式：通用模式（逻辑通道）</div>
@@ -331,7 +336,7 @@
       <input type="checkbox" id="deepVerifyChk" style="margin-top:2px;flex:0 0 auto;width:16px;height:16px">
       <div style="font-size:13px;line-height:1.6">
         <div style="font-weight:600">一致性校验时做内容级比对（CHECKSUM）</div>
-        <div style="color:var(--muted);margin-top:2px">较慢但更强，建议在切换前跑一次。</div>
+        <div style="color:var(--muted);margin-top:2px">较慢但更强，建议在确认完成前跑一次。</div>
       </div>
     </div>
   </div>
@@ -339,7 +344,7 @@
   <div id="binlogPlanBox" style="margin-top:10px;display:none"></div>
   <div id="stepErrBox" style="margin-top:10px;display:none"></div>
   <div class="btn-row">
-    <button class="btn btn-primary" id="runAllBtn" onclick="runAll()">▶ 全部执行（种子→桥接→校验）</button>
+    <button class="btn btn-primary" id="runAllBtn" onclick="runAll()">▶ 全部执行（导出并导入 → 可选校验）</button>
     <button class="btn" onclick="showHistory()">📜 查看历史迁移任务</button>
     <button class="btn" onclick="setStep(2)">← 上一步：改目标</button>
     <button class="btn btn-primary" id="nextStageBtn" style="display:none" onclick="gotoStep4()">进入下一阶段：停桥切换 →</button>
@@ -556,26 +561,19 @@ function setStep(n){
      bridge    = 源库已开 binlog，可建复制桥接并验证追平（安全）；
      stopwrite = 源库未开 binlog，只能停写后一次性拷贝（无法验证追平）。          */
 function guideInfo(n){
-  const bridge = (STATE.mode === "bridge");
   const next = ({
-    1: "录入源库地址与账号后点「探测」，确认版本、待迁库表，以及是否开启 binlog。",
-    2: "选择目标节点与迁移通道，填写目标 root 密码后创建迁移任务。",
-    3: bridge ? "依次执行「数据种子 → 建立桥接 → 一致性校验」；校验通过后点「进入下一阶段」。"
-              : "依次执行「数据种子 → 一致性校验」（源库未开 binlog，无桥接，不支持追平验证）。",
-    4: bridge ? "先点「追平检测」，确认目标已追平后再执行停桥切换。"
-              : "先确认源库已停写（可用「停写检测」辅助判断），再勾选确认并执行切换。",
-    5: "回收源端复制账号并把源库置为只读暖备；不想改动源库可直接完成。",
+    1: "录入源库地址与账号后点「检测两端」，确认版本、待迁库表。",
+    2: "选择目标节点，填写目标 root 密码后创建迁移任务。",
+    3: "点「全部执行」：逐库逻辑导出源库并整库导入目标（目标同名库会先删除再导入）；"
+       + "可选「一致性校验」确认各库表数一致。",
+    4: "（本步骤已在 2.4.0 重做中移除）",
+    5: "（本步骤已在 2.4.0 重做中移除）",
   })[n] || "";
-  const probed = !!(STATE.probe);
   return {
-    // ⚠ 未检测前不能下结论：STATE.mode 初值是 bridge，过去会先显示"桥接追平"并断言
-    //   "源库已开启 binlog"，而此时根本没检测过（用户质疑过这点）。
-    way: !probed ? "待检测" : (bridge ? "桥接追平" : "停写迁移"),
-    wayNote: !probed
-      ? "尚未检测：请在第 1 步点「检测两端」，系统会依据 @@log_bin 判定能否桥接追平。"
-      : (bridge
-        ? "已检测到 @@log_bin=ON：目标会持续追平原库增量，切换前可验证追平，数据不会丢。"
-        : "已检测到 @@log_bin=OFF：无法建立复制桥接，只能先让业务停写、再做一次性拷贝。"),
+    // 2.4.0 重做：纯逻辑导出→导入，不建复制桥接、不追平、不切换
+    way: "逻辑导出导入",
+    wayNote: "本迁移为纯逻辑导出→导入（类似 Navicat 导出各库再导入现有库），"
+             + "不建立复制桥接、不追平、不切换；目标同名库整库替换。",
     next: next,
   };
 }
@@ -584,9 +582,7 @@ function updateGuide(n){
   const g = guideInfo(n);
   // 第1步不显示「迁移方式/已检测」：第2步的 modeSummary 已展示，避免重复与歧义
   const showWay = (n !== 1);
-  const wayCls = (STATE.mode === "bridge")
-    ? "background:rgba(46,204,113,.15);color:var(--ok,#2ecc71)"
-    : "background:rgba(230,162,60,.18);color:var(--warn,#e6a23c)";
+  const wayCls = "background:rgba(46,204,113,.15);color:var(--ok,#2ecc71)";
   let html =
     '<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:6px">'
     + '<b style="font-size:13px">当前：第 ' + n + ' 步</b>';
@@ -843,23 +839,13 @@ async function createTask(){
 }
 
 function buildExecList(){
-  const all = [["seed","数据种子（导出/恢复）"],["bridge","建立桥接（GTID 追平）"],
-               ["verify","一致性校验（行数比对）"]];
-  // 停写模式（源库未开 binlog）：不建桥接，隐藏该步骤并说明原因
-  const steps = (STATE.mode === "stopwrite") ? all.filter(x=>x[0]!=="bridge") : all;
-  let html = steps.map(([k,label])=>
+  // 2.4.0 重做：纯逻辑导出导入，仅「导出并导入」+「完整性校验（可选）」，无桥接/切换
+  const all = [["seed","导出并导入（逐库 dump→restore）"],
+               ["verify","完整性校验（行数比对，可选）"]];
+  let html = all.map(([k,label])=>
     '<div class="run-row"><button class="btn btn-primary" data-step="'+k+'" onclick="runStep(\''+k+'\')">执行</button>'+
     '<span class="kv">'+label+'</span><span class="st wait" id="st_'+k+'">待执行</span></div>'
   ).join("");
-  if(STATE.mode === "stopwrite"){
-    html += '<div class="bk-note" style="margin-top:8px">' +
-      '⚠ <b>停写迁移模式</b>（源库未开 binlog，无法桥接）：本步只跑「数据种子 + 一致性校验」。' +
-      '<b>请先让业务停止写入源库</b>再执行数据种子，否则种子期间的新写入不会进入新集群。' +
-      '<div style="margin-top:6px">没有追平验证 ⇒ 无法用复制延迟证明“已追平”，' +
-      '因此本向导改用<b>逐表行数比对 + 可选内容级校验</b>来确认数据已完整复制到目标主库。</div>' +
-      '<button class="btn" style="margin-top:6px" onclick="loadBinlogPlan()">' +
-      '🔧 查看「开启 binlog」方案（开启后即可桥接追平）</button></div>';
-  }
   $("execList").innerHTML = html;
 }
 
@@ -990,8 +976,7 @@ function runStep(step){
           }else{
             appendLog("\n[" + step + " ✓] " + JSON.stringify(rec.result||{}));
           }
-          // 校验通过：不再自动跳第四步，改为显式“进入下一阶段”按钮（UX-004）
-          if(step === "verify"){ markStepDone(3); $("nextStageBtn").style.display = "block"; }
+          if(step === "verify"){ markStepDone(3); }   // 完成弹窗由 runAll 统一弹出
           resolve(true);
         }else{
           if(stEl){ stEl.className = "st err"; stEl.textContent = "失败"; }
@@ -1158,14 +1143,15 @@ async function loadBinlogPlan(){
   box.innerHTML = h;
 }
 
-// 一键顺序执行：桥接模式 = 种子→桥接→校验；停写模式 = 种子→校验（跳过桥接）
+// 2.4.0 重做：纯逻辑导出导入，唯一顺序 = 导出并导入 → 可选完整性校验（无桥接/切换）
 async function runAll(){
   $("nextStageBtn").style.display = "none";
-  const seq = (STATE.mode === "stopwrite") ? ["seed","verify"] : ["seed","bridge","verify"];
+  const seq = ["seed","verify"];
   for(const s of seq){
     const ok = await runStep(s);
     if(!ok){ alert(s + " 失败，已中止全部执行"); return; }
   }
+  showDoneModal("skip", []);   // 两项均成功 ⇒ 迁移完成（纯导入，不改动源库）
 }
 function gotoStep4(){
   // 离开/进入第四步都停掉正在进行的追平追踪，避免后台空转
@@ -1564,9 +1550,9 @@ async function runCleanup(){
 // ============================================================================
 // 历史任务管理 + 刷新恢复（P0 防刷新 / P1 列表 / P2 详情重试 / P3 删除）
 // ============================================================================
-const STEPS = ["seed","bridge","verify","cutover","cleanup"];
-const STEP_LABELS_JS = {seed:"数据种子",bridge:"建立桥接",verify:"一致性校验",
-                        cutover:"停桥切换",cleanup:"收尾回收"};
+// 2.4.0 重做：纯逻辑「导出→导入」，去掉桥接/切换/收尾步骤
+const STEPS = ["seed","verify"];
+const STEP_LABELS_JS = {seed:"导出并导入",verify:"完整性校验(可选)"};
 let _detailId = null, _detailData = null, _bootTaskId = null, _histTasks = [];
 
 function statusLabel(s){ return ({draft:"草稿",running:"执行中",error:"失败",done:"完成"})[s] || s; }

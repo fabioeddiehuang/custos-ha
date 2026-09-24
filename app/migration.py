@@ -49,14 +49,13 @@ IGNORE_DBS = SYSTEM_DBS | CUSTOS_DBS
 # 数据量阈值（GB）：小于→逻辑通道A；大于等于→物理通道B（用户可覆盖）
 SIZE_THRESHOLD_GB = 500
 
-# 向导步骤（顺序即步进条）
-STEPS = ["seed", "bridge", "verify", "cutover", "cleanup"]
+# 向导步骤（顺序即步进条）—— 2.4.0 重做：纯逻辑「导出→导入」，去掉桥接/切换/收尾
+#   · seed   ：逐库 mariadb-dump --single-transaction → 目标（同名库先 DROP 整库再导入）
+#   · verify ：可选完整性校验（每库表数比对 + 可选 checksum），不阻塞任务完成
+STEPS = ["seed", "verify"]
 STEP_LABELS = {
-    "seed": "数据种子",
-    "bridge": "建立桥接",
-    "verify": "一致性校验",
-    "cutover": "停桥切换",
-    "cleanup": "收尾工作",
+    "seed": "导出并导入",
+    "verify": "完整性校验(可选)",
 }
 
 _lock = threading.Lock()
@@ -379,7 +378,9 @@ def capabilities(src_flavor, src_major, tgt_flavor, tgt_major=None):
         # 物理通道跨产品线不可行：MySQL 8 起删 .frm 改全局数据字典，MariaDB 读不懂
         "physical": same_engine,
         # 桥接限定 MariaDB→MariaDB（我们的复制语句是 MariaDB GTID 语义）
-        "bridge": same_engine and tgt_flavor == "mariadb" and src_flavor == "mariadb",
+        # 2.4.0 重做：迁移改为纯逻辑导出导入，不再建立复制桥接（server_id 撞车 / GTID 空洞 /
+        # 1406 等长链 bug 全部消失），故桥接能力恒为 False。
+        "bridge": False,
         # 同引擎可追平；跨引擎只能停写拷贝
         "pipeline": "continuous" if (same_engine and tgt_flavor == "mariadb") else "stopcopy",
         "cross_engine": cross_engine,
@@ -534,6 +535,33 @@ def seed_logical(task):
     src_flavor = cfg.get("src_flavor") or "mariadb"
     tgt_flavor = cfg.get("tgt_flavor") or "mariadb"
     cap = capabilities(src_flavor, int(cfg.get("src_major") or 0), tgt_flavor)
+
+    # ── 目标同名库处理（用户决策 1b/1c：整库替换）────────────────────────────
+    # 逐个选中库检查：目标实例已存在同名库 → 先 DROP 整库再导入（保证数据完整、无脏数据残留）；
+    # 目标无同名库 → 直接导入（建库由下方 dump 的 --databases 完成）。
+    # 系统库 / Custos 库（IGNORE_DBS）绝不触碰，杜绝误删 mysql 等。
+    tgt_conn = connect(cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg),
+                       cfg["tgt_root_pass"], timeout=8)
+    try:
+        tcur = tgt_conn.cursor()
+        for _db in databases:
+            if _db in IGNORE_DBS:
+                continue
+            try:
+                tcur.execute("SELECT 1 FROM information_schema.schemata "
+                             "WHERE schema_name=%s", (_db,))
+                if tcur.fetchone():
+                    _tick(task, 1, stage="目标已存在同名库 `%s`，先删除再整库导入" % _db,
+                          log="DROP DATABASE `%s`（目标存在同名库，按决策整库替换）" % _db)
+                    tcur.execute("DROP DATABASE `%s`" % _db)
+            except Exception as _e:
+                raise RuntimeError("删除目标同名库 `%s` 失败（已中止，避免部分导入）：%s"
+                                   % (_db, _e))
+    finally:
+        try:
+            tgt_conn.close()
+        except Exception:
+            pass
 
     dump, cli, dialect = resolve_client_tools(src_flavor)
     _tick(task, 2, stage="准备导出（工具=" + os.path.basename(dump) + "）",
@@ -3076,7 +3104,7 @@ def skip_cleanup(task_id):
 # 这里把「百分比 / 阶段文字 / 日志」由后台线程直接落库，前端轮询 /status 渲染。
 # 非后台调用（脚本直接 call）时 _tick 自动降级为空操作，不改变原有行为。
 # ---------------------------------------------------------------------------
-STEP_WEIGHTS = {"seed": 45, "bridge": 15, "verify": 20, "cutover": 15, "cleanup": 5}
+STEP_WEIGHTS = {"seed": 80, "verify": 20}
 
 _REP = {}          # tid -> {"rep": _Reporter, "step": step}
 _RUNNING = set()   # 正在执行步骤的 tid（并发门禁）
@@ -3144,14 +3172,21 @@ def _finish_step(tid, step, ok, payload=None, err=None):
                    **({"result": payload} if ok else {"error": str(err)})}
     base = sum(w for s, w in STEP_WEIGHTS.items()
                if ((steps.get(s) or {}).get("status") == "done"))
-    all_done = all(((steps.get(s) or {}).get("status") == "done") for s in STEPS)
-    status = "error" if not ok else ("done" if all_done else "running")
+    # 2.4.0 重做：seed 是完成性步骤（整库导入完成即迁移成功）；verify 为可选校验，
+    # 不阻塞任务完成。故「全部完成」以 seed 为准。
+    all_done = ((steps.get("seed") or {}).get("status") == "done")
     if ok:
+        status = "done" if all_done else "running"
         execute("UPDATE migration_tasks SET status=%s,steps=%s,progress=%s,stage=%s,"
                 "updated_at=NOW() WHERE id=%s",
                 (status, json.dumps(steps, ensure_ascii=False), int(base),
                  f"{STEP_LABELS.get(step, step)}完成", tid))
     else:
+        if step == "seed":
+            status = "error"            # 仅 seed 失败才判任务失败
+        else:
+            # verify 等可选步骤失败不回退已成功的迁移（seed 已成功视为迁移完成）
+            status = (task.get("status") or "running")
         execute("UPDATE migration_tasks SET status=%s,steps=%s,stage=%s,updated_at=NOW() WHERE id=%s",
                 (status, json.dumps(steps, ensure_ascii=False),
                  f"{STEP_LABELS.get(step, step)}失败: {str(err)[:180]}", tid))
@@ -3327,15 +3362,7 @@ def _execute_step(task_id, step, opts=None):
                                    "MariaDB 无法读取其数据目录），请改用逻辑通道。")
             return seed_logical(task)  # 2.4.1 起高级模式已取消，物理任务降级为逻辑通道
         return seed_logical(task)
-    if step == "bridge":
-        if not cap["bridge"]:
-            raise RuntimeError("该组合不支持 GTID 桥接（跨产品线 GTID 格式不兼容），"
-                               "请在停写窗口内一次性拷贝后直接切换。")
-        return bridge(task)
     if step == "verify":
         return verify(task, deep=bool((opts or {}).get("deep")))
-    if step == "cutover":
-        return cutover(task)
-    if step == "cleanup":
-        return cleanup(task)
-    raise ValueError("未知步骤")
+    # 2.4.0 重做：桥接 / 停桥切换 / 收尾 步骤已移除（纯逻辑导出导入，不再建复制通道）
+    raise ValueError("未知步骤: %s（桥接/切换/收尾步骤已在 2.4.0 重做中移除）" % step)
