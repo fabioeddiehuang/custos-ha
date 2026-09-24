@@ -2804,7 +2804,7 @@ def api_maintenance_end(cluster_id: int = Form(...), scope: str = Form(""),
 
 # ==================================================================
 # 数据迁移向导（既有 MariaDB 集群 → Custos 托管集群）
-# 专注 MariaDB：probe/recommend/seed/bridge/verify/cutover/cleanup。
+# 专注 MariaDB：probe/recommend/seed/verify（2.4.0 重做：纯逻辑导出导入，已移除桥接/切换/收尾步骤）。
 # 步骤驱动：前端逐步调用，天然支持重试(重复调用)/暂停(不调下一步)。
 # ==================================================================
 from . import migration as _migration
@@ -3003,23 +3003,6 @@ async def api_migration_precheck(task_id: int, user=Depends(auth_required)):
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
-@app.post("/api/migration/{task_id}/lag")
-async def api_migration_lag(task_id: int, request: Request, user=Depends(auth_required)):
-    """停桥切换前的追平检测（只读）：确认目标已从源追平，未追平不允许切换。
-
-    body: {"skip_acct": true} 可跳过账号自检（前端高频追踪采样时使用）。
-    """
-    try:
-        b = await _json_body(request)
-        task = _migration.get_task(task_id)
-        if not task:
-            return _json_ok({"ok": False, "error": "任务不存在"})
-        return _json_ok(_migration.check_lag(task, skip_acct=bool(b.get("skip_acct")),
-                                            auto_heal=bool(b.get("auto_heal"))))
-    except Exception as e:
-        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
-
-
 @app.post("/api/migration/{task_id}/heal")
 def api_migration_heal(task_id: int, user=Depends(auth_required)):
     """迁移目标的复制自愈：桥接阶段目标(从库)的 SQL/IO 线程因复制错误(如 1133/冲突)停止时，
@@ -3052,43 +3035,6 @@ async def api_migration_privileges(request: Request, user=Depends(auth_required)
     try:
         b = await _json_body(request)
         return _json_ok(_migration.audit_source_privileges(b))
-    except Exception as e:
-        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
-
-
-@app.post("/api/migration/plan_binlog")
-async def api_migration_plan_binlog(request: Request, user=Depends(auth_required)):
-    """源库未开 binlog 时，用源库 root 连接探测并生成「开启 binlog」的可执行方案。
-
-    只生成方案，绝不自动改配置 / 重启（log_bin 是静态变量，且属高危操作）。
-    """
-    try:
-        b = await _json_body(request)
-        return _json_ok(_migration.plan_binlog_enable(b))
-    except Exception as e:
-        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
-
-
-@app.post("/api/migration/{task_id}/freeze_check")
-def api_migration_freeze_check(task_id: int, user=Depends(auth_required)):
-    """停写迁移模式下的停写检测：实测源库是否已停止写入（采样写入计数器取差值）。
-
-    同步端点（内含数秒采样间隔），FastAPI 会放到线程池执行，不阻塞事件循环。
-    """
-    try:
-        task = _migration.get_task(task_id)
-        if not task:
-            return _json_ok({"ok": False, "error": "任务不存在"})
-        return _json_ok(_migration.check_write_freeze(task))
-    except Exception as e:
-        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
-
-
-@app.post("/api/migration/{task_id}/skip_cleanup")
-async def api_migration_skip_cleanup(task_id: int, user=Depends(auth_required)):
-    """跳过「收尾回收」直接完成迁移：不回收源端账号、不置老主只读，源库保持原状。"""
-    try:
-        return _json_ok(_migration.skip_cleanup(task_id))
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 

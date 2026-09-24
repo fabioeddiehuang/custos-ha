@@ -13,9 +13,9 @@
    Custos 的 ensure_topology 每周期都会对「当前主」执行 promote_to_master
    （STOP REPLICA + RESET REPLICA ALL + read_only=0），且维护模式(v2.3.3)只抑制
    「自动切换」与「状态告警」，**不抑制 ensure_topology**。
-   ⇒ 迁移期间目标节点【绝不注册进 Custos 受管集群】；只有停桥(STOP REPLICA)之后，
-     cutover 才把目标节点登记进 Custos（create_cluster + 插入 hosts/nodes），
-     随后 monitor 接管并提升新主。这样桥接通道不会被提前切断。
+   ⇒ 迁移期间目标节点【绝不注册进 Custos 受管集群】：2.4.0 重做后迁移改为纯逻辑
+     「导出→导入」，不再建立复制桥接，目标仅作为承载导入数据的独立实例，
+     monitor 也无需为「切断桥接」而特殊绕过其拓扑维护。
 """
 import json
 import os
@@ -376,7 +376,7 @@ def capabilities(src_flavor, src_major, tgt_flavor, tgt_major=None):
         "same_engine": same_engine,
         "logical": True,
         # 物理通道跨产品线不可行：MySQL 8 起删 .frm 改全局数据字典，MariaDB 读不懂
-        "physical": same_engine,
+        "physical": False,  # 物理(mariabackup)通道已在 2.4.0 取消
         # 桥接限定 MariaDB→MariaDB（我们的复制语句是 MariaDB GTID 语义）
         # 2.4.0 重做：迁移改为纯逻辑导出导入，不再建立复制桥接（server_id 撞车 / GTID 空洞 /
         # 1406 等长链 bug 全部消失），故桥接能力恒为 False。
@@ -402,76 +402,32 @@ def _sql_lit(s):
     """
     return str(s).replace("\\", "\\\\").replace("'", "\\'")
 
-
-MIG_REPL_USER = "custos_mig_repl"
-
-
-def _ensure_source_repl_account(task):
-    """在【源】MariaDB 上创建最小权限复制账号（迁移完 cleanup 可回收），用专属用户名 MIG_REPL_USER。
-
-    降级策略：若源连接账号无 CREATE USER 权限（桥接会报 1227），则不再建专用账号，
-    改为**直接用源连接账号本身**作为复制账号（前提是源账号允许从目标主机连入，
-    通常 @'%' 即可）。返回 used_src_creds 供 bridge 选择 CHANGE MASTER 的账号。
-    """
-    cfg = task["config"]
-    conn = connect(cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"], timeout=8)
-    try:
-        cur = conn.cursor()
-        u, p = MIG_REPL_USER, _sql_lit(cfg["repl_pass"])
-        try:
-            # ⚠ 关键坑（实测坐实）：CREATE USER IF NOT EXISTS 在用户【已存在】时
-            #   **不会更新口令**。迁移反复重装后，源库残留旧的 replication 账号（旧口令），
-            #   而新任务生成了新口令 ⇒ 该语句静默跳过、不报错、也不触发下面的降级分支，
-            #   于是目标拿着新口令连源 → "Access denied ... (using password: YES)"、
-            #   IO 线程永远起不来（追平检测报「IO 线程未运行」）。
-            #   故必须显式 ALTER USER 强制同步口令，保证幂等。
-            cur.execute(f"CREATE USER IF NOT EXISTS '{u}'@'%'")
-            cur.execute(f"ALTER USER '{u}'@'%' IDENTIFIED BY '{p}'")
-            cur.execute(f"GRANT REPLICATION SLAVE ON *.* TO '{u}'@'%'")
-            cur.execute("FLUSH PRIVILEGES")
-            return {"used_src_creds": False}
-        except Exception as e:
-            err = str(e)
-            # 1227 Access denied / 缺少 CREATE USER：源账号无权建账号 → 降级复用源账号本身
-            if "1227" in err or "Access denied" in err or "CREATE USER" in err:
-                cur.execute("SELECT CURRENT_USER()")
-                who = cur.fetchone()[0]
-                return {"used_src_creds": True,
-                        "note": (f"源连接账号 {who} 无 CREATE USER 权限，已改用源账号本身作为复制账号；"
-                                 f"请确保该账号允许从目标 {cfg['tgt_host']} 连入（如改为 @'%'）")}
-            raise RuntimeError(f"在源库创建复制账号失败: {err}")
-    finally:
-        conn.close()
-
-
 def _pw_arg(pw):
     """空口令时必须整个省略 -p，否则传 'p' 会变成交互等待输入，进程直接挂死。"""
     return [f"-p{pw}"] if pw else []
 
 
 def _ensure_target_accounts(cfg, stage=""):
-    """seed / 桥接后【立刻】补齐目标节点上的 Custos 账号（幂等，失败不阻断）。
+    """seed（逻辑导入）完成后【立刻】补齐目标节点上的 Custos 账号（幂等，失败不阻断）。
 
-    根因（v2.4.0 追平测试实测，203/213 集群）：物理通道 copy-back 会用【源库数据目录】
-    整库覆盖目标 datadir，`mysql.user` 一并被替换 ⇒ 目标上原有的 ha_monitor /
-    replication / app 账号**全部消失**；而旧逻辑只在 cutover 才 `_align_target_creds`
-    补账号 ⇒ 从 seed 到 cutover 的整个桥接/追平窗口内，目标处于「无 Custos 账号」状态：
+    根因（v2.4.0 实测，203/213 集群）：全库导入（含 mysql 库 / 整个实例）会
+    覆盖目标 datadir，`mysql.user` 一并被替换 ⇒ 目标上原有的 ha_monitor /
+    replication / app 账号**全部消失** ⇒ 导入后目标处于「无 Custos 账号」状态：
 
       · 同集群第二节点（213）连新主（203）报 1045
         ``Access denied for user 'replication'@'192.168.1.213'``（账号根本不存在）；
       · 管理器自身连不上目标（ha_monitor 不存在）⇒ 仪表盘复制/IO 全是 “—”；
       · 又因「迁移锁定」让 ensure_topology 整轮跳过（见 failover），这段窗口内
-        没有任何机制能把它修回来，只能等 cutover。
+        现改为：导入完成后立刻重建账号，不再依赖后续步骤兜底。
 
-    对策：seed 完成（目标实例就绪）后立刻按目标所属集群的凭证重建账号，并在 bridge()
-    开头再兜底一次。目标尚未登记进任何集群时无可对齐的凭证 → 跳过（由 cutover 统一处理）。
+    对策：seed（逻辑导入）完成后立刻按目标所属集群的凭证重建账号。目标尚未登记进任何集群时无可对齐的凭证 → 跳过（待其登记进集群后再对齐）。
     """
     try:
         rows = query("SELECT cluster_id FROM nodes WHERE ip=%s AND port=%s",
                      (cfg["tgt_host"], int(cfg["tgt_port"])))
         cid = (rows[0].get("cluster_id") if rows else None)
         if not cid:
-            return {"ok": True, "skipped": "目标尚未登记进 Custos 集群，留待 cutover 对齐凭证"}
+            return {"ok": True, "skipped": "目标尚未登记进 Custos 集群，留待登记进集群后再对齐凭证"}
         cc = query("SELECT ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass "
                    "FROM clusters WHERE id=%s", (cid,))
         if not cc:
@@ -486,7 +442,7 @@ def _ensure_target_accounts(cfg, stage=""):
         return {"ok": True, "cluster_id": cid, "stage": stage,
                 "note": "已按集群 #%s 凭证重建目标 Custos 账号" % cid}
     except Exception as e:
-        # 不阻断迁移主线：账号可由 cutover / monitor 再次自愈，但必须如实回传原因
+        # 不阻断迁移主线：账号可由 monitor 再次自愈，但必须如实回传原因
         return {"ok": False, "stage": stage, "error": str(e)}
 
 
@@ -517,6 +473,57 @@ SEED_STALL_SEC = 300
 
 # 用户主动中止的任务 id 集合（前端「中止任务」写入，步骤循环在安全点检测并退出）
 _CANCEL = set()
+
+
+def _src_dump_priv_flags(host, port, user, pass_):
+    """探测源账号对 事件/触发器/存储过程/视图 的导出权限，决定 dump 时带哪些可选 flag。
+
+    2.4.0 重做（纯逻辑导出导入）：非 root 源账号往往只有 SELECT。若缺对应对象级权限，
+    mariadb-dump 会直接 1044 失败（如 'show events'）。故按权限「尽力导出」——
+    缺哪个对象就跳过哪个，数据本身照常迁移，仅缺失该部分对象（不阻断）。
+    """
+    try:
+        c = connect(host, int(port), user, pass_, timeout=8)
+        cur = c.cursor()
+        cur.execute("SHOW GRANTS FOR CURRENT_USER()")
+        g = "\n".join(str(x[0]) for x in (cur.fetchall() or [])).upper()
+        c.close()
+    except Exception:
+        g = ""
+    allp = ("ALL PRIVILEGES" in g) or ("GRANT ALL" in g)
+    return {
+        "events":   allp or ("EVENT" in g),
+        "triggers": allp or ("TRIGGER" in g),
+        "routines": allp or ("SELECT" in g),   # 例程需能读 mysql 系统库（全局 SELECT）
+        "views":    allp or ("SHOW VIEW" in g),
+    }
+
+
+def _dump_optional_flags(priv, databases, host, port, user, pass_):
+    """根据权限生成 dump 的可选 flag；无 SHOW VIEW 时用 --ignore-table 跳过各库视图。"""
+    f = []
+    if priv.get("events"):
+        f.append("--events")
+    if not priv.get("triggers"):
+        f.append("--skip-triggers")          # 触发器默认导出，缺权限须显式跳过
+    if priv.get("routines"):
+        f.append("--routines")
+    if not priv.get("views"):
+        try:
+            c = connect(host, int(port), user, pass_, timeout=8)
+            cur = c.cursor()
+            for d in databases:
+                try:
+                    cur.execute("SELECT table_name FROM information_schema.views "
+                                "WHERE table_schema=%s", (d,))
+                    for (v,) in (cur.fetchall() or []):
+                        f.append("--ignore-table=%s.%s" % (d, v))
+                except Exception:
+                    pass
+            c.close()
+        except Exception:
+            pass
+    return f
 
 
 def seed_logical(task):
@@ -571,20 +578,28 @@ def seed_logical(task):
     #   实测：mariadb-dump --gtid --master-data=1 会输出 SET GLOBAL gtid_slave_pos='…'，
     #   而当源端此刻尚无 GTID 位点时该值为空，导入目标会触发
     #   ERROR 1948（与目标已有 binlog GTID 冲突）。
-    #   正确做法：位点单独采样，留给 bridge 阶段显式设置，不进数据流。
+    #   正确做法：位点不写进 dump 数据流；纯逻辑导入不建复制桥接（cap["bridge"] 恒 False，
+    #   位点留空），无「留给 bridge 阶段显式设置」的旧需求。
     src_gtid = _snapshot_src_gtid(cfg) if cap["bridge"] else ""
     # 方言跟随真实二进制（见 tool_dialect 注释），避免把 MySQL 参数喂给 mariadb-dump
     gtid_args = dump_gtid_args(dialect, want_gtid=False)
 
+    priv = _src_dump_priv_flags(src[0], src[1], src[2], src[3])
     dump_args = [
         dump, "-h", src[0], "-P", str(src[1]), "-u", src[2],
     ] + _pw_arg(src[3]) + [
-        # 官方迁移建议：single-transaction 一致快照、hex-blob 保二进制安全、
-        # routines/triggers/events 带存储过程与事件器
-        "--single-transaction", "--routines", "--triggers", "--events",
+        # 2.4.0 重做：按源账号权限「尽力导出」事件/触发器/例程/视图；
+        # 缺对应权限则自动跳过该对象（不阻断数据迁移，仅缺失该部分对象）。
+        "--single-transaction",
+    ] + _dump_optional_flags(priv, databases, src[0], src[1], src[2], src[3]) + [
         "--hex-blob", "--default-character-set=utf8mb4",
         "--skip-lock-tables", "--databases",
     ] + databases + gtid_args + ssl_args(dialect)
+    _skipped = [k for k in ("events", "triggers", "routines", "views")
+                if not priv.get(k)]
+    if _skipped:
+        _tick(task, 1, log="源账号缺少 %s 权限，已自动跳过对应对象导出（数据本身照常迁移）；"
+                    "如需完整迁移这些对象，请授予相应权限后重跑。" % "/".join(_skipped))
     # 导入端同样需要跳证书校验（MariaDB 客户端默认校验自签名证书会失败）
     tgt_dialect = tool_dialect(cli)
     load_args = ([cli, "-h", tgt[0], "-P", str(tgt[1]), "-u", tgt[2]]
@@ -829,28 +844,7 @@ def precheck(task_id):
     src = connect(cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"], timeout=8)
     tgt = connect(cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"], timeout=8)
     try:
-        # ① 源账号建复制账号权限预检（桥接会在源建 repl@'%'，需 CREATE USER + GRANT OPTION）
-        try:
-            cur = src.cursor()
-            cur.execute("SELECT CURRENT_USER()")
-            who = cur.fetchone()[0]
-            cur.execute("SHOW GRANTS FOR CURRENT_USER()")
-            grants = "\n".join(r[0] for r in cur.fetchall())
-            can_create = (("CREATE USER" in grants)
-                          or ("GRANT OPTION" in grants and "*.*" in grants)
-                          or ("ALL PRIVILEGES" in grants and "*.*" in grants))
-            if not can_create:
-                findings.append({
-                    "level": "blocker", "kind": "src_create_user",
-                    "detail": (f"源连接账号 {who} 缺少 CREATE USER 权限，桥接步骤无法在源库创建复制账号"
-                               f"（将报 1227）。请在源库执行："
-                               f"GRANT CREATE USER, REPLICATION SLAVE, REPLICATION CLIENT ON *.* "
-                               f"TO CURRENT_USER() WITH GRANT OPTION; FLUSH PRIVILEGES;"),
-                    "sample": [],
-                })
-        except Exception:
-            # 无法判定（旧版本/权限受限）不阻断，留给桥接步骤实测
-            pass
+        # 2.4.0 重做：纯逻辑导入无需在源库建复制账号（桥接已移除），故删除「源账号 CREATE USER」预检。
         tgt_coll = {r[0] for r in _q(tgt, "SHOW COLLATION")}
         tgt_eng = {(r[0] or "").upper() for r in _q(tgt, "SHOW ENGINES")
                    if (str(r[1] or "")).upper() in ("YES", "DEFAULT")}
@@ -908,9 +902,11 @@ def precheck(task_id):
     # ② 结构试运行：只导结构，改名落到目标 scratch schema，真实执行一遍再删除
     trial = {"attempted": 0, "failed": [], "errors": []}
     if databases:
+        _priv = _src_dump_priv_flags(cfg["src_host"], cfg["src_port"], cfg["src_user"], cfg["src_pass"])
         dump_args = [dump, "-h", cfg["src_host"], "-P", str(int(cfg["src_port"])),
                      "-u", cfg["src_user"]] + _pw_arg(cfg["src_pass"]) + [
-            "--no-data", "--routines", "--triggers", "--events",
+            "--no-data",
+        ] + _dump_optional_flags(_priv, databases, cfg["src_host"], cfg["src_port"], cfg["src_user"], cfg["src_pass"]) + [
             "--skip-lock-tables", "--databases",
         ] + databases + dump_gtid_args(dialect, want_gtid=False) + ssl_args(dialect)
         load_args = ([cli, "-h", cfg["tgt_host"], "-P", str(int(cfg["tgt_port"])), "-u", "root"]
@@ -2030,134 +2026,6 @@ def is_node_migrating(host, port):
     return _has_live_migration_task(host, port)
 
 
-def _check_source_binlog(cfg):
-    """桥接前置检查：源库必须开启 binlog、server_id 非 0。
-
-    否则 CHANGE MASTER + START REPLICA 依然会「成功」，但 IO 线程立刻报
-    1236 'Binary log is not open' —— 用户只能去仪表盘才发现，体验等同于静默失败。
-    故在此提前拦截，并给出可操作的修复指引。
-    """
-    conn = connect(cfg["src_host"], int(cfg["src_port"]),
-                   cfg["src_user"], cfg["src_pass"], timeout=8)
-    try:
-        cur = conn.cursor()
-
-        def _v(sql):
-            try:
-                cur.execute(sql)
-                r = cur.fetchone()
-                return r[0] if r else None
-            except Exception:
-                return None
-
-        log_bin = _v("SELECT @@log_bin")
-        server_id = _v("SELECT @@server_id")
-        lb = str(log_bin).strip().upper()
-        if lb in ("0", "OFF", "FALSE", "NONE", ""):
-            raise RuntimeError(
-                "源库 %s:%s 未开启 binlog（@@log_bin=%s），无法建立复制桥接——"
-                "IO 线程会直接报 1236 'Binary log is not open'。\n"
-                "【方案① 想继续桥接追平】在源库 my.cnf 的 [mysqld] 增加并【重启 MariaDB】：\n"
-                "    server_id = <唯一且非 0 的整数>\n"
-                "    log_bin   = /path/to/mysql-bin\n"
-                "    binlog_format = ROW\n"
-                "  （若源库自身还有从库，另需 log_slave_updates=ON）\n"
-                "  改完回到第三步重跑「建立桥接」。\n"
-                "【方案② 不方便重启源库】改走停写迁移：源库停写后只跑「数据种子」，"
-                "再勾选「源库已停写」跳过追平直接切换。"
-                % (cfg["src_host"], cfg["src_port"], log_bin))
-        if str(server_id).strip() in ("0", "None", ""):
-            raise RuntimeError(
-                "源库 %s:%s 的 server_id=%s，复制无法工作（主从 server_id 必须唯一且非 0）。"
-                "请在源库 my.cnf 设置 server_id 后重启 MariaDB。"
-                % (cfg["src_host"], cfg["src_port"], server_id))
-        return {"log_bin": log_bin, "server_id": server_id}
-    finally:
-        conn.close()
-
-
-def bridge(task):
-    """在目标建立指向源的 MariaDB GTID 复制桥接（持续追平）。"""
-    cfg = task["config"]
-    # 前置检查：源库未开 binlog 时建复制必然 1236 失败，提前拦截（见函数注释）
-    _check_source_binlog(cfg)
-    # ⚠ 必须先锁定目标节点再建桥接，否则 monitor 的 promote_to_master 会立刻
-    #   RESET REPLICA ALL 把通道清掉（详见上方「迁移锁定」根因注释）。
-    lock_target(cfg["tgt_host"], int(cfg["tgt_port"]))
-    # 桥接前兜底补齐目标账号：seed 之后若目标又被重装/回滚过（或 seed 时账号重建失败），
-    # 这里再补一次，保证桥接与追平窗口内目标始终可被管理器与同集群节点连入。
-    _ensure_target_accounts(cfg, stage="bridge")
-    acct = _ensure_source_repl_account(task)  # 源端复制账号（最小权限，必要时降级复用源账号）
-    use_src = bool(acct.get("used_src_creds"))
-    m_user = cfg["src_user"] if use_src else MIG_REPL_USER
-    m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
-    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"])
-    # 建桥接前先自检：用复制账号从管理端连一次源库，口令/授权不对立刻暴露，
-    # 否则要等目标 IO 线程报 Access denied 才被发现（且只在仪表盘看得到）。
-    try:
-        probe = connect(cfg["src_host"], int(cfg["src_port"]), m_user, m_pass, timeout=8)
-        probe.close()
-    except Exception as e:
-        raise RuntimeError(
-            "复制账号 %s 无法连入源库 %s:%s：%s。"
-            "请确认源库该账号口令正确、且允许从目标 %s 连入（如 @'%%'）；"
-            "若源库残留同名旧账号，本步骤已用 ALTER USER 强制同步口令，可重跑本步骤。"
-            % (m_user, cfg["src_host"], cfg["src_port"], e, cfg["tgt_host"]))
-    conn = connect(*tgt, timeout=8)
-    try:
-        cur = conn.cursor()
-        # 桥接忽略系统库与 Custos 自有库（best-effort，动态全局变量）
-        try:
-            cur.execute("SET GLOBAL replicate_ignore_db='mysql,ha_local'")
-        except Exception:
-            pass
-        # 目标必须把「从源收到的更新」写进自己的 binlog，否则下游第二节点（如 213）
-        # 永远拿不到迁移过来的数据。
-        # ⚠ MariaDB 只有 @@log_slave_updates（SELECT @@log_replica_updates 报 1193），
-        #   此前写成 log_replica_updates 会被静默吞掉 ⇒ 第二节点数据落后却不报错。
-        #   已修正为 MariaDB 正确名，并保留 MySQL 形态兜底。
-        try:
-            cur.execute("SET GLOBAL log_slave_updates=ON")
-        except Exception:
-            try:
-                cur.execute("SET GLOBAL log_replica_updates=ON")
-            except Exception:
-                pass
-        # 幂等：本步骤允许重复执行（第三步可重跑「建立桥接」）。
-        # 若目标上已有 replica 线程在运行，CHANGE MASTER TO 会被拒绝
-        # （MariaDB 要求先停止 replica 线程），故先 STOP REPLICA 再重建通道。
-        # 无复制通道时 STOP REPLICA 也会报 “not configured”，忽略即可。
-        try:
-            cur.execute("STOP REPLICA")
-        except Exception:
-            try:
-                cur.execute("STOP SLAVE")
-            except Exception:
-                pass
-        # ⚠ 必须按目标【真实 flavour】生成挂载 SQL，且 MariaDB 分支必须带 MASTER_SSL=0。
-        #   v2.4.0 追平测试实测故障：此前硬编码 MariaDB 语法（MASTER_USE_GTID=slave_pos）
-        #   且未关 SSL ⇒ 从库以「要求 SSL」的方式连源（SHOW REPLICA STATUS 显示
-        #   Master_SSL_Allowed=Yes），而源库 have_ssl=DISABLED ⇒ IO 线程永久 Connecting：
-        #     error connecting to master 'replication@x:3306' ...
-        #     message: SSL connection error: SSL is required, but the server does not support it
-        #   内网复制无需 TLS，显式关闭即可根治；MySQL 8 目标则走 SOURCE_AUTO_POSITION=1
-        #   （并索取服务端公钥，规避 caching_sha2_password 非 TLS 握手失败）。
-        _flav = detect_flavour(cur)
-        cur.execute(change_replication_sql(_flav, cfg["src_host"], int(cfg["src_port"]),
-                                            m_user, m_pass, public_key=(_flav == F_MYSQL8)))
-        cur.execute(start_replication_sql(_flav))
-        # 进度上报：让前端桥接阶段不再“卡住”（BUG-004）
-        _tick(task, 60, stage="复制桥接已启动，目标正在从源追平（MariaDB GTID）")
-        note = ("桥接已建立，目标正在从源追平（MariaDB GTID）；"
-                "已暂停该目标节点的 Custos 自动拓扑维护，避免桥接被 monitor 清除")
-        if use_src:
-            note += "（使用源账号本身作为复制账号）"
-        _tick(task, 100, stage="桥接完成（持续追平中，可随时做一致性校验）")
-        return {"ok": True, "note": note, "used_src_creds": use_src}
-    finally:
-        conn.close()
-
-
 def verify(task, deep=False):
     """数据一致性校验：确认源库数据已【完整】复制到新集群主库。
 
@@ -2309,406 +2177,15 @@ def verify(task, deep=False):
     }
 
 
-def _replica_status(tgt):
-    conn = connect(*tgt, timeout=8)
-    try:
-        # ha_client.connect 默认是元组游标，SHOW REPLICA STATUS 需按列名取，改用 DictCursor
-        cur = conn.cursor(pymysql.cursors.DictCursor)
-        cur.execute("SHOW REPLICA STATUS")
-        row = cur.fetchone()
-        if not row:
-            return {"running": False, "note": "无复制通道（尚未建立桥接或已停桥）"}
-        # 列名兼容：MariaDB 10.5+ 用 Replica_*，旧别名 Slave_*。
-        # ⚠ 此前 io_running / sql_running 都调用同一个 _col("Replica")，而 _col 遍历
-        #   (*_IO_Running, *_SQL_Running) 时第一个命中的恒为 IO ⇒ 两个字段实际都取到
-        #   IO 线程状态，**SQL 线程状态从未被正确读取**（一致性校验展示失真，
-        #   且停桥前追平检测会误判为已追平）。已改为按后缀精确取值。
-        def _pick(suffix):
-            for p in ("Replica", "Slave"):
-                k = f"{p}_{suffix}"
-                if k in row:
-                    return row[k]
-            return None
-        return {
-            "io_running": _pick("IO_Running"),
-            "sql_running": _pick("SQL_Running"),
-            "seconds_behind": row.get("Seconds_Behind_Master", row.get("Seconds_Behind_Source")),
-            "last_error": row.get("Last_SQL_Error") or row.get("Last_Error"),
-        }
-    finally:
-        conn.close()
-
-
-def _register_target_node(cluster_id, host, port, root_pass, node_type, mysql_version,
-                          root_user="root"):
-    """把已装好的目标节点登记进 Custos（插入 nodes/hosts），不重新生成部署文件。"""
-    # mysql_version 可能为 SELECT VERSION() 原文，截断到 48 与列宽一致，防 1406。
-    mysql_version = (mysql_version or None) and mysql_version[:48]
-    server_id = node_gen.get_next_server_id()
-    host_compose = f"/home/docker/{host}"
-    execute(
-        "INSERT INTO nodes (ip,port,root_user,root_pass,server_id,compose_path,cluster_id,node_type,mysql_version) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-        "ON DUPLICATE KEY UPDATE port=%s,root_user=%s,root_pass=%s,server_id=%s,compose_path=%s,cluster_id=%s,node_type=%s,mysql_version=%s",
-        (host, port, root_user, crypto.encrypt(root_pass), server_id, host_compose, cluster_id, node_type, mysql_version,
-         port, root_user, crypto.encrypt(root_pass), server_id, host_compose, cluster_id, node_type, mysql_version),
-    )
-    execute(
-        "INSERT INTO hosts (host,port,role,status,initial_role,cluster_id) "
-        "VALUES (%s,%s,'unknown','down',%s,%s) "
-        "ON DUPLICATE KEY UPDATE initial_role=%s,cluster_id=%s",
-        (host, port, "slave", cluster_id, "slave", cluster_id),
-    )
-
-
-def cutover(task):
-    """停桥（STOP REPLICA + RESET REPLICA ALL）→ 凭证对齐 → 登记进 Custos（monitor 接管提升）。
-
-    集群归属策略（修复 BUG-001/002）：若目标节点（203）已在某 Custos 集群中，
-    则【沿用】该集群，绝不再新建只含 203 的单节点集群把节点从原集群拽出；
-    仅当目标尚未登记时才新建集群。同集群的其余节点（如 213/33）归属不受影响。
-    """
-    cfg = task["config"]
-    tgt_host = cfg["tgt_host"]
-    tgt_port = int(cfg["tgt_port"])
-    tgt = (tgt_host, tgt_port, _tgt_user(cfg), cfg["tgt_root_pass"])
-    conn = connect(*tgt, timeout=8)
-    _real_version = None
-    try:
-        cur = conn.cursor()
-        cur.execute("STOP REPLICA")
-        cur.execute("RESET REPLICA ALL")  # MariaDB：清除桥接通道，避免 monitor 误判
-        # ⚠ 登记前必须【在线探测真实版本】：v2.4.0 实测出现过 nodes 表登记为
-        #   docker / 8.0.46，而目标真实是 MariaDB 12.3.3 —— 此后 ha_client /
-        #   mysql_compat 会按 MySQL 8 方言生成 SQL（CHANGE REPLICATION SOURCE TO、
-        #   caching_sha2 等），在 MariaDB 上全部报错 ⇒ 复制与自愈长期失效且极难定位。
-        #   故以 SELECT VERSION() 为准，向导里选的形态只作兜底。
-        try:
-            cur.execute("SELECT VERSION()")
-            _real_version = (cur.fetchone() or [None])[0]
-        except Exception:
-            pass
-    finally:
-        conn.close()
-    node_type = cfg.get("node_type") or "mariadb-docker"
-    mysql_version = _real_version or cfg.get("tgt_version") or None
-    if _real_version:
-        _is_maria = "mariadb" in str(_real_version).lower()
-        if _is_maria and node_type in ("docker", "mysql8", "mysql8-docker"):
-            node_type = "mariadb-docker" if str(node_type).endswith("docker") else "mariadb"
-        elif (not _is_maria) and node_type in ("mariadb", "mariadb-docker"):
-            node_type = "mysql8-docker" if str(node_type).endswith("docker") else "mysql8"
-    # 复用已有集群：避免把目标节点从原集群拽出（BUG-001）
-    existing = query("SELECT cluster_id FROM nodes WHERE ip=%s AND port=%s",
-                    (tgt_host, tgt_port))
-    reused = bool(existing and existing[0].get("cluster_id"))
-    if reused:
-        cluster_id = existing[0]["cluster_id"]
-    else:
-        # 此刻才建集群：create_cluster 生成 Custos 托管的 ha/repl/app 口令
-        cluster_id = create_cluster(name=task["name"], node_type=node_type,
-                                   mysql_version=mysql_version)
-    # 关键：把目标节点账号刷成 Custos 托管口令（并补齐 ha_local 库），
-    # 否则 monitor 接管后因账号口令不匹配而连不上节点。
-    _align_target_creds(cluster_id, cfg)
-    # 登记节点 + 主机（此刻才让 ensure_topology 提升新主、挂第二节点）。
-    # 若目标已在某集群，这里只是原地更新 203 一条记录，不改其它节点（213/33 等）归属。
-    _register_target_node(cluster_id, tgt_host, tgt_port, cfg["tgt_root_pass"],
-                         node_type, mysql_version,
-                         root_user=_tgt_user(cfg))
-    # 桥接已在上面 STOP REPLICA + RESET REPLICA ALL 停掉，可解除迁移锁定，
-    # 把目标交还给 monitor 正常接管（否则该集群的拓扑维护会一直被跳过）。
-    unlock_target(tgt_host, tgt_port)
-    # ⚠ 物理通道（mariabackup copy-back）的固有后果：数据是【直接替换数据目录】落地的，
-    #   **完全不经过 binlog** ⇒ 同集群其余节点（如 213）永远复制不到这批数据；
-    #   更隐蔽的是 copy-back 还会把源库 GTID 集合（如 0-21-47）写进目标的
-    #   gtid_current_pos，从库连上后直接"继承"该 GTID ⇒ SHOW REPLICA STATUS 显示
-    #   IO/SQL=Yes、Seconds_Behind_Master=0（看起来已追平），**但库/表根本不存在**
-    #   （v2.4.0 实测：203 有 piyaotest 47 张表，213 连库都没有，复制却显示健康）。
-    #   故物理通道切换后，必须把同集群其余节点【在线重建】一次（逻辑全量 + 重链复制）。
-    peers = []
-    try:
-        rows = query("SELECT ip, port FROM nodes WHERE cluster_id=%s AND NOT (ip=%s AND port=%s)",
-                     (cluster_id, tgt_host, tgt_port))
-        peers = [(r["ip"], int(r["port"])) for r in (rows or [])]
-    except Exception:
-        peers = []
-    rebuilt = []
-    if (cfg.get("channel") == "physical") and peers:
-        if str(get_setting("AUTO_REBUILD_AFTER_MIGRATION", "1")).strip() == "1":
-            try:
-                from . import rebuild as _rebuild
-                for h, p in peers:
-                    try:
-                        _rebuild.start_rebuild(cluster_id, h, p, actor="auto:migration-physical")
-                        rebuilt.append("%s:%s" % (h, p))
-                    except Exception as _e:
-                        print("[migration] 自动重建 %s:%s 失败：%s" % (h, p, _e))
-            except Exception as _e:
-                print("[migration] 加载 rebuild 模块失败：%s" % _e)
-    if reused:
-        note = ("已停桥、对齐凭证并登记进 Custos（沿用既有集群，新主不会被移出）；"
-                "请在外部手动切换 VIP")
-    else:
-        note = ("已停桥、对齐凭证并登记进 Custos，monitor 将自动提升新主；"
-                "请在外部手动切换 VIP")
-    if (cfg.get("channel") == "physical") and peers:
-        note += ("。⚠ 物理通道恢复的数据不经 binlog，同集群其余节点 %s 不会自动获得数据："
-                 "已%s。请在「节点」页确认其重建完成（大库耗时较长）。"
-                 % ("、".join("%s:%s" % (h, p) for h, p in peers),
-                    ("自动触发在线重建：" + "、".join(rebuilt)) if rebuilt
-                    else "请对其手动执行「从库在线重建」"))
-    return {"ok": True, "cluster_id": cluster_id, "reused_cluster": reused, "note": note,
-            "peers_need_rebuild": ["%s:%s" % (h, p) for h, p in peers]
-            if cfg.get("channel") == "physical" else [],
-            "peers_rebuild_started": rebuilt}
-
-
-def _align_target_creds(cluster_id, cfg):
-    """将目标节点账号对齐为 Custos 托管口令（ha_monitor / replication / app / root），
-    并补齐 ha_local 库——确保 monitor 接管后能连上并管理该节点（认领非重置）。
-
-    复用 node_gen 的 MariaDB 修复脚本（与 Install-ha-mariadb-Node.sh 同源），
-    其同时创建 ha_user@'%'（覆盖管理器任意源 IP）、root@'127.0.0.1'（keepalived 探活）等。
-    """
-    creds = get_cluster_creds(cluster_id)
-    manager_ip = get_mgmt_host() or "127.0.0.1"
-    sql = node_gen.render_fix_node_creds_sql_mariadb(
-        creds["ha_user"], creds["ha_pass"], creds["repl_user"], creds["repl_pass"],
-        _tgt_user(cfg), cfg["tgt_root_pass"], manager_ip, int(cfg["tgt_port"]),
-    )
-    conn = connect(cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"], timeout=8)
-    try:
-        cur = conn.cursor()
-        for stmt in sql.split(";"):
-            s = stmt.strip()
-            if s and not s.lstrip().startswith("--"):
-                cur.execute(s)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def cleanup(task):
-    """回收源端桥接复制账号（最小权限，可收回）+ 老主置只读暖备。"""
-    cfg = task["config"]
-    src = (cfg["src_host"], int(cfg["src_port"]), cfg["src_user"], cfg["src_pass"])
-    conn = connect(*src, timeout=8)
-    done, failed = [], []
-    try:
-        cur = conn.cursor()
-        # ❗此前两项都 try/except 静默吞掉，非 root 账号时会「谎报成功」：
-        #   界面显示已收尾，实际账号没回收、老主也没置只读。故逐项记录并如实上报。
-        try:
-            cur.execute(f"DROP USER IF EXISTS '{MIG_REPL_USER}'@'%'")
-            done.append("已回收源端复制账号 '%s'@'%%'" % MIG_REPL_USER)
-        except Exception as e:
-            failed.append("回收复制账号失败：%s（需 CREATE USER 权限）" % e)
-        try:
-            cur.execute("SET GLOBAL read_only=ON")  # 老主置只读暖备，防误写
-            done.append("已把老主置为只读(read_only=ON)")
-        except Exception as e:
-            failed.append("置老主只读失败：%s（需 SUPER 权限）" % e)
-    finally:
-        conn.close()
-    note = "；".join(done) if done else "未执行任何操作"
-    if failed:
-        note += "。⚠ 未完成项：" + "；".join(failed)
-    # ok=True：收尾不是迁移成功的必要条件（数据已迁完），但必须如实告知未完成项。
-    return {"ok": True, "done": done, "failed": failed, "partial": bool(done and failed),
-            "note": note}
-
-
 # ---------------------------------------------------------------------------
-# 停桥前追平检测 + 跳过收尾
-# ---------------------------------------------------------------------------
-# 追平阈值（秒）：停桥意味着切断 177→203 的桥接，任何残留延迟都会变成永久数据丢失，
-# 故取 0 —— 必须 Seconds_Behind_Master 收敛到 0 才允许切换。
-LAG_CAUGHT_UP_SEC = 0
-
-
-def check_lag(task, skip_acct=False, auto_heal=False):
-    """停桥切换前的「追平检测」：确认目标已从源追平，避免带差切换导致数据丢失。
-
-    纯只读，不改动任何节点。返回 caught_up 供前端放行「执行停桥切换」按钮。
-    skip_acct=True 时跳过「复制账号自检」（用于高频追踪采样，避免反复连源库）。
-    """
-    cfg = task["config"]
-    tgt = (cfg["tgt_host"], int(cfg["tgt_port"]), _tgt_user(cfg), cfg["tgt_root_pass"])
-    try:
-        repl = _replica_status(tgt)
-    except Exception as e:
-        return {"ok": False, "caught_up": False, "error": f"{type(e).__name__}: {e}"}
-    steps = task.get("steps") or {}
-    bridge_done = (steps.get("bridge") or {}).get("status") == "done"
-    cutover_done = (steps.get("cutover") or {}).get("status") == "done"
-    # —— 自动自愈①：复制通道丢失（monitor 清桥接 / 管理器重启）⇒ 自动重跑桥接重建 ——
-    # 仅手动「追平检测」触发（auto_heal=True），高频追踪不触发，避免反复重建。
-    if auto_heal and repl.get("note") and not cutover_done and bridge_done:
-        try:
-            bridge(task)
-            repl = _replica_status(tgt)
-        except Exception as e_heal:
-            repl = repl or {}
-            repl["heal_error"] = "重建桥接失败：" + str(e_heal)
-    if repl.get("note"):
-        # 目标上没有复制通道。仅回一句“不存在”会让人不知道下一步做什么，
-        # 故用任务步骤状态区分三种情况，分别给出可操作指引。
-        steps = task.get("steps") or {}
-        bridge_done = (steps.get("bridge") or {}).get("status") == "done"
-        cutover_done = (steps.get("cutover") or {}).get("status") == "done"
-        if cutover_done:
-            why = "已停桥"
-            hint = ("本任务已执行过停桥切换（STOP REPLICA + RESET REPLICA ALL 会清除复制通道），"
-                    "此时再检测追平没有意义。若需重新迁移，请新建迁移任务。")
-        elif not bridge_done:
-            why = "未建立桥接"
-            hint = ("需要重做【第三步 → 「建立桥接」】这一步："
-                    "回到第三步，点击「建立桥接」那一行的【执行】按钮（支持重复执行），"
-                    "成功后目标才会建立 177→203 的复制通道，再回来点「追平检测」。"
-                    "若你的源库已停写、不需要追平增量，可勾选下方「源库已停写」跳过本检测。")
-        else:
-            why = "复制通道已清除"
-            heal_tip = ("本次「追平检测」已尝试自动重建桥接"
-                        + ("（失败：" + repl.get("heal_error", "") + "）" if repl.get("heal_error") else "，请稍后再次点击「追平检测」或点「重建桥接」。"))
-            hint = ("需要重建【源库 → 目标】的复制通道（桥接执行过，但目标上的复制通道现在不存在）。"
-                    + heal_tip +
-                    "若目标已被登记进 Custos 集群，monitor 的 ensure_topology 会持续清掉该通道，"
-                    "此时应新建迁移任务，而不是重跑桥接。")
-        return {"ok": True, "caught_up": False, "io_running": None, "sql_running": None,
-                "seconds_behind": None, "last_error": None,
-                "reason": "%s：目标上没有复制通道" % why, "why": why, "hint": hint,
-                "bridge_done": bridge_done, "cutover_done": cutover_done,
-                "need_bridge": (not cutover_done),  # 未停桥时，重跑桥接即可恢复通道
-                "replica": repl}
-    io_raw = repl.get("io_running")
-    sql_raw = repl.get("sql_running")
-    io_ok = str(io_raw or "").lower() == "yes"
-    sql_ok = str(sql_raw or "").lower() == "yes"
-    sb = repl.get("seconds_behind")
-    last_err = repl.get("last_error")
-
-    # 附加自检：用复制账号从【管理端】连一次源库。
-    # 目的：区分「账号/口令或授权问题」与「203 → 177 网络不通」——两者表现都是 IO 起不来。
-    steps_prev = task.get("steps") or {}
-    bres = (steps_prev.get("bridge") or {}).get("result") or {}
-    use_src = bool(bres.get("used_src_creds"))
-    m_user = cfg["src_user"] if use_src else MIG_REPL_USER
-    m_pass = cfg["src_pass"] if use_src else cfg["repl_pass"]
-    # skip_acct：前端「追平追踪」每 2s 采样一次，若每次都连源库做账号自检，
-    # 5 分钟就是上百次连接，对老主是无谓负担 ⇒ 仅首次采样做自检，后续跳过。
-    if skip_acct:
-        acct_ok, acct_err, m_user = None, "", m_user
-    else:
-        acct_ok, acct_err = True, ""
-        try:
-            _c = connect(cfg["src_host"], int(cfg["src_port"]), m_user, m_pass, timeout=8)
-            _c.close()
-        except Exception as e:
-            acct_ok, acct_err = False, str(e)
-
-    # —— 自动自愈②：通道在、但 IO/SQL 线程停了（复制错误如 1133/1062/1146）⇒ heal_replication ——
-    if auto_heal and (not io_ok or not sql_ok):
-        try:
-            ok_h, msg_h = heal_replication(
-                cfg["tgt_host"], int(cfg["tgt_port"]), "root", cfg.get("tgt_root_pass") or "",
-                root_user="root", root_pass=cfg.get("tgt_root_pass") or "")
-            if ok_h:
-                repl = _replica_status(tgt)
-                io_raw = repl.get("io_running"); sql_raw = repl.get("sql_running")
-                io_ok = str(io_raw or "").lower() == "yes"
-                sql_ok = str(sql_raw or "").lower() == "yes"
-                sb = repl.get("seconds_behind"); last_err = repl.get("last_error")
-        except Exception:
-            pass
-
-    hint = ""
-    if not sql_ok:
-        reason = "SQL 线程未运行（状态=%s，复制未工作）" % (sql_raw or "未知")
-        if last_err:
-            # 此前只报“状态=No”却把 Last_SQL_Error 吞掉，用户完全看不到线程为什么停。
-            # 追平检测是只读的，但必须把错误文本带出来，否则无法判断是 1133/冲突/还是手动停的。
-            reason += "；复制错误：" + str(last_err)[:300]
-        hint = ("目标复制 SQL 线程已停止（通常是复制重放某条事件出错，如 1133/1062/1146 等）。"
-                "可点击下方「🔧 修复复制」尝试自愈（跳过冲突事务 / 补建缺失账号），"
-                "或到目标节点执行 SHOW REPLICA STATUS\\G 查看 Last_SQL_Error 后手动处理，"
-                "再回来点「追平检测」。")
-    elif not io_ok:
-        le = str(last_err or "")
-        if "1236" in le or "binary log is not open" in le.lower():
-            # 1236 的根因是源库没开 binlog，不能笼统说成“口令/授权不对”误导排障
-            reason = ("源库 %s:%s 未开启 binlog，IO 线程报 1236 'Binary log is not open'"
-                      "（无从拉取 binlog 事件）——这与账号口令无关"
-                      % (cfg["src_host"], cfg["src_port"]))
-        else:
-            state = str(io_raw or "未知")
-            if state.lower() == "connecting":
-                reason = ("IO 线程仍在重试连源（状态=Connecting，MariaDB 默认每 60s 重试一次）："
-                          "通常是复制账号口令/授权不对，或 %s 无法访问 %s:%s"
-                          % (cfg["tgt_host"], cfg["src_host"], cfg["src_port"]))
-            else:
-                reason = "IO 线程未运行（状态=%s），未从源拉取 binlog" % state
-            if last_err:
-                reason += "；复制错误：" + le[:300]
-        if "1236" in le or "binary log is not open" in le.lower():
-            hint = ("源库 %s:%s 未开启 binlog，IO 线程报 1236 'Binary log is not open'。\n"
-                    "【方案① 想继续桥接追平】源库 my.cnf 的 [mysqld] 增加 "
-                    "server_id=<非0唯一值>、log_bin=/path/to/mysql-bin、binlog_format=ROW "
-                    "并【重启 MariaDB】，再回第三步重跑「建立桥接」。\n"
-                    "【方案② 不方便重启源库】走停写迁移：源库停写 → 只跑「数据种子」→ "
-                    "勾选下方「源库已停写」跳过追平 → 直接停桥切换。"
-                    % (cfg["src_host"], cfg["src_port"]))
-        elif "SSL" in le.upper() or "2026" in le:
-            # 专项：SSL 握手类失败（典型的 "SSL connection error: SSL is required,
-            # but the server does not support it"，errno 2026）。它与账号口令完全无关，
-            # 笼统提示「口令/授权不对」会把排错带偏（v2.4.0 实测就是这样误导的）。
-            hint = ("复制通道被建成了「要求 SSL」，但源库 %s:%s 未启用 SSL"
-                    "（have_ssl=DISABLED）⇒ IO 线程握手失败(2026)。\n"
-                    "请重跑第三步「建立桥接」：新版会以 MASTER_SSL=0 重建通道"
-                    "（内网复制无需 TLS）。\n"
-                    "若确实要加密复制，请先在源库启用 SSL（配置 ssl_cert/ssl_key 并重启），"
-                    "再重跑「建立桥接」。"
-                    % (cfg["src_host"], cfg["src_port"]))
-        elif not acct_ok:
-            hint = ("复制账号 %s 从管理端连源库 %s:%s 失败：%s。"
-                    "⇒ 账号口令或 host 授权有问题。请重跑第三步「建立桥接」"
-                    "（会用 ALTER USER 强制把该账号口令同步为当前任务口令），"
-                    "并确认源库允许目标 %s 连入（@'%%'）。"
-                    % (m_user, cfg["src_host"], cfg["src_port"], acct_err, cfg["tgt_host"]))
-        else:
-            hint = ("复制账号从管理端能连上源库，但目标 %s 连不上 ⇒ 请检查 %s → %s:%s 的网络连通"
-                    "（防火墙 / 端口），以及源库是否允许来自 %s 的连接。"
-                    % (cfg["tgt_host"], cfg["tgt_host"], cfg["src_host"], cfg["src_port"],
-                       cfg["tgt_host"]))
-    elif last_err:
-        reason = "存在复制错误：" + str(last_err)[:300]
-    elif sb is None:
-        reason = "无法获取延迟（Seconds_Behind_Master 为空，复制可能未运行）"
-    else:
-        try:
-            lag = int(sb)
-        except Exception:
-            lag = 0
-        reason = "" if lag <= LAG_CAUGHT_UP_SEC else \
-            "尚未追平，仍有 %d 秒延迟（阈值 %ds）" % (lag, LAG_CAUGHT_UP_SEC)
-    return {"ok": True, "caught_up": not reason,
-            "io_running": io_raw, "sql_running": sql_raw, "seconds_behind": sb,
-            "last_error": last_err,
-            "acct_ok": acct_ok, "acct_error": acct_err, "acct_user": m_user,
-            "reason": reason or "已追平（Seconds_Behind_Master=%s）" % sb,
-            "hint": hint, "replica": repl}
-
-
-# 停写检测采样间隔（秒）：连源库采样两次写入计数器，比较差值。
-FREEZE_SAMPLE_SEC = 3
 
 
 def audit_source_privileges(cfg):
-    """源库账号「权限体检」：列出迁移各步骤依赖的权限是否具备，缺了会影响什么。
+    """源库账号「权限体检」：列出逻辑导出导入依赖的权限是否具备，缺了会影响什么。
 
-    目的：迁移大量操作依赖源账号权限（探测/种子/校验需 SELECT，桥接建账号需 CREATE USER，
-    停写检测需 PROCESS，收尾置只读需 SUPER）。非 root 时若静默失败会误导用户，
-    故在第一步就把「缺什么、影响哪一步、怎么补」讲清楚。
+    目的：2.4.0 重做后迁移为纯逻辑「导出→导入」（逐库 dump --single-transaction → 目标），
+    源库只需能导出数据（SELECT / SHOW VIEW / TRIGGER / EVENT），不再需要复制 / 建账号 /
+    置只读等权限。非 root 时若静默失败会误导用户，故在第一步把「缺什么、影响导出、怎么补」讲清楚。
     """
     conn = connect(cfg["src_host"], int(cfg["src_port"]),
                    cfg["src_user"], cfg["src_pass"], timeout=8)
@@ -2740,31 +2217,22 @@ def audit_source_privileges(cfg):
             except Exception:
                 return False
 
+        # 2.4.0 重做：纯逻辑「导出→导入」，源库只需能导出数据，无需复制/建账号/置只读权限。
+        # dump 已带 --skip-lock-tables（单事务快照），故不要求 LOCK TABLES / RELOAD。
         sel_ok = _ok("SELECT schema_name FROM information_schema.schemata LIMIT 1")
-        proc_ok = False
-        try:
-            cur.execute("SHOW GLOBAL STATUS LIKE %s", ("Com_insert",))
-            r = cur.fetchone()
-            proc_ok = bool(r and len(r) > 1 and r[1] is not None)
-        except Exception:
-            proc_ok = False
-        repl_cli_ok = _ok("SHOW REPLICA STATUS")
         checks = [
             {"name": "读取库/表（SELECT）", "ok": sel_ok,
-             "used": "第一步探测、数据种子、一致性校验",
-             "fix": "授予待迁移库的 SELECT"},
-            {"name": "SHOW GLOBAL STATUS（PROCESS）", "ok": proc_ok,
-             "used": "停写检测",
-             "fix": "GRANT PROCESS ON *.*；否则停写检测会判为「无法判定」而不会误报已停写"},
-            {"name": "读复制状态（REPLICATION CLIENT）", "ok": repl_cli_ok,
-             "used": "读取 GTID / 复制状态",
-             "fix": "GRANT REPLICATION CLIENT ON *.*"},
-            {"name": "建复制账号（CREATE USER）", "ok": _has("CREATE USER"),
-             "used": "建立桥接（在源库建复制账号）",
-             "fix": "GRANT CREATE USER ON *.*；无此权限时自动降级为复用源账号本身（须允许从目标连入，通常 @'%'）"},
-            {"name": "置全局变量（SUPER / SET GLOBAL）", "ok": _has("SUPER"),
-             "used": "收尾回收（把老主置为只读）",
-             "fix": "GRANT SUPER ON *.*；无此权限该步会失败，现已如实上报、不会谎报成功"},
+             "used": "第一步探测、数据种子导出、一致性校验",
+             "fix": "授予待迁移库的 SELECT 权限"},
+            {"name": "导出视图（SHOW VIEW）", "ok": _has("SHOW VIEW"),
+             "used": "导出视图定义（缺失则自动跳过视图，不阻断数据迁移）",
+             "fix": "GRANT SHOW VIEW（可选；缺失只跳过视图）"},
+            {"name": "导出触发器（TRIGGER）", "ok": _has("TRIGGER"),
+             "used": "导出触发器（--triggers，缺失则自动跳过，不阻断）",
+             "fix": "GRANT TRIGGER（可选；缺失只跳过触发器）"},
+            {"name": "导出事件（EVENT）", "ok": _has("EVENT"),
+             "used": "导出事件调度器（--events，缺失则自动跳过，不阻断）",
+             "fix": "GRANT EVENT（可选；缺失只跳过事件）"},
         ]
         return {"ok": True, "user": who, "grants": grants, "checks": checks,
                 "missing": [c["name"] for c in checks if not c["ok"]]}
@@ -2778,10 +2246,10 @@ def audit_target_privileges(cfg):
     """目标库账号「分层权限体检」——把"能导数据"和"能接管"分开讲清楚。
 
     为什么要分层（用户明确要求：不能啰嗦，但要说清，且给出「建议 root」）：
-      目标端各阶段对权限的要求【完全不同】——只做数据导入时 CREATE/INSERT 就够，
-      但"桥接追平 / 注册为 Custos 节点 / 提升新主 / 收尾置只读"都需要全局级权限
-      （REPLICATION SLAVE、CREATE USER+GRANT ALL、SUPER，MariaDB 10.11+ 还需
-      READ_ONLY ADMIN）。若不做分层，用户填个非 root 跑到第 4 步才炸，等于白跑一轮。
+      2.4.0 重做（纯逻辑导出导入）：目标端真正需要的两件事——
+      ① 数据导入：CREATE + INSERT（建库建表写数据）；
+      ② 重建集群账号：导入后按集群凭证重建 ha_monitor / 复制账号（需 CREATE USER + GRANT）。
+      实际导入与账号重建均用目标 root（tgt_root_pass）执行，故目标填 root 即可。
 
     返回 levels：每一项 = 一个迁移阶段是否可用 + 缺什么，前端按"可用/不可用"分层展示。
     """
@@ -2821,21 +2289,17 @@ def audit_target_privileges(cfg):
         # 只读探测：能否建库（导入前提）
         create_ok = _has("CREATE") or _has("ALL PRIVILEGES")
         insert_ok = _has("INSERT") or _has("ALL PRIVILEGES")
-        repl_ok = _has("REPLICATION SLAVE")
         create_user_ok = _has("CREATE USER")
-        super_ok = _has("SUPER")
-        # MariaDB 10.11+ 提升主库需 READ_ONLY ADMIN（见 mariadb_matrix.py）
-        ro_admin_ok = _has("READ_ONLY ADMIN") or _has("SUPER")
-
+        # 2.4.0 重做：纯逻辑导入，目标端真正需要的两件事——
+        #  ① 数据导入：CREATE + INSERT（建库建表写数据）；
+        #  ② 重建集群账号：导入后按集群凭证重建 ha_monitor / 复制账号（需 CREATE USER + GRANT）。
+        # 注：实际导入与账号重建均用目标 root（tgt_root_pass）执行，故目标填 root 即可；
+        #     此处列出非 root 时的能力边界，便于用户判断。
         levels = [
             {"stage": "数据导入", "ok": bool(create_ok and insert_ok),
              "need": "CREATE、INSERT（能建库建表写数据）"},
-            {"stage": "桥接追平", "ok": bool(repl_ok),
-             "need": "REPLICATION SLAVE"},
-            {"stage": "注册为 Custos 节点", "ok": bool(create_user_ok and has_all),
-             "need": "CREATE USER + GRANT ALL（建 ha_monitor / 复制账号等）"},
-            {"stage": "提升新主 / 停桥切换", "ok": bool(super_ok and ro_admin_ok),
-             "need": "SUPER（MariaDB 10.11+ 还需 READ_ONLY ADMIN）"},
+            {"stage": "重建集群账号", "ok": bool(create_user_ok and has_all),
+             "need": "CREATE USER + GRANT ALL（导入后重建 ha_monitor / 复制账号等）"},
         ]
         missing = [l["stage"] for l in levels if not l["ok"]]
         return {"ok": True, "user": who or user, "is_root": (user or "root") == "root",
@@ -2845,256 +2309,6 @@ def audit_target_privileges(cfg):
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     finally:
         conn.close()
-
-
-def plan_binlog_enable(cfg):
-    """源库未开 binlog 时，用已有的 root 连接把「开启方案」的准备工作做到位。
-
-    ⚠ 为什么不能直接用 root 打开 binlog（重要，别再提这个方案）：
-      `log_bin` 是【静态变量】，MySQL/MariaDB 均不支持 SET GLOBAL log_bin=ON 在线开启，
-      必须修改配置文件并重启 mysqld 进程。而向导拿到的是**数据库 root**（只能执行 SQL），
-      既改不了 my.cnf（文件系统），也重启不了 mysqld（进程管理）——除非另给源机的
-      SSH 凭据。且自动修改生产库配置并重启属极高危操作（业务中断 + binlog 磁盘规划
-      需人工决策），绝不应自动执行。故这里只做「探测 + 生成可直接照做的方案」。
-    """
-    conn = connect(cfg["src_host"], int(cfg["src_port"]),
-                   cfg["src_user"], cfg["src_pass"], timeout=8)
-    try:
-        cur = conn.cursor()
-
-        def _v(sql):
-            try:
-                cur.execute(sql)
-                r = cur.fetchone()
-                return r[0] if r else None
-            except Exception:
-                return None
-
-        ver = _v("SELECT VERSION()")
-        datadir = _v("SELECT @@datadir")
-        basedir = _v("SELECT @@basedir")
-        server_id = _v("SELECT @@server_id")
-        log_bin = _v("SELECT @@log_bin")
-        replicas = []
-        try:
-            cur.execute("SHOW SLAVE HOSTS")
-            replicas = list(cur.fetchall() or [])
-        except Exception:
-            pass
-        is_slave = False
-        try:
-            cur.execute("SHOW REPLICA STATUS")
-            is_slave = bool(cur.fetchone())
-        except Exception:
-            pass
-    finally:
-        conn.close()
-
-    # ---- 目标 server_id：源与目标的 server_id 必须不同，否则复制会因 id 相同直接失败 ----
-    tgt_sid = None
-    try:
-        if cfg.get("tgt_host"):
-            tc = connect(cfg["tgt_host"], int(cfg.get("tgt_port") or 3306), _tgt_user(cfg),
-                         cfg.get("tgt_root_pass") or "", timeout=5)
-            try:
-                tcur = tc.cursor()
-                tcur.execute("SELECT @@server_id")
-                tr = tcur.fetchone()
-                tgt_sid = int(tr[0]) if tr else None
-            finally:
-                tc.close()
-    except Exception:
-        tgt_sid = None
-
-    # ---- 部署形态推断：容器化 MariaDB 的宿主机 /etc/my.cnf 常常【并不生效】----
-    # 官方镜像版本串形如 10.11.17-MariaDB-ubu2204-log（带发行版后缀、无发行包修订号 ~）；
-    # 发行版包安装的形如 10.11.17-MariaDB-1:10.11.17+maria~ubu2204（含 ~）。据此粗判。
-    _ver = str(ver or "")
-    container_like = ("~" not in _ver) and any(
-        k in _ver for k in ("-ubu", "-ubi", "-deb", "-alma", "-rocky", "-centos", "-fedo"))
-
-    try:
-        sid = int(server_id)
-    except Exception:
-        sid = 0
-    base = str(datadir or "/var/lib/mysql").rstrip("/")
-    need_lsu = bool(is_slave or replicas)
-    # server_id：非 0，且与目标不冲突
-    final_sid = sid if sid else 1001
-    if tgt_sid is not None and final_sid == tgt_sid:
-        final_sid = (tgt_sid + 11) or 1001
-    snippet = "\n".join([
-        "[mysqld]",
-        "server_id      = %d" % final_sid,
-        "log_bin        = %s/mysql-bin" % base,
-        "binlog_format  = ROW",
-    ] + (["log_slave_updates = ON   # 该库自身还挂着从库，需把上游变更写进自己的 binlog"]
-         if need_lsu else [])
-      + ["expire_logs_days = 7       # 按需调整，避免 binlog 占满磁盘（MariaDB 10.6+ 亦可用 binlog_expire_logs_seconds）"])
-    steps = [
-        "1) 先在源机上定位「真正生效」的配置文件（命令见 config_locator）——容器化部署时"
-        "宿主机 /etc/my.cnf 往往并不生效，必须以实际挂载 / mysqld 实际读取的那份为准。",
-        "2) 备份该文件后，把下面的片段加进其 [mysqld] 段（建议追加到文件末尾，"
-        "可避免被 include 的同名项覆盖）。",
-        "3) 确认磁盘空间充足（binlog 会持续增长，务必设置过期清理）。",
-        "4) 重启 MariaDB（容器：docker restart <容器名>；系统服务：systemctl restart mariadb）。",
-        "5) 回本向导重新探测；确认 log_bin=1 后会自动切回【桥接模式】。",
-    ]
-    return {
-        "ok": True,
-        "version": ver, "datadir": datadir, "basedir": basedir,
-        "server_id": server_id, "log_bin": log_bin,
-        "replicas": len(replicas), "is_slave": is_slave,
-        "suggest_server_id": final_sid,
-        "tgt_server_id": tgt_sid,
-        "binlog_path": base + "/mysql-bin",
-        "need_log_slave_updates": need_lsu,
-        "container_like": container_like,
-        "cnf_candidates": ["/etc/mysql/mariadb.conf.d/50-server.cnf",
-                           "/etc/mysql/my.cnf", "/etc/my.cnf", "/etc/my.cnf.d/server.cnf"],
-        "config_locator": [
-            "# 1) 先看 MariaDB 是不是跑在容器里",
-            "docker ps --format '{{.Names}}\\t{{.Image}}\\t{{.Ports}}' | grep -iE 'maria|mysql'",
-            "# 2) 若是容器：看它挂载了宿主机的哪份配置（这里的宿主机路径才是真正生效的）",
-            "docker inspect <容器名> --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'",
-            "# 3) 若是裸机服务：确认 mysqld 实际按顺序读取哪些配置文件",
-            "mysqld --verbose --help 2>/dev/null | head -20",
-        ],
-        "warn_container": ("" if not container_like else
-            "⚠ 该实例的版本串形如官方容器镜像，疑似跑在 Docker / 面板（如 1Panel）的容器里："
-            "宿主机 /etc/my.cnf 通常【不生效】，必须改容器挂载的那份配置，"
-            "否则照着改完、重启后 log_bin 依然为 0。"),
-        "snippet": snippet, "steps": steps,
-        "note": ("log_bin 为静态变量，必须改配置并重启 mysqld；本向导不会自动修改配置或重启服务"
-                 "（数据库 root 也无权这么做）——以下方案供你在源机上执行。"),
-    }
-
-
-def check_write_freeze(task):
-    """停写迁移模式下的「停写检测」：实测源库是否已不再产生写入。
-
-    源库未开 binlog ⇒ 没有桥接可追平，数据种子是唯一数据来源；
-    种子是**一次性快照**，此后源库的新写入不会进入新集群、切换即丢失。
-    故必须确认源库确实停写，而这不该只靠用户口头判断——这里用
-    「间隔采样两次写入类状态计数器取差值」来实测。
-
-    注意：采样窗口内为 0 只能证明这 FREEZE_SAMPLE_SEC 秒内没写入，
-    不代表此后永不写入，故切换的最终放行仍由用户勾选确认（不做自动放行）。
-    """
-    cfg = task["config"]
-    dml_ct = ["Com_insert", "Com_update", "Com_delete", "Com_replace", "Com_commit"]
-    row_ct = ["Innodb_rows_inserted", "Innodb_rows_updated", "Innodb_rows_deleted"]
-
-    def _sample():
-        conn = connect(cfg["src_host"], int(cfg["src_port"]),
-                       cfg["src_user"], cfg["src_pass"], timeout=8)
-        try:
-            cur = conn.cursor()
-            vals = {}
-            missing = []
-            for c in dml_ct + row_ct:
-                try:
-                    cur.execute("SHOW GLOBAL STATUS LIKE %s", (c,))
-                    r = cur.fetchone()
-                    if r is None or len(r) < 2 or r[1] is None:
-                        # 取不到值：多为源账号缺 PROCESS 权限（SHOW GLOBAL STATUS 需 PROCESS）。
-                        # 绝不能当成 0 —— 否则两次都 0、差值 0，会被误判为「已停写」。
-                        missing.append(c)
-                        vals[c] = 0
-                    else:
-                        vals[c] = int(r[1])
-                except Exception:
-                    missing.append(c)
-                    vals[c] = 0
-            ro = sro = None
-            try:
-                cur.execute("SELECT @@read_only")
-                r = cur.fetchone()
-                ro = int(r[0]) if r else None
-            except Exception:
-                pass
-            try:
-                cur.execute("SELECT @@super_read_only")
-                r = cur.fetchone()
-                sro = int(r[0]) if r else None
-            except Exception:
-                pass
-            return vals, ro, sro, missing
-        finally:
-            conn.close()
-
-    try:
-        a, ro, sro, miss_a = _sample()
-    except Exception as e:
-        return {"ok": False, "frozen": False, "error": f"{type(e).__name__}: {e}"}
-    time.sleep(FREEZE_SAMPLE_SEC)
-    try:
-        b, ro, sro, miss_b = _sample()
-    except Exception as e:
-        return {"ok": False, "frozen": False, "error": f"{type(e).__name__}: {e}"}
-    missing = sorted(set(miss_a) | set(miss_b))
-
-    delta = {c: (b.get(c, 0) - a.get(c, 0)) for c in dml_ct + row_ct}
-    writes = sum(max(0, delta.get(c, 0)) for c in dml_ct)
-    rows = sum(max(0, delta.get(c, 0)) for c in row_ct)
-    # 计数器若被 FLUSH STATUS 重置（出现负值），采样即不可靠。
-    # 此时若按 0 处理会【误判为已停写】——漏报比误报危险得多（会让用户在仍有写入时切换），
-    # 故出现负值时保守判定为 unreliable，绝不置 frozen。
-    negative = {c: v for c, v in delta.items() if v < 0}
-    # 缺失（取不到值）比回退更危险：全取不到时 delta 恒为 0，会伪装成「已停写」。
-    unreliable = bool(negative) or bool(missing)
-    frozen = (writes == 0 and rows == 0 and not unreliable)
-    if missing:
-        hint = (
-            "停写检测需要读取源库的「写入活动统计」来判断是否还有业务在写入，"
-            "但当前用来连接源库的账号权限不足，读不到这些统计（共 %s 项取不到值），本次检测不可信。\n"
-            "原因：读取写入统计需要源库账号具备 PROCESS 权限，而当前这个账号没有该权限。\n\n"
-            "如何避免（任选其一）：\n"
-            "1) 给源库上「本迁移任务里填写的那个账号」补授予 PROCESS 权限，"
-            "以源库管理员(root)身份执行下面语句（主机填你填迁移信息时用的那个）：\n"
-            "   GRANT PROCESS ON *.* TO '<源库账号>'@'<对应主机>'; FLUSH PRIVILEGES;\n"
-            "   授权后回到本页重新点「停写检测」即可。\n"
-            "2) 或重新填写一个已经具备 PROCESS 权限的源库账号，再重新检测。\n\n"
-            "若暂时不方便授权：请改用其它方式人工确认源库已停写"
-            "（如查看源库是否还有业务连接、binlog 或数据文件是否仍在增长），"
-            "确认无误后再勾选「源库已停写」执行切换，切勿仅凭本结果判断。"
-            % len(missing))
-    elif negative:
-        hint = ("采样不可靠：以下计数器出现回退（可能被 FLUSH STATUS 重置）：%s。"
-                "无法判断是否真的停写，请勿据此切换，请稍后重新检测。"
-                % "、".join(negative.keys()))
-    elif frozen:
-        hint = ("最近 %.0f 秒采样窗口内源库没有任何写入，可以进行切换。"
-                "（仅代表该窗口，切换前请保持业务停写状态）" % FREEZE_SAMPLE_SEC)
-    else:
-        hint = ("源库仍在写入：窗口内 DML %d 次、行变更 %d 行。"
-                "请先停业务写入，并在源库执行 "
-                "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; 加固后再检测。"
-                "否则种子/切换后这部分增量将永久丢失。" % (writes, rows))
-    return {"ok": True, "frozen": frozen, "unreliable": unreliable,
-            "missing": missing, "negative": list(negative.keys()),
-            "sample_sec": FREEZE_SAMPLE_SEC,
-            "writes": writes, "rows": rows, "delta": delta,
-            "read_only": ro, "super_read_only": sro, "hint": hint}
-
-
-def skip_cleanup(task_id):
-    """跳过「收尾回收」直接完成迁移——**完全不改动源库（老主）**。
-
-    场景：用户无权 / 不愿在老主上做手脚时（不回收源端账号、不置 read_only），
-    迁移到此为止：把 cleanup 标记为 skipped 并收尾，使任务进入完成态。
-    """
-    task = get_task(task_id)
-    if not task:
-        return {"ok": False, "error": "任务不存在"}
-    steps = dict(task.get("steps") or {})
-    note = "已跳过收尾回收：未回收源端账号、未置老主只读，源库保持原状。"
-    steps["cleanup"] = {"status": "done", "at": _now(), "skipped": True,
-                        "result": {"note": note, "skipped": True}}
-    execute("UPDATE migration_tasks SET status='done',steps=%s,progress=100,"
-            "stage='迁移完成（已跳过收尾回收）',updated_at=NOW() WHERE id=%s",
-            (json.dumps(steps, ensure_ascii=False), task_id))
-    return {"ok": True, "skipped": True, "note": note}
 
 
 # ---------------------------------------------------------------------------
