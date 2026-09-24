@@ -191,8 +191,16 @@ def _ch(channel):
 
 
 def change_replication_sql(flavour, host, port, user, password, channel=None,
-                           public_key=False, assign_anon_gtids=False):
+                           public_key=False, assign_anon_gtids=False,
+                           log_file=None, log_pos=None):
     """生成挂载复制通道的 SQL（按 flavour 独立分派）。
+
+    v2.4.1 新增 **log_file / log_pos**：传入这两者时走「传统位点(file/pos)」挂载，
+    不使用 GTID 自动定位。这是纳管**非 GTID 存量老集群**的必备路径——存量老库
+    大量仍是 file/pos 复制，而此前本函数三个分支全是 GTID 自动定位，老集群根本挂不上。
+
+    未传 log_file/log_pos 时行为与 v2.4.0 **完全一致**（仍是 GTID 自动定位），
+    存量集群不受影响。
 
     MySQL 8.0 (flavour=mysql8):
         CHANGE REPLICATION SOURCE TO SOURCE_HOST=..., SOURCE_AUTO_POSITION=1
@@ -211,6 +219,31 @@ def change_replication_sql(flavour, host, port, user, password, channel=None,
     assign_anon_gtids=True 仅 MySQL 8.0 追加 ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS=LOCAL：
     根治反复切换主从时的 1236（源端旧 binlog 含匿名事务）。MariaDB GTID 机制不同，无需此选项。
     """
+    # ---- 传统位点(file/pos) 挂载：非 GTID 存量老集群专用（v2.4.1）----
+    # 纳管阶段**不动复制**；只有需要重新挂载时才走这里（例：老主恢复后回挂成从库、
+    # 切主后把新主位点告知其他节点）。
+    # 前提：位点必须取自「提主瞬间 SHOW MASTER STATUS」并落库保存 —— 非 GTID 下
+    # 没有 GTID_SUBSET 可校验，位点取错就是丢数据或重复应用事务。
+    if log_file and log_pos is not None:
+        pos = int(log_pos)
+        if flavour == F_MYSQL8:
+            pk = "SOURCE_PUBLIC_KEY=1, " if public_key else ""
+            return (f"CHANGE REPLICATION SOURCE TO SOURCE_HOST='{host}', SOURCE_PORT={port}, "
+                    f"SOURCE_USER='{user}', SOURCE_PASSWORD='{password}', {pk}"
+                    f"SOURCE_LOG_FILE='{log_file}', SOURCE_LOG_POS={pos}{_ch(channel)}")
+        if flavour == F_MARIADB:
+            # MariaDB 位点复制：必须显式 MASTER_USE_GTID=no 覆盖可能残留的 slave_pos
+            # 设置，否则与位点冲突；MASTER_SSL=0 同 GTID 分支（WolfSSL/OpenSSL 互操作）。
+            return (f"CHANGE MASTER TO MASTER_HOST='{host}', MASTER_PORT={port}, "
+                    f"MASTER_USER='{user}', MASTER_PASSWORD='{password}', "
+                    f"MASTER_LOG_FILE='{log_file}', MASTER_LOG_POS={pos}, "
+                    f"MASTER_USE_GTID=no, MASTER_SSL=0{_ch(channel)}")
+        # old：MySQL 5.7 等 legacy
+        pk = "MASTER_PUBLIC_KEY=1, " if public_key else ""
+        return (f"CHANGE MASTER TO MASTER_HOST='{host}', MASTER_PORT={port}, "
+                f"MASTER_USER='{user}', MASTER_PASSWORD='{password}', {pk}"
+                f"MASTER_LOG_FILE='{log_file}', MASTER_LOG_POS={pos}{_ch(channel)}")
+
     if flavour == F_MYSQL8:
         pk = "SOURCE_PUBLIC_KEY=1, " if public_key else ""
         anon = "ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS=LOCAL, " if assign_anon_gtids else ""
