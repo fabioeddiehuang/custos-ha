@@ -126,10 +126,58 @@ def _replica_needs_full_clone(st):
     return False, ""
 
 
+def _parse_gtid_pos(s):
+    """解析 MariaDB GTID 位置串（如 '34-34-646,35-35-8'）→ {(domain,server): seq}。
+
+    ⚠ 必须自己解析，绝不能用 SQL 的 GTID_SUBSET()：那是 **MySQL** 的函数，
+      MariaDB 上执行报 1305 FUNCTION GTID_SUBSET does not exist（12.3.3 实测）。
+      调用一旦被 except 吞掉就会静默得出错误结论 —— 这曾让「孤儿安全闸门」恒返回
+      True（放行），等于允许自动克隆覆盖掉真实业务数据。
+    """
+    out = {}
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split("-")
+        if len(bits) != 3:
+            continue
+        try:
+            d, srv, seq = int(bits[0]), int(bits[1]), int(bits[2])
+        except (TypeError, ValueError):
+            continue
+        k = (d, srv)
+        if seq > out.get(k, 0):
+            out[k] = seq
+    return out
+
+
+def _gtid_pos_is_subset(a, b):
+    """True 表示 a 中每个 (domain,server) 的序号都不超过 b（即 a ⊆ b）。
+
+    MariaDB 的 gtid_*_pos 是「每个 domain-server 的最后序号」，故子集判断即逐项比序号。
+    a 空 ⇒ 无事务，恒为子集（克隆不会丢数据）；a 非空而 b 空 ⇒ 全是孤儿。
+    """
+    da, db = _parse_gtid_pos(a), _parse_gtid_pos(b)
+    if not da:
+        return True
+    if not db:
+        return False
+    for k, v in da.items():
+        if k not in db or v > db[k]:
+            return False
+    return True
+
+
 def _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
     """True = 从库所有已提交事务主库都有（自动克隆不会丢数据）。
 
     安全闸门用：从库有孤儿写入（其 GTID 不是主库的子集）时返回 False，禁止自动克隆。
+
+    ⚠ 两个「已提交事务」来源都必须查：
+      - gtid_slave_pos：复制应用过的事务；
+      - gtid_binlog_pos：本节点 binlog 里的，含**它自己写过的事务——孤儿就在那里**。
+    只看前者会漏判孤儿（实测：从库自写产生 35-35-8，而 slave_pos 仍是 35-35-2）。
     """
     host, port = h["host"], int(h["port"])
     sru, srp = node_root(host, cluster_id)
@@ -137,6 +185,7 @@ def _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
     sconn = connect_robust(host, port, creds["ha_user"], creds["ha_pass"], sru, srp)
     if sconn is None:
         return True  # 连不上则保守放行，交给既有自愈，不阻断拓扑
+    s_slave = s_binlog = m_gt = ""
     try:
         mconn = connect_robust(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], mru, mrp)
         if mconn is None:
@@ -145,14 +194,9 @@ def _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
             with sconn.cursor() as sc, mconn.cursor() as mc:
                 sc.execute("SELECT @@gtid_slave_pos, @@gtid_binlog_pos")
                 s = sc.fetchone() or [None, None]
-                s_gt = (s[0] or "") or (s[1] or "")
+                s_slave, s_binlog = (s[0] or ""), (s[1] or "")
                 mc.execute("SELECT @@gtid_binlog_pos")
                 m_gt = (mc.fetchone() or [None])[0] or ""
-            if not s_gt or not m_gt:
-                return True
-            with sconn.cursor() as sc:
-                sc.execute("SELECT GTID_SUBSET(%s, %s)", (s_gt, m_gt))
-                return bool((sc.fetchone() or [0])[0])
         finally:
             try:
                 mconn.close()
@@ -165,6 +209,11 @@ def _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
             sconn.close()
         except Exception:
             pass
+    if not m_gt:
+        return True
+    # 两者都必须是主库的子集，任一含孤儿即拦截
+    return (_gtid_pos_is_subset(s_slave, m_gt)
+            and _gtid_pos_is_subset(s_binlog, m_gt))
 
 
 def _slave_missing_master_dbs(cluster_id, h, cur_h, cur_p, creds):
