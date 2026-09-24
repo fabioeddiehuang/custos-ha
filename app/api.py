@@ -2940,21 +2940,6 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
             "tgt_flavor": b.get("tgt_flavor") or "mariadb",
             # 数据量：逻辑通道用它做真实百分比进度的分母
             "size_mb": float(b.get("size_mb") or 0),
-            # 物理通道源端路径（非标安装必填）
-            "src_my_cnf": b.get("src_my_cnf") or "",
-            "src_data_dir": b.get("src_data_dir") or "",
-            # 物理通道 B：源端形态（默认同目标）与源机 SSH 凭据（管理器经 SSH 到源机跑 mariabackup）
-            "src_type": b.get("src_type") or "",
-            "src_ssh_user": b.get("src_ssh_user") or "root",
-            "src_ssh_pass": b.get("src_ssh_pass") or "",
-            # 目标端 SSH 账号/密码（物理通道 B 在目标节点本地跑 docker/mariabackup/copy-back 用）
-            "tgt_ssh_user": b.get("tgt_ssh_user") or "root",
-            "tgt_ssh_pass": b.get("tgt_ssh_pass") or "",
-            # SSH 端口（生产环境未必是 22），源/目标各自独立
-            "src_ssh_port": int(b.get("src_ssh_port", 22) or 22),
-            "tgt_ssh_port": int(b.get("tgt_ssh_port", 22) or 22),
-            # 物理通道目标数据目录（留空则按 node_type 推导）
-            "tgt_datadir": b.get("tgt_datadir") or "",
         }
         task = {
             "name": b.get("name") or "未命名迁移",

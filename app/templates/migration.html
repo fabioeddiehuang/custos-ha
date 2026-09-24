@@ -289,16 +289,9 @@
   <div id="modeSummary" class="bk-note">检测结果：尚未检测，请先在第 1 步点「检测两端」。</div>
   <div id="methodSummary" class="bk-note" style="margin-top:12px">已选迁移方式：<b id="methodSummaryTxt">—</b></div>
 
-  <!-- 通用/高级都必填：节点形态决定后续如何登记与恢复 -->
-  <div class="acct-title" style="margin-top:16px">节点形态（源端 → 目标节点）</div>
+  <!-- 目标节点形态决定后续如何登记与恢复（纯逻辑通道，源端形态无作用） -->
+  <div class="acct-title" style="margin-top:16px">目标节点形态</div>
   <div class="form-grid">
-    <div class="field"><label>源端形态</label>
-      <select id="srcType">
-        <option value="mariadb-docker">容器化 MariaDB</option>
-        <option value="mariadb">裸机 MariaDB</option>
-        <option value="docker">容器化 MySQL</option>
-      </select>
-    </div>
     <div class="field"><label>目标节点形态</label>
       <select id="tgtType">
         <option value="" disabled selected>请选择节点形态</option>
@@ -677,7 +670,6 @@ async function createTask(){
     tgt_root_pass:$("tgtRoot").value,
     tgt_user:($("tgtUser").value.trim()||"root"),
     node_type:$("tgtType").value, channel:"logical",
-    src_type:$("srcType").value||null,
     src_flavor:(STATE.probe&&STATE.probe.flavor)||"mariadb",
     src_major:(STATE.probe&&STATE.probe.major)||0,
     // 目标产品线跟随「目标节点形态」下拉：docker=MySQL，其余均为 MariaDB
