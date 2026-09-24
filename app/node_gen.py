@@ -173,6 +173,30 @@ def get_next_server_id():
     return base + 1
 
 
+def server_id_conflict(sid, exclude_ip=None, exclude_port=None):
+    """检查 server_id 是否已被**其他**节点占用；被占用返回占用者 "ip:port"，空闲返回 None。
+
+    用于自定义 server_id 的撞 id 防护：server_id 在复制拓扑里必须全局唯一，
+    两个节点撞 id 会导致 GTID 混乱（从库认错事务来源、复制反复中断）。
+    exclude_ip/port 用于排除「节点自身」，使同一节点重新生成时不算冲突。
+    """
+    try:
+        sid = int(sid)
+    except (TypeError, ValueError):
+        return None
+    for tbl, hcol in (("nodes", "ip"), ("hosts", "host")):
+        try:
+            rows = query("SELECT %s AS h, port FROM %s WHERE server_id=%%s" % (hcol, tbl), (sid,))
+        except Exception:
+            continue
+        for r in rows or []:
+            if exclude_ip is not None and str(r.get("h")) == str(exclude_ip) \
+                    and int(r.get("port") or 0) == int(exclude_port or 0):
+                continue
+            return "%s:%s" % (r.get("h"), r.get("port"))
+    return None
+
+
 def _peer_ips(self_ip, cluster_id):
     """同一集群内的对等节点（用于 keepalived unicast_peer）。"""
     peers = set()
@@ -1810,7 +1834,7 @@ def verify_pending_all():
 
 
 def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None,
-                  node_type="docker", mysql_version=None):
+                  node_type="docker", mysql_version=None, server_id=None):
     ip = (ip or "").strip()
     if not ip:
         raise ValueError("节点 IP 不能为空")
@@ -1863,20 +1887,35 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     vip_port = creds.get("vip_port") or VIP_PORT
     manager_public_ip = get_manager_public_ip()
     manager_subnet = get_manager_docker_subnet_wildcard()
-    server_id = get_next_server_id()
-    # 【修复 2026-09-24】server_id 必须与该节点自身的 GTID 历史保持一致。
-    # 同一节点(ip+port)重新生成配置时若换成新的 server_id，其 data 目录里原有的
-    # GTID（domain / server 取自旧 server_id）会与新 domain 混杂，主从随即报
-    #   1236 '... missing the GTID x-y-N requested by the slave
-    #         (even though both a prior and a subsequent sequence number does exist)'
-    # —— 即主库 binlog 出现「空洞」。故已存在的节点一律复用原 server_id，
-    #    只有在首次添加（nodes 表无记录）时才分配新的。
-    try:
-        _rows = query("SELECT server_id FROM nodes WHERE ip=%s AND port=%s", (ip, int(port)))
-        if _rows and _rows[0].get("server_id"):
-            server_id = int(_rows[0]["server_id"])
-    except Exception:
-        pass
+    # ---- server_id：支持页面自定义，规避「自动分配撞 id」的风险 ----
+    # 自定义值必须全局唯一（复制拓扑里撞 id 会导致 GTID 混乱、复制反复中断），
+    # 故先做范围与占用校验；未填则沿用原策略。
+    if server_id not in (None, "", 0):
+        try:
+            _sid = int(server_id)
+        except (TypeError, ValueError):
+            raise ValueError("server_id 必须是整数，收到 %r" % (server_id,))
+        if _sid < 1 or _sid > 4294967295:
+            raise ValueError("server_id 必须落在 1~4294967295（MySQL/MariaDB 合法范围）")
+        _used = server_id_conflict(_sid, exclude_ip=ip, exclude_port=port)
+        if _used:
+            raise ValueError("server_id %d 已被节点 %s 占用，请换一个" % (_sid, _used))
+        server_id = _sid
+    else:
+        server_id = get_next_server_id()
+        # 【修复 2026-09-24】server_id 必须与该节点自身的 GTID 历史保持一致。
+        # 同一节点(ip+port)重新生成配置时若换成新的 server_id，其 data 目录里原有的
+        # GTID（domain / server 取自旧 server_id）会与新 domain 混杂，主从随即报
+        #   1236 '... missing the GTID x-y-N requested by the slave
+        #         (even though both a prior and a subsequent sequence number does exist)'
+        # —— 即主库 binlog 出现「空洞」。故已存在的节点一律复用原 server_id，
+        #    只有在首次添加（nodes 表无记录）时才分配新的。
+        try:
+            _rows = query("SELECT server_id FROM nodes WHERE ip=%s AND port=%s", (ip, int(port)))
+            if _rows and _rows[0].get("server_id"):
+                server_id = int(_rows[0]["server_id"])
+        except Exception:
+            pass
     node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
     peers = _peer_ips(ip, cluster_id)
     # MariaDB 两种形态（裸机 / 容器 host 网络）的 keepalived 容器都在 host 网络，

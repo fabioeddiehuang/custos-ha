@@ -27,7 +27,7 @@ from .state import get_current_master
 from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root, _LAST_FAILOVER_TS
 from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
                        sync_node_creds, render_fix_node_creds_sql,
-                       render_fix_node_creds_sql_mariadb)
+                       render_fix_node_creds_sql_mariadb, get_next_server_id)
 from .clusters import list_clusters, validate_node_version, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
 from .alerts import send_alert, last_error, smtp_view
 from .ha_client import (connect, heal_replication, heal_io_gtid_gap, heal_io_auth,
@@ -3420,8 +3420,14 @@ def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", err
         groups.append({"id": 0, "name": "未分配集群", "node_type": "",
                        "type_summary": _node_type_summary(orphans), "vip": "", "nodes": orphans})
 
+    # 表单里「建议的下一个 server_id」提示值（真正分配在提交时按库实时计算并校验）
+    try:
+        _next_sid = get_next_server_id()
+    except Exception:
+        _next_sid = ""
     return render("nodes.html", request, user=user, nodes=nodes, clusters=clusters,
-                  groups=groups, creds=creds, cfg=cfg, active_cluster=ac, msg=msg, error=error)
+                  groups=groups, creds=creds, cfg=cfg, active_cluster=ac, msg=msg, error=error,
+                  next_server_id=_next_sid)
 
 
 @app.get("/audit")
@@ -3441,6 +3447,7 @@ def nodes_add(
     cluster_id: int = Form(0),
     node_type: str = Form("docker"),
     mysql_version: str = Form(""),
+    server_id: str = Form(""),
     user=Depends(auth_required),
 ):
     initial_role = "master" if initial_role == "master" else "slave"
@@ -3473,6 +3480,7 @@ def nodes_add(
         info = generate_node(
             ip, port, root_user, root_pass, initial_role, cid,
             node_type=node_type.strip() or "docker", mysql_version=mysql_version.strip() or None,
+            server_id=server_id.strip() or None,
         )
         audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
                         "add_node", f"{ip}:{port}",
