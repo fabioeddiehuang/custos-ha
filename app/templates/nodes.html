@@ -116,7 +116,7 @@
         <td>
           {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-right:4px">MariaDB 裸机</span>
           {% elif n.node_type == 'mariadb-docker' %}<span class="badge sky" style="margin-right:4px">MariaDB 容器</span>
-          {% elif n.node_type in ('docker','mysql8','mysql8-docker','mysql-docker','mysql') %}<span class="badge emerald" style="margin-right:4px">MySQL</span>{% endif %}
+          {% elif n.node_type == 'docker' %}<span class="badge emerald" style="margin-right:4px">MySQL</span>{% endif %}
           {% if n.mysql_version %}<span class="mono">{{ n.mysql_version }}</span>{% endif %}
         </td>
         <td data-f="status"><span class="badge" style="background:var(--surface-3);color:var(--muted);">检测中…</span></td>
@@ -189,12 +189,16 @@
         </label>
         <label>节点类型
           <select name="node_type" id="nodeType" onchange="onNodeTypeChange()">
-            <option value="mysql-docker">MySQL（容器化 MySQL + keepalived 客户端）</option>
+            <option value="docker" selected>MySQL（容器化 MySQL + keepalived 客户端）</option>
             <option value="mariadb">MariaDB（裸机全量安装；可与原容器 MariaDB 同集群混部）</option>
-            <option value="mariadb-docker" selected>MariaDB（容器化，官方镜像首选；可与原裸机 MariaDB 同集群混部）</option>
+            <option value="mariadb-docker">MariaDB（容器化，官方镜像首选；可与原裸机 MariaDB 同集群混部）</option>
           </select>
         </label>
         <label>MySQL 版本<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=自动探测）"></label>
+        <label>server_id（可选）
+          <span style="font-size:12px;color:var(--muted,#94a3b8);font-weight:400;line-height:1.4">复制拓扑内必须全局唯一，明确指定可避免撞 id；留空自动分配{% if next_server_id %}（当前建议 {{ next_server_id }}）{% endif %}</span>
+          <input name="server_id" type="number" min="1" max="4294967295" step="1" placeholder="{% if next_server_id %}{{ next_server_id }}{% endif %}">
+        </label>
         <label>所属集群
           <select name="cluster_id" required>
             <option value="" disabled {% if not active_cluster %}selected{% endif %}>请选择已有集群</option>
@@ -555,18 +559,43 @@
   // 「配置待生效」自动监测：每 30s 复核仍挂着徽标的节点，管理器已自动核验落实的
   // 会隐去徽标与「待生效操作」按钮，无需运维每次手动点「已执行」。
   // （exec / 首次部署等节点侧一次性动作无法远程观测，仍保留手动按钮。）
+  function _syncPendingRow(tr, ip, has){
+    // 徽标挂在节点主行的 <td class="mono"> 内
+    var cell = tr.querySelector("td.mono");
+    var badge = cell ? cell.querySelector(".pending-badge") : null;
+    if(has){
+      if(cell && !badge){
+        cell.insertAdjacentHTML("beforeend",
+          '<span class="badge pending-badge" style="margin-left:6px;background:#E11D74;color:#fff;cursor:pointer"'
+          + ' onclick="showPending(\''+ip+'\')" title="有配置变更尚未在节点生效，点击查看需要在节点执行的操作">配置待生效</span>');
+      }
+    } else if(badge){ badge.remove(); }
+    // 「待生效操作」按钮在展开详情行（#d<ip>）的 .dd-actions 里，不在主行
+    var detail = document.getElementById("d"+ip);
+    if(detail){
+      var box = detail.querySelector(".dd-actions");
+      var btn = detail.querySelector(".pending-btn");
+      if(has){
+        if(box && !btn){
+          box.insertAdjacentHTML("beforeend",
+            '<button class="btn btn-sm pending-btn" style="background:#E11D74;color:#fff"'
+            + ' onclick="showPending(\''+ip+'\')">待生效操作</button>');
+        }
+      } else if(btn){ btn.remove(); }
+    }
+  }
+  // 「配置待生效」自动监测：每 30s 复核**全部**节点行（不再只查已挂徽标的行）。
+  // 管理器已自动核验落实的会隐去徽标与「待生效操作」按钮；新产生待办的会即时补上徽标。
+  // 这样重新生成配置后，不刷新页面也能让新待办进入自动检测。
+  // （exec / 首次部署等节点侧一次性动作无法远程观测，仍保留手动按钮。）
   function refreshPendingBadges(){
-    document.querySelectorAll("tr[data-host] .pending-badge").forEach(function(badge){
-      var tr = badge.closest("tr"); if(!tr) return;
+    document.querySelectorAll("tr[data-host]").forEach(function(tr){
       var ip = (tr.getAttribute("data-host")||"").split(":")[0]; if(!ip) return;
       fetch("/api/nodes/"+encodeURIComponent(ip)+"/pending")
         .then(function(r){return r.json();})
         .then(function(d){
           var acts = (d.ok && d.actions) ? d.actions : [];
-          if(!acts.length){
-            var b = tr.querySelector(".pending-badge"); if(b) b.remove();
-            var btn = tr.querySelector(".pending-btn"); if(btn) btn.remove();
-          }
+          _syncPendingRow(tr, ip, acts.length > 0);
         })
         .catch(function(){});
     });
@@ -590,6 +619,9 @@
           body.innerHTML='<div class="banner ok">✓ <div>'+esc(d.msg||"")+'</div></div>'
             +(_ah ? _ah : (d.run_cmd?'<div class="runcmd">到目标主机执行：\n'+esc(d.run_cmd)+'</div>':''))
             +'<p style="margin:8px 0 4px;color:var(--muted,#94a3b8)">生成文件 MD5（用于核对一致性）：</p>'+md5html;
+          // 重新生成后立刻同步一次徽标，让新产生的待办马上进入自动检测
+          // （此前只刷新已带徽标的行，重新生成出来的新待办不刷新页面就看不到）。
+          refreshPendingBadges();
         }
         document.getElementById("regenModal").classList.add("show");
       })

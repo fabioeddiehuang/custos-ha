@@ -27,7 +27,7 @@ from .state import get_current_master
 from .failover import do_failover, do_failover_to, load_creds, ensure_topology, node_root, _LAST_FAILOVER_TS
 from .node_gen import (generate_node, list_nodes, delete_node, delete_node_dir,
                        sync_node_creds, render_fix_node_creds_sql,
-                       render_fix_node_creds_sql_mariadb)
+                       render_fix_node_creds_sql_mariadb, get_next_server_id)
 from .clusters import list_clusters, validate_node_version, get_cluster, create_cluster, update_cluster, delete_cluster, get_cluster_creds
 from .alerts import send_alert, last_error, smtp_view
 from .ha_client import (connect, heal_replication, heal_io_gtid_gap, heal_io_auth,
@@ -37,9 +37,7 @@ from .ha_client import (connect, heal_replication, heal_io_gtid_gap, heal_io_aut
 from .monitor import run_once, start_in_background, _probe_all, trigger_act_once_async
 from . import precheck, audit, metrics, slow_log, config_drift, docker_helper, backup, os_metrics
 from . import rebuild, consistency
-from .mysql_compat import (detect_flavour, flavour_from_node_type, F_MARIADB,
-                           normalize_node_type, is_mysql_node, is_mariadb_node,
-                           NT_MARIADB, NT_MARIADB_DOCKER, NT_MYSQL, NT_MYSQL_DOCKER)
+from .mysql_compat import detect_flavour, flavour_from_node_type, F_MARIADB
 
 # ---------------------------------------------------------------------------
 # 全站统一使用中国时间（Asia/Shanghai = UTC+8）
@@ -155,11 +153,11 @@ TEMPLATES.globals["APP_VERSION"] = APP_VERSION
 
 
 def display_node_type(nt):
-    """部署形态（node_type）对外展示名：MySQL 家族统一显示为 MySQL，MariaDB 家族显示为 MariaDB。"""
-    nt = (nt or "mariadb-docker").strip()
-    if is_mysql_node(nt):
+    """部署形态（node_type）对外展示名：docker 形态即「容器化 MySQL」，统一显示为 MySQL。"""
+    nt = (nt or "docker").strip()
+    if nt == "docker":
         return "MySQL"
-    if is_mariadb_node(nt):
+    if nt in ("mariadb", "mariadb-docker"):
         return "MariaDB"
     return nt
 
@@ -520,7 +518,7 @@ def api_vip_status(user=Depends(auth_required)):
                     p = 0
                 info["nodes"].append({
                     "host": nr["ip"], "port": p,
-                    "node_type": nr.get("node_type") or "mariadb-docker",
+                    "node_type": nr.get("node_type") or "docker",
                     "reachable": _port_online(nr["ip"], p) if p else False,
                 })
             return cid, info
@@ -1607,7 +1605,7 @@ def _cluster_js(c):
         "vip_port": _s(c.get("vip_port")),
         "vip_prefix": _s(c.get("vip_prefix")),
         "interface": _s(c.get("interface")),
-        "node_type": _s(c.get("node_type") or "mariadb-docker"),
+        "node_type": _s(c.get("node_type") or "docker"),
         "mysql_version": _s(c.get("mysql_version")),
         "creds": {
             "ha_user": _s(cr.get("ha_user")),
@@ -1632,17 +1630,6 @@ def clusters_page(request: Request, user=Depends(auth_required), msg: str = "", 
                   msg=msg, error=error,
                   auto_failover=get_setting("AUTO_FAILOVER", "1") == "1",
                   auto_repair=get_setting("AUTO_REPAIR", "1") == "1")
-
-
-@app.get("/api/clusters")
-def api_clusters_list(user=Depends(auth_required)):
-    """集群列表（JSON，供接管向导等前端下拉选择）。"""
-    out = []
-    for row in list_clusters():
-        v = _cluster_view(row["id"])
-        if v:
-            out.append(v)
-    return _json_ok({"clusters": out})
 
 
 @app.get("/clusters/{cid}")
@@ -2817,11 +2804,10 @@ def api_maintenance_end(cluster_id: int = Form(...), scope: str = Form(""),
 
 # ==================================================================
 # 数据迁移向导（既有 MariaDB 集群 → Custos 托管集群）
-# 专注 MariaDB：probe/recommend/seed/bridge/verify/cutover/cleanup。
+# 专注 MariaDB：probe/recommend/seed/verify（2.4.0 重做：纯逻辑导出导入，已移除桥接/切换/收尾步骤）。
 # 步骤驱动：前端逐步调用，天然支持重试(重复调用)/暂停(不调下一步)。
 # ==================================================================
 from . import migration as _migration
-from . import takeover as _takeover
 
 
 @app.get("/migration")
@@ -2922,10 +2908,10 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
     b = await _json_body(request)
     try:
         # BUG-003：节点形态必须显式选择，禁止静默回退为容器默认值
-        node_type = normalize_node_type(b.get("node_type") or "")
-        if node_type not in (NT_MARIADB, NT_MARIADB_DOCKER, NT_MYSQL, NT_MYSQL_DOCKER):
+        node_type = b.get("node_type") or ""
+        if node_type not in ("mariadb", "mariadb-docker", "docker"):
             return _json_ok({"ok": False,
-                             "error": "请选择有效的目标节点形态（容器化 MariaDB / 裸机 MariaDB / 容器化 MySQL / 裸机 MySQL）"})
+                             "error": "请选择有效的目标节点形态（容器化 MariaDB / 裸机 MariaDB / 容器化 MySQL）"})
         databases = b.get("databases") or []
         if isinstance(databases, str):
             databases = [d.strip() for d in databases.split(",") if d.strip()]
@@ -2954,21 +2940,6 @@ async def api_migration_create(request: Request, user=Depends(auth_required)):
             "tgt_flavor": b.get("tgt_flavor") or "mariadb",
             # 数据量：逻辑通道用它做真实百分比进度的分母
             "size_mb": float(b.get("size_mb") or 0),
-            # 物理通道源端路径（非标安装必填）
-            "src_my_cnf": b.get("src_my_cnf") or "",
-            "src_data_dir": b.get("src_data_dir") or "",
-            # 物理通道 B：源端形态（默认同目标）与源机 SSH 凭据（管理器经 SSH 到源机跑 mariabackup）
-            "src_type": b.get("src_type") or "",
-            "src_ssh_user": b.get("src_ssh_user") or "root",
-            "src_ssh_pass": b.get("src_ssh_pass") or "",
-            # 目标端 SSH 账号/密码（物理通道 B 在目标节点本地跑 docker/mariabackup/copy-back 用）
-            "tgt_ssh_user": b.get("tgt_ssh_user") or "root",
-            "tgt_ssh_pass": b.get("tgt_ssh_pass") or "",
-            # SSH 端口（生产环境未必是 22），源/目标各自独立
-            "src_ssh_port": int(b.get("src_ssh_port", 22) or 22),
-            "tgt_ssh_port": int(b.get("tgt_ssh_port", 22) or 22),
-            # 物理通道目标数据目录（留空则按 node_type 推导）
-            "tgt_datadir": b.get("tgt_datadir") or "",
         }
         task = {
             "name": b.get("name") or "未命名迁移",
@@ -3017,23 +2988,6 @@ async def api_migration_precheck(task_id: int, user=Depends(auth_required)):
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
-@app.post("/api/migration/{task_id}/lag")
-async def api_migration_lag(task_id: int, request: Request, user=Depends(auth_required)):
-    """停桥切换前的追平检测（只读）：确认目标已从源追平，未追平不允许切换。
-
-    body: {"skip_acct": true} 可跳过账号自检（前端高频追踪采样时使用）。
-    """
-    try:
-        b = await _json_body(request)
-        task = _migration.get_task(task_id)
-        if not task:
-            return _json_ok({"ok": False, "error": "任务不存在"})
-        return _json_ok(_migration.check_lag(task, skip_acct=bool(b.get("skip_acct")),
-                                            auto_heal=bool(b.get("auto_heal"))))
-    except Exception as e:
-        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
-
-
 @app.post("/api/migration/{task_id}/heal")
 def api_migration_heal(task_id: int, user=Depends(auth_required)):
     """迁移目标的复制自愈：桥接阶段目标(从库)的 SQL/IO 线程因复制错误(如 1133/冲突)停止时，
@@ -3066,43 +3020,6 @@ async def api_migration_privileges(request: Request, user=Depends(auth_required)
     try:
         b = await _json_body(request)
         return _json_ok(_migration.audit_source_privileges(b))
-    except Exception as e:
-        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
-
-
-@app.post("/api/migration/plan_binlog")
-async def api_migration_plan_binlog(request: Request, user=Depends(auth_required)):
-    """源库未开 binlog 时，用源库 root 连接探测并生成「开启 binlog」的可执行方案。
-
-    只生成方案，绝不自动改配置 / 重启（log_bin 是静态变量，且属高危操作）。
-    """
-    try:
-        b = await _json_body(request)
-        return _json_ok(_migration.plan_binlog_enable(b))
-    except Exception as e:
-        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
-
-
-@app.post("/api/migration/{task_id}/freeze_check")
-def api_migration_freeze_check(task_id: int, user=Depends(auth_required)):
-    """停写迁移模式下的停写检测：实测源库是否已停止写入（采样写入计数器取差值）。
-
-    同步端点（内含数秒采样间隔），FastAPI 会放到线程池执行，不阻塞事件循环。
-    """
-    try:
-        task = _migration.get_task(task_id)
-        if not task:
-            return _json_ok({"ok": False, "error": "任务不存在"})
-        return _json_ok(_migration.check_write_freeze(task))
-    except Exception as e:
-        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
-
-
-@app.post("/api/migration/{task_id}/skip_cleanup")
-async def api_migration_skip_cleanup(task_id: int, user=Depends(auth_required)):
-    """跳过「收尾回收」直接完成迁移：不回收源端账号、不置老主只读，源库保持原状。"""
-    try:
-        return _json_ok(_migration.skip_cleanup(task_id))
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
@@ -3153,118 +3070,6 @@ async def api_migration_unlock(request: Request, user=Depends(auth_required)):
         return _json_ok({"ok": True, **info})
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
-
-
-# ==================================================================
-# 集群接管（v2.4.1）：旧集群 → Custos 托管 + 配 Custos VIP
-# 先实现「公共骨架」：连接旧主 → 拓扑/版本/GTID 发现 → 能力门禁 → 开关审计 → 建任务。
-# 模式 A(平行新建+切换) / B(原地纳管) 的部署与切换在后续阶段接入。
-# ==================================================================
-@app.get("/takeover")
-def takeover_page(request: Request, user=Depends(auth_required)):
-    """集群接管向导页。"""
-    return render("takeover.html", request, user=user)
-
-
-@app.get("/takeover/history")
-def takeover_history_page(request: Request, user=Depends(auth_required)):
-    """接管历史记录页。"""
-    return render("takeover.html", request, user=user)
-
-
-@app.post("/api/takeover/probe")
-async def api_takeover_probe(request: Request, user=Depends(auth_required)):
-    b = await _json_body(request)
-    try:
-        r = _takeover.probe_old_cluster({
-            "old_host": b.get("old_host", ""),
-            "old_port": int(b.get("old_port", 3306)),
-            "old_user": b.get("old_user", "root"),
-            "old_pass": b.get("old_pass", ""),
-            "old_timeout": int(b.get("old_timeout", 8)),
-        })
-        return _json_ok(r)
-    except Exception as e:
-        return _json_ok({"ok": False, "error": str(e)})
-
-
-@app.post("/api/takeover/capabilities")
-async def api_takeover_capabilities(request: Request, user=Depends(auth_required)):
-    b = await _json_body(request)
-    return _json_ok(_takeover.takeover_capabilities(b.get("probe") or {}))
-
-
-@app.post("/api/takeover/create")
-async def api_takeover_create(request: Request, user=Depends(auth_required)):
-    b = await _json_body(request)
-    task = _takeover.create_task(b)
-    return _json_ok({"ok": True, "task_id": task["id"]})
-
-
-@app.get("/api/takeover/list")
-def api_takeover_list(user=Depends(auth_required)):
-    return _json_ok({"ok": True, "tasks": _takeover.list_tasks()})
-
-
-@app.get("/api/takeover/{task_id}/status")
-def api_takeover_status(task_id: int, user=Depends(auth_required)):
-    t = _takeover.get_task(task_id)
-    if not t:
-        return _json_ok({"ok": False, "error": "任务不存在"}), 404
-    return _json_ok({"ok": True, "task": t})
-
-
-@app.delete("/api/takeover/{task_id}")
-def api_takeover_delete(task_id: int, user=Depends(auth_required)):
-    _takeover.delete_task(task_id)
-    return _json_ok({"ok": True})
-
-
-@app.post("/api/takeover/{task_id}/start_step")
-async def api_takeover_start_step(task_id: int, request: Request, user=Depends(auth_required)):
-    b = await _json_body(request)
-    return _json_ok(_takeover.start_step(task_id, b.get("step") or ""))
-
-
-@app.post("/api/takeover/{task_id}/flip")
-def api_takeover_flip(task_id: int, user=Depends(auth_required)):
-    t = _takeover.get_task(task_id)
-    if not t:
-        return _json_ok({"ok": False, "error": "任务不存在"}), 404
-    return _json_ok(_takeover.flip_vip(t))
-
-
-@app.post("/api/takeover/{task_id}/undo")
-def api_takeover_undo(task_id: int, user=Depends(auth_required)):
-    t = _takeover.get_task(task_id)
-    if not t:
-        return _json_ok({"ok": False, "error": "任务不存在"}), 404
-    return _json_ok(_takeover.undo_takeover(t))
-
-
-# ------------------------------------------------------------------
-# 接管 sidecar 统一安装源：/agent/install.sh（带一次性 token，节点 curl|bash）
-# 自判 OS 装 python3 → 从管理器拉取 node_agent + systemd 服务 → 启用。
-# 优先级：节点包经 SSH rsync 推送为准；本端点为「统一源、降 scp 失败率」兜底。
-# ------------------------------------------------------------------
-@app.get("/agent/install.sh")
-def agent_install_sh(token: str = "", family: str = "mariadb", request: Request = None):
-    base = ""
-    if request is not None:
-        base = str(request.base_url).rstrip("/")
-    script = _takeover.render_agent_install_sh(base, family)
-    from fastapi.responses import Response
-    return Response(script, media_type="text/x-shellscript", headers={"Content-Disposition": "attachment; filename=install.sh"})
-
-
-@app.get("/agent/asset/node_agent.py")
-def agent_asset_node_agent():
-    from pathlib import Path
-    p = Path(__file__).resolve().parent.parent / "scripts" / "node_agent.py"
-    if not p.exists():
-        return _json_ok({"ok": False, "error": "node_agent.py 不存在"}), 404
-    from fastapi.responses import FileResponse
-    return FileResponse(p, media_type="text/plain", filename="node_agent.py")
 
 
 # ==================================================================
@@ -3367,7 +3172,7 @@ def clusters_create(
     vip: str = Form(""), vip_prefix: str = Form("24"),
     interface: str = Form(""), vrid: str = Form(""),
     vip_port: str = Form(""),
-    node_type: str = Form("mariadb-docker"), mysql_version: str = Form(""),
+    node_type: str = Form("docker"), mysql_version: str = Form(""),
     ha_user: str = Form(""), ha_pass: str = Form(""),
     repl_user: str = Form(""), repl_pass: str = Form(""),
     app_user: str = Form(""), app_pass: str = Form(""),
@@ -3400,7 +3205,7 @@ def clusters_create(
             interface=interface.strip() or None,
             vrid=vrid.strip() or None,
             vip_port=vip_port_val,
-            node_type=node_type.strip() or "mariadb-docker",
+            node_type=node_type.strip() or "docker",
             mysql_version=mysql_version.strip() or None,
         )
     except Exception as e:
@@ -3550,15 +3355,9 @@ _DIR_PREFIXES = ("mysql-ha-manager/", "custos-ha/", "custos/")
 
 # 节点形态 → 中文标签（与 nodes.html 节点行徽标口径保持一致）
 _NODE_TYPE_LABEL = {
-    # 规范名（v2.4.1 起）
-    "mysql": "MySQL 裸机",
-    "mysql-docker": "MySQL 容器",
+    "docker": "Docker",
     "mariadb": "MariaDB 裸机",
     "mariadb-docker": "MariaDB 容器",
-    # 历史别名（归一化前的旧值，仍可能出现于存量数据展示）
-    "docker": "MySQL 容器",
-    "mysql8": "MySQL 裸机",
-    "mysql8-docker": "MySQL 容器",
 }
 
 
@@ -3570,7 +3369,7 @@ def _node_type_summary(nodes):
     组头若直接展示集群级 node_type，会让用户误以为集群内所有节点都是该形态。
     """
     from collections import Counter
-    cnt = Counter((n.get("node_type") or "mariadb-docker") for n in nodes)
+    cnt = Counter((n.get("node_type") or "docker") for n in nodes)
     return " · ".join("%s×%d" % (_NODE_TYPE_LABEL.get(t, t), c) for t, c in cnt.most_common())
 
 
@@ -3610,7 +3409,7 @@ def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", err
         groups.append({
             "id": cid,
             "name": c.get("name") or f"集群{cid}",
-            "node_type": c.get("node_type") or "mariadb-docker",
+            "node_type": c.get("node_type") or "docker",
             "type_summary": _node_type_summary(members),
             "vip": c.get("vip") or "",
             "nodes": members,
@@ -3621,8 +3420,14 @@ def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", err
         groups.append({"id": 0, "name": "未分配集群", "node_type": "",
                        "type_summary": _node_type_summary(orphans), "vip": "", "nodes": orphans})
 
+    # 表单里「建议的下一个 server_id」提示值（真正分配在提交时按库实时计算并校验）
+    try:
+        _next_sid = get_next_server_id()
+    except Exception:
+        _next_sid = ""
     return render("nodes.html", request, user=user, nodes=nodes, clusters=clusters,
-                  groups=groups, creds=creds, cfg=cfg, active_cluster=ac, msg=msg, error=error)
+                  groups=groups, creds=creds, cfg=cfg, active_cluster=ac, msg=msg, error=error,
+                  next_server_id=_next_sid)
 
 
 @app.get("/audit")
@@ -3640,8 +3445,9 @@ def nodes_add(
     root_pass: str = Form(...),
     initial_role: str = Form("master"),
     cluster_id: int = Form(0),
-    node_type: str = Form("mariadb-docker"),
+    node_type: str = Form("docker"),
     mysql_version: str = Form(""),
+    server_id: str = Form(""),
     user=Depends(auth_required),
 ):
     initial_role = "master" if initial_role == "master" else "slave"
@@ -3667,13 +3473,14 @@ def nodes_add(
         return RedirectResponse("/nodes?error=请先在「集群管理」创建集群，再选择所属集群", status_code=303)
     # 同集群「同构」校验：禁止 docker/mariadb 混部、主版本须一致
     try:
-        validate_node_version(cid, node_type.strip() or "mariadb-docker", mysql_version.strip() or None)
+        validate_node_version(cid, node_type.strip() or "docker", mysql_version.strip() or None)
     except Exception as e:
         return RedirectResponse(f"/nodes?error={e}", status_code=303)
     try:
         info = generate_node(
             ip, port, root_user, root_pass, initial_role, cid,
-            node_type=node_type.strip() or "mariadb-docker", mysql_version=mysql_version.strip() or None,
+            node_type=node_type.strip() or "docker", mysql_version=mysql_version.strip() or None,
+            server_id=server_id.strip() or None,
         )
         audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
                         "add_node", f"{ip}:{port}",
@@ -3733,7 +3540,7 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
         info = generate_node(
             n["ip"], n["port"], n["root_user"], n["root_pass"],
             initial_role, int(n["cluster_id"] or 0),
-            node_type=n.get("node_type") or "mariadb-docker",
+            node_type=n.get("node_type") or "docker",
             mysql_version=n.get("mysql_version"),
         )
         # 计算生成目录内各文件的 md5，便于核对
@@ -3798,7 +3605,7 @@ def _render_node_fix_sql(n, creds, manager_ip, manager_subnet=None):
         except Exception:
             flavour = None
     if flavour is None:
-        flavour = flavour_from_node_type(n.get("node_type") or "mariadb-docker")
+        flavour = flavour_from_node_type(n.get("node_type") or "docker")
 
     if flavour == F_MARIADB:
         return render_fix_node_creds_sql_mariadb(

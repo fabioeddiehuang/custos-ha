@@ -47,48 +47,26 @@ def is_mariadb(version_str):
 
 
 # 节点部署形态常量（nodes.node_type / clusters.node_type）
+NT_DOCKER = "docker"                  # 容器化 MySQL 8.0
 NT_MARIADB = "mariadb"                # 裸机 MariaDB（Install 脚本全量安装）
 NT_MARIADB_DOCKER = "mariadb-docker"  # 容器化 MariaDB（官方镜像 + Install 脚本）
-NT_MYSQL = "mysql"                    # 裸机 MySQL 8.0（v2.4.1 起规范名；旧名 mysql8 保留兼容）
-NT_MYSQL_DOCKER = "mysql-docker"      # 容器化 MySQL 8.0（v2.4.1 起规范名；旧名 docker/mysql8-docker 保留兼容）
-# 注：原 NT_DOCKER（"docker"）与 NT_MYSQL_DOCKER 语义完全相同（都是容器化 MySQL 8.0），
-#     故不再单列规范名，统一用 mysql-docker；"docker" 仅作为历史别名保留（见 _NODE_TYPE_ALIASES）。
-
-# 历史遗留别名（已废弃，保留兼容）：
-#   docker        → mysql-docker（容器 MySQL 8.0，最早默认形态）
-#   mysql8        → mysql       （裸机 MySQL 8.0，v2.4.1 旧名）
-#   mysql8-docker → mysql-docker（容器 MySQL 8.0，v2.4.1 旧名）
-_NODE_TYPE_ALIASES = {"docker": NT_MYSQL_DOCKER, "mysql8": NT_MYSQL, "mysql8-docker": NT_MYSQL_DOCKER}
 
 # 引擎族：同为 MariaDB 的两种形态可以同集群混部（复制/切换完全兼容），
-# 同为 MySQL 的两种规范形态（mysql/mysql-docker，旧名 docker/mysql8/mysql8-docker）也可同集群混部（复制/切换完全兼容），
 # 与 MySQL 之间仍然禁止混部（GTID 机制根本不兼容）。
 _MARIADB_NODE_TYPES = (NT_MARIADB, NT_MARIADB_DOCKER)
-_MYSQL_NODE_TYPES = (NT_MYSQL, NT_MYSQL_DOCKER, "docker", "mysql8", "mysql8-docker")
-
-
-def normalize_node_type(node_type):
-    """把历史别名归一化到当前规范名（docker→mysql-docker，mysql8→mysql，mysql8-docker→mysql-docker）。"""
-    return _NODE_TYPE_ALIASES.get((node_type or "").strip().lower(),
-                                  (node_type or "").strip().lower())
 
 
 def is_mariadb_node(node_type):
     """node_type 是否属于 MariaDB 引擎族（裸机 MariaDB / 容器化 MariaDB）。"""
-    return normalize_node_type(node_type) in _MARIADB_NODE_TYPES
-
-
-def is_mysql_node(node_type):
-    """node_type 是否属于 MySQL 引擎族（容器 / 裸机 8.0）。"""
-    return normalize_node_type(node_type) in _MYSQL_NODE_TYPES
+    return (node_type or "").strip().lower() in _MARIADB_NODE_TYPES
 
 
 def node_family(node_type):
     """把部署形态归一到引擎族：mariadb / mysql / 原值。用于同集群「同构」校验。"""
-    nt = normalize_node_type(node_type)
+    nt = (node_type or "").strip().lower()
     if nt in _MARIADB_NODE_TYPES:
         return "mariadb"
-    if nt in _MYSQL_NODE_TYPES:
+    if nt in (NT_DOCKER, "mysql", "mysql-docker"):
         return "mysql"
     return nt
 
@@ -173,7 +151,7 @@ def default_auth_plugin(version_str=None, node_type=None, prefer="auto"):
         # 版本未知：MariaDB 节点（裸机/容器）可凭 node_type 判定；其余沿用既有行为
         if is_mariadb_node(node_type):
             return "mysql_native_password"
-        # 容器 MySQL（mysql-docker）节点固定 MySQL 8.0，但小版本未知（可能 < 8.0.34），不敢冒进改插件
+        # docker 节点固定 MySQL 8.0，但小版本未知（可能 < 8.0.34），不敢冒进改插件
         return "mysql_native_password"
     if is_mariadb(version_str):
         return "mysql_native_password"
@@ -196,15 +174,14 @@ def identify_clause(plugin, password, mariadb=False):
 def flavour_from_node_type(node_type):
     """把库里的 node_type 映射到 flavour（无连库时可用，作为 fallback）。
 
-    node_type: mysql(MySQL8 裸机) / mysql-docker(MySQL8 容器) / mariadb(MariaDB 裸机) / mariadb-docker(MariaDB 容器)
-    历史别名 docker/mysql8/mysql8-docker 经 normalize 后同样归一到上述规范名。
-    注：容器/裸机 MySQL 固定为 MySQL 8.0；两种 MariaDB 形态都是 MariaDB（独立 GTID 机制，与 MySQL 不兼容）。
+    node_type: docker(MySQL8 容器) / mariadb(MariaDB 裸机) / mariadb-docker(MariaDB 容器)
+    注：docker 节点固定为 MySQL 8.0；两种 MariaDB 形态都是 MariaDB（独立 GTID 机制，与 MySQL 不兼容）。
     真实 flavour 仍建议连库 detect_flavour 确认。
     """
-    nt = normalize_node_type(node_type)
+    nt = (node_type or "").lower()
     if nt in _MARIADB_NODE_TYPES:
         return F_MARIADB
-    if nt in _MYSQL_NODE_TYPES:
+    if nt == NT_DOCKER:
         return F_MYSQL8
     return F_OLD
 

@@ -217,9 +217,9 @@ def _dump_database(conn, cur, w, db, with_data: bool,
     # 单独开一个连接专供数据流式导出，避免与上面的元数据游标争用同一连接。
     # v2.3.2：若调用方传入 data_conn（一致性快照事务连接），则**复用它**——
     # 每个库各自开连接会让各库落在不同时点的快照上，跨库数据依旧不一致。
-    # ⚠ 关键：传入的 data_conn 由调用方（run_backup）统一提交/关闭，**绝不可在此关闭**，
+    # 关键：传入的 data_conn 由调用方（run_backup）统一提交/关闭，**绝不可在此关闭**，
     # 否则第一个库导出完就关掉共享快照连接，后续库的 SSCursor 建在已关闭连接上抛异常，
-    # 被逐个表的 except 吞掉 → 只写结构不写数据（"只备份了空表"）。
+    # 被逐个表的 except 吞掉 -> 只写结构不写数据（"只备份了空表"）。
     sconn = None
     _own_sconn = False
     if with_data:

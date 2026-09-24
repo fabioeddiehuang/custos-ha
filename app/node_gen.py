@@ -24,7 +24,7 @@ from pathlib import Path
 import pymysql
 
 from .db import get_setting, query, execute
-from .mysql_compat import default_auth_plugin, is_mariadb_node, normalize_node_type, is_mysql_node
+from .mysql_compat import default_auth_plugin, is_mariadb_node
 from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, is_semi_sync_enabled
 from . import mariadb_matrix
 from . import crypto as _crypto
@@ -171,6 +171,30 @@ def get_next_server_id():
     except Exception:
         pass
     return base + 1
+
+
+def server_id_conflict(sid, exclude_ip=None, exclude_port=None):
+    """检查 server_id 是否已被**其他**节点占用；被占用返回占用者 "ip:port"，空闲返回 None。
+
+    用于自定义 server_id 的撞 id 防护：server_id 在复制拓扑里必须全局唯一，
+    两个节点撞 id 会导致 GTID 混乱（从库认错事务来源、复制反复中断）。
+    exclude_ip/port 用于排除「节点自身」，使同一节点重新生成时不算冲突。
+    """
+    try:
+        sid = int(sid)
+    except (TypeError, ValueError):
+        return None
+    for tbl, hcol in (("nodes", "ip"), ("hosts", "host")):
+        try:
+            rows = query("SELECT %s AS h, port FROM %s WHERE server_id=%%s" % (hcol, tbl), (sid,))
+        except Exception:
+            continue
+        for r in rows or []:
+            if exclude_ip is not None and str(r.get("h")) == str(exclude_ip) \
+                    and int(r.get("port") or 0) == int(exclude_port or 0):
+                continue
+            return "%s:%s" % (r.get("h"), r.get("port"))
+    return None
 
 
 def _peer_ips(self_ip, cluster_id):
@@ -579,83 +603,6 @@ def render_mariadb_my_cnf(server_id, port, gtid_domain_id=None, data_dir="/data/
     return _inject_semisync(_cnf)
 
 
-def render_mysql_my_cnf(server_id, port, data_dir=MYSQL_DOCKER_DATA_DIR, install_dir="/opt/mysql"):
-    """生成 MySQL 8.0 裸机节点的【完整 my.cnf】（非片段，可直接用）。
-
-    MySQL 的 GTID 机制与 MariaDB 根本不兼容：MySQL 用 gtid_mode=ON + enforce_gtid_consistency=ON
-    （无 gtid_domain_id 概念），复制挂载用 MASTER_AUTO_POSITION=1。
-    该文件由 Install-ha-mysql8-Node.sh 在节点上全量落盘，保证配置一致性。
-
-    ⚠ datadir 默认值必须与 Install-ha-mysql8-Node.sh 的 DATA_DIR 默认值【完全一致】
-    （同为 /data/custos-ha/mysql8）：log_error 由 datadir 基名推导
-    （/data/custos-ha/logs/mysql8），两者一旦不一致就会出现「my.cnf 指向的日志目录
-    不存在 / mysqld 因无法写 error.log 起不来」，或「prepare-logs.sh 建的目录与真实
-    日志目录不是同一个」——排错时按统一路径找不到日志。
-    """
-    _cnf = (
-        "# ---- Custos 生成的 MySQL 8.0 节点配置（完整 my.cnf，Install 脚本落盘）----\n"
-        "[mysqld]\n"
-        f"server-id = {server_id}\n"
-        "# MySQL 8.0 原生 GTID：开启 gtid_mode + 强制一致性（无 gtid_domain_id 概念）\n"
-        "gtid_mode = ON\n"
-        "enforce_gtid_consistency = ON\n"
-        "log_bin = mysql-bin\n"
-        "log_slave_updates = ON\n"
-        "relay_log = relay-bin\n"
-        "relay_log_recovery = ON\n"
-        "binlog_format = ROW\n# binlog 清理：避免复制 binlog 无限累积撑爆 /data（历史版本未设导致磁盘告警）\n# MySQL 8.0 必须用 binlog_expire_logs_seconds(7 天=604800s)：expire_logs_days 已废弃，\n# 且二者运行时互斥（binlog_expire_logs_seconds 默认 2592000 非 0 时 SET expire_logs_days 会被 3683 拒绝）\nbinlog_expire_logs_seconds = 604800\nmax_binlog_size = 256M\n"
-        "binlog_row_image = FULL\n"
-        # ⚠ 静态配置只写 read_only，**绝不能**写 super_read_only=ON：
-        # super_read_only 会连 SUPER 用户（root）一起拒绝写入，导致安装脚本的
-        # init.sql（CREATE USER / CREATE DATABASE）全部报 1290，节点账号建不出来、
-        # 管理器永远连不上。从库只读由 ha_client.set_read_only() 在运行时按需开
-        # （MySQL 上它会先关 super_read_only 再关 read_only），不由静态配置固定。
-        "read_only = ON\n"
-        "# 复制/性能（与 docker 节点保持一致，避免单节点复制延迟累积）\n"
-        "innodb_buffer_pool_size = 320M\n"
-        "innodb_io_capacity = 2000\n"
-        "innodb_io_capacity_max = 4000\n"
-        "slave_parallel_workers = 4\n"
-        "slave_preserve_commit_order = ON\n"
-        + _MEMORY_CNF_BLOCK_MYSQL + _IO_TUNE_BLOCK_MYSQL +
-        "# 慢日志（供观测/排错）\n"
-        "slow_query_log = 1\n"
-        "long_query_time = 0.5\n"
-        "log_output = TABLE\n"
-        "log_queries_not_using_indexes = 0\n"
-        f"log_error = {_log_dir_host(data_dir)}/error.log\n"
-        "secure_file_priv = ''\n"
-        f"port = {port}\n"
-        f"datadir = {data_dir}\n"
-        f"socket = {data_dir}/mysql.sock\n"
-        f"pid_file = {data_dir}/mysqld.pid\n"
-        "bind_address = 0.0.0.0\n"
-        "skip-name-resolve\n"
-        "# 字符集\n"
-        "character_set_server = utf8mb4\n"
-        "collation_server = utf8mb4_general_ci\n"
-        "\n"
-        "# 客户端默认连接参数\n"
-        "[client]\n"
-        f"port = {port}\n"
-        f"socket = {data_dir}/mysql.sock\n"
-        "default-character-set = utf8mb4\n"
-    )
-    return _inject_semisync_mysql(_cnf)
-
-
-def _inject_semisync_mysql(cnf):
-    """MySQL 半同步注入（若项目启用 SEMI_SYNC=1）。MySQL 8.0 用 rpl_semi_sync_* 插件。"""
-    try:
-        if str(get_setting("SEMI_SYNC")).strip() == "1":
-            blk = _semisync_block_mysql(None) or ""
-            if blk:
-                cnf = cnf.replace("[mysqld]\n", "[mysqld]\n" + blk, 1)
-    except Exception:
-        pass
-    return cnf
-
-
 def render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=None):
     """容器化 MariaDB 节点的配置片段（docker-my.cnf，由 Install 脚本挂载进容器）。
 
@@ -1040,8 +987,7 @@ def render_prepare_logs(node_type, log_dir):
     必须执行：compose 挂载的宿主目录由 root 自动创建(0755 root:root)，容器内 mysqld 以
     mysql(uid 999) 运行，无权写 error.log —— 表现为 mysqld 起不来或日志恒为空。
     """
-    # 裸机形态（MariaDB 裸机 / MySQL 8.0 裸机）：mysqld 以宿主系统用户 mysql 运行。
-    if node_type in ("mariadb", "mysql"):
+    if node_type == "mariadb":
         chown_line = 'if id -u mysql >/dev/null 2>&1; then chown -R mysql:mysql "$LOG_DIR"; fi'
         who = "mysql（系统用户，不存在则跳过 chown）"
     else:
@@ -1364,7 +1310,7 @@ def regenerate_cluster_compose(cluster_id):
         (cluster_id,))
     for r in rows:
         ip = r["ip"]
-        node_type = r.get("node_type") or "mariadb-docker"
+        node_type = r.get("node_type") or "docker"
         kd = _safe_node_path(ip) / "keepalived"
         if not kd.exists():
             continue
@@ -1403,18 +1349,10 @@ def regenerate_cluster_compose(cluster_id):
         if is_mariadb_node(node_type):
             # 两种 MariaDB 形态的 compose 都只含 keepalived 客户端
             content = render_baremetal_compose(node_name, vip_port)
-        elif node_type == "mysql":
-            # 裸机 MySQL 8.0 同样是 keepalived-only（mysqld 由宿主 systemd 提供），
-            # 不能走下面的 _render_compose（那是含 MySQL 容器的 docker 形态）。
-            content = render_baremetal_compose(node_name, vip_port, data_dir=MYSQL_DOCKER_DATA_DIR)
-            # 同步刷新裸机 my.cnf（server_id / port / 日志路径随集群配置变化）
-            _write(kd.parent / MYSQL_NODE_CONF_DIR / "conf" / "my.cnf",
-                   render_mysql_my_cnf(int(r.get("server_id") or 0), int(r.get("port") or 3306)), mode=0o644)
         else:
             content = _render_compose(
                 node_name, r.get("root_pass") or "", int(r["port"]),
                 int(r.get("server_id") or 0), vip_port)
-            # 慢日志覆盖片段：仅容器 MySQL 挂载生效；裸机形态不生成（避免误导）
             _write(kd.parent / MYSQL_NODE_CONF_DIR / "conf" / "ha-overrides.cnf", render_docker_my_cnf(r.get("mysql_version"), int(r.get("port") or 3306)), mode=0o644)
         _write(p, content)
         # sync node agent script (OS metrics sidecar deployed with node compose)
@@ -1477,7 +1415,7 @@ def _db_service(node_type):
     """compose 中数据库服务的服务名；裸机形态返回 None（由 systemd 管理，不在 compose 内）。"""
     if node_type == "mariadb-docker":
         return "mariadb"
-    if node_type in ("mysql-docker", "docker", "mysql8-docker", ""):
+    if node_type in ("docker", "mysql", "mysql-docker", ""):
         return "mysql"
     return None
 
@@ -1896,8 +1834,7 @@ def verify_pending_all():
 
 
 def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None,
-                  node_type="mariadb-docker", mysql_version=None, gtid_domain_id=None, adopt=False):
-    node_type = normalize_node_type(node_type)
+                  node_type="docker", mysql_version=None, server_id=None):
     ip = (ip or "").strip()
     if not ip:
         raise ValueError("节点 IP 不能为空")
@@ -1950,20 +1887,35 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     vip_port = creds.get("vip_port") or VIP_PORT
     manager_public_ip = get_manager_public_ip()
     manager_subnet = get_manager_docker_subnet_wildcard()
-    server_id = get_next_server_id()
-    # 【修复 2026-09-24】server_id 必须与该节点自身的 GTID 历史保持一致。
-    # 同一节点(ip+port)重新生成配置时若换成新的 server_id，其 data 目录里原有的
-    # GTID（domain / server 取自旧 server_id）会与新 domain 混杂，主从随即报
-    #   1236 '... missing the GTID x-y-N requested by the slave
-    #         (even though both a prior and a subsequent sequence number does exist)'
-    # —— 即主库 binlog 出现「空洞」。故已存在的节点一律复用原 server_id，
-    #    只有在首次添加（nodes 表无记录）时才分配新的。
-    try:
-        _rows = query("SELECT server_id FROM nodes WHERE ip=%s AND port=%s", (ip, int(port)))
-        if _rows and _rows[0].get("server_id"):
-            server_id = int(_rows[0]["server_id"])
-    except Exception:
-        pass
+    # ---- server_id：支持页面自定义，规避「自动分配撞 id」的风险 ----
+    # 自定义值必须全局唯一（复制拓扑里撞 id 会导致 GTID 混乱、复制反复中断），
+    # 故先做范围与占用校验；未填则沿用原策略。
+    if server_id not in (None, "", 0):
+        try:
+            _sid = int(server_id)
+        except (TypeError, ValueError):
+            raise ValueError("server_id 必须是整数，收到 %r" % (server_id,))
+        if _sid < 1 or _sid > 4294967295:
+            raise ValueError("server_id 必须落在 1~4294967295（MySQL/MariaDB 合法范围）")
+        _used = server_id_conflict(_sid, exclude_ip=ip, exclude_port=port)
+        if _used:
+            raise ValueError("server_id %d 已被节点 %s 占用，请换一个" % (_sid, _used))
+        server_id = _sid
+    else:
+        server_id = get_next_server_id()
+        # 【修复 2026-09-24】server_id 必须与该节点自身的 GTID 历史保持一致。
+        # 同一节点(ip+port)重新生成配置时若换成新的 server_id，其 data 目录里原有的
+        # GTID（domain / server 取自旧 server_id）会与新 domain 混杂，主从随即报
+        #   1236 '... missing the GTID x-y-N requested by the slave
+        #         (even though both a prior and a subsequent sequence number does exist)'
+        # —— 即主库 binlog 出现「空洞」。故已存在的节点一律复用原 server_id，
+        #    只有在首次添加（nodes 表无记录）时才分配新的。
+        try:
+            _rows = query("SELECT server_id FROM nodes WHERE ip=%s AND port=%s", (ip, int(port)))
+            if _rows and _rows[0].get("server_id"):
+                server_id = int(_rows[0]["server_id"])
+        except Exception:
+            pass
     node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
     peers = _peer_ips(ip, cluster_id)
     # MariaDB 两种形态（裸机 / 容器 host 网络）的 keepalived 容器都在 host 网络，
@@ -1980,16 +1932,10 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     kd.mkdir(parents=True, exist_ok=True)
 
     # 1) init.sql / compose（按节点类型分支）
-    # adopt 模式（v2.4.1 接管）：旧节点已自带数据库，仅部署 Custos sidecar（agent + keepalived
-    # 漂移 Custos VIP），不写 init.sql / 不跑 Install 脚本 / 不生成数据库 my.cnf。
     init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
                                 auth_plugin=_auth_plugin_for(mysql_version, node_type))
     extra_files = {}
-    if adopt:
-        # 接管 sidecar：复用 keepalived-only compose（host 网络漂移 VIP），DB 由旧集群自带。
-        # init.sql / Install 脚本 / 数据库 my.cnf 一律不生成；compose 在下方 5) 统一生成。
-        pass
-    elif is_mariadb_node(node_type):
+    if is_mariadb_node(node_type):
         # MariaDB 两种形态（裸机 / 容器）共用：init_mariadb.sql + fix-node-creds.sql。
         # 差异仅在「配置文件」与「部署脚本」，故此处先写公共部分，再按形态分支。
         _write(d / MARIADB_NODE_CONF_DIR / "conf" / "init_mariadb.sql", render_mariadb_init_sql(
@@ -2000,15 +1946,14 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             manager_subnet)
         _write(d / MARIADB_NODE_CONF_DIR / "conf" / "fix-node-creds.sql", fix_sql, mode=0o644)
         extra_files["init_mariadb_sql"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/conf/init_mariadb.sql"
-        # gtid_domain_id 显式指定为非 0 值：默认与 server_id 一致；v2.4.1 接管可外部传入旧集群
-        # domain_id 以继承（避免 ha_client 按单域比较 GTID 误判提升/丢数）。
-        _domain = gtid_domain_id if gtid_domain_id is not None else server_id
+        # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
+        # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
         if node_type == "mariadb-docker":
             # 容器化 MariaDB：纯 compose 部署（render_mariadb_compose 已含 mariadb + keepalived），
             # 故只交付配置片段（不含 datadir/socket）+ 卸载脚本，不再生成安装脚本
             # （部署入口即 docker compose up -d）；安装脚本仅作「裸机装不上 tarball」回退在裸机分支交付。
             _write(d / MARIADB_NODE_CONF_DIR / "conf" / "docker-my.cnf",
-                   render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=_domain),
+                   render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=server_id),
                    mode=0o644)
             extra_files["docker_my_cnf"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/conf/docker-my.cnf"
             extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-docker-Node.sh"
@@ -2018,43 +1963,30 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         else:
             # 裸机 MariaDB：完全独立安装，由 Install 脚本全量安装 tarball。
             # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
-            my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=_domain)
+            my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=server_id)
             _write(d / MARIADB_NODE_CONF_DIR / "conf" / "my.cnf", my_cnf, mode=0o644)
             extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/conf/my.cnf"
             extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/scripts/Install-ha-mariadb-Node.sh"
             extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-Node.sh"
+            # 裸机包【只适配裸机】：不再交付 Install-mariadb-docker-Node.sh 容器回退脚本。
+            # 原因：该脚本把裸机完整 my.cnf（仅剔除 datadir/socket/pid_file）喂给官方镜像容器，
+            # 残留裸机专属参数（缺失 log_error → 官方镜像默认写 stdout，管理器「错误日志」
+            # 面板读不到恒为空；buffer pool 1G 等），且部署机制分裂为
+            # 「docker run --network host + keepalived-only compose」，与 mariadb-docker 的
+            # 纯 compose 形成两条并存路径，必然再次漂移。
+            # 需要容器化（如 glibc 过低装不上 tarball）时，创建节点直接选 mariadb-docker 即可：
+            # node_family 允许两种 MariaDB 形态同集群混部，且数据目录同为
+            # /data/custos-ha/mariadb12，既有回退安装可无损迁移到纯 compose。
             for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh"):
                 src = NODE_SCRIPTS / sf
                 if src.exists():
                     _write(d / MARIADB_NODE_CONF_DIR / "scripts" / sf, src.read_text(), mode=0o755)
     else:
-        # MySQL 家族：容器(mysql-docker，旧名 docker/mysql8-docker) 或 裸机(mysql，旧名 mysql8)
         # init.sql 会被 MySQL 容器以非 root 的 mysql 用户读取执行，
         # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。
         _write(d / MYSQL_NODE_CONF_DIR / "conf" / "init.sql", init_sql, mode=0o644)
-        if node_type == "mysql":
-            # 裸机 MySQL 8.0：完整 my.cnf（Install 脚本落盘）+ 安装脚本。
-            # ⚠ 不生成 ha-overrides.cnf：那是「容器 MySQL 挂载进 /etc/mysql/conf.d」的
-            # 慢日志覆盖片段，裸机形态无人挂载、也不生效，留着只会让人误以为它生效
-            # （或误改它以为能改配置）。裸机的慢日志/日志路径全部在 conf/my.cnf 里。
-            my_cnf = render_mysql_my_cnf(server_id, port)
-            _write(d / MYSQL_NODE_CONF_DIR / "conf" / "my.cnf", my_cnf, mode=0o644)
-            extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/{MYSQL_NODE_CONF_DIR}/conf/my.cnf"
-            extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/{MYSQL_NODE_CONF_DIR}/scripts/Install-ha-mysql8-Node.sh"
-            extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/{MYSQL_NODE_CONF_DIR}/scripts/Uninstall-mysql8-Node.sh"
-            for sf in ("Install-ha-mysql8-Node.sh", "Uninstall-mysql8-Node.sh"):
-                src = NODE_SCRIPTS / sf
-                if src.exists():
-                    _write(d / MYSQL_NODE_CONF_DIR / "scripts" / sf, src.read_text(), mode=0o755)
-        else:
-            # 容器 MySQL（mysql-docker，旧名 docker/mysql8-docker）：纯 compose，不交付安装脚本。
-            # ha-overrides.cnf 由 compose 挂载到 /etc/mysql/conf.d/ 生效（慢日志 + 半同步）；
-            # docker-my.cnf 是同一份内容的可读副本，便于人工核对。
-            _write(d / MYSQL_NODE_CONF_DIR / "conf" / "ha-overrides.cnf",
-                   render_docker_my_cnf(mysql_version, port), mode=0o644)
-            _write(d / MYSQL_NODE_CONF_DIR / "conf" / "docker-my.cnf",
-                   render_docker_my_cnf(mysql_version, port), mode=0o644)
-            extra_files["docker_my_cnf"] = f"{NODES_HOST_BASE}/{ip}/{MYSQL_NODE_CONF_DIR}/conf/docker-my.cnf"
+        # 慢日志覆盖配置（挂载到容器 /etc/mysql/conf.d）
+        _write(d / MYSQL_NODE_CONF_DIR / "conf" / "ha-overrides.cnf", render_docker_my_cnf(mysql_version, port), mode=0o644)
 
     # 2) keepalived.conf
     keep_conf = _render_keepalived_conf(
@@ -2113,31 +2045,18 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     #    MariaDB 裸机（mariadb）：compose 只跑 keepalived 客户端（mysqld 由宿主 systemd 起）；
     #    MariaDB 容器化（mariadb-docker）：纯 compose（mariadb + keepalived 合一）；
     #    仅 MySQL Docker 才在 compose 内单独含 MySQL 容器。
-    if node_type == "mariadb" or node_type == "mysql" or adopt:
-        # 裸机 MariaDB / 裸机 MySQL 8.0 / 接管(adopt)：compose 只跑 keepalived 客户端，
-        # 数据库由宿主 systemd 或旧集群自带；容器 MariaDB 走 render_mariadb_compose。
-        # ⚠ data_dir 必须按形态传：keepalived/agent 容器的日志卷由它推导，
-        # 否则裸机 MySQL 8.0 会误挂到 /data/custos-ha/logs/mariadb（日志落错目录）。
-        if node_type == "mariadb":
-            _bm_data_dir = "/data/custos-ha/mariadb"
-        elif node_type == "mariadb-docker":
-            _bm_data_dir = MARIADB_DOCKER_DATA_DIR
-        else:
-            # mysql（裸机，旧名 mysql8）/ docker / mysql8-docker（接管旧集群）
-            _bm_data_dir = MYSQL_DOCKER_DATA_DIR
-        compose = render_baremetal_compose(node_name, vip_port, data_dir=_bm_data_dir)
+    if node_type == "mariadb":
+        compose = render_baremetal_compose(node_name, vip_port)
     elif node_type == "mariadb-docker":
         compose = render_mariadb_compose(node_name, root_pass, port, server_id, vip_port)
     else:
-        # 容器 MySQL（mysql-docker，旧名 docker/mysql8-docker）：compose 内单独含 MySQL 容器 + keepalived。
         compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
     _write(d / "docker-compose.yaml", compose)
 
     # 5.5) 统一日志目录：logrotate 配置 + 目录初始化脚本（三形态一致）
     #      排错时按固定路径 /data/custos-ha/logs/<基名>/ 找日志，不再逐个形态猜。
     _data_dir_for_log = {
-        "mariadb": "/data/custos-ha/mariadb",    # 裸机默认（与 render_mariadb_my_cnf 默认值一致）
-        "mysql": MYSQL_DOCKER_DATA_DIR,          # 裸机 MySQL 8.0 默认（与 render_mysql_my_cnf 默认值一致）
+        "mariadb": "/data/mariadb",              # 裸机默认（与 render_mariadb_my_cnf 默认值一致）
         "mariadb-docker": MARIADB_DOCKER_DATA_DIR,
     }.get(node_type, MYSQL_DOCKER_DATA_DIR)
     conf_dir = _node_conf_dir(node_type)
@@ -2322,7 +2241,7 @@ def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_r
             port = int(n["port"])
             root_user = n.get("root_user") or "root"
             root_pass = n.get("root_pass") or ""
-            node_type = n.get("node_type") or "mariadb-docker"
+            node_type = n.get("node_type") or "docker"
             mysql_version = n.get("mysql_version") or ""
 
             # 只读副本：账号密码由主库经复制自动同步，严禁在副本上直接执行

@@ -378,25 +378,6 @@ def init_schema():
                     c.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_def}")
                 except Exception:
                     pass
-            # ---- v2.4.1：旧集群接管任务（与 migration_tasks 独立，互不污染）----
-            # config 为加密 JSON（含旧集群主库凭据与接管参数）；steps 为各阶段状态 JSON。
-            try:
-                c.execute("""CREATE TABLE IF NOT EXISTS takeover_tasks (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(128) NOT NULL DEFAULT '未命名接管',
-                    mode VARCHAR(8) NOT NULL DEFAULT 'A',
-                    status VARCHAR(16) NOT NULL DEFAULT 'draft',
-                    config MEDIUMBLOB,
-                    steps MEDIUMTEXT,
-                    log MEDIUMTEXT,
-                    progress TINYINT UNSIGNED NOT NULL DEFAULT 0,
-                    stage VARCHAR(255) NOT NULL DEFAULT '',
-                    created_at DATETIME,
-                    updated_at DATETIME,
-                    INDEX idx_status (status)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
-            except Exception as e:
-                print(f"[init_db] 创建 takeover_tasks 表失败(可忽略): {e}")
             # ---- v2.3.0：节点「配置待生效」提示 ----
             # gen_fingerprint：最近一次生成的部署文件指纹（路径+内容），用于判断配置是否又变了
             # pending_actions：regen 后需在节点执行的动作清单（JSON，空串=无待办）
@@ -411,11 +392,11 @@ def init_schema():
                 except Exception:
                     pass
             # ---- v2.1：节点/集群支持裸机（node_type）与 MySQL 大版本（mysql_version）----
-            # 默认 node_type='mariadb-docker'（容器化 MariaDB）；mysql_version=NULL 表示沿用旧复制语法。
+            # 默认 node_type='docker' 行为完全不变；mysql_version=NULL 表示沿用旧复制语法。
             for _tbl, _col, _def in (
-                ("nodes", "node_type", "varchar(16) NOT NULL DEFAULT 'mariadb-docker'"),
+                ("nodes", "node_type", "varchar(16) NOT NULL DEFAULT 'docker'"),
                 ("nodes", "mysql_version", "varchar(16) DEFAULT NULL"),
-                ("clusters", "node_type", "varchar(16) NOT NULL DEFAULT 'mariadb-docker'"),
+                ("clusters", "node_type", "varchar(16) NOT NULL DEFAULT 'docker'"),
                 ("clusters", "mysql_version", "varchar(16) DEFAULT NULL"),
             ):
                 try:
