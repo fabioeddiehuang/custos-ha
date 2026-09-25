@@ -98,7 +98,7 @@ def test_semisync_naming_is_master_slave_for_all_mariadb():
 
 
 def test_server_privileges_probes_real_names():
-    cur = __import__("tests.conftest", fromlist=["FakeCursor"]).FakeCursor()
+    cur = __import__("regression.conftest", fromlist=["FakeCursor"]).FakeCursor()
     cur.add("SHOW PRIVILEGES", [("REPLICATION SLAVE",), ("BINLOG ADMIN",), ("SELECT",)])
     out = mm.server_privileges(cur)
     assert out == {"REPLICATION SLAVE", "BINLOG ADMIN", "SELECT"}

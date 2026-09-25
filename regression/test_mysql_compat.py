@@ -5,7 +5,7 @@ MySQL 8.0 与 MariaDB 两条复制路径的**共享分派层**，改 MariaDB 极
 本文件同时构造两套输入，确保同一逻辑在两条路径都不回归（双路径回归）。
 """
 from app import mysql_compat as mc
-from tests.conftest import FakeCursor
+from regression.conftest import FakeCursor
 
 
 # ---------------------------------------------------------------- 版本/风味判定
