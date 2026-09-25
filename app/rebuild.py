@@ -13,7 +13,7 @@
 2. 目标从库 STOP SLAVE，断开复制
 3. 对主库执行 dump（backup.run_backup）
 4. 恢复到目标从库（restore_backup，关闭会话 binlog 避免污染 GTID）
-5. make_slave_of 重新挂载（GTID 自动定位；分叉由其内部判断处理）
+5. make_slave_of 重新挂载（GTID 自动定位；不一致由其内部判断处理）
 6. 回查复制线程状态
 
 安全约束（改动前务必读）
@@ -22,7 +22,7 @@
   擅自清空本机 GTID 会让主库重放同名事务，引发 1007/1062 使 SQL 线程停摆。
 - 重建目标禁止是当前主库 —— 那等于用主库数据覆盖主库本身，会抹掉整个集群数据。
 - 恢复必须 SET sql_log_bin=0：否则从库 binlog 产生新 GTID 集合，与主库历史
-  GTID 冲突，重链时被判分叉并触发 RESET MASTER（见 backup.restore_backup）。
+  GTID 冲突，重链时被判不一致并触发 RESET MASTER（见 backup.restore_backup）。
 """
 import threading
 import time
@@ -316,7 +316,7 @@ def _run(task_id, cluster_id, host, port):
         # 的全量导出，直接用主库【当前 binlog 文件+位点】做坐标续传即可，不再依赖历史。
         if io != "Yes" and is_gtid_purged_error(io_err):
             # ① 先用【主库当前 GTID 位点】重新对齐再拉起 IO 线程。
-            #    位点可能被 make_slave_of 的分叉处理（RESET MASTER）冲掉，或导出期间
+            #    位点可能被 make_slave_of 的不一致处理（RESET MASTER）冲掉，或导出期间
             #    主库又切换过，故这里重新取一次主库位点。
             _flv2, _mgtid2 = _gtid_state(m_host, m_port, mru, mrp)
             if _mgtid2 and flavour == "mariadb":

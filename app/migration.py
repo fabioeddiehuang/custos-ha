@@ -1034,7 +1034,7 @@ def force_clear_node(host, port, clear_tasks=True):
     if is_target_locked(host, port):
         unlock_target(host, port)
         info["unlocked"] = True
-    # 2) 清指向该节点的 running 任务（并清内存集合，避免孤儿线程干扰 cleanup_stale）
+    # 2) 清指向该节点的 running 任务（并清内存集合，避免残留线程干扰 cleanup_stale）
     if clear_tasks:
         try:
             rows = query("SELECT id, config FROM migration_tasks WHERE status='running'")
@@ -1066,7 +1066,7 @@ def _has_live_migration_task(host, port):
     """是否存在指向该节点、且【确实有后台线程在跑】的迁移任务。
 
     为什么必须同时校验内存集合 _RUNNING：migration_tasks.status='running' 只是数据库
-    记录，管理器重启 / 线程异常退出后记录会残留成【孤儿任务】。若只认 status，节点会被
+    记录，管理器重启 / 线程异常退出后记录会残留成【无活线程的任务记录】。若只认 status，节点会被
     永久判定为「迁移中」，而 failover.ensure_topology 会跳过迁移中节点的复制维护，
     结果是【该节点再也建不上主从】（2026-09-23「容器版 MariaDB 无法主从」的根因）。
     _RUNNING 是内存集合、随线程启动写入、重启即空，正好等价于"真的在跑"。
@@ -1078,7 +1078,7 @@ def _has_live_migration_task(host, port):
     for r in rows:
         try:
             if int(r.get("id")) not in _RUNNING:
-                continue          # 孤儿任务：没有活线程，不算数
+                continue          # 残留任务记录：没有活线程，不算数
         except (TypeError, ValueError):
             continue
         try:
@@ -1126,7 +1126,7 @@ def is_target_locked(host, port):
     # ⚠ 这里【绝不能】调用 is_node_migrating()：它反过来会调 is_target_locked()，
     #   二者互相递归 → RecursionError → 被下面的 except 吞掉 ⇒ 整个兜底静默失效。
     # ⚠ 且必须要求任务「真有活线程」：只认 status='running' 会让管理器重启/线程异常
-    #   留下的孤儿任务把节点永久锁死 → ensure_topology 永久跳过 → 再也建不上主从。
+    #   留下的残留任务记录把节点永久锁死 → ensure_topology 永久跳过 → 再也建不上主从。
     try:
         if _has_live_migration_task(host, port):
             return True
@@ -1138,13 +1138,13 @@ def is_target_locked(host, port):
 def is_node_migrating(host, port):
     """该节点是否正处于迁移中（目标被锁定，或存在指向它的进行中迁移任务）。
 
-    供 monitor 正确展示「迁移中」状态、避免把 seed/桥接/追平期的节点误判为离线/数据分叉。
+    供 monitor 正确展示「迁移中」状态、避免把 seed/桥接/追平期的节点误判为离线/数据不一致。
     优先用内存锁（快），并兜底查 running 任务（覆盖锁未设的窗口，如 seed 刚开始瞬间）。
     """
     if is_target_locked(host, port):
         return True
     # 覆盖「锁还没落库」的窗口（如 seed 刚开始的瞬间）。
-    # 注意：只认【有活线程】的任务，孤儿 running 任务不再让节点永远显示/停留在迁移中。
+    # 注意：只认【有活线程】的任务，残留的 running 任务记录不再让节点永远显示/停留在迁移中。
     return _has_live_migration_task(host, port)
 
 

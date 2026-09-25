@@ -202,7 +202,7 @@ refreshCsBadge();
           {% elif r.repl_state == 'orphan' %}
             <span class="pill warn">● 脱管异常</span>
           {% elif r.repl_state == 'repl_fork' %}
-            <span class="pill down" title="复制线程正常但上游并非当前主库：正从幽灵/旧主拉数据，存在静默数据分叉，管理器将自动重指">● 数据分叉</span>
+            <span class="pill down" title="复制线程正常但上游并非当前主库：正从幽灵/旧主拉数据，存在静默数据不一致，管理器将自动重指">● 数据不一致</span>
             {% if r.upstream %}<div class="repl-link">← {{ r.upstream }}(非当前主)</div>{% endif %}
           {% elif r.repl_state == 'migrating' %}
             <span class="pill" style="color:var(--accent,#0ABAB5);border-color:var(--accent,#0ABAB5)">● 迁移中</span>
@@ -1037,13 +1037,13 @@ refreshCsBadge();
             : '<div style="padding:14px;border-radius:8px;background:#ffb02014;border:1px solid #ffb02044;color:#ffd479;">本次未发现【已确认】差异，但结论不是「一致」——原因见上方判定说明。</div>';
         } else {
           h += '<div style="padding:10px 12px;border-radius:8px;background:#ff6b6b14;border:1px solid #ff6b6b44;margin-bottom:10px;">'
-            + '⚠ 发现 '+d.length+' 处<b>已确认</b>差异（<span style="color:#ff6b6b;">红=从库独有孤儿行，疑似真实写入，需回灌主库</span>；<span style="color:#ffb020;">黄=从库缺失</span>）</div>'
+            + '⚠ 发现 '+d.length+' 处<b>已确认</b>差异（<span style="color:#ff6b6b;">红=从库独有行（主库没有），疑似真实写入，需回灌主库</span>；<span style="color:#ffb020;">黄=从库缺失</span>）</div>'
             + '<table class="tbl" style="width:100%;font-size:12px;"><thead><tr>'
             + '<th>从库</th><th>表</th><th>主库值</th><th>从库值</th><th>分类</th><th>说明</th><th>操作</th></tr></thead><tbody>';
           for(var i=0;i<d.length && i<200;i++){
             var x=d[i];
             var cat=x.category||'';
-            var badge = cat==='orphan' ? '<span style="color:#ff6b6b;font-weight:600;">从库独有·孤儿</span>'
+            var badge = cat==='orphan' ? '<span style="color:#ff6b6b;font-weight:600;">从库独有·残留</span>'
                       : cat==='missing' ? '<span style="color:#ffb020;">从库缺失</span>'
                       : cat==='content' ? '<span style="color:#ff944d;">内容差异</span>'
                       : cat==='table_extra' ? '<span style="color:#ff6b6b;font-weight:600;">从库多表</span>'
@@ -1112,7 +1112,7 @@ refreshCsBadge();
           return s;
         };
         h+=mk(j.only_in_master,'仅在主库（从库缺失）','#ffb020');
-        h+=mk(j.only_in_slave,'仅在从库（孤儿·疑似真实写入）','#ff6b6b');
+        h+=mk(j.only_in_slave,'仅在从库（残留·疑似真实写入）','#ff6b6b');
         b.innerHTML=h;
       }).catch(function(e){ var bb=document.getElementById('csBody'); if(bb) bb.innerHTML='请求失败：'+e; });
   }
@@ -1128,7 +1128,7 @@ refreshCsBadge();
       .then(function(r){return r.json();}).then(function(j){
         if(!j.ok){ b.innerHTML='<div style="color:#ff6b6b;">导出失败：'+(j.error||'未知')+'</div>'; return; }
         if(!j.orphan_rows || !j.orphan_rows.length){
-          b.innerHTML='<div style="padding:12px;border-radius:8px;background:#22d3ee14;border:1px solid #22d3ee33;">该表无非主库侧独有的孤儿行，无需导出。</div>';
+          b.innerHTML='<div style="padding:12px;border-radius:8px;background:#22d3ee14;border:1px solid #22d3ee33;">该表没有主库缺失、仅从库存在的行，无需导出。</div>';
           return;
         }
         var h='<div style="color:#ffd479;margin-bottom:8px;">⚠ 从库独有 '+j.orphan_rows.length+' 行，疑似分裂窗口内的真实写入。<b>推荐先回灌主库</b>，不要直接以主库为准删除。</div>';

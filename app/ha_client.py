@@ -1353,10 +1353,10 @@ def purge_binlog_before(host, port, user, password, dt_str, root_user="root", ro
             pass
 
 
-# ---- vip-guard fencing 状态（2026-09-23 新增）----
+# ---- vip-guard 写入隔离状态（2026-09-23 新增）----
 # _FENCE_FIRST_SEEN: 记录「自认主但无法自愈」节点首次被发现的时间，用于宽限期计时。
 # 宽限期内仅高优告警（吸收网络抖动/瞬时 root 口令失效）；超宽限仍不可纠正则 read_only=ON
-# 封写（管不住就别让它写），杜绝静默分叉。管理器重启会重置（下一周期重新计时，可接受）。
+# 封写（管不住就别让它写），杜绝无人察觉的双写不一致。管理器重启会重置（下一周期重新计时，可接受）。
 import os as _os
 import time as _time
 _VIPGUARD_FENCE_GRACE = float(_os.environ.get("VIPGUARD_FENCE_GRACE", "60"))  # 秒
@@ -1451,7 +1451,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
             # 旧实现只做「拒绝降级」，形成死锁：
             #   状态推送失败 → 本机记录过期 → 守卫拒绝降级 → 记录永远得不到纠正；
             # 后果有两层，且互相放大：
-            #   ① 回归的旧主既不重入集群、又保留自己的 binlog 继续接受写入 → 静默分叉；
+            #   ① 回归的旧主既不重入集群、又保留自己的 binlog 继续接受写入 → 无人察觉的双写不一致；
             #   ② 真主（_target）在 keepalived 那侧也可能因同类过期记录而拒绝持有 VIP
             #      → 两节点同时放弃 → VIP 全网消失（实测现象）。
             # 故此处就地把本机 current_master 纠正为 _target，再复读确认；纠正成功即放行。
@@ -1463,7 +1463,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
             except Exception:
                 _writable = True
             if not _writable:
-                # 已被 fencing 置为只读（read_only=ON）：改造为从库不会让情况更糟，
+                # 已被写入隔离置为只读（read_only=ON）：改造为从库不会让情况更糟，
                 # 反而能让它重新入集群并恢复复制，故放行（保持原语义）。
                 print(f"[vip-guard] {host}:{port} 自认主(ha_local={_rec!r})但已为只读，"
                       f"放行重挂载为 {_target} 的从库以恢复复制。")
@@ -1477,8 +1477,8 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                 #   DELETE/CREATE，**没有 BINLOG ADMIN** ⇒ MariaDB >= 10.5.2 上
                 #   `SET SESSION sql_log_bin=0` 必被 1227 拒绝 ⇒ 自愈必然失败（已实测）。
                 #   后果：守卫永久拒绝降级，回归的旧主既不入集群又保持可写，且 keepalived
-                #   按其过期记录仍把 VIP 绑在它身上 ⇒ 业务写入造成静默分叉；只能等推送器
-                #   最长 PUSH_MAX_INTERVAL=300s 才解开，那时分叉已成事实。
+                #   按其过期记录仍把 VIP 绑在它身上 ⇒ 业务写入造成无人察觉的双写不一致；只能等推送器
+                #   最长 PUSH_MAX_INTERVAL=300s 才解开，那时不一致已成事实。
                 _ok_fix, _ferr = set_local_master_flag_ex(
                     host, port, user, password, _target, root_user, root_pass)
                 _fixed = bool(_ok_fix)
@@ -1489,9 +1489,9 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                     _self_m = False
                 else:
                     print(f"[vip-guard] {host}:{port} 就地纠正本地 current_master 失败：{_ferr}")
-                    # ---- 宽限期后 fencing（2026-09-23 新增）----
+                    # ---- 宽限期后 写入隔离（2026-09-23 新增）----
                     # 就地纠正失败 => 节点处于「自认主但非当前主、且无法自愈」的分裂态，
-                    # 保持可写会继续产生静默分叉。策略：首次发现仅高优告警（宽限期吸收抖动），
+                    # 保持可写会继续产生无人察觉的双写不一致。策略：首次发现仅高优告警（宽限期吸收抖动），
                     # 超宽限仍未自愈则 read_only=ON 封写（管不住就别让它写）。
                     _fk = "%s:%s" % (host, port)
                     _now = _time.time()
@@ -1501,7 +1501,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                         _fenced, _ferr_fence = _fence_readonly(
                             host, port, user, password, root_user, root_pass)
                         if not _fenced:
-                            print(f"[vip-guard] {_fk} fencing 失败：{_ferr_fence}")
+                            print(f"[vip-guard] {_fk} 写入隔离失败：{_ferr_fence}")
         if _self_m and not _addr_eq(_target, host, port):
             msg = (f"[vip-guard] 拒绝把 {host}:{port} 改造为从库：其本机 ha_local.state 仍记录 "
                    f"current_master={_rec!r}（keepalived 据此把 VIP 绑在该节点），与本次要挂载的"
@@ -1512,8 +1512,8 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                    f"（MariaDB >= 10.5.2 执行 SET SESSION sql_log_bin 必需）；"
                    f"③ 管理端记录的该节点 root 口令是否有效（缺 BINLOG ADMIN 时靠它回退）；"
                    f"④ 到该节点的网络连通性。"
-                   f"{(chr(91) + '已触发 fencing：已将该节点 read_only=ON 封写，避免继续静默分叉' + chr(93)) if _fenced else '[宽限期内：尚未封写，将在超限后自动 fencing]'}"
-                   f"{(chr(32) + 'fencing 失败：' + _ferr_fence) if (_fenced is False and _ferr_fence) else ''}。")
+                   f"{(chr(91) + '已触发写入隔离：已将该节点 read_only=ON 封写，避免继续无人察觉的双写不一致' + chr(93)) if _fenced else '[宽限期内：尚未封写，将在超限后自动写入隔离]'}"
+                   f"{(chr(32) + '写入隔离失败：' + _ferr_fence) if (_fenced is False and _ferr_fence) else ''}。")
             print(msg)
             try:
                 from .alerts import send_alert   # 局部导入，避免模块级循环依赖
@@ -1542,7 +1542,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
             if gm is not None and gm != "ON":
                 return False, (f"本节点 gtid_mode={gm}（应为 ON），无法使用 GTID 自动定位。"
                                f"请重新运行 Install-ha-mariadb-Node.sh 开启 GTID 后重入集群。")
-        # ---- GTID 分叉感知（升版重启/历史切换后从库执行集可能超前或分叉于主库）----
+        # ---- GTID 不一致感知（升版重启/历史切换后从库执行集可能超前或偏离主库）----
         # 正常重指向：RESET SLAVE ALL + MASTER_USE_GTID=slave_pos 即可（GTID 自动定位跳过已执行事务）。
         # 但若从库「自有 binlog(gtid_binlog_pos) 或 已应用集(gtid_slave_pos)」不是主库
         # gtid_binlog_pos 的子集（如本例 100 曾为主、自有 binlog 含 3-3-17737，主库却发 3-3-1），
@@ -1552,7 +1552,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
         # （极少见：从库应用过主库没有的事务）才把 gtid_slave_pos 对齐到主库当前位置跳过重放。
         try:
             # MariaDB 不支持 GTID_SUBSET / GTID_SUBTRACT（12.3.3 实测报
-            # 1305 FUNCTION GTID_SUBSET does not exist）。下面这套分叉检测一执行到
+            # 1305 FUNCTION GTID_SUBSET does not exist）。下面这套不一致检测一执行到
             # GTID_SUBSET 就抛异常、被 except 静默吞掉 ⇒ 在 MariaDB 上**从未真正生效**。
             # 但「gtid_slave_pos 为空」时不会调用 GTID_SUBSET，反而会走到 RESET MASTER +
             # 设置起点的分支 ⇒ 原主库（100）被跳过历史、数据永久不一致。
@@ -1560,7 +1560,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
             # 与其依赖「抛异常被吞」这种偶然行为，不如显式跳过：MariaDB 的 GTID 自动定位
             # (MASTER_USE_GTID=slave_pos) 本身即可正确定位位点，无需这套 MySQL 语义逻辑。
             if flavour == F_MARIADB:
-                raise RuntimeError("MariaDB 不支持 GTID_SUBSET，显式跳过分叉检测")
+                raise RuntimeError("MariaDB 不支持 GTID_SUBSET，显式跳过不一致检测")
             cur.execute("SELECT @@gtid_slave_pos, @@gtid_binlog_pos")
             _sr = cur.fetchone() or [None, None]
             _slave_gt = _sr[0] or ""
@@ -1595,7 +1595,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                             #   已应用集为空 ⇒ **不设置**起点，保持为空 ⇒ 从库从头完整重放主库
                             #   binlog，数据必然完整。重放不会因建账号冲突，因为安装脚本用的都是
                             #   CREATE USER IF NOT EXISTS / CREATE DATABASE IF NOT EXISTS。
-                            # 仅当已应用集非空且确实分叉时，才对齐主库当前位点以避免 1236。
+                            # 仅当已应用集非空且确实不一致时，才对齐主库当前位点以避免 1236。
                             # 若主库早期 binlog 已清理，重放会报 1236，由上层自动全量克隆兜底。
                             if _slave_gt and _master_gt:
                                 cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
@@ -1603,9 +1603,9 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                                     # 已应用集为主库子集：保留以免从头重放报 1062
                                     cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
                                 else:
-                                    # 已应用集也分叉：对齐到主库当前位置，跳过重放避免 1236（2.2.20 行为）
+                                    # 已应用集也不一致：对齐到主库当前位置，跳过重放避免 1236（2.2.20 行为）
                                     cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
-                                    print("[gtid] %s:%s 已应用集分叉，gtid_slave_pos 已对齐主库当前 %s" % (host, port, _master_gt))
+                                    print("[gtid] %s:%s 已应用集不一致，gtid_slave_pos 已对齐主库当前 %s" % (host, port, _master_gt))
                             elif _slave_gt:
                                 cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
                             elif _master_gt:
@@ -1614,22 +1614,22 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                                 print("[gtid] %s:%s 已应用集为空：保持 gtid_slave_pos 为空，"
                                       "从头完整重放主库 binlog（2.2.20 行为）" % (host, port))
                         except Exception as e2:
-                            print("[gtid] 分叉重建失败(可忽略，继续常规重链): %s" % e2)
+                            print("[gtid] 不一致重建失败(可忽略，继续常规重链): %s" % e2)
                     elif not _pos_ok:
                         # 纯净从库（无自有 binlog GTID）：仅已应用集非主库子集才对齐（原有逻辑）
-                        print("[gtid] %s:%s 本地 GTID 非主库子集(分叉)，RESET MASTER 解除冲突后重链" % (host, port))
+                        print("[gtid] %s:%s 本地 GTID 非主库子集(不一致)，RESET MASTER 解除冲突后重链" % (host, port))
                         try:
                             cur.execute(stop_replication_sql(flavour))
                             cur.execute(reset_replica_sql(flavour))
                             cur.execute("RESET MASTER")
                             if _slave_gt and not _pos_ok:
-                                # 已应用集也分叉：对齐到主库当前位置，跳过重放避免 1236
+                                # 已应用集也不一致：对齐到主库当前位置，跳过重放避免 1236
                                 cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))
-                                print("[gtid] %s:%s 已应用集分叉，gtid_slave_pos 已对齐主库当前 %s" % (host, port, _master_gt))
+                                print("[gtid] %s:%s 已应用集不一致，gtid_slave_pos 已对齐主库当前 %s" % (host, port, _master_gt))
                         except Exception as e2:
-                            print("[gtid] 分叉重建失败(可忽略，继续常规重链): %s" % e2)
+                            print("[gtid] 不一致重建失败(可忽略，继续常规重链): %s" % e2)
         except Exception as e:
-            print("[gtid] 分叉检测跳过(可忽略): %s" % e)
+            print("[gtid] 不一致检测跳过(可忽略): %s" % e)
 
         try:
             cur.execute(stop_replication_sql(flavour))

@@ -87,7 +87,7 @@ node_main() {
     cat <<EOF
 用法: $PROG node <命令> [--dir <节点包目录>]
   install                部署节点（docker: docker compose up -d；裸机: 运行 Install 脚本），并建 logs 软链、自装 custosctl
-  prepare                节点包自检（校验必备文件 + 软链 logs + 下发 agent；管理器侧还会扫描 generated_nodes 并清理孤立单元，可加 --clean 删除孤立单元）
+  prepare                节点包自检（校验必备文件 + 软链 logs + 下发 agent；管理器侧还会扫描 generated_nodes 并清理残留节点目录，可加 --clean 删除残留节点目录）
   start                  启动（docker: up -d；裸机: systemctl start mariadb-ha + docker compose up -d keepalived/agent）
   stop                   停止（docker: down；裸机: systemctl stop mariadb-ha + docker compose down）
   restart                重启（docker: down && up -d；裸机: systemctl restart mariadb-ha + docker compose up -d keepalived/agent）
@@ -230,7 +230,7 @@ EOF
         echo "==> 节点侧准备：$ndir"
         prepare_node_pkg "$ndir"; exit $?
       fi
-      # 管理器侧：定位 CUSTOS_HOME 后扫描 generated_nodes（校验 + 软链 + 下发 agent + 清理孤立单元）
+      # 管理器侧：定位 CUSTOS_HOME 后扫描 generated_nodes（校验 + 软链 + 下发 agent + 清理残留节点目录）
       _ch=$(_custos_home)
       if [ -n "$_ch" ] && [ -d "$_ch/generated_nodes" ]; then
         CUSTOS_HOME="$_ch"
@@ -241,9 +241,9 @@ EOF
           if [ -d "$ipd/mysql8.0/conf" ] || [ -d "$ipd/mariadb12.3.3/conf" ]; then
             prepare_node_pkg "$ipd" || rc=1
           else
-            # 孤立单元：既非 mysql 也非 mariadb 合法包 → 疑似残留，不计入失败码
-            echo "  [ORPHAN?] $ipd 非合法节点包（缺 mysql8.0/conf 与 mariadb12.3.3/conf）"
-            if [ "$1" = "--clean" ]; then rm -rf "$ipd" && echo "  [clean] 已删除孤立单元 $ipd"; fi
+            # 残留节点目录：既非 mysql 也非 mariadb 合法包 → 疑似残留，不计入失败码
+            echo "  [异常?] $ipd 非合法节点包（缺 mysql8.0/conf 与 mariadb12.3.3/conf）"
+            if [ "$1" = "--clean" ]; then rm -rf "$ipd" && echo "  [clean] 已删除残留节点目录 $ipd"; fi
           fi
         done
         [ $rc -eq 0 ] && echo "==> 节点包自检全部通过" || echo "==> 节点包自检存在告警（见上）"
@@ -373,7 +373,7 @@ fi
 
 # ⑦ custosctl 自身所在目录（最高优先级，仅次于 -C）：无论 compose 是否已生成。
 # 仅在 -C 未显式指定、且当前已定位目录无效（如 /etc 旧路径）时启用，避免误覆盖用户意图。
-# 注意：判定用「有 install.sh / docker-compose.yml / env.example」，不把孤立的 custosctl
+# 注意：判定用「有 install.sh / docker-compose.yml / env.example」，不把残留的 custosctl
 # 当成项目目录（否则装入 /usr/bin 时 SCRIPT_DIR=/usr/bin 会被误判）。
 if [ -z "$CUSTOS_HOME_ENV" ] && { [ -z "${CUSTOS_HOME:-}" ] || ! _proj_ok "$CUSTOS_HOME"; } \
    && [ -n "$SCRIPT_DIR" ] \
