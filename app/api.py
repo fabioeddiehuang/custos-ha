@@ -877,6 +877,123 @@ def api_rebuild_status(task: str = "", user=Depends(auth_required)):
     return _json_ok(rebuild.get_task(task))
 
 
+# ==================================================================
+# 节点引导安装（v2.5.0 F1）：一行 curl 完成部署
+#
+# 下面三个「下载类」端点**刻意不要求登录**——节点上是 curl 在跑，没有登录态。
+# 安全性完全由一次性 token 保证：绑定节点 IP + 短 TTL + 部署完成即失效。
+# 这与「下载自愈 SQL」是同一类端点：URL 本身就是凭据，必须短命。
+# ==================================================================
+@app.post("/api/node/bootstrap")
+def api_node_bootstrap(ip: str = Form(...), ttl_hours: int = Form(24),
+                       user=Depends(auth_required)):
+    """生成节点引导命令（含一次性 token）。
+
+    ttl_hours 默认 24 小时：运维拿到命令后可能隔天才上机，太短会白跑一趟；
+    安全性由「绑定 IP + 完成后作废」兜底，而不是靠把有效期压到几分钟。
+    """
+    from . import bootstrap
+    ip = (ip or "").strip()
+    if not ip:
+        return _json_ok({"ok": False, "error": "节点 IP 不能为空"})
+    try:
+        ttl = int(ttl_hours)
+    except (TypeError, ValueError):
+        ttl = 24
+    ttl = max(1, min(ttl, 24 * 7))
+    try:
+        rows = query("SELECT node_type, cluster_id FROM nodes WHERE ip=%s", (ip,))
+        node_type = (rows[0].get("node_type") if rows else "") or "docker"
+        cluster_id = (rows[0].get("cluster_id") if rows else None)
+    except Exception:
+        node_type, cluster_id = "docker", None
+    try:
+        info = bootstrap.issue_for_node(ip, node_type=node_type, cluster_id=cluster_id,
+                                        actor=str(user), ttl_hours=ttl)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    try:
+        audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                        "BOOTSTRAP", ip, f"签发节点引导命令（有效期 {ttl}h）", cluster_id)
+    except Exception:
+        pass
+    return _json_ok({"ok": True, **info})
+
+
+@app.get("/api/node/bootstrap/{token}")
+def api_bootstrap_script(token: str, request: Request):
+    """引导安装脚本本体（节点 `curl … | bash` 拉的就是它）。
+
+    不要求登录；token 无效/过期/已用一律 403，且不透露具体原因
+    （避免把「该 IP 有有效 token」这类信息泄露给探测者）。
+    """
+    from . import bootstrap
+    row = bootstrap.verify_token(token)
+    if not row:
+        return Response("引导命令无效或已过期，请在管理端重新生成。",
+                        status_code=403, media_type="text/plain; charset=utf-8")
+    ip = row["ip"]
+    try:
+        rows = query("SELECT node_type FROM nodes WHERE ip=%s", (ip,))
+        node_type = (rows[0].get("node_type") if rows else "") or "docker"
+    except Exception:
+        node_type = "docker"
+    try:
+        script = bootstrap.render_bootstrap_script(ip, token, node_type)
+    except Exception as e:
+        return Response(f"生成引导脚本失败：{e}", status_code=500,
+                        media_type="text/plain; charset=utf-8")
+    return Response(script, media_type="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": f'inline; filename="custos-node-{ip}.sh"'})
+
+
+@app.get("/api/node/bundle/{token}")
+def api_bootstrap_bundle(token: str, request: Request):
+    """节点部署单元包（tar.gz），含集群凭据——故必须凭 token 下载。"""
+    from . import bootstrap
+    row = bootstrap.verify_token(token)
+    if not row:
+        return Response("引导命令无效或已过期，请在管理端重新生成。",
+                        status_code=403, media_type="text/plain; charset=utf-8")
+    try:
+        data = bootstrap.build_bundle(row["ip"])
+    except Exception as e:
+        # 打包失败必须明确报出（少一个 ha_check.conf，节点上 keepalived 就起不来，
+        # 而这种缺失在管理端完全看不出来，只会在真正切换时才发现 VIP 漂不动）。
+        return Response(f"打包节点单元失败：{e}", status_code=500,
+                        media_type="text/plain; charset=utf-8")
+    return Response(data, media_type="application/gzip",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="custos-node-{row["ip"]}.tar.gz"'})
+
+
+@app.post("/api/nodes/{ip}/ready")
+def api_node_ready(ip: str, request: Request, token: str = Form(""),
+                   status: str = Form("online"), error: str = Form("")):
+    """节点部署回执（引导脚本最后一步调用，F3）。
+
+    回执成功即**作废 token**——凭据已完成使命，不该继续可用。
+    这也是 deploy_state 由 registered → online 的唯一入口。
+    """
+    from . import bootstrap
+    src_ip = ""
+    try:
+        src_ip = request.client.host if request.client else ""
+    except Exception:
+        pass
+    row = bootstrap.verify_token(token, ip=ip)
+    if not row:
+        return _json_ok({"ok": False, "error": "token 无效、已过期或 IP 不匹配"})
+    state = "online" if str(status).strip().lower() in ("online", "ok", "success", "") else "failed"
+    try:
+        execute("UPDATE nodes SET deploy_state=%s, last_ready_at=NOW(), deploy_error=%s "
+                "WHERE ip=%s", (state, (error or "")[:250], ip))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"回执写入失败：{e}"})
+    bootstrap.consume_token(token, src_ip=src_ip)
+    return _json_ok({"ok": True, "deploy_state": state})
+
+
 # 手动「修复复制」的点击冷却（秒）。monitor 自动巡检有 _heal_fail 退避，
 # 但手动点击此前完全没有限频：连点会反复 STOP/START SLAVE、CHANGE MASTER，
 # 并每次无脑新增一条 unresolved 告警 —— 「报错不断」的观感正来源于此。

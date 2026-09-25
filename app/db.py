@@ -91,6 +91,21 @@ SCHEMA_SQL = [
     ) ENGINE=InnoDB
     """,
     """
+    CREATE TABLE IF NOT EXISTS bootstrap_tokens (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        token_hash VARCHAR(64) NOT NULL UNIQUE,
+        ip VARCHAR(64) NOT NULL,
+        cluster_id INT DEFAULT NULL,
+        issued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME NOT NULL,
+        used_at DATETIME DEFAULT NULL,
+        issued_by VARCHAR(64) DEFAULT '',
+        used_from VARCHAR(64) DEFAULT '',
+        KEY idx_ip (ip),
+        KEY idx_expires (expires_at)
+    ) ENGINE=InnoDB
+    """,
+    """
     CREATE TABLE IF NOT EXISTS clusters (
         id INT AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(64) NOT NULL,
@@ -413,6 +428,19 @@ def init_schema():
                 c.execute("ALTER TABLE nodes ADD COLUMN cluster_id INT DEFAULT NULL")
             except Exception:
                 pass
+            # ---- v2.5.0：节点引导安装（F1 引导 / F3 就绪回执）----
+            # deploy_state  ：registered(已登记未部署) / provisioning(部署中) / online(在线) / failed(失败)
+            # last_ready_at ：最近一次收到节点部署回执的时间
+            # deploy_error  ：最近一次部署失败的原因（页面直接展示，不用去翻日志）
+            for _tbl, _col, _def in (
+                ("nodes", "deploy_state", "varchar(16) NOT NULL DEFAULT 'registered'"),
+                ("nodes", "last_ready_at", "DATETIME NULL"),
+                ("nodes", "deploy_error", "varchar(255) DEFAULT ''"),
+            ):
+                try:
+                    c.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_def}")
+                except Exception:
+                    pass
             # hosts 增加半同步复制健康指标（monitor.get_status 采集，仪表盘展示 + 退化告警）。
             # SEMI_SYNC=0 时变量恒为 OFF，这些列保持 NULL，不影响核心探活。
             for _col, _def in (
