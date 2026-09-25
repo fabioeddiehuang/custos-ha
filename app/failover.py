@@ -969,7 +969,20 @@ def ensure_topology(cluster_id):
     # keepalived 检查脚本会判定本机只读而放弃 VIP，导致 VIP 永不绑定。
     # ⚠ 迁移桥接期（_locked）绝不能 promote：那会清掉 203→177 的桥接通道。
     #   此时只把主库置为可写（不清复制通道），保证 VIP 判断不受影响。
-    if _locked:
+    # v2.5.0 F7：强制同步期间主库被有意置为只读（等从库追平），拓扑维护**绝不能**
+    #   把它又设回可写——否则停写形同虚设，同步窗口内仍有写入，判据彻底失效。
+    try:
+        from . import syncgate
+        _sync_locked = syncgate.is_locked(cluster_id)
+    except Exception:
+        _sync_locked = False
+    if _sync_locked:
+        _pk = ("sync_locked", cluster_id, cur_h, int(cur_p))
+        if time.monotonic() - _TOPO_AT.get(_pk, 0.0) >= 60:
+            _TOPO_AT[_pk] = time.monotonic()
+            print(f"[topology] 强制同步进行中：主库 {cur_h}:{cur_p} 保持只读，跳过置可写"
+                  f"（停写窗口内勿恢复可写，否则同步判据失效）")
+    elif _locked:
         _pk = ("mig_locked", cluster_id, cur_h, int(cur_p))
         if time.monotonic() - _TOPO_AT.get(_pk, 0.0) >= 300:
             _TOPO_AT[_pk] = time.monotonic()

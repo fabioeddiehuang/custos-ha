@@ -106,6 +106,24 @@ SCHEMA_SQL = [
     ) ENGINE=InnoDB
     """,
     """
+    CREATE TABLE IF NOT EXISTS agent_commands (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        ip VARCHAR(64) NOT NULL,
+        verb VARCHAR(32) NOT NULL,
+        payload TEXT,
+        status VARCHAR(16) NOT NULL DEFAULT 'pending',
+        actor VARCHAR(64) DEFAULT '',
+        dedupe_key VARCHAR(128) DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        sent_at DATETIME NULL,
+        done_at DATETIME NULL,
+        expires_at DATETIME NULL,
+        result TEXT,
+        KEY idx_ip_status (ip, status),
+        KEY idx_status (status)
+    ) ENGINE=InnoDB
+    """,
+    """
     CREATE TABLE IF NOT EXISTS clusters (
         id INT AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(64) NOT NULL,
@@ -436,6 +454,8 @@ def init_schema():
                 ("nodes", "deploy_state", "varchar(16) NOT NULL DEFAULT 'registered'"),
                 ("nodes", "last_ready_at", "DATETIME NULL"),
                 ("nodes", "deploy_error", "varchar(255) DEFAULT ''"),
+                # agent 心跳令牌：每节点独立，心跳与指令下发凭它认证
+                ("nodes", "agent_token", "varchar(64) DEFAULT ''"),
             ):
                 try:
                     c.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_def}")

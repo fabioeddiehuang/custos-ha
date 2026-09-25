@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+{% block title %}集群接管 · Custos{% endblock %}
+{% block page_title %}集群接管{% endblock %}
+
+{% block content %}
+<style>
+  .step-bar{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+  .step-bar .st{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted)}
+  .step-bar .st .n{width:20px;height:20px;border-radius:50%;display:inline-flex;align-items:center;
+    justify-content:center;background:var(--surface-2);border:1px solid var(--border);font-size:11px}
+  .step-bar .st.on{color:var(--primary);font-weight:700}
+  .step-bar .st.on .n{background:var(--primary);color:#fff;border-color:var(--primary)}
+  .node-row{display:grid;grid-template-columns:1.4fr .7fr 1fr 1fr auto;gap:8px;margin-bottom:8px;align-items:end}
+  .issues{margin:8px 0 0;padding:0;list-style:none}
+  .issues li{padding:6px 10px;border-radius:8px;font-size:12.5px;margin-bottom:6px}
+  .issues li.blocker{background:rgba(225,29,116,.12);color:#E11D74;border:1px solid rgba(225,29,116,.3)}
+  .issues li.warn{background:rgba(234,179,8,.12);color:#a16207;border:1px solid rgba(234,179,8,.3)}
+  .verdict{display:inline-block;padding:5px 12px;border-radius:999px;font-size:12.5px;font-weight:700}
+  .verdict.ready{background:rgba(10,186,181,.16);color:#0ABAB5}
+  .verdict.needs_change{background:rgba(234,179,8,.16);color:#a16207}
+  .verdict.unsupported{background:rgba(225,29,116,.14);color:#E11D74}
+  pre.cmd{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;
+    padding:10px 12px;font-size:12px;line-height:1.7;word-break:break-all;white-space:pre-wrap;margin:6px 0 0}
+</style>
+
+<div class="card">
+  <div class="step-bar">
+    <span class="st on" id="st1"><span class="n">1</span>填节点</span> ›
+    <span class="st" id="st2"><span class="n">2</span>探测</span> ›
+    <span class="st" id="st3"><span class="n">3</span>接管参数</span> ›
+    <span class="st" id="st4"><span class="n">4</span>执行</span>
+  </div>
+
+  <div class="note">
+    接管 = <b>纳管</b>，不是重建：老库正在跑业务，本向导<b>不碰数据、不重装数据库</b>。
+    流程是「只读探测 → 建 Custos 账号 → 登记 → 在节点上执行一行命令装 keepalived + agent」。
+  </div>
+
+  <!-- 第 1 步 -->
+  <h3 style="margin:16px 0 8px;font-size:14px">① 要接管的节点</h3>
+  <div id="nodeList"></div>
+  <button class="btn btn-sm" onclick="addRow()">＋ 再加一个节点</button>
+
+  <!-- 第 2 步 -->
+  <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-primary btn-sm" onclick="doProbe()">② 开始探测（只读）</button>
+    <span id="probeTip" style="color:var(--muted);font-size:12px;align-self:center"></span>
+  </div>
+  <div id="probeBox"></div>
+
+  <!-- 第 3 步 -->
+  <div id="step3" style="display:none">
+    <h3 style="margin:16px 0 8px;font-size:14px">③ 接管到哪个集群</h3>
+    <div class="grid2">
+      <label>集群
+        <select id="cid" onchange="onCidChange()">
+          <option value="0">＋ 新建集群</option>
+          {% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>新集群名称<input id="cname" placeholder="例如 接管-生产库"></label>
+      <label>VIP（节点同网段空闲 IP）<input id="cvip" placeholder="例如 192.168.1.190"></label>
+      <label>VIP 端口<input id="cvipport" value="3306"></label>
+      <label>节点数据库 root 用户<input id="ruser" value="root"></label>
+      <label>节点数据库 root 密码<input id="rpass" type="password" placeholder="已运行实例的 root 口令"></label>
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn btn-accent btn-sm" onclick="doAdopt()">④ 执行接管</button>
+    </div>
+  </div>
+
+  <div id="resultBox"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function addRow(h, p, u, pw){
+    var d=document.createElement('div'); d.className='node-row';
+    d.innerHTML =
+      '<label>IP/主机名<input class="nip" value="'+(h||'')+'" placeholder="192.168.1.50"></label>' +
+      '<label>端口<input class="nport" value="'+(p||3306)+'"></label>' +
+      '<label>用户<input class="nuser" value="'+(u||'root')+'"></label>' +
+      '<label>密码<input class="npwd" type="password" value="'+(pw||'')+'"></label>' +
+      '<button class="btn btn-sm" onclick="this.parentNode.remove()">删除</button>';
+    document.getElementById('nodeList').appendChild(d);
+  }
+  function collect(){
+    var out=[];
+    document.querySelectorAll('#nodeList .node-row').forEach(function(r){
+      var ip=r.querySelector('.nip').value.trim();
+      if(!ip) return;
+      out.push({host:ip, port:parseInt(r.querySelector('.nport').value||3306,10),
+                user:r.querySelector('.nuser').value.trim()||'root',
+                password:r.querySelector('.npwd').value});
+    });
+    return out;
+  }
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function post(url, fd){
+    return fetch(url,{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:fd.toString(), credentials:'same-origin'}).then(function(r){return r.json();});
+  }
+  var _probe=null;
+  function doProbe(){
+    var nodes=collect();
+    if(!nodes.length){alert('请至少填一个节点');return;}
+    document.getElementById('probeTip').textContent='探测中…（只读，不会改动老库）';
+    var fd=new URLSearchParams(); fd.set('nodes', JSON.stringify(nodes));
+    post('/api/adopt/probe', fd).then(function(d){
+      document.getElementById('probeTip').textContent='';
+      _probe=d; renderProbe(d);
+    }).catch(function(e){document.getElementById('probeTip').textContent='探测失败：'+e;});
+  }
+  function renderProbe(d){
+    var box=document.getElementById('probeBox');
+    if(d.error){box.innerHTML='<div class="issues"><li class="blocker">'+esc(d.error)+'</li></div>';return;}
+    var vn={ready:'可以接管',needs_change:'需先整改',unsupported:'不支持接管'}[d.verdict]||d.verdict;
+    var h='<h3 style="margin:16px 0 8px;font-size:14px">② 探测结果</h3>';
+    h+='<div>结论：<span class="verdict '+esc(d.verdict)+'">'+esc(vn)+'</span>'
+      +' ｜ 场景：'+esc(d.scenario_label||d.scenario)+' ｜ 同网段：'+(d.l2_ok?'是':'否（'+esc(d.l2_note)+'）')+'</div>';
+    var iss=(d.issues||[]).map(function(i){
+      return '<li class="'+esc(i.level)+'">'+esc(i.msg)+(i.fix?'<br><span style="opacity:.8">→ '+esc(i.fix)+'</span>':'')+'</li>';
+    }).join('');
+    if(iss) h+='<ul class="issues">'+iss+'</ul>';
+    (d.nodes||[]).forEach(function(n){
+      h+='<div style="margin-top:10px;font-size:12.5px"><b>'+esc(n.host)+':'+esc(n.port)+'</b> '
+        +(n.ok?'✅ 可连接':'❌ '+esc(n.error||'连接失败'))
+        +' ｜ 版本 '+esc(n.version||'?')+' ｜ server_id '+esc(n.server_id)
+        +' ｜ 角色 '+esc(n.role||'standalone')+' ｜ binlog '+esc(n.log_bin)+'</div>';
+      var ni=(n.issues||[]).map(function(i){
+        return '<li class="'+esc(i.level)+'">'+esc(i.msg)+(i.fix?'<br><span style="opacity:.8">→ '+esc(i.fix)+'</span>':'')+'</li>';}).join('');
+      if(ni) h+='<ul class="issues">'+ni+'</ul>';
+    });
+    box.innerHTML=h;
+    // 有阻断项时不放开下一步（避免带病接管）
+    var blocked = (d.verdict==='unsupported');
+    document.getElementById('step3').style.display = blocked?'none':'block';
+    if(blocked) box.innerHTML += '<div class="issues"><li class="blocker">存在不支持项，请先整改后再接管</li></div>';
+  }
+  function onCidChange(){
+    var v=document.getElementById('cid').value;
+    var isNew=(v==='0');
+    ['cname','cvip','cvipport'].forEach(function(id){
+      document.getElementById(id).parentNode.style.display = isNew?'':'none';
+    });
+  }
+  function doAdopt(){
+    var nodes=collect();
+    var fd=new URLSearchParams();
+    fd.set('nodes', JSON.stringify(nodes));
+    fd.set('cluster_id', document.getElementById('cid').value);
+    fd.set('name', document.getElementById('cname').value);
+    fd.set('vip', document.getElementById('cvip').value);
+    fd.set('vip_port', document.getElementById('cvipport').value||'3306');
+    fd.set('root_user', document.getElementById('ruser').value||'root');
+    fd.set('root_pass', document.getElementById('rpass').value);
+    document.getElementById('resultBox').innerHTML='<div class="note">接管执行中…</div>';
+    post('/api/adopt/run', fd).then(function(d){
+      var h='<h3 style="margin:16px 0 8px;font-size:14px">④ 执行结果</h3>';
+      if(!d.ok){h+='<div class="issues"><li class="blocker">'+esc(d.error||'失败')+'</li></div>';}
+      else{
+        h+='<div>集群 ID：'+esc(d.cluster_id)+'</div>';
+        (d.bootstrap||[]).forEach(function(b){
+          h+='<div style="margin-top:12px"><b>'+esc(b.ip)+'</b>：'+esc(b.msg)
+            +(b.command?'<pre class="cmd">'+esc(b.command)+'</pre>':'')+'</div>';
+        });
+        h+='<div class="note" style="margin-top:12px">把上面每条命令分别拿到对应节点主机上以 root 执行，'
+          +'即可完成 sidecar（keepalived + agent）安装。命令含一次性凭据，请勿外传。</div>';
+      }
+      document.getElementById('resultBox').innerHTML=h;
+    }).catch(function(e){
+      document.getElementById('resultBox').innerHTML='<div class="issues"><li class="blocker">失败：'+esc(e)+'</li></div>';
+    });
+  }
+  addRow(); onCidChange();
+</script>
+{% endblock %}

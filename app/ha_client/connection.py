@@ -521,6 +521,8 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
 """底层连接与游标工具（与节点建连、root 回退、元组/Dict 游标辅助）。"""
 
 from ._const import *
+from .credentials import (_granted_privs, _account_hosts, _parse_grant_privs, _ensure_local_state_grant, _native_password_hash, _can_login, _ensure_account, _has_all_privileges, _as_int)
+
 
 def _pymysql_at_least(major, minor):
     try:

@@ -521,6 +521,19 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
 """节点本地主库标记（ha_local.local_master_flag）读写。"""
 
 from ._const import *
+from ..mysql_compat import (detect_flavour, F_MARIADB, F_MYSQL8, default_auth_plugin)
+
+
+from .connection import (connect, connect_robust, _esc_sql)
+
+# —— 拆包后的补齐导入 ——
+# 本文件的账号/权限辅助函数实体在 credentials 与 mysql_compat 中；缺少时 py_compile
+# 查不出来，运行到那一行才抛 NameError。
+
+from .credentials import (_native_password_hash, _parse_grant_privs, _granted_privs,
+                          _account_hosts, _ensure_local_state_grant, _as_int,
+                          _can_login, _ensure_account, _has_all_privileges)
+
 
 def _addr_eq(addr, host, port):
     """比较形如 'IP:port' 的字符串与 (host, port) 是否指向同一个实例。"""

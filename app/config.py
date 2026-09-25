@@ -248,6 +248,9 @@ NODES_DIR = env("NODES_DIR", "/app/generated_nodes")
 # 仓库目录改名为 custos-ha 后此处默认值同步更新；也可在 docker-compose.yml 里显式设置
 # NODES_HOST_BASE 覆盖，无需改代码。
 NODES_HOST_BASE = env("NODES_HOST_BASE", "custos-ha/generated_nodes")
+# v2.5.0 F2：节点镜像 tar 目录（由 compose 挂载宿主 ./images），
+# 供 curl 引导脚本下载后 docker load，解决内网节点拉不到镜像的问题。
+IMAGES_DIR = env("IMAGES_DIR", "/app/images")
 
 # VIP / 网络（供节点生成使用，可在 Web「服务端配置」中设置）
 # VIP 必须由用户填写（需为节点同网段空闲 IP，无法自动探测），故默认留空；

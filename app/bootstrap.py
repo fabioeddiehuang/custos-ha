@@ -281,31 +281,61 @@ def manager_base_url():
     return "http://%s:%d" % (ip, int(WEB_PORT))
 
 
-def node_install_cmds(ip, node_type):
+def node_install_cmds(ip, node_type, sidecar_only=False):
     """按节点形态给出安装/启动命令序列。
 
     裸机 MariaDB（mariadb）：数据库本体由 Install-ha-mariadb-Node.sh 全量安装
     （铁律 3：不要另写数据库安装逻辑），随后只起 keepalived + agent 两个 sidecar。
     容器形态（docker / mariadb-docker）：compose 一次拉起全部服务。
+
+    sidecar_only=True（**接管场景**）：只在已有数据库上装 keepalived + agent。
+    必须跳过 Install 脚本——接管的是**正在跑业务的库**，跑安装脚本等于重装数据库。
     """
-    if node_type == "mariadb":
-        return [
-            "bash %s/%s/scripts/Install-ha-mariadb-Node.sh" % (INSTALL_BASE, ip),
-            "cd %s/%s && docker compose up -d keepalived custos-node-agent" % (INSTALL_BASE, ip),
-        ]
+    if node_type == "mariadb" or sidecar_only:
+        cmds = ["cd %s/%s && docker compose up -d keepalived custos-node-agent"
+                % (INSTALL_BASE, ip)]
+        if node_type == "mariadb" and not sidecar_only:
+            cmds.insert(0, "bash %s/%s/scripts/Install-ha-mariadb-Node.sh"
+                        % (INSTALL_BASE, ip))
+        return cmds
     return ["cd %s/%s && docker compose up -d" % (INSTALL_BASE, ip)]
 
 
-def render_bootstrap_script(ip, token, node_type="docker", images=None):
+def available_images():
+    """列出服务端已托管的节点镜像（F2）。
+
+    没有镜像包时返回空列表，引导脚本会跳过 docker load——
+    此时依赖节点本地构建（compose 里带 build: ./keepalived）或节点已有镜像。
+    """
+    import os
+    try:
+        from .config import IMAGES_DIR
+        d = IMAGES_DIR
+    except Exception:
+        return []
+    try:
+        if not os.path.isdir(d):
+            return []
+        return sorted(f[:-4] for f in os.listdir(d) if f.endswith(".tar"))
+    except OSError:
+        return []
+
+
+def render_bootstrap_script(ip, token, node_type="docker", images=None,
+                            sidecar_only=False):
     """渲染引导安装脚本（bash）。
 
     脚本是**幂等**的：重复执行会覆盖单元并重新 up，便于失败重试与后续升级
     （这正是存量老节点升级 agent 的路径）。
+
+    sidecar_only：接管已有数据库时只装 keepalived + agent，跳过数据库安装。
     """
     mgr = manager_base_url()
-    cmds = node_install_cmds(ip, node_type)
+    cmds = node_install_cmds(ip, node_type, sidecar_only=sidecar_only)
 
     # 镜像分发（F2）：服务端托管 tar，节点 docker load。未配置时跳过。
+    if images is None:
+        images = available_images()
     img_lines = []
     for name in (images or []):
         img_lines.append(
@@ -377,15 +407,17 @@ def bootstrap_command(ip, token):
 
 
 def issue_for_node(ip, node_type="docker", cluster_id=None, actor="",
-                   ttl_hours=DEFAULT_TTL_HOURS, images=None):
+                   ttl_hours=DEFAULT_TTL_HOURS, images=None, sidecar_only=False):
     """一次性产出「命令 + 脚本 + token」，供 API/页面直接使用。"""
     token = issue_token(ip, cluster_id=cluster_id, actor=actor, ttl_hours=ttl_hours)
     return {
         "ip": ip,
         "token": token,
         "command": bootstrap_command(ip, token),
-        "script": render_bootstrap_script(ip, token, node_type, images),
+        "script": render_bootstrap_script(ip, token, node_type, images,
+                                          sidecar_only=sidecar_only),
         "expires_in_hours": ttl_hours,
         "manager": manager_base_url(),
         "install_base": "%s/%s" % (INSTALL_BASE, ip),
+        "sidecar_only": bool(sidecar_only),
     }

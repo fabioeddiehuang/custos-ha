@@ -99,6 +99,27 @@ KEEPALIVED_IMAGE_NAME = "custos-node"
 # Reads real host metrics: pid: host shares host PID ns for /proc; read-only mount / -> /host
 # with --root /host for real disk stats; network_mode: host lets manager reach <nodeIP>:28889.
 # node_agent.py is copied into the node unit dir (./node_agent.py) by generate_node/regenerate.
+def agent_env_yaml(ip, token, manager_url, unit_dir, heartbeat=30):
+    """custos-node-agent 的心跳环境变量块（v2.5.0 F5）。
+
+    心跳方向是 agent → manager，所以节点必须知道：
+      - 自己是谁（NODE_IP）
+      - 管理器在哪（MANAGER_URL）
+      - 凭什么认证（NODE_AGENT_TOKEN，每节点独立）
+    缺任何一个都不启用心跳（agent 退化为纯被动，与旧版一致）。
+    """
+    if not (ip and token and manager_url):
+        return ""
+    return (
+        "    environment:\n"
+        f"      NODE_IP: '{ip}'\n"
+        f"      NODE_AGENT_TOKEN: '{token}'\n"
+        f"      NODE_AGENT_HEARTBEAT: '{int(heartbeat)}'\n"
+        f"      MANAGER_URL: '{manager_url}'\n"
+        f"      NODE_UNIT_DIR: '{unit_dir}'\n"
+    )
+
+
 def render_agent_service(log_dir_host):
     """渲染 custos-node-agent sidecar service（日志落盘到统一日志目录，便于 <ip>/logs 软链接入）。"""
     return f"""
@@ -120,7 +141,11 @@ def render_agent_service(log_dir_host):
     pid: host
     network_mode: host
     volumes:
-      - /:/host:ro
+      # 注意：宿主根挂到 /host 必须是【读写】。F4/F5 需要把配置文件（如 ha_check.conf）
+      # 真实写入节点单元目录、并被对应容器挂载生效；若只读则 agent 容器无 docker CLI、
+      # 且无法落盘。agent 已持有 docker.sock（宿主上帝权限），只读挂载对威胁模型无实质
+      # 缓解（已可用 docker run -v / 拿到宿主写），故此处放宽为读写以支撑功能。
+      - /:/host
       - ./agent/node_agent.py:/app/node_agent.py:ro
       - {log_dir_host}:/var/log/custos-ha:z
       # Plan B：迁移物理通道经 agent 在宿主跑 docker/mariabackup，需宿主 docker.sock。
@@ -1833,6 +1858,43 @@ def verify_pending_all():
             logger.warning("自动核验节点[%s]待生效异常(可忽略): %s", ip, e)
 
 
+def _auto_push_changed(ip, changed, unit_dir):
+    """把重新生成后**真正变化的文件**经 agent 自动下发到节点（v2.5.0 F4）。
+
+    以前重新生成只在页面留一句「请在节点执行 update-node.sh」，节点侧的配置
+    永远是旧的，而页面看起来一切正常——这正是「配置漂移」。现在直接下发：
+      - keepalived/* 变化 → 重启 keepalived
+      - agent/* 变化      → 重启 agent
+    下发失败也不影响主流程（仍可按「待生效操作」手工执行）。
+    """
+    import base64
+    from pathlib import Path
+    from . import agent_hub
+
+    files, restart = {}, set()
+    for rel in changed or []:
+        p = Path(unit_dir) / rel
+        if not p.is_file():
+            continue
+        try:
+            files["/home/docker/%s/%s" % (ip, rel)] = base64.b64encode(p.read_bytes()).decode()
+        except OSError:
+            continue
+        r = str(rel)
+        if r.startswith("keepalived"):
+            restart.add("keepalived")
+        elif r.startswith("agent"):
+            restart.add("agent")
+    if not files:
+        return None
+    return agent_hub.enqueue(
+        ip, "update_files",
+        {"files": files, "restart": sorted(restart)},
+        actor="node_gen", ttl_sec=3600,
+        dedupe_key="drift_%s_%s" % (ip, abs(hash(tuple(sorted(files)))) % 10**8),
+    )
+
+
 def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None,
                   node_type="docker", mysql_version=None, server_id=None):
     ip = (ip or "").strip()
@@ -2051,6 +2113,31 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         compose = render_mariadb_compose(node_name, root_pass, port, server_id, vip_port)
     else:
         compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
+
+    # ---- v2.5.0 F5：每节点独立 agent token + 心跳环境变量 ----
+    # regen 时**保留既有 token**：换 token 会让已经在线的 agent 立刻认证失败、心跳断连，
+    # 而重新下发单元/重启容器并不是总能同时发生。
+    try:
+        _tk_rows = query("SELECT agent_token FROM nodes WHERE ip=%s", (ip,))
+        agent_token = ((_tk_rows[0] or {}).get("agent_token") if _tk_rows else "") or ""
+    except Exception:
+        agent_token = ""
+    if not agent_token:
+        from .config import rand_secret as _rand_secret
+        agent_token = _rand_secret(24)
+    from .config import WEB_PORT as _WEB_PORT
+    _mgr_url = "http://%s:%d" % (get_manager_public_ip() or "", int(_WEB_PORT))
+    _unit_dir = "/home/docker/%s" % ip
+    _anchor = "  custos-node-agent:\n    image: python:3-slim"
+    if _anchor in compose:
+        compose = compose.replace(
+            _anchor,
+            _anchor + "\n" + agent_env_yaml(ip, agent_token, _mgr_url, _unit_dir).rstrip("\n"),
+            1)
+    else:
+        # 模板结构若变化，宁可显式告警也不要静默丢掉心跳配置
+        print("[warn] 未能在 compose 中找到 custos-node-agent 服务块，agent 心跳未配置", flush=True)
+
     _write(d / "docker-compose.yaml", compose)
 
     # 5.5) 统一日志目录：logrotate 配置 + 目录初始化脚本（三形态一致）
@@ -2075,11 +2162,14 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # v2.3.1：root 口令落库前加密（后续写 ha_check.conf 等仍用局部明文变量，不受影响）
     _root_pass_enc = _crypto.encrypt(root_pass)
     execute(
-        "INSERT INTO nodes (ip, port, root_user, root_pass, server_id, compose_path, cluster_id, node_type, mysql_version) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        # agent_token 只在「为空」时写入：regen 不覆盖既有 token，
+        # 否则已在线节点的 agent 会因 token 变更而认证失败、心跳断连。
+        "INSERT INTO nodes (ip, port, root_user, root_pass, server_id, compose_path, cluster_id, node_type, mysql_version, agent_token) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON DUPLICATE KEY UPDATE port=%s, root_user=%s, root_pass=%s, server_id=%s, "
-        "compose_path=%s, cluster_id=%s, node_type=%s, mysql_version=%s",
-        (ip, port, root_user, _root_pass_enc, server_id, host_compose, cluster_id, node_type, mysql_version,
+        "compose_path=%s, cluster_id=%s, node_type=%s, mysql_version=%s, "
+        "agent_token=IF(agent_token IS NULL OR agent_token='', VALUES(agent_token), agent_token)",
+        (ip, port, root_user, _root_pass_enc, server_id, host_compose, cluster_id, node_type, mysql_version, agent_token,
          port, root_user, _root_pass_enc, server_id, host_compose, cluster_id, node_type, mysql_version),
     )
     execute(
@@ -2094,6 +2184,14 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     _new_snap = _snapshot_dir(d)
     _changed = sorted(k for k in (set(_new_snap) | set(_old_snap))
                       if _new_snap.get(k) != _old_snap.get(k))
+    # v2.5.0 F4：把变化的文件经 agent 自动下发，节点配置不再停留在旧版本。
+    # 失败不阻断生成（页面仍保留「待生效操作」供人工执行）。
+    if _changed:
+        try:
+            _auto_push_changed(ip, _changed, d)
+        except Exception as _e:
+            print("[warn] 自动下发变更文件失败（可改用「待生效操作」手工执行）：%s" % _e,
+                  flush=True)
     _fp = _fingerprint(_new_snap)
     try:
         _prev = query("SELECT gen_fingerprint FROM nodes WHERE ip=%s", (ip,))

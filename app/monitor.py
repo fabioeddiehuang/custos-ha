@@ -1495,42 +1495,51 @@ def _pick_backup_nodes(cid, mode="slave"):
     return (slaves + masters) if mode != "master" else (masters + slaves)
 
 
-def _maybe_scheduled_backup():
-    """定时备份（默认关闭）：按 settings 周期对所有集群备份，并按保留期清理旧备份。
+# 同一轮定时备份里，各集群之间的错峰间隔（秒）。
+# 为什么需要：管理器重启后若多个集群都已逾期，会同时开备，把磁盘和主库 I/O 一起打满。
+_BACKUP_STAGGER_SEC = 20
 
-    配置项（settings 表，可在 Web「系统设置」调整）：
-      BACKUP_SCHEDULE_ENABLED  1/0          是否启用（默认 0，保持既有行为不变）
-      BACKUP_INTERVAL_HOURS    小时          备份间隔（默认 24）
-      BACKUP_RETENTION_DAYS    天            保留天数（默认 7，0=不清理）
-      BACKUP_TARGET            slave/master  备份目标（默认 slave）
-      BACKUP_WITH_DATA         1/0           是否含数据（默认 1）
+
+def _maybe_scheduled_backup():
+    """定时备份（默认关闭）：按**集群**策略备份 + 按「天数/份数」双条件清理。
+
+    v2.5.0 F9：策略下沉到集群（`backup_policy.get_policy`），未配置回退全局 settings，
+    存量行为不变。新增：
+      - 保留**份数**（retention_count）与天数双条件，且永不删除最新一份；
+      - 备份前可选「追平等待」，保证备份位点干净；
+      - 备份目录磁盘占用预警；
+      - 停机错过窗口后**补做**，并按集群错峰，避免重启瞬间所有集群一起备份。
     """
-    if get_setting("BACKUP_SCHEDULE_ENABLED", "0") != "1":
-        return
-    try:
-        hours = float(get_setting("BACKUP_INTERVAL_HOURS", "24") or 24)
-    except (TypeError, ValueError):
-        hours = 24.0
-    if hours <= 0:
-        return
-    if not _collect_due("backup", int(hours * 3600)):
-        return
-    mode = (get_setting("BACKUP_TARGET", "slave") or "slave").lower()
-    with_data = get_setting("BACKUP_WITH_DATA", "1") != "0"
-    try:
-        retention = int(get_setting("BACKUP_RETENTION_DAYS", "7") or 7)
-    except (TypeError, ValueError):
-        retention = 7
+    from . import backup_policy
     for cl in list_clusters():
         cid = cl.get("id")
         name = cl.get("name") or cid
+        pol = backup_policy.get_policy(cid)
+        if not pol.get("enabled"):
+            continue
+        try:
+            hours = float(pol.get("interval_hours") or 24)
+        except (TypeError, ValueError):
+            hours = 24.0
+        if hours <= 0:
+            continue
+        ok_due, overdue = backup_policy.due(cid, hours)
+        if not ok_due:
+            continue
+        # 错峰：同轮内每集群之间留间隔，避免多集群同时压磁盘 / 主库
+        time.sleep(_BACKUP_STAGGER_SEC)
+        if pol.get("wait_catch_up"):
+            backup_policy.wait_catch_up(cid, timeout_sec=60)
         done, last_err = False, ""
-        for host, port in _pick_backup_nodes(cid, mode):
+        for host, port in _pick_backup_nodes(cid, (pol.get("target") or "slave").lower()):
             try:
-                res = backup.run_backup(cid, host, port, with_data=with_data, scope="all")
+                res = backup.run_backup(cid, host, port,
+                                        with_data=bool(pol.get("with_data", True)), scope="all")
                 if res.get("ok"):
-                    print(f"[monitor] 定时备份完成：集群 {name} <- {host}:{port}", flush=True)
+                    tip = "（补做，已逾期 %d 分钟）" % (overdue // 60) if overdue > 60 else ""
+                    print(f"[monitor] 定时备份完成：集群 {name} <- {host}:{port}{tip}", flush=True)
                     done = True
+                    backup_policy.mark_run(cid)
                     break
                 last_err = str(res.get("error") or "未知错误")
             except Exception as e:
@@ -1542,12 +1551,24 @@ def _maybe_scheduled_backup():
                        cluster_id=cid)
         # 无论本次是否成功都清理，避免磁盘被历史备份占满
         try:
-            purged = backup.purge_old_backups(cid, retention)
-            if purged.get("deleted"):
-                print(f"[monitor] 集群 {name}：已清理过期备份 {len(purged['deleted'])} 份",
-                      flush=True)
+            purged = backup_policy.purge(cid, pol.get("retention_days"),
+                                         pol.get("retention_count"))
+            n = len(purged.get("by_days") or []) + len(purged.get("by_count") or [])
+            if n:
+                print(f"[monitor] 集群 {name}：已清理过期备份 {n} 份", flush=True)
         except Exception as e:
             print(f"[monitor] 备份清理异常: {e}", flush=True)
+        # 磁盘占用预警（备份与 binlog 都曾撑爆磁盘，宁可早报）
+        try:
+            gb = pol.get("disk_alert_gb") or 0
+            if gb and float(gb) > 0:
+                used = backup_policy.usage_bytes(cid) / float(1024 ** 3)
+                if used >= float(gb):
+                    send_alert("备份占用超阈值",
+                               f"【{name}】备份目录已占用 {used:.1f} GB，超过告警阈值 {gb} GB。"
+                               f"请调整保留策略或清理历史备份。", cluster_id=cid)
+        except Exception:
+            pass
 
 
 _WATCHDOG_THREAD = None

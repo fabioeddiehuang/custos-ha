@@ -967,6 +967,34 @@ def api_bootstrap_bundle(token: str, request: Request):
                              f'attachment; filename="custos-node-{row["ip"]}.tar.gz"'})
 
 
+@app.get("/api/node/image/{name}")
+def api_node_image(name: str, token: str = ""):
+    """节点镜像 tar（v2.5.0 F2）：引导脚本下载后 `docker load`。
+
+    解决内网节点拉不到 `custos-node:<ver>`（本地构建镜像，公网没有）
+    与 `python:3-slim`（公共镜像，离线拉不到）的问题。
+    """
+    from . import bootstrap
+    import os
+    from .config import IMAGES_DIR
+    # 防路径穿越：只取文件名，且必须落在 IMAGES_DIR 内
+    safe = os.path.basename((name or "").strip())
+    if not safe.endswith(".tar"):
+        safe += ".tar"
+    row = bootstrap.verify_token(token)
+    if not row:
+        return Response("引导命令无效或已过期，请在管理端重新生成。",
+                        status_code=403, media_type="text/plain; charset=utf-8")
+    path = os.path.join(IMAGES_DIR, safe)
+    if not os.path.isfile(path):
+        return Response("服务端未托管该镜像包：%s（请先在服务端执行 scripts/build_node_images.sh）"
+                        % safe, status_code=404, media_type="text/plain; charset=utf-8")
+    with open(path, "rb") as f:
+        data = f.read()
+    return Response(data, media_type="application/x-tar",
+                    headers={"Content-Disposition": f'attachment; filename="{safe}"'})
+
+
 @app.post("/api/nodes/{ip}/ready")
 def api_node_ready(ip: str, request: Request, token: str = Form(""),
                    status: str = Form("online"), error: str = Form("")):
@@ -992,6 +1020,405 @@ def api_node_ready(ip: str, request: Request, token: str = Form(""),
         return _json_ok({"ok": False, "error": f"回执写入失败：{e}"})
     bootstrap.consume_token(token, src_ip=src_ip)
     return _json_ok({"ok": True, "deploy_state": state})
+
+
+# ==================================================================
+# agent 心跳与指令通道（v2.5.0 F5）
+#
+# 心跳方向是 agent → manager，因此**不要求登录**，凭节点独立 token 认证。
+# 指令只允许白名单动词（agent 侧二次校验），通用 exec 默认关闭。
+# ==================================================================
+@app.post("/api/agent/heartbeat")
+def api_agent_heartbeat(ip: str = Form(""), token: str = Form(""),
+                        agent_version: str = Form(""), facts: str = Form("")):
+    """agent 心跳：上报存活并取回待执行指令。
+
+    为什么不用登录态：节点上跑的是 daemon，没有浏览器会话。
+    安全性由「每节点独立 token + 白名单动词」保证。
+    """
+    from . import agent_hub
+    ip = (ip or "").strip()
+    if not ip:
+        return _json_ok({"ok": False, "error": "缺少 ip"})
+    if not agent_hub.verify_agent(ip, token):
+        # 不区分「token 错」还是「节点不存在」，避免泄露拓扑
+        return _json_ok({"ok": False, "error": "认证失败"})
+    try:
+        facts_d = json.loads(facts) if facts else {}
+    except Exception:
+        facts_d = {}
+    res = agent_hub.on_heartbeat(ip, {"version": agent_version, "facts": facts_d})
+    # 心跳顺带把 agent 版本记下来（排障时一眼看出哪些节点还是旧 agent）
+    if agent_version:
+        try:
+            upsert_setting("agent_version_%s" % ip, str(agent_version)[:32])
+        except Exception:
+            pass
+    # 记录「最近一次收到该节点心跳」的本地时间戳（v2.5.0 F11 无保护窗口提示用）
+    try:
+        upsert_setting("agent_last_seen_%s" % ip, str(int(_time.time())))
+    except Exception:
+        pass
+    return _json_ok(res)
+
+
+@app.post("/api/agent/cmd_result")
+def api_agent_cmd_result(ip: str = Form(""), token: str = Form(""),
+                         id: int = Form(0), ok: str = Form("0"),
+                         message: str = Form("")):
+    """agent 回报指令执行结果。"""
+    from . import agent_hub
+    ip = (ip or "").strip()
+    if not ip or not agent_hub.verify_agent(ip, token):
+        return _json_ok({"ok": False, "error": "认证失败"})
+    return _json_ok(agent_hub.on_result(ip, int(id), str(ok) in ("1", "true", "True"),
+                                        message))
+
+
+@app.post("/api/agent/commands")
+def api_agent_enqueue(ip: str = Form(...), verb: str = Form(...),
+                      payload: str = Form("{}"), ttl_sec: int = Form(3600),
+                      dedupe_key: str = Form(""), user=Depends(auth_required)):
+    """下发一条指令给节点（只入队，由心跳拉取执行）。
+
+    verb 必须在白名单内，否则直接拒绝——agent 有 root + docker.sock，
+    绝不允许服务端下发任意命令。
+    """
+    from . import agent_hub
+    try:
+        pl = json.loads(payload) if payload else {}
+    except Exception as e:
+        return _json_ok({"ok": False, "error": "payload 不是合法 JSON：%s" % e})
+    try:
+        cid = agent_hub.enqueue(ip, verb, pl,
+                                actor=(user.get("username") if isinstance(user, dict) else str(user)),
+                                ttl_sec=ttl_sec, dedupe_key=dedupe_key)
+    except Exception as e:
+        return _json_ok({"ok": False, "error": str(e)})
+    return _json_ok({"ok": True, "command_id": cid})
+
+
+@app.get("/api/agent/commands")
+def api_agent_list(ip: str = "", limit: int = 30, user=Depends(auth_required)):
+    """查询指令下发与执行情况（排障用）。"""
+    from . import agent_hub
+    return _json_ok({"ok": True, "commands": agent_hub.list_commands(ip or None, limit),
+                     "pending": agent_hub.pending_count(ip or None)})
+
+
+# ==================================================================
+# 无保护窗口提示（v2.5.0 F11）
+#
+# 管理器停机 = 集群进入「无保护窗口」：自动切换 / 复制自愈 / 告警 / 备份全部失效。
+# 本端点用于在管理器恢复后，根据各节点「最近一次心跳」时间戳，算出管理器曾离线多久，
+# 并在仪表盘就此发出醒目警告，避免运维误以为保护仍在生效。
+# ==================================================================
+APP_STARTED_AT = _time.time()
+
+
+@app.get("/api/system/protection")
+def api_system_protection(user=Depends(auth_required)):
+    """返回各节点最近心跳时间与管理器离线时长评估。"""
+    now = int(_time.time())
+    rows = query("SELECT ip, deploy_state FROM nodes ORDER BY ip") or []
+    gaps = []
+    for r in rows:
+        ip = r["ip"]
+        try:
+            lst = get_setting("agent_last_seen_%s" % ip)
+        except Exception:
+            lst = None
+        seen = int(lst) if lst and str(lst).isdigit() else 0
+        ago = (now - seen) if seen else None
+        gaps.append({"ip": ip, "deploy_state": r.get("deploy_state"), "last_seen_sec_ago": ago})
+    # 「无保护窗口」判定：管理器本次已连续运行足够久（>2min），但某节点的最近心跳
+    # 仍停在更早之前（>2min），说明管理器确实离线过一段时间。
+    uptime = int(now - APP_STARTED_AT)
+    offline_nodes = [g for g in gaps
+                     if g["last_seen_sec_ago"] is not None
+                     and g["last_seen_sec_ago"] > 120
+                     and uptime > 120]
+    max_gap = max([g["last_seen_sec_ago"] for g in offline_nodes], default=0)
+    return _json_ok({
+        "ok": True,
+        "manager_uptime_sec": uptime,
+        "manager_was_offline": bool(offline_nodes),
+        "offline_sec": max_gap,
+        "offline_nodes": offline_nodes,
+        "nodes": gaps,
+    })
+
+
+# ==================================================================
+# 强制同步 / 切主就绪判定（v2.5.0 F7）
+#
+# 长任务**绝不阻塞请求**：立即返回 task_id，前端 1.5s 轮询 /api/sync/status。
+# 首帧必须已有阶段文字与进度，否则用户会以为卡死。
+# ==================================================================
+@app.post("/api/sync/force")
+def api_sync_force(cluster_id: int = Form(...), timeout_sec: int = Form(120),
+                   grace_sec: int = Form(300), user=Depends(auth_required)):
+    """强制同步：停写 → 等从库追平 → 报告「可以安全切主」。
+
+    超时/取消/宽限期到都会**自动恢复主库写入**，绝不让业务长期停写。
+    """
+    from . import syncgate
+    try:
+        r = syncgate.start_forced_sync(
+            int(cluster_id), int(timeout_sec), int(grace_sec),
+            actor=(user.get("username") if isinstance(user, dict) else str(user)))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok({"ok": True, **r})
+
+
+@app.get("/api/sync/status")
+def api_sync_status(task: str = "", user=Depends(auth_required)):
+    """查询强制同步进度（status/stage/progress/ready/locked）。"""
+    from . import syncgate
+    return _json_ok(syncgate.get_task(task))
+
+
+@app.get("/api/sync/readiness")
+def api_sync_readiness(cluster_id: int = 0, user=Depends(auth_required)):
+    """只读判定：现在能不能安全切主（不动任何状态）。"""
+    from . import syncgate
+    try:
+        return _json_ok(syncgate.readiness(int(cluster_id)))
+    except Exception as e:
+        return _json_ok({"ok": False, "ready": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/sync/cancel")
+def api_sync_cancel(task: str = Form(...), user=Depends(auth_required)):
+    """取消强制同步：立即恢复主库写入。"""
+    from . import syncgate
+    return _json_ok(syncgate.cancel(task))
+
+
+# ==================================================================
+# 免 SSH 改密（v2.5.0 F6）
+#
+# 允许**只改单个账号**（UI 勾选哪个改哪个）；失败自动回滚，绝不留下半套新密码。
+# ==================================================================
+@app.post("/api/passwords/change")
+def api_passwords_change(cluster_id: int = Form(...),
+                         ha_pass: str = Form(""), repl_pass: str = Form(""),
+                         app_pass: str = Form(""), root_pass: str = Form(""),
+                         sync_files: int = Form(1),
+                         user=Depends(auth_required)):
+    """修改集群账号密码（可只改其中几个，留空=不改）。
+
+    流程：主库 ALTER USER → 更新凭证记录 → 等复制下发 → 同步节点凭据文件
+          → 重启 keepalived。任一环节失败即回滚。
+    """
+    from . import passmgr
+    changes = {}
+    if ha_pass:
+        changes[passmgr.ACCT_HA] = ha_pass
+    if repl_pass:
+        changes[passmgr.ACCT_REPL] = repl_pass
+    if app_pass:
+        changes[passmgr.ACCT_APP] = app_pass
+    if root_pass:
+        changes[passmgr.ACCT_ROOT] = root_pass
+    if not changes:
+        return _json_ok({"ok": False, "error": "请至少填写一个要修改的账号密码"})
+    try:
+        res = passmgr.change(int(cluster_id), changes,
+                             actor=(user.get("username") if isinstance(user, dict) else str(user)),
+                             sync_node_files=bool(int(sync_files)))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    try:
+        audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                        "change_password", f"cluster={cluster_id}",
+                        "修改账号：" + "、".join(sorted(changes.keys())), cluster_id=int(cluster_id))
+    except Exception:
+        pass
+    return _json_ok(res)
+
+
+# ==================================================================
+# 定时备份策略（集群级，v2.5.0 F9）
+#
+# 它现在是「节点纯净重建」的数据源前提：没有定期备份，重建就只能走全量导出。
+# ==================================================================
+@app.get("/api/backup/policy")
+def api_backup_policy_get(cluster_id: int = 0, user=Depends(auth_required)):
+    """读取集群定时备份策略 + 下次执行时间 + 当前占用（页面展示用）。"""
+    from . import backup_policy
+    cid = int(cluster_id)
+    pol = backup_policy.get_policy(cid)
+    ok_due, overdue = backup_policy.due(cid, pol.get("interval_hours"))
+    return _json_ok({
+        "ok": True, "policy": pol,
+        "last_run": backup_policy.last_run(cid),
+        "due": ok_due,
+        "next_run_at": backup_policy.next_run_at(cid, pol.get("interval_hours")),
+        "overdue_sec": overdue,
+        "usage_bytes": backup_policy.usage_bytes(cid),
+    })
+
+
+@app.post("/api/backup/policy")
+def api_backup_policy_set(cluster_id: int = Form(...), enabled: int = Form(0),
+                          interval_hours: int = Form(24), retention_days: int = Form(7),
+                          retention_count: int = Form(7), target: str = Form("slave"),
+                          with_data: int = Form(1), wait_catch_up: int = Form(1),
+                          disk_alert_gb: int = Form(0),
+                          user=Depends(auth_required)):
+    """设置集群定时备份策略（未配置的字段保持原值）。"""
+    from . import backup_policy
+    pol = backup_policy.set_policy(
+        int(cluster_id), enabled=bool(int(enabled)),
+        interval_hours=int(interval_hours), retention_days=int(retention_days),
+        retention_count=int(retention_count), target=(target or "slave").lower(),
+        with_data=bool(int(with_data)), wait_catch_up=bool(int(wait_catch_up)),
+        disk_alert_gb=int(disk_alert_gb))
+    return _json_ok({"ok": True, "policy": pol})
+
+
+# ==================================================================
+# 集群接管（v2.5.0 F10）
+#
+# 接管 = **纳管**，不是重建：只读探测 → 建账号 → 登记 → 用引导命令装 sidecar。
+# 全程不碰数据、不重装数据库。
+# ==================================================================
+@app.post("/api/adopt/probe")
+def api_adopt_probe(nodes: str = Form(...), l2_prefix: int = Form(24),
+                    user=Depends(auth_required)):
+    """只读探测一组存量节点（幂等，可反复跑，绝不写入老库）。
+
+    nodes: JSON 数组字符串
+        [{"host":"192.168.1.50","port":3306,"user":"root","password":"pwd"}, ...]
+    """
+    from . import adopt
+    try:
+        arr = json.loads(nodes)
+        if not isinstance(arr, list) or not arr:
+            raise ValueError("nodes 必须是非空 JSON 数组")
+    except Exception as e:
+        return _json_ok({"ok": False, "error": "nodes 解析失败：%s" % e})
+    try:
+        return _json_ok(adopt.probe_cluster(arr, l2_prefix=int(l2_prefix)))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/adopt/run")
+def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
+                  name: str = Form(""), vip: str = Form(""),
+                  vip_prefix: str = Form("24"), vip_port: int = Form(3306),
+                  root_user: str = Form("root"), root_pass: str = Form(""),
+                  user=Depends(auth_required)):
+    """执行接管：建 Custos 账号 → 登记 nodes/hosts → 生成 sidecar 引导命令。
+
+    cluster_id=0 时按 name/vip 新建集群。返回每个节点的引导命令。
+    """
+    from . import adopt
+    try:
+        arr = json.loads(nodes)
+        if not isinstance(arr, list) or not arr:
+            raise ValueError("nodes 必须是非空 JSON 数组")
+    except Exception as e:
+        return _json_ok({"ok": False, "error": "nodes 解析失败：%s" % e})
+
+    actor = user.get("username") if isinstance(user, dict) else str(user)
+    cid = int(cluster_id or 0)
+    if not cid:
+        if not (name or "").strip():
+            return _json_ok({"ok": False, "error": "新建集群必须给名称"})
+        if not (vip or "").strip():
+            return _json_ok({"ok": False, "error": "接管必须指定 VIP（节点同网段空闲 IP）"})
+        try:
+            cid = create_cluster((name or "").strip(), vip=(vip or "").strip(),
+                                 vip_prefix=(vip_prefix or "24").strip(),
+                                 vip_port=int(vip_port or 3306),
+                                 node_type="mariadb")
+        except Exception as e:
+            return _json_ok({"ok": False, "error": "创建集群失败：%s" % e})
+
+    # 1) 只读探测（先确认能不能接）
+    probe = adopt.probe_cluster(arr)
+    if probe.get("verdict") == adopt.VERDICT_UNSUPPORTED:
+        return _json_ok({"ok": False, "error": "探测判定不支持接管", "probe": probe})
+    if not any(n.get("ok") for n in probe.get("nodes", [])):
+        return _json_ok({"ok": False, "error": "所有节点都无法连接", "probe": probe})
+
+    # 2) 建 Custos 账号（复用 ensure_ha_creds，自动处理 root 回退与 host 集合）
+    creds = get_cluster_creds(cid) or {}
+    cred_res = adopt.adopt_cluster(probe, root_user, root_pass, creds)
+
+    # 3) 登记 + 生成引导命令（sidecar only，绝不重装数据库）
+    reg = adopt.register_and_bootstrap(probe, cid, root_user=root_user,
+                                       root_pass=root_pass, actor=actor)
+    try:
+        audit.add_audit(actor, "adopt", "cluster=%s" % cid,
+                        "接管节点：" + "、".join(r["ip"] for r in reg), cluster_id=cid)
+    except Exception:
+        pass
+    return _json_ok({"ok": True, "cluster_id": cid, "probe": probe,
+                     "credentials": cred_res, "bootstrap": reg})
+
+
+# ==================================================================
+# 滚动升级 + 节点修复分档（v2.5.0 F8）
+#
+# L1 重启 / L2 重建复制 / L3 纯净重建（停服务→清数据目录→重建）。
+# L3 严禁对当前主库执行——那等于清空整个集群的数据。
+# ==================================================================
+@app.post("/api/upgrade/start")
+def api_upgrade_start(cluster_id: int = Form(...), actions: str = Form("{}"),
+                      new_master: str = Form(""), do_switch: int = Form(1),
+                      user=Depends(auth_required)):
+    """启动滚动升级。actions 为 JSON：{"192.168.1.213":"restart", ...}
+
+    取值：restart（重启）/ rebuild（重建复制）/ pure（纯净重建）
+    """
+    from . import rolling
+    try:
+        acts = json.loads(actions or "{}")
+        if not isinstance(acts, dict):
+            raise ValueError("actions 必须是 JSON 对象")
+        bad = [k for k, v in acts.items() if v not in rolling.ACTIONS]
+        if bad:
+            return _json_ok({"ok": False,
+                             "error": "非法动作（仅 %s）：%s"
+                                      % ("、".join(rolling.ACTIONS), "、".join(map(str, bad)))})
+    except Exception as e:
+        return _json_ok({"ok": False, "error": "actions 解析失败：%s" % e})
+    actor = user.get("username") if isinstance(user, dict) else str(user)
+    try:
+        r = rolling.start_upgrade(int(cluster_id), acts, new_master or "", actor,
+                                  bool(int(do_switch)))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return _json_ok({"ok": True, **r})
+
+
+@app.get("/api/upgrade/status")
+def api_upgrade_status(task: str = "", user=Depends(auth_required)):
+    from . import rolling
+    return _json_ok(rolling.get_task(task))
+
+
+@app.post("/api/upgrade/cancel")
+def api_upgrade_cancel(task: str = Form(...), user=Depends(auth_required)):
+    from . import rolling
+    return _json_ok(rolling.cancel(task))
+
+
+@app.get("/api/passwords/accounts")
+def api_password_accounts(cluster_id: int = 0, user=Depends(auth_required)):
+    """列出本集群可修改的账号（供 UI 勾选展示）。"""
+    creds = get_cluster_creds(int(cluster_id)) or {}
+    return _json_ok({"ok": True, "accounts": [
+        {"key": "ha_monitor", "label": "监控账号", "user": creds.get("ha_user") or "ha_monitor"},
+        {"key": "replication", "label": "复制账号", "user": creds.get("repl_user") or "replication"},
+        {"key": "app", "label": "业务账号", "user": creds.get("app_user") or "app"},
+        {"key": "root", "label": "数据库 root", "user": "root"},
+    ]})
 
 
 # 手动「修复复制」的点击冷却（秒）。monitor 自动巡检有 _heal_fail 退避，
@@ -1772,6 +2199,28 @@ def cluster_detail_page(request: Request, cid: int, user=Depends(auth_required),
 # 备份 / 恢复（全库 / 指定库）
 # 纯 Python 实现，容器内无需 mysqldump；产物落在 ./backups/<集群ID>/。
 # ==================================================================
+@app.get("/adopt")
+def adopt_page(request: Request, user=Depends(auth_required), msg: str = "", error: str = ""):
+    """存量集群接管向导（v2.5.0 F10）：只读探测 → 建账号 → 登记 → 装 sidecar。"""
+    return render("adopt.html", request, user=user, clusters=list_clusters(),
+                  msg=msg, error=error)
+
+
+@app.get("/clusters/{cid}/upgrade")
+def cluster_upgrade_page(request: Request, cid: int, user=Depends(auth_required),
+                         msg: str = "", error: str = ""):
+    """集群滚动升级页（v2.5.0 F8）。"""
+    c = _cluster_view(cid)
+    if not c:
+        return RedirectResponse("/clusters?error=集群不存在或已被删除", status_code=303)
+    try:
+        mh, mp = get_current_master(int(cid))
+    except Exception:
+        mh, mp = "", 0
+    return render("upgrade.html", request, user=user, cluster=c,
+                  nodes=list_nodes(int(cid)), master=mh or "", msg=msg, error=error)
+
+
 @app.get("/clusters/{cid}/backup")
 def cluster_backup_page(request: Request, cid: int, user=Depends(auth_required),
                         msg: str = "", error: str = ""):

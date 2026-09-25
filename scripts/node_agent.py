@@ -231,6 +231,44 @@ def _host_strip(root, real_path):
     return real_path
 
 
+def _in_container():
+    """agent 是否运行在容器 sidecar 里（而非裸机直接部署）。
+
+    判定依据：存在 /host 目录且宿主根里确有 docker CLI。容器部署时宿主 /
+    被挂到 /host，裸机部署则 /host 不存在（root 直接是 "/"）。
+    """
+    return os.path.isdir("/host") and (
+        os.path.exists("/host/usr/bin/docker") or os.path.exists("/host/bin/docker"))
+
+
+def _host_path(p):
+    """宿主绝对路径 -> agent 视角真实路径（容器里落到 /host 下；裸机即原样）。"""
+    if _in_container():
+        return _host_join("/host", p)
+    return p
+
+
+def _host_sh(script):
+    """在宿主执行 shell 脚本。容器部署时 chroot /host（用宿主 docker CLI + docker.sock）；
+    裸机直接执行。返回 {ok, rc, stdout, stderr}。
+
+    F5 指令（docker compose 重启/建复制、清理数据目录、跑内置脚本）必须经此通道：
+    agent 容器本身是 python:3-slim，没有 docker CLI，且 /host 是宿主真实根，
+    只有 chroot 进去才能正确解析宿主路径与宿主 dockerd。
+    """
+    env = dict(os.environ)
+    if _in_container():
+        env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        args = ["chroot", "/host", "/bin/sh", "-c", script]
+    else:
+        args = ["/bin/sh", "-c", script]
+    try:
+        cp = subprocess.run(args, env=env, capture_output=True, text=True, timeout=3600 * 6)
+        return {"ok": True, "rc": cp.returncode, "stdout": cp.stdout, "stderr": cp.stderr}
+    except Exception as e:
+        return {"ok": False, "rc": 1, "stdout": "", "stderr": str(e)}
+
+
 def _log_allowed(root, real_path):
     """只允许读取白名单目录下的文件（避免变成任意文件读取接口）。"""
     host_path = _host_strip(root, os.path.realpath(real_path))
@@ -346,26 +384,8 @@ def _self_started_at(root):
 # 宿主命令执行（Plan B：迁移物理通道 agent-exec 兜底）
 # ---------------------------------------------------------------------------
 def exec_on_host(script):
-    """在宿主文件系统执行 shell 脚本，返回 {ok, rc, stdout, stderr}。
-
-    容器节点：agent 容器挂了 /:/host:ro 且 pid:host，故 chroot /host 后执行，
-    使脚本里的宿主路径（如 /data/custos-ha）与宿主 docker（/host/usr/bin/docker +
-    挂载的 /host/var/run/docker.sock）都正确解析；docker 命令实际在宿主 dockerd 上跑，
-    写入发生在目标容器内，不写宿主只读层。裸机节点：/host 即宿主根，等同原生执行。
-    仅迁移场景使用；与 /stats 同样受 NODE_AGENT_TOKEN 保护。
-    """
-    env = dict(os.environ)
-    if os.path.isdir("/host") and (os.path.exists("/host/usr/bin/docker")
-                                   or os.path.exists("/host/bin/docker")):
-        env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        args = ["chroot", "/host", "/bin/sh", "-c", script]
-    else:
-        args = ["/bin/sh", "-c", script]
-    try:
-        cp = subprocess.run(args, env=env, capture_output=True, text=True, timeout=3600 * 6)
-        return {"ok": True, "rc": cp.returncode, "stdout": cp.stdout, "stderr": cp.stderr}
-    except Exception as e:
-        return {"ok": False, "rc": 1, "stdout": "", "stderr": str(e)}
+    """在宿主文件系统执行 shell 脚本（Plan B：迁移物理通道兜底）。见 _host_sh。"""
+    return _host_sh(script)
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +499,179 @@ def make_handler(collector, token):
     return Handler
 
 
+# ---------------------------------------------------------------------------
+# v2.5.0 F5：心跳出向 + 指令执行（白名单）
+#
+# agent 拥有 root + docker.sock，等于节点上的上帝权限，因此指令**只认白名单动词**，
+# 且服务端下发后这里**再校验一次**（纵深防御：服务端被篡改也不至于让节点跑任意命令）。
+# ---------------------------------------------------------------------------
+AGENT_VERSION = "2.5.0"
+ALLOWED_SCRIPTS = ("update-node.sh", "prepare-logs.sh")
+ALLOWED_SERVICES = ("keepalived", "agent", "mariadb")
+
+
+def _unit_dir():
+    """部署单元目录（compose 所在处）。"""
+    return (os.environ.get("NODE_UNIT_DIR")
+            or "/home/docker/%s" % (os.environ.get("NODE_IP") or ""))
+
+
+def _write_file(path, content_b64, mode=None):
+    """写文件：必须为绝对路径；父目录不存在时自动创建。
+
+    容器部署时落盘到宿主（经 _host_path 把宿主绝对路径映射到 /host 下），
+    裸机直接落盘。这样 F4 漂移自动应用下发的配置（如 ha_check.conf）才会真正
+    落到节点单元目录、被对应容器挂载生效，而不是写进 agent 容器自身只读层。
+    """
+    import base64
+    if not path or not path.startswith("/"):
+        raise ValueError("非法路径（必须为绝对路径）：%r" % path)
+    real = _host_path(path)
+    data = base64.b64decode(content_b64 or "")
+    d = os.path.dirname(real)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    with open(real, "wb") as f:
+        f.write(data)
+    if mode:
+        os.chmod(real, int(mode, 8) if isinstance(mode, str) else int(mode))
+
+
+def _compose(action, service):
+    """构造在宿主执行 `docker compose` 的 argv。
+
+    容器部署时 agent 容器无 docker CLI，必须 chroot /host 用宿主 docker
+    （docker.sock 已挂到 /host/var/run/docker.sock → chroot 内即 /var/run/docker.sock）；
+    单元目录路径在 chroot 内也才能正确解析。裸机直接执行。
+    """
+    import shlex
+    d = _unit_dir()
+    inner = "docker compose -f %s %s %s" % (
+        shlex.quote(os.path.join(d, "docker-compose.yaml")),
+        " ".join(shlex.quote(a) for a in action),
+        shlex.quote(service),
+    )
+    if _in_container():
+        return ["chroot", "/host", "/bin/sh", "-c",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin " + inner]
+    return ["/bin/sh", "-c", inner]
+
+
+def run_command(verb, payload):
+    """执行白名单指令，返回 (ok, message)。"""
+    payload = payload or {}
+    if verb == "update_files":
+        files = payload.get("files") or {}
+        if not isinstance(files, dict) or not files:
+            return False, "files 必须是非空字典 {路径: base64内容}"
+        modes = payload.get("modes") or {}
+        for p, c in files.items():
+            _write_file(p, c, modes.get(p))
+        for svc in (payload.get("restart") or []):
+            if svc not in ALLOWED_SERVICES:
+                return False, "不允许重启的服务：%s" % svc
+            subprocess.run(_compose(["restart"], svc), timeout=120)
+        return True, "已更新 %d 个文件" % len(files)
+    if verb in ("restart_service", "stop_service", "start_service"):
+        svc = payload.get("service")
+        if svc not in ALLOWED_SERVICES:
+            return False, "不允许操作的服务：%s（允许：%s）" % (svc, "/".join(ALLOWED_SERVICES))
+        act = {"restart_service": "restart", "stop_service": "stop",
+               "start_service": "start"}[verb]
+        r = subprocess.run(_compose([act], svc), capture_output=True,
+                           text=True, timeout=180)
+        return (r.returncode == 0), ((r.stdout or "") + (r.stderr or ""))[-500:]
+    if verb == "wipe_data":
+        # L3 纯净重建：只清「数据卷/数据目录」这一种目标，绝不接触系统路径。
+        target = payload.get("target")
+        if target not in ("mariadb_data",):
+            return False, "只允许清理 mariadb_data 数据卷"
+        d = payload.get("path") or ""
+        if not d or not d.startswith("/"):
+            return False, "缺少合法的数据目录路径"
+        # 二次防线：路径必须看起来像数据库数据目录，避免误删
+        if "/var/lib/mysql" not in d and "/data/" not in d:
+            return False, "数据目录路径不合预期，拒绝清理：%s" % d
+        # 经宿主上下文执行（容器里 /data 等挂在 /host 下，且 rm 必须真落到宿主）。
+        r = _host_sh("rm -rf %s/*" % d.replace("'", ""))
+        _msg = ((r.get("stdout") or "") + (r.get("stderr") or ""))[-500:] or "数据目录已清空"
+        return (r.get("rc") == 0 and r.get("ok")), _msg
+    if verb == "set_credential":
+        files = payload.get("files") or {}
+        if not files:
+            return False, "缺少 files"
+        for p, c in files.items():
+            _write_file(p, c)
+        return True, "凭据文件已更新（%d 个）" % len(files)
+    if verb == "run_builtin_script":
+        name = payload.get("name")
+        if name not in ALLOWED_SCRIPTS:
+            return False, "只允许内置脚本：%s" % "/".join(ALLOWED_SCRIPTS)
+        p = os.path.join(_unit_dir(), name)
+        hp = _host_path(p)
+        if not os.path.isfile(hp):
+            return False, "脚本不存在：%s" % p
+        r = _host_sh("bash %s" % p.replace("'", ""))
+        _msg = ((r.get("stdout") or "") + (r.get("stderr") or ""))[-1000:]
+        return (r.get("rc") == 0 and r.get("ok")), _msg
+    if verb == "exec":
+        # 逃生舱：默认关闭，需显式在 agent 环境设置 NODE_AGENT_ALLOW_SHELL=1
+        if os.environ.get("NODE_AGENT_ALLOW_SHELL", "") != "1":
+            return False, "exec 逃生舱未开启（需设置 NODE_AGENT_ALLOW_SHELL=1）"
+        cmd = payload.get("cmd") or ""
+        if not cmd:
+            return False, "缺少 cmd"
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        return (r.returncode == 0), ((r.stdout or "") + (r.stderr or ""))[-2000:]
+    return False, "未知指令：%s" % verb
+
+
+def _post_form(url, data, timeout=15):
+    import urllib.request
+    body = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(url, data=body)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads((r.read() or b"{}").decode("utf-8"))
+
+
+def heartbeat_loop(manager, ip, token, interval, logg=None):
+    """心跳循环：上报存活 → 取回指令 → 执行 → 回报结果。
+
+    失败按指数退避重试（上限 300s），避免管理器停机时疯狂刷日志。
+    """
+    def _log(m):
+        if logg is not None:
+            logg.info(m)
+        else:
+            print(m, flush=True)
+
+    base = (manager or "").rstrip("/")
+    _log("[heartbeat] 启动 -> %s（每 %ss）" % (base, interval))
+    backoff = max(5, int(interval))
+    while True:
+        try:
+            res = _post_form(base + "/api/agent/heartbeat",
+                             {"ip": ip, "token": token, "agent_version": AGENT_VERSION})
+            backoff = max(5, int(interval))
+            for c in (res.get("commands") or []):
+                try:
+                    ok, msg = run_command(c.get("verb"), c.get("payload") or {})
+                except Exception as e:
+                    ok, msg = False, "执行异常：%s" % e
+                try:
+                    _post_form(base + "/api/agent/cmd_result",
+                               {"ip": ip, "token": token, "id": c.get("id"),
+                                "ok": "1" if ok else "0", "message": msg[:1500]})
+                except Exception as e:
+                    _log("[heartbeat] 结果回报失败：%s" % e)
+                _log("[heartbeat] 指令 #%s %s -> %s"
+                     % (c.get("id"), c.get("verb"), "成功" if ok else "失败"))
+        except Exception as e:
+            _log("[heartbeat] 失败：%s（%ss 后重试）" % (e, backoff))
+            backoff = min(backoff * 2, 300)
+        time.sleep(backoff)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Custos 节点 OS 指标采集 agent")
     ap.add_argument("--bind", default="0.0.0.0")
@@ -490,6 +683,14 @@ def main():
                     help="要统计磁盘占用的根挂载点。裸机默认 /；容器部署时配合 -v /:/host:ro 传 --root /host")
     ap.add_argument("--log", default=os.environ.get("NODE_AGENT_LOG", ""),
                     help="日志文件路径（如 /var/log/custos-ha/node_agent.log）；不指定则仅 stdout")
+    # v2.5.0 F5：心跳出向。给了 --manager 与 --ip 才启用（否则保持纯被动，行为不变）
+    ap.add_argument("--manager", default=os.environ.get("MANAGER_URL", ""),
+                    help="管理器地址（如 http://192.168.1.66:28888）；设置后启用心跳出向 + 指令通道")
+    ap.add_argument("--ip", default=os.environ.get("NODE_IP", ""),
+                    help="本节点对外 IP（心跳上报用，需与管理器登记的一致）")
+    ap.add_argument("--heartbeat", type=int,
+                    default=int(os.environ.get("NODE_AGENT_HEARTBEAT", "30")),
+                    help="心跳间隔秒数；0=关闭心跳（默认 30）")
     args = ap.parse_args()
 
     log = None
@@ -508,6 +709,21 @@ def main():
         log.info(msg)
     else:
         print(msg, flush=True)
+    # 心跳出向（v2.5.0 F5）：仅在显式配置管理器地址与本节点 IP 时启用，
+    # 未配置时与旧版完全一致（纯被动 HTTP），不影响存量部署。
+    if args.manager and args.ip and int(args.heartbeat) > 0:
+        t = threading.Thread(
+            target=heartbeat_loop,
+            args=(args.manager, args.ip, args.token.strip(), int(args.heartbeat), log),
+            daemon=True)
+        t.start()
+        hb_msg = "[node_agent] heartbeat -> %s every %ss (ip=%s)" % (
+            args.manager, args.heartbeat, args.ip)
+        if log is not None:
+            log.info(hb_msg)
+        else:
+            print(hb_msg, flush=True)
+
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -435,8 +435,11 @@ def adopt_node(node, root_user, root_pass, creds, manager_ip="", manager_subnet=
         取自管理器统一凭据（AUTH 设置），全 Custos 集群一致
     :return: (ok: bool, msg: str)
     """
-    if not node.get("reachable"):
-        return False, "节点不可达，无法建立账号"
+    # ⚠ 修正：probe_node 的输出里是 "ok"，没有 "reachable" 字段。
+    # 原写法 `node.get("reachable")` 恒为假，会让每个节点都直接返回失败——
+    # 接管流程在第一步就卡死，且错误信息「节点不可达」极具误导性（其实是字段对不上）。
+    if not (node.get("ok") or node.get("reachable")):
+        return False, "节点探测未通过，无法建立账号（请先确认探测结果）"
     from app.ha_client.credentials import ensure_ha_creds
     ok, msg = ensure_ha_creds(
         host=node["host"], port=node["port"],
@@ -459,4 +462,65 @@ def adopt_cluster(probe, root_user, root_pass, creds, manager_ip="", manager_sub
     for node in probe.get("nodes", []):
         ok, msg = adopt_node(node, root_user, root_pass, creds, manager_ip, manager_subnet)
         results.append({"host": node.get("host"), "ok": ok, "msg": msg})
+    return results
+
+
+# --------------------------------------------------------------------------
+# 阶段 1 后半：登记 nodes/hosts + 生成 sidecar 单元 + 给出引导命令
+#
+# 接管**不是重建**：老库正在跑业务，所以
+#   1. 只登记，不动数据库本体；
+#   2. sidecar（keepalived + agent）走 curl 引导命令在节点上装，
+#      且**必须 sidecar_only**——不能跑 Install-ha-mariadb-Node.sh，那等于重装数据库。
+# --------------------------------------------------------------------------
+
+def _node_type_for(probed):
+    """按探测结果决定登记形态。
+
+    接管的库都是**已经在跑**的实例，按裸机 MariaDB 登记（mariadb）：
+    它的部署单元只含 keepalived + agent 两个 sidecar，不会碰数据库本体。
+    MySQL 族登记为容器形态（docker），同理只装 sidecar。
+    """
+    family = (probed.get("family") or "").lower()
+    return "docker" if family == "mysql" else "mariadb"
+
+
+def register_and_bootstrap(probe, cluster_id, root_user="root", root_pass="",
+                           actor="", ttl_hours=24):
+    """登记被接管节点并生成「一行引导命令」。
+
+    :return: [{"ip","ok","command","msg"}, ...]
+    """
+    from . import node_gen, bootstrap
+    results = []
+    master = (probe.get("master") or "").strip()
+    for p in probe.get("nodes", []):
+        ip = (p.get("host") or "").strip()
+        if not ip or not p.get("ok"):
+            results.append({"ip": ip, "ok": False, "command": "",
+                            "msg": "节点探测失败，跳过登记"})
+            continue
+        role = "master" if (master and ip == master) else "slave"
+        ntype = _node_type_for(p)
+        try:
+            node_gen.generate_node(
+                ip, int(p.get("port") or 3306), root_user, root_pass,
+                role, int(cluster_id),
+                node_type=ntype,
+                mysql_version=(p.get("version") or "")[:48] or None,
+                server_id=p.get("server_id") or None,
+            )
+        except Exception as e:
+            results.append({"ip": ip, "ok": False, "command": "",
+                            "msg": "登记失败：%s" % e})
+            continue
+        try:
+            info = bootstrap.issue_for_node(
+                ip, node_type=ntype, cluster_id=int(cluster_id), actor=actor,
+                ttl_hours=ttl_hours, sidecar_only=True)
+            results.append({"ip": ip, "ok": True, "command": info["command"],
+                            "msg": "已登记，到节点执行引导命令装 sidecar（keepalived + agent）"})
+        except Exception as e:
+            results.append({"ip": ip, "ok": False, "command": "",
+                            "msg": "生成引导命令失败：%s" % e})
     return results

@@ -150,6 +150,7 @@
             <button class="btn btn-sm btn-primary" onclick="showSelfhealSql({{ n.cluster_id or 0 }}, '{{ n.ip }}', {{ n.port }})">查看/下载自愈 SQL</button>
             {% endif %}
             <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
+            <button class="btn btn-sm" style="background:linear-gradient(135deg,#0ABAB5,#22d3ee);color:#04121a;font-weight:600" onclick="openBootstrap('{{ n.ip }}')" title="生成一行命令，在节点主机上执行即可自动完成部署">引导安装</button>
             {% if n.pending_actions %}<button class="btn btn-sm pending-btn" style="background:#E11D74;color:#fff" onclick="showPending('{{ n.ip }}')">待生效操作</button>{% endif %}
             <a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none" href="/nodes/{{ n.ip }}/creds_sql" download>下载修复SQL</a>
             <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delNode('{{ n.ip }}')">删除节点</button>
@@ -250,6 +251,40 @@
   </div>
 </div>
 
+<!-- 节点引导安装 modal（v2.5.0 F1） -->
+<div class="overlay" id="bootOverlay" onclick="if(event.target===this)closeBootstrap()">
+  <div class="modal wide">
+    <header><b>节点引导安装 · <span id="bootIp"></span></b><span class="close" onclick="closeBootstrap()">×</span></header>
+    <div class="body">
+      <div class="note">
+        在目标节点主机上以 <b>root</b> 执行下面这一行命令，即可自动完成部署
+        （下载部署单元 → 建目录 → 起服务 → 回报状态），<b>无需再手工拷贝文件</b>。<br>
+        <span style="color:var(--danger)">⚠ 该命令含一次性凭据</span>：仅对这一个节点 IP 有效、有效期有限、
+        部署成功后自动作废，请勿转发他人。
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin:12px 0 8px">
+        <label style="margin:0">有效期
+          <select id="bootTtl" onchange="genBootstrap()">
+            <option value="24" selected>24 小时</option>
+            <option value="6">6 小时</option>
+            <option value="72">72 小时</option>
+          </select>
+        </label>
+        <span id="bootMeta" style="color:var(--muted);font-size:12px"></span>
+      </div>
+      <div id="bootCmd" class="mono" style="background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px 14px;font-size:12.5px;line-height:1.7;word-break:break-all;user-select:all;max-height:30vh;overflow:auto">生成中…</div>
+      <div style="margin-top:10px;color:var(--muted);font-size:12px">
+        提示：命令可重复执行（幂等）。若提示已过期，点「重新生成」即可拿到新命令。
+      </div>
+    </div>
+    <footer>
+      <button class="btn" onclick="closeBootstrap()">关闭</button>
+      <button class="btn btn-sm" onclick="genBootstrap()">重新生成</button>
+      <button class="btn btn-primary" onclick="copyBootCmd()">复制命令</button>
+    </footer>
+  </div>
+</div>
+
 <script>
   function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
   function escAttr(s){return String(s==null?"":s).replace(/"/g,"&quot;");}
@@ -270,6 +305,60 @@
   }
   function openAddNode(){document.getElementById("addOverlay").classList.add("show");}
   function closeAddNode(){document.getElementById("addOverlay").classList.remove("show");}
+
+  // ===== 节点引导安装（v2.5.0 F1）：一行 curl 完成部署 =====
+  var _bootIp="";
+  function openBootstrap(ip){
+    _bootIp=ip;
+    document.getElementById("bootIp").textContent=ip;
+    document.getElementById("bootOverlay").classList.add("show");
+    document.body.style.overflow="hidden";           // 锁 body 滚动
+    genBootstrap();
+  }
+  function closeBootstrap(){
+    document.getElementById("bootOverlay").classList.remove("show");
+    document.body.style.overflow="";
+  }
+  function genBootstrap(){
+    if(!_bootIp)return;
+    var ttl=document.getElementById("bootTtl").value||"24";
+    var fd=new URLSearchParams();fd.set("ip",_bootIp);fd.set("ttl_hours",ttl);
+    var box=document.getElementById("bootCmd"), meta=document.getElementById("bootMeta");
+    box.textContent="生成中…"; meta.textContent="";
+    fetch("/api/node/bootstrap",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:fd.toString(),credentials:"same-origin"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d||!d.ok){
+          box.textContent="生成失败："+((d&&d.error)||"未知错误");
+          toast((d&&d.error)||"生成引导命令失败","err");return;
+        }
+        box.textContent=d.command;
+        meta.textContent="安装目录 "+d.install_base+" ｜ 有效期 "+d.expires_in_hours+" 小时 ｜ 管理端 "+d.manager;
+      })
+      .catch(function(e){box.textContent="请求失败："+e;toast("请求失败","err");});
+  }
+  function copyBootCmd(){
+    var t=(document.getElementById("bootCmd").textContent||"").trim();
+    if(t.indexOf("curl")!==0){toast("还没有可复制的命令","err");return;}
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(t).then(
+        function(){toast("已复制，到节点主机粘贴执行");},
+        function(){_fallbackCopy(t);});
+    }else{_fallbackCopy(t);}
+  }
+  function _fallbackCopy(t){
+    var ta=document.createElement("textarea");ta.value=t;
+    ta.style.position="fixed";ta.style.opacity="0";
+    document.body.appendChild(ta);ta.select();
+    try{document.execCommand("copy");toast("已复制");}
+    catch(e){toast("复制失败，请手动选中复制","err");}
+    ta.remove();
+  }
+  document.addEventListener("keydown",function(e){
+    if(e.key==="Escape"&&document.getElementById("bootOverlay")&&document.getElementById("bootOverlay").classList.contains("show"))closeBootstrap();
+  });
 
   // 展开/收起详情 + 懒加载账号
   function toggleDetail(id){

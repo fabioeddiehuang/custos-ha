@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}滚动升级 · {{ cluster.name }}{% endblock %}
+{% block page_title %}滚动升级 · {{ cluster.name }}{% endblock %}
+
+{% block content %}
+<style>
+  .acts td{vertical-align:middle}
+  .warn{background:rgba(225,29,116,.10);border:1px solid rgba(225,29,116,.3);
+    color:#E11D74;padding:10px 12px;border-radius:10px;font-size:12.5px;margin:10px 0}
+  pre.out{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;
+    padding:10px 12px;font-size:12px;line-height:1.8;max-height:44vh;overflow:auto;margin-top:8px}
+</style>
+
+<div class="card">
+  <div class="note">
+    滚动升级：先更新所有<b>从库</b> → 等追平 → <b>强制同步</b>（拿到客观就绪判据）→ 切主 →
+    再更新原主库。全程可视化，不用再靠猜什么时候能切。
+  </div>
+
+  <h3 style="margin:16px 0 8px;font-size:14px">每个节点做什么</h3>
+  <table class="acts">
+    <thead><tr><th>节点</th><th>角色</th><th>动作</th><th>切换目标</th></tr></thead>
+    <tbody>
+    {% for n in nodes %}
+      <tr>
+        <td><b>{{ n.ip }}</b>:{{ n.port }}</td>
+        <td>{% if n.ip == master %}<span style="color:var(--primary);font-weight:700">当前主库</span>{% else %}从库{% endif %}</td>
+        <td>
+          <select class="act" data-ip="{{ n.ip }}">
+            <option value="restart">L1 重启服务</option>
+            <option value="rebuild">L2 重建复制（全量重新导入）</option>
+            <option value="pure">L3 纯净重建（清空数据目录后重建）</option>
+          </select>
+        </td>
+        <td>{% if n.ip != master %}<input type="radio" name="nm" value="{{ n.ip }}">{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="warn">
+    ⚠ <b>L3 纯净重建</b>会清空该节点的数据目录并从主库重新拉取数据。
+    它<b>不能对当前主库执行</b>（等于清空整个集群的数据），服务端会直接拒绝。
+    执行前请确认集群另有健康主库，且已有可用备份。
+  </div>
+
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <label style="margin:0"><input type="checkbox" id="doSwitch" checked> 完成后切换主库</label>
+    <button class="btn btn-primary btn-sm" onclick="start()">开始滚动升级</button>
+    <button class="btn btn-sm" onclick="cancel()">中止</button>
+    <span id="tip" style="color:var(--muted);font-size:12px"></span>
+  </div>
+
+  <div id="prog"></div>
+  <pre class="out" id="out" style="display:none"></pre>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  var _task="", _timer=null;
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function start(){
+    var acts={};
+    document.querySelectorAll('.act').forEach(function(s){acts[s.dataset.ip]=s.value;});
+    var nm=""; var r=document.querySelector('input[name=nm]:checked'); if(r)nm=r.value;
+    var fd=new URLSearchParams();
+    fd.set('cluster_id','{{ cluster.id }}');
+    fd.set('actions', JSON.stringify(acts));
+    fd.set('new_master', nm);
+    fd.set('do_switch', document.getElementById('doSwitch').checked?'1':'0');
+    document.getElementById('tip').textContent='提交中…';
+    fetch('/api/upgrade/start',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:fd.toString(),credentials:'same-origin'})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.ok){document.getElementById('tip').textContent='失败：'+(d.error||'');return;}
+        _task=d.task_id; document.getElementById('tip').textContent='';
+        document.getElementById('out').style.display='block';
+        _timer=setInterval(poll,2000); poll();
+      });
+  }
+  function poll(){
+    if(!_task)return;
+    fetch('/api/upgrade/status?task='+encodeURIComponent(_task),{credentials:'same-origin'})
+      .then(function(r){return r.json();})
+      .then(function(t){
+        var bar = t.progress||0;
+        document.getElementById('prog').innerHTML =
+          '<div style="margin-top:12px">状态：<b>'+esc(t.status)+'</b> ｜ '+esc(t.stage||'')+'</div>'+
+          '<div style="background:var(--surface-2);border-radius:8px;height:8px;margin-top:6px;overflow:hidden">'+
+          '<div style="width:'+bar+'%;height:100%;background:linear-gradient(90deg,#0ABAB5,#22d3ee)"></div></div>';
+        document.getElementById('out').textContent=(t.steps||[]).join('\n')+(t.error?('\n[错误] '+t.error):'');
+        if(['done','failed','cancelled'].indexOf(t.status)>=0){
+          clearInterval(_timer); _timer=null; _task="";
+        }
+      });
+  }
+  function cancel(){
+    if(!_task){return;}
+    var fd=new URLSearchParams(); fd.set('task',_task);
+    fetch('/api/upgrade/cancel',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:fd.toString(),credentials:'same-origin'})
+      .then(function(r){return r.json();})
+      .then(function(){document.getElementById('tip').textContent='已请求中止';});
+  }
+</script>
+{% endblock %}

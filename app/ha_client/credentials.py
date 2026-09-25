@@ -18,6 +18,18 @@ from app.config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, is_
 from app import mariadb_matrix
 
 
+def connect(host, port, user, password, timeout=5):
+    """惰性转发到 connection.connect，避免与 connection<->credentials 的循环导入。"""
+    from .connection import connect as _connect
+    return _connect(host, port, user, password, timeout=timeout)
+
+
+def _esc_sql(s):
+    """惰性转发到 connection._esc_sql，同上避免循环导入。"""
+    from .connection import _esc_sql as _e
+    return _e(s)
+
+
 import os as _os
 import time as _time
 _ALTER_MEMO_TTL = 3600
@@ -521,6 +533,8 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
 """HA 账号/权限的探测、建立与校正（root 回退、host 去 %% 集合）。"""
 
 from ._const import *
+from ..mysql_compat import (detect_flavour, F_MARIADB, F_MYSQL8, default_auth_plugin)
+
 
 def reset_replication_creds_on_master(master_host, master_port, ha_user, ha_pass,
                                        root_user, root_pass, repl_user, repl_pass,

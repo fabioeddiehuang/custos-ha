@@ -1,7 +1,7 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> **稳定版：v2.4.0**（镜像标签 `custos-server:v2.4.0`，**已发布 · 该分支只修 bug**）
-> **开发中：v2.5.0**（主线 `.env VERSION=v2.5.0`；集群接管 + 节点引导安装 + agent 指令通道）
+> **主线（已发布）：v2.5.0**（镜像标签 `custos-server:v2.5.0`，`.env VERSION=v2.5.0`；集群接管 + 节点 curl 引导安装 + agent 指令通道 + 滚动升级 + 集群级定时备份 + 强制同步 + 无保护窗口提示，**真机全功能验证通过**）
+> **稳定版：v2.4.0**（镜像标签 `custos-server:v2.4.0`，**已发布 · 该分支只修 bug**；数据迁移向导：MariaDB↔MariaDB + MySQL 5.7→MariaDB）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
 > 配套文档：`README.md`、`doc/手册/用户操作手册.md`、`doc/手册/迁移到本集群操作手册.md`、`doc/开发/API接口文档.md`、`doc/开发/数据库字段说明.md`、`doc/开发/数据库字段说明.md`
 
@@ -33,7 +33,7 @@
 | v2.3.9 | 重构 | 节点部署目录结构归整（配置/脚本/agent 分目录）；`custosctl node prepare` 自检；`.env` 去密（SECRET_KEY→`data/secret_key`，WEB_PASS/MGMT_MYSQL_PASS→compose，`.env` 纳入 git） |
 | v2.3.10 | 修复 | 凭证加密改为**默认关闭**（`CRED_ENCRYPTION`，零密钥依赖）；密钥持久化 + 解密钥匙串回退；修 ENC1 密文当复制口令导致复制集体瘫痪（1470）；`_repoint_slave` 返回值契约与假成功；`custosctl node install` 支持容器 MySQL/MariaDB |
 | v2.4.0 | 功能 | 数据迁移向导（MariaDB↔MariaDB + MySQL 5.7→MariaDB）；能力矩阵门禁；引擎方言适配；迁移前兼容性预检（dry-run） |
-| v2.5.0 | 功能 | 集群接管（纳管存量集群）；节点 **curl 一行引导安装**；agent **心跳出向 + 指令通道**（免 SSH 运维）；节点镜像内部分发 |
+| v2.5.0 | 功能 | 集群接管（纳管存量集群，零侵入）；节点 **curl 一行引导安装**（token + 离线镜像分发）；agent **心跳出向 + 指令通道**（免 SSH 运维）；**免 SSH 改密**（主库 ALTER+复制下发）；**滚动升级向导**（L1/L2/L3）；**集群级定时备份**（份数+天数双条件·错峰·磁盘预警·备份前追平）；**强制同步**（GTID 判据+锁写窗口）；**无保护窗口提示** |
 
 ---
 
@@ -127,6 +127,62 @@
   - **把现有数据库搬进 Custos（v2.4.0 主线功能）**：[`doc/手册/迁移到本集群操作手册.md`](./doc/手册/迁移到本集群操作手册.md)（分步图解，小白版）
   - 接口对接：[`doc/开发/API接口文档.md`](./doc/开发/API接口文档.md)；字段含义：[`doc/开发/数据库字段说明.md`](./doc/开发/数据库字段说明.md)
 - **升级方式**：`./scripts/deploy.sh up -d --build`（版本号经环境变量注入容器，**必须重建镜像才生效**）；节点侧无需升级。
+
+---
+
+## v2.5.0 详细变更（主线 · 真机全功能验证通过）
+
+> v2.5.0 在真实 4 节点环境（203 主 / 213 从 / 177 / 33，MariaDB 12.3.3 容器 + 裸机混合）完成 F1–F11 全部端到端验证，并修复一批实测必炸点。
+
+### v2.5.0 · 接管 + 引导安装 + agent 指令通道 + 运维增强
+
+#### F1 节点 curl 一行引导安装
+- 节点侧一条命令完成引导：`curl -sSL http://<管理器IP>:28888/api/node/bootstrap?token=<TOKEN> | bash`。
+- **一次性引导 token**：HMAC 签名 + IP 绑定 + TTL 24h + 用后作废（回执即销毁），由 Web「添加节点 → 生成引导命令」签发；单元不再预生成 token。
+- 裸机 MariaDB 仍走 `app/node_assets/Install-ha-mariadb-Node.sh`（tarball 全量安装），curl 引导只负责调用它；容器形态 `docker compose up -d`。
+
+#### F2 节点镜像内部分发（离线方案 B）
+- 服务端托管 `custos-node-<ver>.tar`（含 agent 镜像 tar），存 `./images/` 走 compose 挂载，经 token 端点下载、`docker load` 加载——**无需公网拉取**，适合离线/内网。
+- `scripts/build_node_images.sh` 一键构建镜像包；镜像目录必须进 `.dockerignore`（与 compose 宿主挂载一一对应）避免打进管理器镜像（历史教训：`backups/` 漏排除致镜像 1.27GB）。
+- `available_images()` 随包自动下发，引导脚本据版本选包。
+
+#### F5 agent 心跳出向 + 指令通道（免 SSH 运维）
+- agent 改为**长轮询**服务端待执行指令，**令牌认证**；服务端据此免 SSH 向节点下发运维动作：白名单动词 `update_files` / `restart_service` / `set_credential` / `run_builtin_script` / `stop_service` / `start_service` / `wipe_data`，外加受限逃生舱 `exec`（默认关闭）。
+- **隔离容器落盘修复**：隔离容器（python:3-slim）无 docker CLI 且 `/:/host:ro` 只读 → `restart_service`/`update_files` 写宿主失败。改 `chroot /host` 调宿主 docker + 落盘宿主，`node_gen.py` 宿主根挂载改 `/:/host`（读写）。
+- 配置漂移自动应用（F4）：重新生成后 `_auto_push_changed` 经 agent `update_files` 下发变更文件 + 重启受影响服务。
+
+#### F6 免 SSH 改密
+- 三类密码分流：① **DB 账号** → 服务端直连主库 `ALTER USER` + 复制下发（**绝不在只读副本执行**，避免争用 `mysql.*` 元数据锁导致复制死锁；改前自检 `@@read_only`，失败回滚旧密码）；② **节点文件凭据** → agent `update_files` + `restart`；③ **agent token** → `set_credential`。
+- 可只改单账号；**改完必须同步 `ha_check.conf`**（含 VIP 健康检查账号口令），否则 keepalived 健康检查失败 → VIP 乱漂。`MYSQL_ROOT_PASSWORD` 对已初始化卷不生效。
+
+#### F7 强制同步（零丢失追平）
+- 基于 **GTID 判据** + **稳定采样**（多次采样确认位点收敛）显式判定就绪；锁写期间 monitor 拓扑维护须跳过「置可写」（syncgate `_mark_locked` + failover `is_locked` 抑制），确保 `read_only` 真正生效。
+- 异步轮询（首帧即出内容）+ 超时自适应 `max(120, 预估×1.5)` 封顶 600s + 超时自动解锁。
+- MariaDB 兼容：无 `super_read_only`/`GTID_SUBSET`/`GTID_SUBTRACT`，停写回退 `read_only`、GTID 追平在 Python 侧解析比对（`_parse_gtid_set`）。
+
+#### F8 滚动升级向导 + 节点修复分档
+- 集群详情页新增「升级」Tab，引导逐步升级并实时反馈状态。
+- 节点故障分档自愈：**L1 重启**（服务异常）、**L2 重建复制**（复制中断/卡死）、**L3 纯净重建**（停服务 → 清数据目录 → 重建 → 建复制；铁律：**禁止对当前主库执行**）。
+- 修复：`rolling._apply_action` 把 `rebuild.start_rebuild` 返回的 **task_id 字符串**当字典 `.get` → `'str' object has no attribute 'get'`，已改为直接接字符串。
+
+#### F9 集群级定时备份
+- 每个集群可独立配置**保留份数 + 保留天数双条件**（任一满足即保留，二者皆不满足才清理，**绝不删最新一份**）。
+- 补做**错峰**执行 + UI 显**计划开始时刻** + **磁盘预警**（剩余空间低于阈值告警）+ **备份前追平等待**（确保从库与主库一致后再备份）。
+- 修复：`api_backup_policy_get` 未返回 `last_run`/`due` → 前端显示不出上次备份时间，已补字段。
+
+#### F10 集群接管（零侵入纳管）
+- 流程：只读探测（`SELECT VERSION()` / 复制状态 / 探活，**不写数据**）→ 仅建 Custos 运维账号（主库授权 + 复制下发，**不动业务库与现有账号**）→ 登记（只写 `nodes`/`hosts`）→ 下发 `sidecar_only` 引导命令（**绝不重装/重初始化数据库**）。
+- 修复：`adopt_node` 用 `node.get("reachable")` 恒假 → 建账号永远失败，改为 `node.get("ok")`；`credentials.py` 漏导入 `connect`/`_esc_sql`（且该模块被 `connection.py` 顶层 import 形成循环导入）→ 接管直接 NameError，已加**惰性包装函数**（`connect()`/`_esc_sql()` 调用时才 `from .connection import`）绕开循环。
+
+#### F11 无保护窗口提示
+- 集群处于**升级中 / 管理器离线**时，仪表盘顶部出现醒目红色横幅并标注离线时长，提醒自动切换能力暂时不可用。
+- 修复：`nodes` 表列是 `deploy_state` 非 `status`，原 `SELECT ... status` 致 500，已改读 `deploy_state`。
+- 另：管理器自身 HA 不做；看门狗默认不开启（风险略高）。
+
+#### 升级注意（v2.5.0）
+- 版本号唯一来源 `.env` 的 `VERSION=`；升级须 `./scripts/deploy.sh up -d --build`（重建管理器镜像，节点侧无需升级）。
+- agent 节点 compose 的宿主根挂载须为 `/:/host`（读写）以支持指令通道落盘/重启；旧 `/:/host:ro` 只读挂载会导致 `restart_service`/`update_files` 失效。
+- 引导镜像包 `custos-node-<ver>.tar` 由 `scripts/build_node_images.sh` 生成并放 `./images/`；新装/升级后首次引导前确认包已存在。
 
 ---
 

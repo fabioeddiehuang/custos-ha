@@ -521,6 +521,21 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
 """复制搭建与切换核心：make_slave_of / 起停从库 / 提主 / VIP 守卫。"""
 
 from ._const import *
+from ..mysql_compat import (detect_syntax, detect_flavour, F_MARIADB, F_MYSQL8, default_auth_plugin, change_replication_filter_sql, reset_replica_sql, stop_replication_sql, start_replication_sql, change_replication_sql)
+
+
+from .connection import (connect, connect_robust, _esc_sql)
+
+# —— 拆包后的补齐导入（必读）——
+# 本文件与 status/gtid/local_state/replication 共用同一段「账号/权限」代码（拆包时按职责
+# 复制到了各子模块），这些辅助函数实体在 credentials 与 mysql_compat 中。缺少它们时
+# py_compile 查不出来，只会在运行到那一行时抛 NameError —— 实测正是因此导致
+# 「提升主库为可写」失败（name 'detect_syntax' is not defined）、账号建不出来、探活全失败。
+
+from .credentials import (_native_password_hash, _parse_grant_privs, _granted_privs,
+                          _account_hosts, _ensure_local_state_grant, _as_int,
+                          _can_login, _ensure_account, _has_all_privileges)
+
 
 def restart_slave_io(host, port, user, password, root_user="root", root_pass="", timeout=8):
     from .connection import (connect_robust)

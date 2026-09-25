@@ -11,6 +11,11 @@ generated_nodes/
 # 服务端镜像 —— 生产实测：本应 340MB 的镜像因此膨胀到 1.27GB，且 docker save 同为 1.2GB
 # （.sql.gz 已是压缩态，不会再变小）。
 backups/
+# 节点镜像 tar（v2.5.0 F2 镜像内部分发）：由 scripts/build_node_images.sh 生成在宿主
+# ./images/，运行时经 compose 挂载后由服务端 HTTP 下发给节点（curl 引导脚本 docker load）。
+# **必须排除**：否则 `COPY . .` 会把这些几百 MB 的镜像包整体打进服务端镜像，
+# 重蹈 backups/ 导致镜像膨胀到 1.27GB 的覆辙。
+images/
 *.md
 .codebuddy/
 
