@@ -16,11 +16,11 @@ pip install -r requirements.txt pytest
 
 # 3) 运行
 pytest -q            # 全部
-pytest tests/test_mysql_compat.py -v   # 单文件
+pytest regression/test_mysql_compat.py -v   # 单文件
 pytest -k "enc1 or mariadb" -v         # 按关键字
 ```
 
-`pytest.ini` 已配置 `testpaths = tests`，无需额外参数。
+`pytest.ini` 已配置 `testpaths = regression`，无需额外参数。
 
 ## 2. 设计：为什么不需要真实数据库
 

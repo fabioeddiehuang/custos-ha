@@ -24,10 +24,10 @@
 
 | 版本 | 定位 | 文档 |
 |---|---|---|
-| v2.3 | MariaDB 正确性与安全基线 | [`v2.3.0.md`](./doc/releases/v2.3.0.md) |
-| v2.4 | MariaDB 运维闭环 | [`v2.4.0.md`](./doc/releases/v2.4.0.md) |
-| v2.5 | 节点纳管与部署体验 | [`v2.5.0.md`](./doc/releases/v2.5.0.md) |
-| v3.0 | MariaDB 深度 + 平台化 + UI v3 | [`v3.0.0.md`](./doc/releases/v3.0.0.md) |
+| v2.3 | MariaDB 正确性与安全基线 | [`v2.3.0.md`](../releases/v2.3.0.md) |
+| v2.4 | MariaDB 运维闭环 | [`v2.4.0.md`](../releases/v2.4.0.md) |
+| v2.5 | 节点纳管与部署体验 | [`v2.5.0.md`](../releases/v2.5.0.md) |
+| v3.0 | MariaDB 深度 + 平台化 + UI v3 | [`v3.0.0.md`](../releases/v3.0.0.md) |
 
 ---
 
@@ -61,9 +61,9 @@
 - [ ] **1.3 MySQL 侧冻结策略与回归清单** `P0`
   - `mysql_compat` 是共享分派层，改 MariaDB 分支**极易误伤 MySQL 路径**
   - 规则：MySQL 侧只修 bug；每次 MariaDB 改动跑一遍 MySQL 回归（建节点 → 复制 → 切换 → 备份恢复）
-  - ✅ **代码级双路径回归已就位**：`tests/test_mysql_compat.py` 对 `mysql_compat` 的复制 SQL 生成 / 风味分派
+  - ✅ **代码级双路径回归已就位**：`regression/test_mysql_compat.py` 对 `mysql_compat` 的复制 SQL 生成 / 风味分派
     同时构造 MySQL 8.0 与 MariaDB 两套输入，覆盖 `change_replication_sql` / 启停术语 / 复制过滤 / 认证插件 /
-    GTID 解析，确保同一逻辑在两条路径都不回归（48 个单测全绿，见 `tests/README.md`）。
+    GTID 解析，确保同一逻辑在两条路径都不回归（48 个单测全绿，见 `regression/README.md`）。
   - ⏳ **环境级回归仍待做**：真实「版本 × 形态 × 发行版」矩阵与端到端链路（建节点→复制→切换→备份恢复）
     需容器编排，不在纯单测范围内，列为后续。
 
@@ -82,10 +82,10 @@
 | **v2.3.4** | 备份按库分文件 + index.json | ✅ 已实现 |
 | **v2.3.5** | MariaDB 三形态日志采集确认与提示 | ✅ 已实现 |
 
-> 说明：原 v2.3「一次性做 5 项」拆成 6 个小版本。**2.3.x 已全部做完（v2.3.5 收官）**，每版均已完成 MariaDB 冒烟 + MySQL 回归的代码级改造。整体规划与变更记录见 [`doc/releases/v2.3.1-v2.3.5.md`](./doc/releases/v2.3.1-v2.3.5.md)。
+> 说明：原 v2.3「一次性做 5 项」拆成 6 个小版本。**2.3.x 已全部做完（v2.3.5 收官）**，每版均已完成 MariaDB 冒烟 + MySQL 回归的代码级改造。整体规划与变更记录见 [`doc/releases/v2.3.1-v2.3.5.md`](../releases/v2.3.1-v2.3.5.md)。
 
 ### v2.3 — MariaDB 正确性与安全基线
-> 独立规划与变更记录：[`doc/releases/v2.3.0.md`](./doc/releases/v2.3.0.md)（v2.3.0）、[`doc/releases/v2.3.1-v2.3.5.md`](./doc/releases/v2.3.1-v2.3.5.md)（v2.3.1~2.3.5）
+> 独立规划与变更记录：[`doc/releases/v2.3.0.md`](../releases/v2.3.0.md)（v2.3.0）、[`doc/releases/v2.3.1-v2.3.5.md`](../releases/v2.3.1-v2.3.5.md)（v2.3.1~2.3.5）
 
 - [x] **2.3.0 MariaDB 版本支持矩阵** `P0` ✅ — 见上表
 - [x] **2.3.0 变更生效提示（重建容器 / 重启 / 执行 SQL）** `P0` ✅
@@ -96,7 +96,7 @@
 - [x] **2.3.5 MariaDB 三形态日志采集确认** `P1` ✅
 
 ### v2.4 — 运维闭环（让集群"自己跑"）
-> 独立规划与变更记录：[`doc/releases/v2.4.0.md`](./doc/releases/v2.4.0.md)
+> 独立规划与变更记录：[`doc/releases/v2.4.0.md`](../releases/v2.4.0.md)
 
 - [ ] **2.4.1 备份调度增强** `P1` — 保留份数、失败重试、RPO/成功率/耗时面板
 - [ ] **2.4.2 备份自动校验** `P1` — 行数/checksum 抽检，标记「可信/存疑」
@@ -105,7 +105,7 @@
 - [ ] **2.4.5 任务中心持久化** `P1` — 现状仅 rebuild 有 task 且存内存，重启即失
 
 ### v2.5 — 纳管与部署体验（Zabbix 感）
-> 独立规划与变更记录：[`doc/releases/v2.5.0.md`](./doc/releases/v2.5.0.md)
+> 独立规划与变更记录：[`doc/releases/v2.5.0.md`](../releases/v2.5.0.md)
 
 - [ ] **2.5.1 单元分发** `P1` — 下载 + 一行引导命令（依赖 2.3.1）
 - [ ] **2.5.2 镜像分发** `P1` — 内网 registry 或离线 tar + `docker load`
@@ -116,7 +116,7 @@
 ---
 
 ## 3. 3.0 路线：MariaDB 深度 + 平台化
-> 独立规划与变更记录：[`doc/releases/v3.0.0.md`](./doc/releases/v3.0.0.md)
+> 独立规划与变更记录：[`doc/releases/v3.0.0.md`](../releases/v3.0.0.md)
 
 - [ ] **3.0.1 拓扑可视化 + 拓扑 API** `P1`
 - [ ] **3.0.2 mariabackup 物理备份 + 增量 + PITR** `P1`（依赖 2.3.2）
