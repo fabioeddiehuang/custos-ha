@@ -499,9 +499,9 @@ fi
 
 # ---------------------------------------------------------------------------
 say "7/6 节点包自检（custosctl node prepare）"
-# 非阻断：仅报告各 generated_nodes 节点包的完整性 / 孤立刻，发现问题不中止安装。
+# 非阻断：仅报告各 generated_nodes 节点包的完整性 / 残留情况，发现问题不中止安装。
 if command -v custosctl >/dev/null 2>&1; then
-  echo "以下为节点包自检（如有 [WARN]/[ORPHAN?] 可重新生成节点目录，或用 --clean 清理孤立单元）："
+  echo "以下为节点包自检（如有 [WARN]/[异常?] 可重新生成节点目录，或用 --clean 清理残留节点目录）："
   custosctl node prepare || true
 else
   warn "未找到 custosctl，跳过节点包自检（可稍后手动执行 custosctl node prepare）"

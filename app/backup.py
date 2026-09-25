@@ -813,7 +813,7 @@ def restore_backup(cid, host, port, filename, databases=None, no_binlog=False,
 
     no_binlog=True 时在本会话执行 SET sql_log_bin=0：
       重建从库必须关掉，否则恢复产生的海量 DML 会写入从库 binlog、生成新的
-      GTID 集合，与主库历史 GTID 冲突，重链时被判「分叉」进而触发 RESET MASTER。
+      GTID 集合，与主库历史 GTID 冲突，重链时被判「不一致」进而触发 RESET MASTER。
       该变量是 session 级（不能 SET GLOBAL），故只能在本函数建连后设置。
 
     progress(done, total, phase)：进度回调（可为 None），供后台任务展示进度。

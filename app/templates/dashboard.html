@@ -132,7 +132,7 @@
             {% elif h.repl_state == 'orphan' %}
               <span class="pill warn">● 脱管异常</span>
             {% elif h.repl_state == 'repl_fork' %}
-              <span class="pill down" title="复制线程正常但上游并非当前主库：正从幽灵/旧主拉数据，存在静默数据分叉，管理器将自动重指">● 数据分叉</span>
+              <span class="pill down" title="复制线程正常但上游并非当前主库：正从幽灵/旧主拉数据，存在静默数据不一致，管理器将自动重指">● 数据不一致</span>
               {% if h.upstream %}<div class="repl-link">← {{ h.upstream }}(非当前主)</div>{% endif %}
             {% elif h.repl_state == 'migrating' %}
               <span class="pill" style="color:var(--accent,#0ABAB5);border-color:var(--accent,#0ABAB5)">● 迁移中</span>
@@ -379,7 +379,7 @@
           } else if (s === 'orphan') {
             return '<span class="pill warn">● 脱管异常</span>';
           } else if (s === 'repl_fork') {
-            return '<span class="pill down" title="复制线程正常但上游并非当前主库：正从幽灵/旧主拉数据，存在静默数据分叉，管理器将自动重指">● 数据分叉</span>' + (up ? '<div class="repl-link">← ' + esc(up) + '(非当前主)</div>' : '');
+            return '<span class="pill down" title="复制线程正常但上游并非当前主库：正从幽灵/旧主拉数据，存在静默数据不一致，管理器将自动重指">● 数据不一致</span>' + (up ? '<div class="repl-link">← ' + esc(up) + '(非当前主)</div>' : '');
           } else if (s === 'offline') {
             return '<span class="pill down">● 离线</span>';
           }

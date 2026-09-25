@@ -317,7 +317,7 @@ def _classify_repl_state(st, is_master, cur_master=None):
     - repl_stuck  从库·复制卡死（线程在跑但 exec_gtid 锁死不前进）
     - repl_purged 主库 binlog 已清理（1236），复制无解，必须重建该从库
     - repl_fork   从库·复制线程双 Yes，但上游并非当前主库（F14 新增）。
-                  静默数据分叉：节点正从「幽灵/旧主」拉数据，旧逻辑却报 repl_ok 掩盖之。
+                  静默数据不一致：节点正从「幽灵/旧主」拉数据，旧逻辑却报 repl_ok 掩盖之。
     """
     if not st.get("alive"):
         return "offline"
@@ -333,8 +333,8 @@ def _classify_repl_state(st, is_master, cur_master=None):
         return "repl_broken"
     # 【F14】健康判定必须校验上游：从库复制双 Yes 只说明「在跟某个源同步」，
     # 不说明「跟的是当前主库」。本轮真机实测：33 顶着早已消失的幽灵主库，
-    # 双线程 Yes 却持续把错误数据当正常写入，旧逻辑据此报 repl_ok 掩盖了分叉。
-    # 只有上游 == 当前主库才算真正对齐；否则标 repl_fork，让分叉在仪表盘与告警中可见，
+    # 双线程 Yes 却持续把错误数据当正常写入，旧逻辑据此报 repl_ok 掩盖了不一致。
+    # 只有上游 == 当前主库才算真正对齐；否则标 repl_fork，让不一致在仪表盘与告警中可见，
     # 并由每周期的 ensure_topology 自动重指回当前主库。
     if cur_master:
         _up = st.get("master_host")
@@ -527,20 +527,20 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
                 send_alert("半同步恢复",
                            f"{tag}节点 {host} 半同步已恢复（status=ON），数据丢失(RPO)风险解除。",
                            cluster_id=cluster_id)
-        # 6) 复制指向错误主库（静默数据分叉，F14）：从库线程双 Yes 但上游≠当前主库。
+        # 6) 复制指向错误主库（静默数据不一致，F14）：从库线程双 Yes 但上游≠当前主库。
         #    旧逻辑只看 slave_io/slave_sql，会把它当 repl_ok 掩盖；此处显式告警，
         #    并依赖每周期 ensure_topology 自动重指回当前主库（重指成功后取消告警）。
         _ck_fork = ("fork", h_cid, h_host, h_port)
         if status == "up" and not is_master:
             if repl_state == "repl_fork":
                 send_alert(
-                    "复制指向错误主库(数据分叉风险)",
+                    "复制指向错误主库(数据不一致风险)",
                     f"{tag}节点 {host} 复制线程正常(IO/SQL=Yes)，但其上游是 {upstream}，"
-                    f"并非当前主库 {cur_master}。该节点正从「幽灵/旧主」拉数据，存在静默数据分叉；"
+                    f"并非当前主库 {cur_master}。该节点正从「幽灵/旧主」拉数据，存在静默数据不一致；"
                     f"管理器将在下一周期自动重指回当前主库，若持续请检查拓扑与 current_master 记录。",
                     cluster_id=cluster_id, cancel_key=_ck_fork)
             elif prev.get("repl_state") == "repl_fork":
-                # 此前是分叉、现已重指回正确主库：撤销告警并记一条自愈记录
+                # 此前是不一致、现已重指回正确主库：撤销告警并记一条自愈记录
                 if cancel_alert(_ck_fork, note=f"{host} 已重指回当前主库 {cur_master}"):
                     record_alert(cluster_id, h_host, h_port, "selfheal",
                                  f"{tag}节点 {host} 复制已重指回正确主库 {cur_master}（观察期内，未发送邮件）")
@@ -737,7 +737,7 @@ def _probe_all():
     if not clusters:
         return  # 尚未创建任何集群，空闲等待
     # 迁移中节点识别（延迟导入避免循环依赖）：迁移目标在 seed/桥接/追平期间
-    # 应显示「迁移中」而非离线/数据分叉，且不发状态类告警。
+    # 应显示「迁移中」而非离线/数据不一致，且不发状态类告警。
     try:
         from . import migration as _migration
     except Exception:
@@ -804,8 +804,8 @@ def _probe_all():
             is_master = ((host, port) == cur_key) and (st.get("mode") != "slave")
             # 节点半同步状态：主库看 master_status，从库看 slave_status
             semi = st.get("semi_master_status") if is_master else st.get("semi_slave_status")
-            # 迁移目标节点：seed/桥接/追平期间显示「迁移中」而非离线/数据分叉，且跳过
-            # 状态类告警（离线/复制中断/数据分叉）。seed 起始已 lock_target，monitor 的
+            # 迁移目标节点：seed/桥接/追平期间显示「迁移中」而非离线/数据不一致，且跳过
+            # 状态类告警（离线/复制中断/数据不一致）。seed 起始已 lock_target，monitor 的
             # 拓扑维护也会跳过该集群，故此处只需修正卡片语义，不真正探活状态。
             if _migration is not None and _migration.is_node_migrating(host, port):
                 _mig_st = dict(st, alive=True)  # 显示用：不计入离线，避免误导
@@ -829,8 +829,8 @@ def _probe_all():
                 else:
                     _STUCK_PREV[_pk_s] = ("", 0)
             # 【F14】数据交互状态分类须校验上游：从库双线程 Yes 但上游≠当前主库时，
-            # 判为 repl_fork（静默数据分叉），不能再报 repl_ok。分类结果同时供：
-            # ① _update_host 落库 repl_state（仪表盘可见）；② 下方 repl_ok 与分叉告警。
+            # 判为 repl_fork（静默数据不一致），不能再报 repl_ok。分类结果同时供：
+            # ① _update_host 落库 repl_state（仪表盘可见）；② 下方 repl_ok 与不一致告警。
             _cur_master_str = ("%s:%s" % cur_key) if cur_key else None
             _up = st.get("master_host")
             _upstream_str = ("%s:%s" % (_up, int(st.get("master_port") or 0))) if _up else None
@@ -845,7 +845,7 @@ def _probe_all():
                 f[key] = 0
             # 复制是否真正对齐（主库无复制通道，视为主库自身即「正常」）：
             # repl_ok 仅在分类为 repl_ok（双线程 Yes 且上游==当前主库）时为真，
-            # 确保「顶着幽灵主库」的节点不会被当作复制正常，从而触发分叉告警而非静默。
+            # 确保「顶着幽灵主库」的节点不会被当作复制正常，从而触发不一致告警而非静默。
             repl_ok = is_master or (repl_state == "repl_ok")
             _alert_on_transition(key, "up" if st["alive"] else "down", is_master, repl_ok,
                                  st.get("seconds_behind"), cluster_name, cid, semi,
@@ -931,7 +931,7 @@ def _act_once():
                     print(f"[monitor] 时钟漂移检测异常 {h_host}:{h_port}: {type(e).__name__}: {e}")
             # ---- 从库可写检测 ----
             # 从库若 read_only 被突破（人工误操作 / 参数漂移 / 提升后残留可写），
-            # 业务一旦写进来就会与主库数据分叉，且这类分叉**不可逆**（复制不会自动
+            # 业务一旦写进来就会与主库数据不一致，且这类不一致**不可逆**（复制不会自动
             # 收敛，只会逐步报 1062/1032）。故持续校验并自动纠正 + 告警。
             if (not is_master and st.get("mode") == "slave"
                     and str(st.get("ro")).strip() in ("0", "0.0", "False", "false")
@@ -948,7 +948,7 @@ def _act_once():
                     print(f"[monitor] 从库只读纠正失败 {h_host}:{h_port}: {_ro_err}")
                 send_alert("从库可写(已自动纠正)" if _ro_ok else "从库可写(纠正失败)",
                            f"【{cluster_name}】节点 {h_host}:{h_port} 挂着复制通道但 read_only=OFF，"
-                           f"业务写入会导致主从数据分叉且不可逆。"
+                           f"业务写入会导致主从数据不一致且不可逆。"
                            + (f"已自动重新置为只读。" if _ro_ok
                               else f"自动纠正失败（{_ro_err}），请立即人工处理！"),
                            cluster_id=cid)

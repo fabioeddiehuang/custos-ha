@@ -115,7 +115,7 @@ def probe_node(host, port, user, password, timeout=5):
         "supported": False, "profile_note": "",
         "server_id": None, "read_only": None, "super_read_only": None,
         "log_bin": None, "binlog_format": "",
-        "gtid_enabled": False, "repl_mode": _vp.REPL_NONE,
+        "gtid_enabled": False, "repl_mode": _vp.REPL_NONE, "gtid_domain_id": None,
         "role": "standalone", "replica": None, "replicas": 0,
         "gtid_executed": "", "data_size_bytes": 0,
         "grants": [], "issues": [],
@@ -146,6 +146,8 @@ def probe_node(host, port, user, password, timeout=5):
         out["level"] = p["level"]
         out["supported"] = _vp.is_supported(ver)
         out["profile_note"] = p.get("notes", "")
+        # 接管可能需要显式开启的开关（log_bin 默认 OFF 等），向导作为 opt-in 选项提供
+        out["switches"] = _vp.adopt_switch_requirements(ver)
 
         flavour = detect_flavour(cur)
 
@@ -159,6 +161,7 @@ def probe_node(host, port, user, password, timeout=5):
         # ---- GTID 与复制模式 ----
         if p["family"] == _vp.FAMILY_MARIADB:
             out["gtid_executed"] = str(_scalar(cur, "SELECT @@gtid_slave_pos") or "")
+            out["gtid_domain_id"] = _scalar(cur, "SELECT @@gtid_domain_id")
             # MariaDB 用 SHOW SLAVE STATUS 的 Using_Gtid 判定（No / Slave_pos / Current_pos）
         else:
             out["gtid_executed"] = str(_scalar(cur, "SELECT @@gtid_executed") or "")
@@ -408,3 +411,52 @@ def probe_cluster(nodes, l2_prefix=24):
 
     res["scenario_label"] = SCENARIO_LABEL.get(res["scenario"], res["scenario"])
     return res
+
+
+# --------------------------------------------------------------------------
+# 阶段 1：adopt（建账号 + 登记 + 装 sidecar）
+#
+# 只读探测见 probe_node / probe_cluster（幂等、可反复跑、绝不改动老库）。
+# 以下为「动手」部分——仅建立 Custos 接管账号，不动任何复制拓扑。
+# 登记 nodes/hosts 与装 sidecar 由 API 层在账号建立成功后调用（阶段 1 后续）。
+# --------------------------------------------------------------------------
+
+def adopt_node(node, root_user, root_pass, creds, manager_ip="", manager_subnet=None):
+    """在旧节点上建立 Custos 接管账号（ha_monitor / replication / app / root@'<管理器IP>'）。
+
+    复用 ha_client.credentials.ensure_ha_creds 的完整自愈（账号不存在则 CREATE + GRANT、
+    密码漂移则 ALTER、root 回退），MariaDB 与 MySQL 风味自动分派。host 集合由
+    config.ACCOUNT_HOST_MODE 决定（segment 模式 = 仅网段%，落实「去 %」策略，最多开放内网段%）。
+
+    :param node: probe_node 结果 dict（需含 host / port / flavour / reachable）
+    :param root_user / root_pass: 旧节点 root（compose 固定 MYSQL_ROOT_PASSWORD）
+    :param creds: Custos 接管账号凭据
+        {"ha_user","ha_pass","repl_user","repl_pass","app_user","app_pass"}
+        取自管理器统一凭据（AUTH 设置），全 Custos 集群一致
+    :return: (ok: bool, msg: str)
+    """
+    if not node.get("reachable"):
+        return False, "节点不可达，无法建立账号"
+    from app.ha_client.credentials import ensure_ha_creds
+    ok, msg = ensure_ha_creds(
+        host=node["host"], port=node["port"],
+        root_user=root_user, root_pass=root_pass,
+        ha_user=creds.get("ha_user", ""), ha_pass=creds.get("ha_pass", ""),
+        repl_user=creds.get("repl_user", ""), repl_pass=creds.get("repl_pass", ""),
+        app_user=creds.get("app_user", ""), app_pass=creds.get("app_pass", ""),
+        manager_ip=manager_ip, manager_subnet=manager_subnet,
+    )
+    return ok, msg
+
+
+def adopt_cluster(probe, root_user, root_pass, creds, manager_ip="", manager_subnet=None):
+    """对 probe_cluster 结果逐个节点建立接管账号。
+
+    :param probe: probe_cluster 返回（含 nodes 列表）
+    :return: [{"host","ok","msg"}, ...]
+    """
+    results = []
+    for node in probe.get("nodes", []):
+        ok, msg = adopt_node(node, root_user, root_pass, creds, manager_ip, manager_subnet)
+        results.append({"host": node.get("host"), "ok": ok, "msg": msg})
+    return results

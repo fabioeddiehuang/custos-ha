@@ -50,7 +50,7 @@ _TOPO_AT = {}
 #   ① 该节点在最长 PUSH_MAX_INTERVAL 秒内**不会再被重试**；
 #   ② 失败持续时，它本地 current_master 会长期停留在旧值甚至幽灵值；
 #   ③ keepalived 检查脚本第 3 关据此判定「本机非主库」→ **真主拒绝持有 VIP**，
-#      而 vip-guard 又读到该节点「自认主」→ 拒绝把回归的旧主降级为从库（静默分叉）。
+#      而 vip-guard 又读到该节点「自认主」→ 拒绝把回归的旧主降级为从库（无人察觉的双写不一致）。
 # 两者叠加即 VIP 在两节点上同时被放弃 → VIP 凭空消失。
 # 改为 (cluster_id, host, port) 粒度记账：只有**真正写成功**的节点才被记时间戳，
 # 失败的节点下一个监控周期（~2s）立即重试，并可被诊断日志/告警暴露。
@@ -74,8 +74,8 @@ _LAST_FAILOVER_TS = {}
 # 且 IO/SQL 自愈对其无效（heal_replication 拒绝跳过「会让数据永久不一致」的缺表错误）。
 # 故：重指向失败且属「缺表 / 主库 binlog 已清理」这类 binlog 重放不可自愈的缺口时，
 # 自动触发全量克隆（复用 rebuild.start_rebuild：主库 dump → 从库 restore → 对齐 GTID）。
-# 安全闸门：从库若存在主库没有的写入（孤儿数据，GTID 超前），克隆会覆盖丢失 → 禁止
-# 自动克隆，转人工（一致性校验导出孤儿行回灌主库）。可用 CUSTOS_AUTO_FULL_CLONE=0 关闭。
+# 安全闸门：从库若存在主库没有的写入（残留数据，GTID 超前），克隆会覆盖丢失 → 禁止
+# 自动克隆，转人工（一致性校验导出主库缺失、仅从库存在的行回灌主库）。可用 CUSTOS_AUTO_FULL_CLONE=0 关闭。
 AUTO_FULL_CLONE = os.environ.get("CUSTOS_AUTO_FULL_CLONE", "1") != "0"
 _AUTO_CLONE_COOLDOWN = 3600  # 同一节点两次自动克隆最短间隔（秒），避免重建风暴
 _AUTO_CLONE_AT = {}
@@ -131,7 +131,7 @@ def _parse_gtid_pos(s):
 
     ⚠ 必须自己解析，绝不能用 SQL 的 GTID_SUBSET()：那是 **MySQL** 的函数，
       MariaDB 上执行报 1305 FUNCTION GTID_SUBSET does not exist（12.3.3 实测）。
-      调用一旦被 except 吞掉就会静默得出错误结论 —— 这曾让「孤儿安全闸门」恒返回
+      调用一旦被 except 吞掉就会静默得出错误结论 —— 这曾让「残留安全闸门」恒返回
       True（放行），等于允许自动克隆覆盖掉真实业务数据。
     """
     out = {}
@@ -156,7 +156,7 @@ def _gtid_pos_is_subset(a, b):
     """True 表示 a 中每个 (domain,server) 的序号都不超过 b（即 a ⊆ b）。
 
     MariaDB 的 gtid_*_pos 是「每个 domain-server 的最后序号」，故子集判断即逐项比序号。
-    a 空 ⇒ 无事务，恒为子集（克隆不会丢数据）；a 非空而 b 空 ⇒ 全是孤儿。
+    a 空 ⇒ 无事务，恒为子集（克隆不会丢数据）；a 非空而 b 空 ⇒ 全是残留。
     """
     da, db = _parse_gtid_pos(a), _parse_gtid_pos(b)
     if not da:
@@ -172,12 +172,12 @@ def _gtid_pos_is_subset(a, b):
 def _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
     """True = 从库所有已提交事务主库都有（自动克隆不会丢数据）。
 
-    安全闸门用：从库有孤儿写入（其 GTID 不是主库的子集）时返回 False，禁止自动克隆。
+    安全闸门用：从库有残留写入（其 GTID 不是主库的子集）时返回 False，禁止自动克隆。
 
     ⚠ 两个「已提交事务」来源都必须查：
       - gtid_slave_pos：复制应用过的事务；
-      - gtid_binlog_pos：本节点 binlog 里的，含**它自己写过的事务——孤儿就在那里**。
-    只看前者会漏判孤儿（实测：从库自写产生 35-35-8，而 slave_pos 仍是 35-35-2）。
+      - gtid_binlog_pos：本节点 binlog 里的，含**它自己写过的事务——残留就在那里**。
+    只看前者会漏判残留（实测：从库自写产生 35-35-8，而 slave_pos 仍是 35-35-2）。
     """
     host, port = h["host"], int(h["port"])
     sru, srp = node_root(host, cluster_id)
@@ -211,7 +211,7 @@ def _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
             pass
     if not m_gt:
         return True
-    # 两者都必须是主库的子集，任一含孤儿即拦截
+    # 两者都必须是主库的子集，任一含残留即拦截
     return (_gtid_pos_is_subset(s_slave, m_gt)
             and _gtid_pos_is_subset(s_binlog, m_gt))
 
@@ -263,8 +263,8 @@ def _maybe_auto_full_clone(cluster_id, h, cur_h, cur_p, creds, force_reason=None
     触发条件二选一：
       ① force_reason 非空：调用方已判定存在「数据缺口」（如重装后缺主库的业务库）；
       ② 否则：复制中断属『缺表 / 主库 binlog 已清理』(binlog 重放补救不了)。
-    且必须通过安全闸门：从库无孤儿写入（GTID 是主库的子集，克隆不丢数据）。
-    才自动调 start_rebuild。否则维持原『告警降级』，转人工（导出孤儿行回灌主库）。
+    且必须通过安全闸门：从库无残留写入（GTID 是主库的子集，克隆不丢数据）。
+    才自动调 start_rebuild。否则维持原『告警降级』，转人工（导出主库缺失、仅从库存在的行回灌主库）。
     """
     if not AUTO_FULL_CLONE:
         _warn_repoint(h["host"], h["port"],
@@ -287,8 +287,8 @@ def _maybe_auto_full_clone(cluster_id, h, cur_h, cur_p, creds, force_reason=None
     if not _slave_gtid_is_subset_of_master(h, creds, cluster_id, cur_h, cur_p):
         _AUTO_CLONE_AT[key] = time.monotonic()
         msg = (f"节点 {host}:{port} 复制中断（{why}），但检测到该节点存在主库没有的写入"
-               f"（孤儿数据）：自动全量克隆会覆盖丢失，已暂停自动重建。"
-               f"请先「一致性校验 → 导出孤儿行回灌主库」，再手动重建；"
+               f"（残留数据）：自动全量克隆会覆盖丢失，已暂停自动重建。"
+               f"请先「一致性校验 → 导出主库缺失、仅从库存在的行回灌主库」，再手动重建；"
                f"或确认数据可丢弃后在节点页点「重建」。")
         print(f"[topology][安全] {msg}")
         try:
@@ -441,7 +441,7 @@ def push_current_master_to_nodes(cluster_id, master_str, force=False):
             detail = "；".join("%s:%s (%s)" % (h, p, e) for h, p, e in failed)
             msg = ("[ha_local] 当前主库标识 %s 推送失败 %d 个节点：%s "
                    "这些节点本地 ha_local.state 已过期，keepalived 会据此误判 VIP 归属"
-                   "（真主可能拒绝持 VIP、回归的旧主可能拒绝降级为从库→静默分叉）。"
+                   "（真主可能拒绝持 VIP、回归的旧主可能拒绝降级为从库→无人察觉的双写不一致）。"
                    "请检查节点 ha_monitor 账号权限（需 BINLOG ADMIN 及 ha_local 库权限）"
                    "与到节点的网络连通性。" % (master_str, len(failed), detail))
             print(msg)
@@ -664,7 +664,7 @@ def confirm_master_down(cluster_id, master_host, master_port, creds, node_root_f
 
 @_failover_guarded
 def do_failover(cluster_id, reason="auto"):
-    """主库判定宕机后执行切换：fencing -> 提升延迟最小从库 -> 更新 current_master -> 其余节点重指向。"""
+    """主库判定宕机后执行切换：写入隔离 -> 提升延迟最小从库 -> 更新 current_master -> 其余节点重指向。"""
     cur_h, cur_p = get_current_master(cluster_id)
     creds = load_creds(cluster_id)
     if not cur_h or not creds["ha_user"]:
@@ -691,16 +691,16 @@ def do_failover(cluster_id, reason="auto"):
         new = candidates[0]
     new_h, new_p = new["host"], int(new["port"])
 
-    # 1) fencing：尽量把旧主置只读，使其释放 VIP 并拒绝写入
+    # 1) 写入隔离：尽量把旧主置只读，使其释放 VIP 并拒绝写入
     ru, rp = node_root(cur_h, cluster_id)
     fenced = True
     try:
         set_read_only(cur_h, cur_p, creds["ha_user"], creds["ha_pass"], True, ru, rp)
     except Exception as e:
         fenced = False
-        print(f"[failover] 无法连接旧主做 fencing(可能已宕机): {e}")
+        print(f"[failover] 无法连接旧主做 写入隔离(可能已宕机): {e}")
 
-    # 1.5) 防误切 / 防脑裂：fencing 失败只说明「管理器连不上旧主」，不等于旧主已宕机
+    # 1.5) 防误切 / 防脑裂：写入隔离失败只说明「管理器连不上旧主」，不等于旧主已宕机
     #      （网络分区、max_connections 打满、账号权限失效都会如此）。此时必须由集群内
     #      其它节点作证主库确实不可达，否则**宁可不切**——两个可写节点（脑裂双写）
     #      的代价远大于「该切没切」。
@@ -708,7 +708,7 @@ def do_failover(cluster_id, reason="auto"):
         ok_c, detail = confirm_master_down(cluster_id, cur_h, cur_p, creds, node_root)
         if not ok_c:
             send_alert("切换中止(疑似脑裂风险)",
-                       f"无法连接旧主 {cur_h}:{cur_p} 做 fencing，且交叉验证未通过：{detail}。"
+                       f"无法连接旧主 {cur_h}:{cur_p} 做 写入隔离，且交叉验证未通过：{detail}。"
                        f"为避免出现两个可写节点（脑裂双写），本次切换已中止。请检查管理器到旧主的"
                        f"网络、旧主 max_connections 与 ha_monitor 账号权限；确需强制切换时，"
                        f"可临时将 REQUIRE_WITNESS_FOR_FAILOVER 设为 0。",
@@ -761,7 +761,7 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
         return False
     if (cur_h, int(cur_p or 0)) == (target_host, target_port):
         return True  # 已是主库
-    # 1) fencing 旧主（置只读），若已宕机则忽略
+    # 1) 对旧主写入隔离（置只读），若已宕机则忽略
     fenced = True
     if cur_h:
         ru, rp = node_root(cur_h, cluster_id)
@@ -769,14 +769,14 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
             set_read_only(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], True, ru, rp)
         except Exception as e:
             fenced = False
-            print(f"[failover] 无法连接旧主做 fencing(可能已宕机): {e}")
-    # 1.5) 与自动切换同口径：fencing 失败时必须由其它节点作证旧主确实不可达，
+            print(f"[failover] 无法连接旧主做 写入隔离(可能已宕机): {e}")
+    # 1.5) 与自动切换同口径：写入隔离失败时必须由其它节点作证旧主确实不可达，
     #      否则中止（手动切换同样会造成脑裂双写）。
     if cur_h and not fenced and get_setting("REQUIRE_WITNESS_FOR_FAILOVER", "1") == "1":
         ok_c, detail = confirm_master_down(cluster_id, cur_h, int(cur_p or 0), creds, node_root)
         if not ok_c:
             send_alert("手动切换中止(疑似脑裂风险)",
-                       f"无法连接旧主 {cur_h}:{cur_p} 做 fencing，且交叉验证未通过：{detail}。"
+                       f"无法连接旧主 {cur_h}:{cur_p} 做 写入隔离，且交叉验证未通过：{detail}。"
                        f"为避免脑裂双写，本次手动切换已中止。请检查管理器到旧主的网络或"
                        f"旧主 max_connections；确需强制执行可将 REQUIRE_WITNESS_FOR_FAILOVER 设为 0。",
                        cluster_id=cluster_id)
@@ -1071,7 +1071,7 @@ def ensure_topology(cluster_id):
         else:
             # 重指向失败：若属 binlog 重放不可自愈的缺口（缺表/主库 binlog 已清理），
             # 自动触发全量克隆（复用重建逻辑），把「重装从库只重指不克隆」的缺口补上；
-            # 从库有孤儿写入时由安全闸门拦截、转人工（导出孤儿行回灌主库）。
+            # 从库有残留写入时由安全闸门拦截、转人工（导出主库缺失、仅从库存在的行回灌主库）。
             _maybe_auto_full_clone(cluster_id, h, cur_h, cur_p, creds)
         # 自愈：从库 IO 报「匿名事务」1236（主库 binlog 含 gtid_mode=OFF 时期写入的匿名事务，
         # AUTO_POSITION=1 无法复制）。清理主库 binlog 后从库续传。每次重指向后都查一次。

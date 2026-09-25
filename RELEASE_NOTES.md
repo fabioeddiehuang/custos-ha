@@ -1,8 +1,9 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> 当前版本：**v2.4.0**（镜像标签 `custos-server:v2.4.0`）
+> **稳定版：v2.4.0**（镜像标签 `custos-server:v2.4.0`，**已发布 · 该分支只修 bug**）
+> **开发中：v2.5.0**（主线 `.env VERSION=v2.5.0`；集群接管 + 节点引导安装 + agent 指令通道）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
-> 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
+> 配套文档：`README.md`、`doc/手册/用户操作手册.md`、`doc/手册/迁移到本集群操作手册.md`、`doc/开发/API接口文档.md`、`doc/开发/数据库字段说明.md`、`doc/开发/数据库字段说明.md`
 
 ---
 
@@ -32,6 +33,7 @@
 | v2.3.9 | 重构 | 节点部署目录结构归整（配置/脚本/agent 分目录）；`custosctl node prepare` 自检；`.env` 去密（SECRET_KEY→`data/secret_key`，WEB_PASS/MGMT_MYSQL_PASS→compose，`.env` 纳入 git） |
 | v2.3.10 | 修复 | 凭证加密改为**默认关闭**（`CRED_ENCRYPTION`，零密钥依赖）；密钥持久化 + 解密钥匙串回退；修 ENC1 密文当复制口令导致复制集体瘫痪（1470）；`_repoint_slave` 返回值契约与假成功；`custosctl node install` 支持容器 MySQL/MariaDB |
 | v2.4.0 | 功能 | 数据迁移向导（MariaDB↔MariaDB + MySQL 5.7→MariaDB）；能力矩阵门禁；引擎方言适配；迁移前兼容性预检（dry-run） |
+| v2.5.0 | 功能 | 集群接管（纳管存量集群）；节点 **curl 一行引导安装**；agent **心跳出向 + 指令通道**（免 SSH 运维）；节点镜像内部分发 |
 
 ---
 
@@ -113,6 +115,18 @@
 - **修复 7 个实测必炸点**：mariadb-dump 无 `--set-gtid-purged`、MariaDB 无 `@@log_replica_updates`、管理器镜像缺数据库客户端（Dockerfile 已补 `mariadb-client`）、GTID 位点写入 dump 冲突、方言按文件名误判、自签证书 TLS 校验失败、subprocess 二次 flush 崩溃。
 - **已知边界**：`bridge / verify / cutover / cleanup` 四步尚未端到端实测；物理通道未实测（镜像内尚缺 `mariabackup`，且跨引擎本就被门禁拒绝）；账号/权限迁移未实现（当前排除 `mysql` 系统库）；MySQL 8.0 → MariaDB 按决策暂不实现。
 - 详见 [`doc/releases/v2.4.0.md`](./doc/releases/v2.4.0.md)。
+
+#### v2.4.0 稳定版定位
+
+- **v2.4.0 为稳定版**：自本版起，**v2.4.0 分支只修 bug，不再新增功能**；新功能（集群接管 / 节点引导安装 / agent 指令通道）统一进入 **v2.5.0**。
+- 镜像标签：`custos-server:v2.4.0`；版本号唯一来源 `.env` 的 `VERSION=`。
+- **使用说明入口**（按使用场景选）：
+  - 安装与部署：[`README.md`](./README.md)「一、快速开始」「1.4 添加被管节点（三种部署形态）」
+  - Web 各页面与按钮：[`README.md`](./README.md)「二、Web 控制台各页面与按钮说明」
+  - 日常运维 / 切换 / 备份 / 告警：[`doc/手册/用户操作手册.md`](./doc/手册/用户操作手册.md)
+  - **把现有数据库搬进 Custos（v2.4.0 主线功能）**：[`doc/手册/迁移到本集群操作手册.md`](./doc/手册/迁移到本集群操作手册.md)（分步图解，小白版）
+  - 接口对接：[`doc/开发/API接口文档.md`](./doc/开发/API接口文档.md)；字段含义：[`doc/开发/数据库字段说明.md`](./doc/开发/数据库字段说明.md)
+- **升级方式**：`./scripts/deploy.sh up -d --build`（版本号经环境变量注入容器，**必须重建镜像才生效**）；节点侧无需升级。
 
 ---
 

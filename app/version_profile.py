@@ -66,6 +66,19 @@ _MARIA_BINLOG_ADMIN_MIN = (10, 5, 2)
 # MySQL 8.0 起提主改 read_only 需要 SYSTEM_VARIABLES_ADMIN（5.7 只有 SUPER）
 _MYSQL_SYSVAR_ADMIN_MIN = (8, 0)
 
+# 接管时可能需要「开启」、但默认关闭的系统变量（MariaDB 存量老库常见）。
+# 这些变量大多需改 my.cnf + 重启（停机窗口），故在接管向导里作为**显式 opt-in 选项**
+# 提供；probe 仅报告当前是否缺失，由用户在确认停机窗口后启用。
+# 仅 MariaDB 当前落地；MySQL 后续接入（log_bin / gtid_mode+enforce_gtid_consistency 等）。
+_MARIA_ADOPT_SWITCHES = [
+    {"name": "log_bin", "target": "ON", "restart": True, "scenario": "extend",
+     "note": "单机扩从库(场景2)必须先开 binlog；已有主从(场景1)主库通常已开。"},
+    {"name": "gtid_domain_id", "target": ">0", "restart": True, "scenario": "extend",
+     "note": "场景2 选 GTID 复制时设置（MASTER_USE_GTID=slave_pos 依赖）；不设则回退 file/pos。"},
+    {"name": "gtid_strict_mode", "target": "ON", "restart": True, "scenario": "extend",
+     "note": "场景2 选 GTID 时建议开启，防止乱序 GTID 被应用。"},
+]
+
 
 # ---------------------------------------------------------------- 档案表
 #
@@ -122,13 +135,13 @@ _PROFILES = {
         notes="MariaDB 10.6 LTS：可纳管，但不再主动回归验证。10.5+ 已具备 READ_ONLY/BINLOG ADMIN。",
     ),
     (10, 11): dict(
-        family=FAMILY_MARIADB, level=LEVEL_LEGACY,
+        family=FAMILY_MARIADB, level=LEVEL_SUPPORTED,
         gtid_var="gtid_slave_pos", gtid_dialect="mariadb_gtid",
         promote_privs=["READ_ONLY ADMIN", "SUPER"],
         binlog_off_privs=["BINLOG ADMIN", "SUPER"],
         repl_privs=["REPLICATION SLAVE ADMIN", "REPLICATION SLAVE"],
         dump_tool="mariadb-dump",
-        notes="MariaDB 10.11 LTS：可纳管，建议升级至 12.3 主线。",
+        notes="MariaDB 10.11 LTS：本轮回接管的优先目标版本（与 11.4 权限模型一致）。",
     ),
     (11, 4): dict(
         family=FAMILY_MARIADB, level=LEVEL_SUPPORTED,
@@ -251,6 +264,17 @@ def needs_public_key(version_str):
     if is_mariadb(version_str):
         return False
     return parse_version(version_str) >= _MYSQL_SYSVAR_ADMIN_MIN
+
+
+def adopt_switch_requirements(version_str):
+    """返回接管时可能需要显式开启的开关清单（当前 MariaDB 落地）。
+
+    清单里的变量默认常关（尤其 log_bin 在独立部署的 MariaDB 上默认 OFF），
+    enabling 通常需改 my.cnf + 重启，故作为 opt-in 选项提供给用户，不在探测期自动改。
+    """
+    if is_mariadb(version_str):
+        return [dict(s) for s in _MARIA_ADOPT_SWITCHES]
+    return []
 
 
 def supported_series():

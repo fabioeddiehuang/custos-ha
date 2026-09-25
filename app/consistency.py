@@ -44,7 +44,7 @@
    **绝不宣称「一致」**。
 
 处置方向（与 README/手册一致）：
-- **权威副本 = 当前主库**。从库独有行（orphan）可能是分裂窗口内的真实业务写入，必须先导出
+- **权威副本 = 当前主库**。从库独有行（orphan：主库没有、仅从库存在的行）可能是切换窗口内的真实业务写入，必须先导出
   回灌主库（零丢失），**不得直接以主库为准删除**。
 - 从库缺失（missing）在复制已追平时才说明真有缺口；未追平时应先等追平。
 """
@@ -192,7 +192,7 @@ def _replica_status(conn):
     # ⚠ 必须显式用 DictCursor：ha_client.connect 建立的是【默认元组游标】连接
     #   （只有管理库 db.py 用 DictCursor）。下面按列名取值在元组游标上永远取不到，
     #   函数会静默返回「全 None」—— 本函数此前正是如此：既让复制健康度无法参与判定，
-    #   也让「分叉窗口标注」从未真正生效。
+    #   也让「不一致时段标注」从未真正生效。
     try:
         with conn.cursor(DictCursor) as cur:
             try:
@@ -230,7 +230,7 @@ def _replica_status(conn):
 
 
 def _divergence_window(cid, host, port):
-    """基于监控快照（metric_history）估算复制最近一次异常时段（分叉窗口标注）。
+    """基于监控快照（metric_history）估算复制最近一次异常时段（不一致时段标注）。
 
     返回 {available, last_interrupted_ts}；last_interrupted_ts 为最近一次
     slave_sql 非 Yes 的采样时间——分裂/中断往往在此期间发生，从库独有行嫌疑最大。
@@ -255,7 +255,7 @@ def _divergence_window(cid, host, port):
 
 
 def _classify(mv, sv, mode):
-    """把一处表级差异分类：orphan=从库独有孤儿行 / missing=从库缺失 / content=内容差异。
+    """把一处表级差异分类：orphan=从库独有行（主库没有） / missing=从库缺失 / content=内容差异。
 
     ⚠ checksum 模式下**不臆断行数关系**：旧实现在这里直接断言「行数相同但内容有差异」，
     而它根本没读过行数——这是一句假话，会误导处置方向。真正的分类由 _classify_checked()
@@ -268,7 +268,7 @@ def _classify(mv, sv, mode):
     except Exception:
         return "unknown", "medium", "数值无法解析"
     if si > mi:
-        return "orphan", "high", "从库行数多于主库，疑似分裂窗口内的孤儿写入（可能是真实业务数据）"
+        return "orphan", "high", "从库行数多于主库：这些是主库没有、仅从库存在的行（可能是切换窗口内的真实业务写入）"
     if si < mi:
         return "missing", "medium", "从库行数少于主库，可能复制未追平或数据缺失"
     return "unknown", "low", "行数一致"
@@ -673,7 +673,7 @@ def last_result(cid):
             "transient_items": (detail.get("transient") or [])[:50]}
 
 
-# ===================== abc / d 新增（行级差异、分叉窗口、导出回灌）=====================
+# ===================== abc / d 新增（行级差异、不一致时段、导出回灌）=====================
 # 仅追加，不改动上方既有只读比对逻辑。
 
 MAX_ROWDIFF_KEYS = 2000   # 行级差异最多比对的主键数（防止超大表拖垮管理器/节点）
@@ -815,7 +815,7 @@ def export_divergent_rows(cid, host, port, schema, table):
     """（d）生成差异处置 SQL 并落 quarantine。
 
     返回 {ok, orphan_rows, remaster_sql, converge_sql, recycle_id, pk_cols, columns, truncated, error}
-    - orphan_rows: 从库独有行（分裂窗口嫌疑真实写入），完整列值。
+    - orphan_rows: 从库独有行（主库缺失，可能是切换窗口内的真实写入），完整列值。
     - remaster_sql: 把这些行 INSERT 回【当前主库】（推荐，零丢失，复制自然下发）。
     - converge_sql: 在【从库】上 DELETE 这些行（以主库为准收敛，危险，已 quarantine 兜底）。
     默认动作 = 导出/回灌优先；收敛删除仅作带闸门的子动作。
@@ -826,7 +826,7 @@ def export_divergent_rows(cid, host, port, schema, table):
     orphans = rd["only_in_slave"]
     if not orphans:
         return {"ok": True, "orphan_rows": [], "remaster_sql": "", "converge_sql": "",
-                "recycle_id": None, "note": "该表无非主库侧独有的孤儿行，无需导出。"}
+                "recycle_id": None, "note": "该表没有主库缺失、仅从库存在的行，无需导出。"}
     pk = rd["pk_cols"]
     cols = rd["columns"]
     pk_sql = ", ".join("`%s`" % c.replace("`", "``") for c in pk)
