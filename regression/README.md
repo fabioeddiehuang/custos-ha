@@ -11,8 +11,8 @@ python3 -m venv .venv && . .venv/bin/activate
 
 # 2) 装依赖
 #    注意：若默认 PyPI 不可达（如本沙箱代理超时），改用腾讯云镜像：
-pip install -r requirements.txt pytest
-#   或： pip install -i https://mirrors.tencent.com/pypi/simple/ -r requirements.txt pytest
+pip install -r requirements-dev.txt
+#   或： pip install -i https://mirrors.tencent.com/pypi/simple/ -r requirements-dev.txt
 
 # 3) 运行
 pytest -q            # 全部
