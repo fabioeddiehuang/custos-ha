@@ -27,8 +27,14 @@ if [ -z "${VERSION:-}" ]; then
   echo "[错误] 未能从 .env 读取 VERSION=，请先设置（升版只改这一处）" >&2
   exit 1
 fi
-# 镜像标签去掉 v 前缀：custos-node:2.5.0（与 compose 里 PKG_VERSION 的口径保持一致）
-TAG="${VERSION#v}"
+# 镜像标签必须与 compose 里 keepalived 的 image **逐字符一致**，否则
+# `docker load` 出来的名字对不上，compose 会退回本地 build（离线环境直接起不来）。
+# compose 用的是 `custos-node:{PKG_VERSION}`，而 PKG_VERSION = APP_VERSION = .env 的 VERSION
+# （形如 v2.5.0，**带 v 前缀**）—— 所以这里绝不能去掉 v。
+# （历史 bug：曾写成 TAG="${VERSION#v}" 去掉 v，导致导出的 tar 是 custos-node:2.5.0，
+#   节点 load 后找不到 custos-node:v2.5.0，keepalived 起不来。）
+# 不再另打「不带 v」的兼容别名：新包一律带 v，保持单一口径，避免两种标签并存。
+TAG="$VERSION"
 
 IMAGES_DIR="./images"
 mkdir -p "$IMAGES_DIR"
@@ -42,9 +48,10 @@ build_keepalived() {
   echo "==> 构建 custos-node:${TAG}（上下文 $ctx）"
   docker build -t "custos-node:${TAG}" "$ctx"
   echo "==> 导出 $IMAGES_DIR/custos-node-${TAG}.tar"
+  # 只导出【这一个】包（带 v）。不再另存不带版本的同名副本：
+  # available_images() 会把目录下每个 tar 都列出来让节点逐个 docker load，
+  # 存两份同内容的包等于让每个节点多下载约 70MB 并重复 load 一次。
   docker save "custos-node:${TAG}" -o "$IMAGES_DIR/custos-node-${TAG}.tar"
-  # 同时给一个不带版本的稳定名，便于脚本按名下载
-  cp -f "$IMAGES_DIR/custos-node-${TAG}.tar" "$IMAGES_DIR/custos-node.tar" 2>/dev/null || true
 }
 
 save_agent_image() {
@@ -65,5 +72,7 @@ echo
 echo "[完成] 镜像包已生成在 $IMAGES_DIR/："
 ls -lh "$IMAGES_DIR" | tail -n +2
 echo
-echo "提示：images/ 已在 .dockerignore 中排除，不会进入服务端镜像；"
-echo "      它由 docker-compose.yml 挂载进容器供节点下载。"
+echo "提示：images/ 是【构建产物】—— .gitignore 已排除（不入库，每个约 70MB），"
+echo "      .dockerignore 也已排除（不会打进服务端镜像）；"
+echo "      它由 docker-compose.yml 挂载进容器，供节点 curl 引导时下载。"
+echo "      install.sh 首次安装会自动执行本脚本，一般无需手工运行。"

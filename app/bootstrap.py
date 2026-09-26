@@ -372,6 +372,31 @@ def render_bootstrap_script(ip, token, node_type="docker", images=None,
 
     install_block = "\n".join('  step "%s"\n  %s' % (c, c) for c in cmds)
 
+    # keepalived 镜像标签校正：compose 要求 `custos-node:<PKG_VERSION>`（如 v2.5.0，带 v），
+    # 而服务端托管的 tar 可能是历史版本导出的 `custos-node:2.5.0`（不带 v）。
+    # 标签对不上时 compose 会退回 build ./keepalived（需联网编译，离线节点直接失败，
+    # 表现为「mariadb/agent 都起来了，只有 keepalived 没有」）。
+    # 这里在 load 之后、compose up 之前按需补标签，旧镜像包也能直接用。
+    try:
+        from .node_gen import PKG_VERSION, KEEPALIVED_IMAGE_NAME
+        _want = "%s:%s" % (KEEPALIVED_IMAGE_NAME, PKG_VERSION)
+    except Exception:
+        _want = "custos-node:v2.5.0"
+    _repo = _want.split(":", 1)[0]
+    tagfix_block = (
+        'step "校正 keepalived 镜像标签（需要 %s）"\n'
+        'if ! docker image inspect "%s" >/dev/null 2>&1; then\n'
+        '  _src=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep -m1 "^%s:" || true)\n'
+        '  if [ -n "$_src" ]; then\n'
+        '    docker tag "$_src" "%s" && echo "  已将 $_src 另标为 %s"\n'
+        '  else\n'
+        '    echo "  未找到 %s 系列镜像，compose 将尝试本地编译 build: ./keepalived"\n'
+        '  fi\n'
+        'else\n'
+        '  echo "  镜像 %s 已存在，无需处理"\n'
+        'fi' % (_want, _want, _repo, _want, _want, _repo, _want)
+    )
+
     tpl = r"""#!/usr/bin/env bash
 # Custos 节点引导安装脚本（由管理端生成）
 #
@@ -400,6 +425,8 @@ curl -fsSL "$MGR/api/node/bundle/$TOKEN" -o "$UNIT" \
   || die "下载失败：token 可能已过期或已使用，请在管理端重新生成引导命令。"
 
 __IMAGES__
+
+__TAGFIX__
 
 step "解压到 $DEST"
 mkdir -p "$DEST"
@@ -435,6 +462,7 @@ printf '请回到管理端「节点管理」确认状态变为「在线」。\n'
     out = out.replace("__MGR__", mgr)
     out = out.replace("__DEST__", dest)
     out = out.replace("__IMAGES__", img_block)
+    out = out.replace("__TAGFIX__", tagfix_block)
     out = out.replace("__INSTALL__", install_block)
     return out
 

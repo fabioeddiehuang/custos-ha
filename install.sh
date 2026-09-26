@@ -227,7 +227,7 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-say "1/6 环境检查"
+say "1/8 环境检查"
 command -v docker >/dev/null 2>&1 || { echo "错误：未安装 docker。" >&2; exit 1; }
 docker compose version >/dev/null 2>&1 || { echo "错误：docker compose 插件不可用（需 Docker 20.10+）。" >&2; exit 1; }
 info "docker：OK"
@@ -236,7 +236,7 @@ info "docker：OK"
 info "项目目录：$CUSTOS_HOME"
 
 # ---------------------------------------------------------------------------
-say "2/6 读取现有配置作为默认值"
+say "2/8 读取现有配置作为默认值"
 CUR_VER=$(grep -E '^VERSION=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \t\r\n')
 [ -n "$CUR_VER" ] || CUR_VER=$(grep -E '^VERSION=' env.example 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \t\r\n')
 [ -n "$CUR_VER" ] || CUR_VER=v2.2.20
@@ -271,7 +271,7 @@ DEF_VIP=$(grep -E '^[[:space:]]*VIP:' "$COMPOSE_FILE" 2>/dev/null | head -1 \
 info "版本 $CUR_VER；将使用现有值作为默认（直接回车即采用）"
 
 # ---------------------------------------------------------------------------
-say "3/6 部署参数"
+say "3/8 部署参数"
 if [ "$WITH_DB" = "1" ]; then
   # P0-2：内置管理库一键 —— 用 compose 服务名直连，端口固化 3306，ha 账号口令自动生成（内部使用）。
   MGMT_HOST=mgmt-mysql
@@ -335,7 +335,7 @@ if [ -n "$VIP" ] && ping -c1 -W1 "$VIP" >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-say "4/6 生成 .env 与 docker-compose.yml"
+say "4/8 生成 .env 与 docker-compose.yml"
 if [ ! -f "$COMPOSE_FILE" ] && [ -f docker-compose-example.yml ]; then
   cp docker-compose-example.yml docker-compose.yml
   info "已由 docker-compose-example.yml 生成 docker-compose.yml"
@@ -478,7 +478,7 @@ for k in cred.key secret_key; do
 done
 
 # ---------------------------------------------------------------------------
-say "5/6 安装命令行工具 custosctl"
+say "5/8 安装命令行工具 custosctl"
 if [ "$(id -u)" = "0" ]; then
   sh "$SCRIPT_DIR/scripts/install-custosctl.sh" "$CUSTOS_HOME" || warn "custosctl 安装失败，可稍后手动执行"
 else
@@ -486,7 +486,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-say "6/6 构建并启动管理器"
+say "6/8 构建并启动管理器"
 sh scripts/deploy.sh up -d --build || { echo "启动失败，请执行：custosctl tail 查看日志" >&2; exit 1; }
 
 sleep 5
@@ -498,7 +498,25 @@ if command -v curl >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-say "7/6 节点包自检（custosctl node prepare）"
+say "7/8 构建节点镜像包（curl 引导安装用）"
+# 节点的 keepalived 镜像 custos-node:<版本> 是【本地构建】的（Docker Hub 上没有），
+# agent 用的 python:3-slim 在离线环境拉不到 —— 缺了任意一个，curl 引导安装都会卡在
+# `docker compose up` 这一步（表现为「mariadb/agent 都起来了，只有 keepalived 没有」）。
+# 故随首次安装一并构建，落到项目根 ./images/：
+#   · .gitignore  已排除 → 不入库（每个约 70MB，属构建产物）
+#   · .dockerignore 已排除 → 不打进服务端镜像（避免镜像膨胀，见 backups/ 的教训）
+#   · 由 compose 挂载进容器供服务端 HTTP 下发给节点（引导脚本 docker load）
+# 失败不阻断安装：节点侧仍可退回本地编译 keepalived，或稍后手动补跑本脚本。
+if command -v docker >/dev/null 2>&1; then
+  _bbi="bash"; command -v bash >/dev/null 2>&1 || _bbi="sh"
+  "$_bbi" "$SCRIPT_DIR/scripts/build_node_images.sh" all \
+    || warn "节点镜像包构建失败（不影响管理器运行）：可稍后手动执行 scripts/build_node_images.sh"
+else
+  warn "未检测到 docker，跳过节点镜像包构建（稍后手动执行 scripts/build_node_images.sh）"
+fi
+
+# ---------------------------------------------------------------------------
+say "8/8 节点包自检（custosctl node prepare）"
 # 非阻断：仅报告各 generated_nodes 节点包的完整性 / 残留情况，发现问题不中止安装。
 if command -v custosctl >/dev/null 2>&1; then
   echo "以下为节点包自检（如有 [WARN]/[异常?] 可重新生成节点目录，或用 --clean 清理残留节点目录）："

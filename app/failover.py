@@ -924,12 +924,128 @@ def _migration_locked(host, port):
 _TOPO_LOCK_SKIPPED = set()
 
 
+# ============================ 部署期（集群尚未初始化）选主 ============================
+# 背景（真实故障）：预设主库 177（裸机，装得慢）还没起来，203/213 先装完。
+# 旧逻辑在【添加节点】时就把 current_master 写成 177，而 ensure_topology 只在
+# current_master 为空时才选主 ⇒ 部署期被永久钉在不可达的 177 上：其余节点
+# make_slave_of(177) 全失败（复制中断），且没人把 203 置只读 ⇒ 203 成了可写「野主」。
+#
+# 新语义：initial_role=master 只是【偏好】不是任命。集群未完成首次选主前（initialized=0）：
+#   ① 预设主库已上线 → 选它为主（满足"预设主库必定为主"）；
+#   ② 预设主库未上线 → 等待（窗口内不选举），其余在线节点【强制 read_only=ON】杜绝野主；
+#   ③ 窗口超时 → 按 GTID 最先进自举，集群照样能起来（不会永久卡死）。
+# 一旦完成首次选主（initialized=1），后续主库离线完全交给自动切换（witness/冷却），
+# 本逻辑不再介入 —— 这正是它不与"设置里自动切换"冲突的原因。
+def _provision_wait_sec():
+    """部署期等待预设主库上线的时长（秒）。默认 1200s（20 分钟，够裸机全量安装）。"""
+    try:
+        from .db import get_setting
+        v = int(get_setting("PROVISION_WAIT_SEC", "1200") or 1200)
+    except (TypeError, ValueError):
+        v = 1200
+    return v if v > 0 else 1200
+
+
+def _cluster_initialized(cluster_id):
+    try:
+        rows = query("SELECT initialized FROM clusters WHERE id=%s", (cluster_id,))
+    except Exception:
+        return True          # 查不到时按"已初始化"处理，避免误入部署期逻辑
+    return int((rows[0] or {}).get("initialized") or 0) == 1 if rows else True
+
+
+def _mark_initialized(cluster_id):
+    try:
+        execute("UPDATE clusters SET initialized=1, master_wait_since=NULL WHERE id=%s",
+                (cluster_id,))
+    except Exception:
+        pass
+
+
+def _provision_wait_ok(cluster_id):
+    """是否仍在等待窗口内（首次调用会记下等待起点）。"""
+    wait = _provision_wait_sec()
+    try:
+        rows = query("SELECT master_wait_since FROM clusters WHERE id=%s", (cluster_id,))
+    except Exception:
+        return False
+    since = ((rows[0] or {}).get("master_wait_since") if rows else None)
+    if since is None:
+        try:
+            execute("UPDATE clusters SET master_wait_since=NOW() WHERE id=%s", (cluster_id,))
+        except Exception:
+            pass
+        return True
+    try:
+        elapsed = time.time() - float(since.timestamp())
+    except Exception:
+        return True
+    return elapsed < wait
+
+
+def _force_readonly_all(cluster_id, creds, hosts, reason):
+    """部署期把全部在线节点置只读，杜绝「先起来的节点变成可写野主」造成数据分叉。"""
+    for h in hosts:
+        if h.get("status") != "up":
+            continue
+        try:
+            ru, rp = node_root(h["host"], cluster_id)
+            set_read_only(h["host"], int(h["port"]), creds["ha_user"], creds["ha_pass"],
+                          True, ru, rp)
+        except Exception as _e:
+            print(f"[topology] 部署期置只读失败 {h['host']}:{h['port']}: {_e}")
+
+
 def ensure_topology(cluster_id):
     """保证每台存活的'非当前主'库都是当前主的从库（用于切后对齐 + 旧主恢复重入）。"""
     cur_h, cur_p = get_current_master(cluster_id)
     creds = load_creds(cluster_id)
     if not creds["ha_user"]:
         return
+    # ---- 部署期（尚未完成首次选主）：预设主库优先 / 等待 / 超时自举 ----
+    if not _cluster_initialized(cluster_id):
+        try:
+            _hosts = list_hosts(cluster_id)
+        except Exception:
+            _hosts = []
+        _up = [h for h in _hosts if h.get("status") == "up"]
+        _pref = [h for h in _hosts if (h.get("initial_role") or "slave") == "master"]
+        _pref_up = [h for h in _pref if h.get("status") == "up"]
+        if cur_h and any(h["host"] == cur_h and int(h["port"]) == int(cur_p or 0) for h in _up):
+            # 已记录的主库【在线】→ 集群其实已经在工作（典型：切换后 initial_role=master
+            # 的旧节点已下线、现任主是别的节点）。绝不能进部署期逻辑，否则会把现任主库
+            # 也置成只读 → 直接写故障。直接认定初始化完成即可。
+            _mark_initialized(cluster_id)
+            print(f"[topology] 集群 {cluster_id} 已有在线主库 {cur_h}:{cur_p}，标记为已初始化")
+        elif _pref_up:
+            # ① 预设主库已上线 → 就是它（满足"预设主库必定为主"）
+            cur_h, cur_p = _pref_up[0]["host"], int(_pref_up[0]["port"])
+            set_current_master(cluster_id, cur_h, cur_p)
+            _mark_initialized(cluster_id)
+            print(f"[topology] 部署期：预设主库 {cur_h}:{cur_p} 已上线，选为主库并完成初始化")
+        elif _pref:
+            # ② 预设主库尚未上线
+            if _provision_wait_ok(cluster_id):
+                _force_readonly_all(cluster_id, creds, _up, "等待预设主库")
+                _pk = ("wait_master", cluster_id)
+                if time.monotonic() - _TOPO_AT.get(_pk, 0.0) >= 60:
+                    _TOPO_AT[_pk] = time.monotonic()
+                    print(f"[topology] 部署期：等待预设主库 {_pref[0]['host']}:{_pref[0]['port']} 上线"
+                          f"（窗口 {_provision_wait_sec()}s，期间其余节点保持只读，避免野主）")
+                return
+            # ③ 超时 → 按 GTID 最先进自举
+            if _up:
+                bh, bp = pick_best_master(cluster_id, _up, creds)
+                if not bh:
+                    bh, bp = _up[0]["host"], int(_up[0]["port"])
+                cur_h, cur_p = bh, bp
+                set_current_master(cluster_id, cur_h, cur_p)
+                _mark_initialized(cluster_id)
+                print(f"[topology] 部署期：等待预设主库 {_pref[0]['host']} 超时，"
+                      f"按 GTID 最先进自举 {cur_h}:{cur_p} 为主库")
+            else:
+                return
+        # 无预设主库 → 落到下方原有选举逻辑（谁先起谁主）
     # 迁移锁定：当前主正在作为迁移【目标】追平源库（桥接中）。
     # ⚠ 只跳过「对它执行 promote_to_master」（那会 STOP REPLICA + RESET REPLICA ALL
     #   把桥接通道清掉，根因见 _migration_locked 注释），**绝不整轮跳过本集群**：

@@ -2229,13 +2229,12 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
                     (_fp, json.dumps(_actions, ensure_ascii=False) if _actions else "", ip))
         except Exception:
             pass
-    # 若指定为初始主库，则登记为当前主库，使 keepalived VIP 选举偏向上位
-    if initial_role == "master":
-        execute("UPDATE hosts SET is_current_master=0 WHERE cluster_id=%s", (cluster_id,))
-        execute("UPDATE hosts SET is_current_master=1 WHERE cluster_id=%s AND host=%s AND port=%s",
-                (cluster_id, ip, port))
-        from .state import set_current_master
-        set_current_master(cluster_id, ip, port)
+    # ⚠ 不再「添加节点即任命主库」：initial_role 只是【偏好】，不是任命。
+    # 旧行为在此直接把 current_master 写成该节点，可它还根本没装/没上线；
+    # 而 ensure_topology 只在 current_master 为空时才选主 ⇒ 部署期被永久钉在一个
+    # 不可达的主库上（其余节点复制全挂），同时先起来的节点没人置只读、变成可写野主。
+    # 现在仅由 hosts.initial_role 记录偏好，真正选主交给 ensure_topology 的部署期逻辑：
+    # 预设主库【上线后】才被选为主；上线前其余节点等待且强制只读。
 
     # 7) 新增节点后刷新同集群所有节点的对等列表
     _refresh_all_keepalived_conf(cluster_id)

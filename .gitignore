@@ -20,6 +20,12 @@ data/
 # 节点部署单元（内含明文密码）
 generated_nodes/
 
+# 节点镜像 tar（v2.5.0 F2 镜像内部分发）：由 scripts/build_node_images.sh 构建生成，
+# 首次安装时自动产出到 ./images/（服务端下发给节点供 curl 引导 docker load 用）。
+# 属【构建产物】且每个约 70MB —— 不入库；.dockerignore 同样已排除，避免 `COPY . .`
+# 把它们打进服务端镜像（重蹈 backups/ 导致镜像膨胀到 1.27GB 的覆辙）。
+images/
+
 # 本地真实部署配置（含真实内网 IP / 管理库口令 / Web 口令，切勿入库）。
 # 仓库只保留脱敏模板 docker-compose-example.yml；新环境首次部署：
 #   cp docker-compose-example.yml docker-compose.yml 再按需修改。

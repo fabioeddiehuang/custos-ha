@@ -2572,6 +2572,8 @@ def api_setting_set(key: str = Form(...), value: str = Form(...),
                "SKIP_DATA_CONFLICT", "REQUIRE_WITNESS_FOR_FAILOVER",
                "AUTO_PURGE_BINLOG", "BINLOG_SIZE_ALERT_MB",
                "BINLOG_KEEP_HOURS", "SEMI_SYNC",
+               # 部署期等待「预设主库」上线的时长（秒，默认 1200=20 分钟）
+               "PROVISION_WAIT_SEC",
                # 告警自愈观察期（秒）与「binlog 已清理时自动重建」（默认关闭）
                "ALERT_GRACE_SEC", "AUTO_REBUILD_ON_PURGE"}
     if key not in allowed:

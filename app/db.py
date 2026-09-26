@@ -138,7 +138,9 @@ SCHEMA_SQL = [
         vip_prefix VARCHAR(4) DEFAULT '24',
         interface VARCHAR(32),
         vrid VARCHAR(8),
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        initialized TINYINT(1) DEFAULT 0,
+        master_wait_since DATETIME NULL
     ) ENGINE=InnoDB
     """,
     """
@@ -275,6 +277,15 @@ def init_schema():
                         )
             except Exception:
                 pass
+            # 旧库补列：clusters.initialized / master_wait_since（部署期选主用）。
+            # initialized=0 表示集群尚未完成首次选主（部署期），此时适用
+            # 「预设主库优先 + 其余节点等待并强制只读」；=1 后完全交给自动切换。
+            for _sql in ("ALTER TABLE clusters ADD COLUMN initialized TINYINT(1) DEFAULT 0",
+                         "ALTER TABLE clusters ADD COLUMN master_wait_since DATETIME NULL"):
+                try:
+                    c.execute(_sql)
+                except Exception:
+                    pass          # 列已存在（1060）即忽略
             # 旧库补列：bootstrap_tokens.install_dir（引导命令按节点指定的安装目录）。
             # 新增列用于让「curl | bash」实际拉到的脚本也用上该目录（否则会回退默认）。
             try:
