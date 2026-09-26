@@ -205,11 +205,8 @@
         </label>
         <input type="hidden" name="node_type" id="nodeTypeHidden" value="mariadb-docker">
         <label id="addNodeVerWrap" style="display:none">MySQL 版本<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=自动探测）"></label>
-        <label class="full">server_id（可选）
-          <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-            <input name="server_id" type="number" min="1" max="4294967295" step="1" placeholder="{% if next_server_id %}{{ next_server_id }}{% endif %}" style="width:170px">
-            <span class="hint">复制集群内必须唯一，留空自动分配{% if next_server_id %}（建议 {{ next_server_id }}）{% endif %}</span>
-          </span>
+        <label>server_id（复制集群内必须唯一，留空自动分配）
+          <input name="server_id" type="number" min="1" max="4294967295" step="1" placeholder="{% if next_server_id %}{{ next_server_id }}{% endif %}">
         </label>
         <label>所属集群
           <select name="cluster_id" required>
