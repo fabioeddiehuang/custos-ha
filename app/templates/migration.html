@@ -288,14 +288,29 @@
   <div id="modeSummary" class="bk-note">检测结果：尚未检测，请先在第 1 步点「检测两端」。</div>
   <div id="methodSummary" class="bk-note" style="margin-top:12px">已选迁移方式：<b id="methodSummaryTxt">—</b></div>
 
-  <div class="field"><label>目标节点形态</label>
-    <select id="tgtType">
-      <option value="" disabled selected>请选择节点形态</option>
-      <option value="mariadb-docker">容器化 MariaDB</option>
-      <option value="mariadb">裸机 MariaDB</option>
-      <option value="docker">容器化 MySQL</option>
+  <div class="field"><label>目标数据库引擎</label>
+    <select id="tgtEngine" onchange="syncTgtType()">
+      <option value="mariadb" selected>MariaDB</option>
+      <option value="mysql">MySQL（容器化）</option>
     </select>
   </div>
+  <div class="field" id="tgtDeployWrap" style="display:none"><label>MariaDB 部署方式</label>
+    <select id="tgtDeploy" onchange="syncTgtType()">
+      <option value="docker" selected>容器化（官方镜像，纯 compose）</option>
+      <option value="baremetal">裸机全量安装</option>
+    </select>
+  </div>
+  <input type="hidden" id="tgtType" value="mariadb-docker">
+  <script>
+    function syncTgtType(){
+      var e=document.getElementById("tgtEngine").value;
+      var wrap=document.getElementById("tgtDeployWrap");
+      if(wrap)wrap.style.display=(e==="mariadb")?"block":"none";
+      var dep=(e==="mariadb")?document.getElementById("tgtDeploy").value:"docker";
+      document.getElementById("tgtType").value=(e==="mysql")?"docker":(dep==="baremetal"?"mariadb":"mariadb-docker");
+    }
+    syncTgtType();
+  </script>
 
   <!-- 高级/物理（SSH + mariabackup）模式已砍掉：逻辑通道不依赖任何文件系统路径，
        源/目标账号与连接信息已在第 1 步填写，无需在此重复或指定 my.cnf / 数据目录。 -->
@@ -618,8 +633,12 @@ async function autoTarget(){
   const r = await postJSON("/api/migration/target_hint", {ip:host});
   if(r && r.ok){
     if(r.port) $("tgtPort").value = r.port;
-    if(r.node_type && r.node_type !== "docker"){
-      const sel = $("tgtType"); if(sel) sel.value = r.node_type;
+    if(r.node_type){
+      const e=(r.node_type==="docker")?"mysql":"mariadb";
+      const dep=(r.node_type==="mariadb")?"baremetal":"docker";
+      const eng=$("tgtEngine"); if(eng)eng.value=e;
+      const dp=$("tgtDeploy"); if(dp)dp.value=dep;
+      syncTgtType();
     }
   }
 }

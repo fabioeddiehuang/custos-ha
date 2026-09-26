@@ -188,13 +188,19 @@
             <option value="slave">从库</option>
           </select>
         </label>
-        <label>节点类型
-          <select name="node_type" id="nodeType" onchange="onNodeTypeChange()">
-            <option value="docker">MySQL（容器化 MySQL + keepalived 客户端）</option>
-            <option value="mariadb">MariaDB（裸机全量安装；可与原容器 MariaDB 同集群混部）</option>
-            <option value="mariadb-docker" selected>MariaDB（容器化，官方镜像首选；可与原裸机 MariaDB 同集群混部）</option>
+        <label>数据库引擎
+          <select name="engine" id="nodeEngine" onchange="syncAddNodeType()">
+            <option value="mariadb" selected>MariaDB（推荐）</option>
+            <option value="mysql">MySQL（容器化 MySQL 8.0）</option>
           </select>
         </label>
+        <label id="addNodeDeployWrap" style="display:none">MariaDB 部署方式
+          <select name="deploy" id="addNodeDeploy" onchange="syncAddNodeType()">
+            <option value="docker" selected>容器化（官方镜像，纯 compose，首选）</option>
+            <option value="baremetal">裸机全量安装（宿主 systemd 管理 mysqld）</option>
+          </select>
+        </label>
+        <input type="hidden" name="node_type" id="nodeTypeHidden" value="mariadb-docker">
         <label>MySQL 版本<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=自动探测）"></label>
         <label>server_id（可选）
           <span style="font-size:12px;color:var(--muted,#94a3b8);font-weight:400;line-height:1.4">复制拓扑内必须全局唯一，明确指定可避免撞 id；留空自动分配{% if next_server_id %}（当前建议 {{ next_server_id }}）{% endif %}</span>
@@ -296,15 +302,19 @@
     el.style.cssText="background:"+(kind==="err"?"#fb7185":"#7C2D52")+";color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
     t.appendChild(el);setTimeout(function(){el.remove();},2600);
   }
-  function onNodeTypeChange(){
-    var t=document.getElementById("nodeType").value;
+  function syncAddNodeType(){
+    var e=document.getElementById("nodeEngine").value;
+    var wrap=document.getElementById("addNodeDeployWrap");
+    if(wrap)wrap.style.display=(e==="mariadb")?"block":"none";
+    var dep=(e==="mariadb")?document.getElementById("addNodeDeploy").value:"docker";
+    document.getElementById("nodeTypeHidden").value=(e==="mysql")?"docker":(dep==="baremetal"?"mariadb":"mariadb-docker");
     var maria=document.getElementById("mariadbTip");
     var mariaDocker=document.getElementById("mariadbDockerTip");
-    if(maria)maria.style.display=(t==="mariadb")?"block":"none";
-    if(mariaDocker)mariaDocker.style.display=(t==="mariadb-docker")?"block":"none";
+    if(maria)maria.style.display=(e==="mariadb"&&dep==="baremetal")?"block":"none";
+    if(mariaDocker)mariaDocker.style.display=(e==="mariadb"&&dep==="docker")?"block":"none";
   }
-  // 默认节点类型为 MariaDB（mariadb-docker），加载即按默认态显示对应部署提示
-  onNodeTypeChange();
+  // 默认节点类型为 MariaDB 容器化（mariadb-docker），加载即按默认态显示对应部署提示
+  syncAddNodeType();
   function openAddNode(){document.getElementById("addOverlay").classList.add("show");}
   function closeAddNode(){document.getElementById("addOverlay").classList.remove("show");}
 
