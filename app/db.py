@@ -512,10 +512,34 @@ def init_schema():
                     c.execute("ALTER TABLE current_master_new RENAME TO current_master")
                 except Exception as e:
                     print(f"[init_db] 迁移 current_master 失败(可忽略): {e}")
-            # 首次迁移：把既有 hosts/nodes 归入默认集群(id=1)，并从旧 settings 迁移凭证
+            # 首次迁移：把既有 hosts/nodes 归入默认集群(id=1)，并从旧 settings 迁移凭证。
+            # 仅当确实存在「旧版单集群」数据（v2.0 升级场景）时才建默认集群；
+            # 全新安装（无 hosts/nodes 数据、无旧 CLUSTER_NAME/VIP/HA_USER 等 settings）
+            # 不再自动建默认集群——多集群产品下，一个空的「默认集群」形态会被误判为 MySQL
+            # 且毫无用途，应由用户在 Web 控制台显式创建（建集群/加节点默认形态已是
+            # mariadb-docker）。
             try:
                 c.execute("SELECT COUNT(*) AS n FROM clusters")
-                if (c.fetchone() or {}).get("n", 0) == 0:
+                _clusters_empty = ((c.fetchone() or {}).get("n", 0) == 0)
+
+                def _has_legacy_cluster_data():
+                    """是否存在需要迁移的旧版（v2.0 单集群）数据。"""
+                    try:
+                        c.execute("SELECT COUNT(*) AS n FROM hosts")
+                        if (c.fetchone() or {}).get("n", 0) > 0:
+                            return True
+                        c.execute("SELECT COUNT(*) AS n FROM nodes")
+                        if (c.fetchone() or {}).get("n", 0) > 0:
+                            return True
+                        for _lk in ("CLUSTER_NAME", "VIP", "HA_USER"):
+                            c.execute("SELECT value FROM settings WHERE `key`=%s", (_lk,))
+                            if c.fetchone():
+                                return True
+                    except Exception:
+                        pass
+                    return False
+
+                if _clusters_empty and _has_legacy_cluster_data():
                     # 从 settings 读取旧凭证
                     def _s(k):
                         c.execute("SELECT value FROM settings WHERE `key`=%s", (k,))
@@ -532,13 +556,14 @@ def init_schema():
                     vip_prefix = _s("VIP_PREFIX") or "24"
                     interface = _s("INTERFACE") or "eth0"
                     vrid = _s("VRID") or "51"
+                    # 旧版世界即 MySQL，显式置 node_type=docker，避免形态被误判
                     c.execute(
                         """INSERT INTO clusters
                         (id, name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
-                         vip, vip_prefix, interface, vrid)
-                        VALUES (1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                         vip, vip_prefix, interface, vrid, node_type)
+                        VALUES (1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (name, ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
-                         vip, vip_prefix, interface, vrid),
+                         vip, vip_prefix, interface, vrid, "docker"),
                     )
                     c.execute("UPDATE hosts SET cluster_id=1 WHERE cluster_id IS NULL")
                     c.execute("UPDATE nodes SET cluster_id=1 WHERE cluster_id IS NULL")
