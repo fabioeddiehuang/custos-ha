@@ -411,6 +411,15 @@ mkdir -p /etc/custos
 printf '# Custos 节点包目录（custosctl node 自动发现用）\nNODE_DIR=%s\n' "$DEST" > /etc/custos/node.env
 chmod 644 /etc/custos/node.env
 
+step "安装/刷新命令行工具 custosctl"
+# 必须每次引导都刷新：只写 node.env 而不换二进制的话，节点上残留的旧版 custosctl
+# 不认识 node.env，仍旧只会用当前目录 —— 表现为「custosctl node 只能在节点包目录里跑」。
+if [ -f "$DEST/custosctl" ]; then
+  install -m 0755 "$DEST/custosctl" /usr/bin/custosctl
+else
+  echo "[warn] 单元内未带 custosctl，跳过安装（不影响节点服务）"
+fi
+
 __INSTALL__
 
 step "上报部署结果"

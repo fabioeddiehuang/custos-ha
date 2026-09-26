@@ -68,6 +68,13 @@ _node_dir_find() {
   if [ -n "${NODE_UNIT_DIR:-}" ] && _node_dir_ok "$NODE_UNIT_DIR"; then
     echo "$NODE_UNIT_DIR"; return 0
   fi
+  # 兜底：常见基目录下【扫一层子目录】。兼容目录名不叫 custos-node 的历史部署
+  # （如 /opt/ha-node、/data/custos 等），避免只剩「必须 cd 进去」一条路。
+  for _base in /home/docker /opt /data /srv /home; do
+    for _sub in "$_base"/*; do
+      if [ -d "$_sub" ] && _node_dir_ok "$_sub"; then echo "$_sub"; return 0; fi
+    done
+  done
   return 1
 }
 
@@ -249,7 +256,12 @@ EOF
       fi
       link_logs
       if [ "$(id -u)" = "0" ]; then
-        install -m 0755 "$(command -v custosctl 2>/dev/null || echo "$0")" /usr/bin/custosctl 2>/dev/null \
+        # 优先装【节点包内自带】的 custosctl —— 它一定是本次生成的最新版。
+        # 若用 command -v custosctl，会拿到 /usr/bin 下的旧版本再装回去，
+        # 等于原地踏步：旧 CLI 不认识 node.env，之后仍无法在任意目录执行。
+        _ctl="$ndir/custosctl"
+        [ -f "$_ctl" ] || _ctl=$(command -v custosctl 2>/dev/null || echo "$0")
+        install -m 0755 "$_ctl" /usr/bin/custosctl 2>/dev/null \
           || install -m 0755 "$0" /usr/bin/custosctl 2>/dev/null || true
         echo "已自装 custosctl 到 /usr/bin/custosctl"
         # 记录节点包目录，供之后任意目录直接 custosctl node <cmd>
@@ -372,9 +384,25 @@ EOF
         inst_bin=$(command -v bash 2>/dev/null || echo sh)
         "$inst_bin" "$flavor"12.3.3/scripts/Uninstall-mariadb-Node.sh "$@"
       fi
-      # 清理节点登记：仅删节点专属的 node.env，绝不碰管理器的 custosctl.env / /usr/bin/custosctl
+      # 清理节点登记：仅删节点专属的 node.env，绝不碰管理器的 custosctl.env
       rm -f /etc/custos/node.env 2>/dev/null || true
-      echo "已清理节点登记 /etc/custos/node.env（管理器不受影响）"
+      # C/S 同机判断：本机是否同时是【管理器】（custosctl.env 指向真实项目目录）。
+      # /usr/bin/custosctl 是管理器与节点【共用】的同一个命令，
+      # 无论是不是同机都**一律保留** —— 同机时删了会直接废掉管理器的命令行；
+      # 纯节点机上留着也无害（真正要移除它由管理器卸载流程负责）。
+      # （此处不删还在运行的自身脚本：sh 边读边执行，删自己会导致后续语句读取失败。）
+      _is_mgr=0
+      if [ -r /etc/custos/custosctl.env ]; then
+        _ch=$(. /etc/custos/custosctl.env 2>/dev/null; echo "${CUSTOS_HOME:-}")
+        if [ -n "$_ch" ] && { [ -f "$_ch/docker-compose.yml" ] || [ -f "$_ch/install.sh" ] || [ -f "$_ch/custosctl" ]; }; then
+          _is_mgr=1
+        fi
+      fi
+      if [ "$_is_mgr" = "1" ]; then
+        echo "已清理节点登记 /etc/custos/node.env；本机同时是管理器 → 保留 /usr/bin/custosctl（管理器仍在使用）。"
+      else
+        echo "已清理节点登记 /etc/custos/node.env；本机不是管理器 → 保留 /usr/bin/custosctl（共用命令，如需移除：rm -f /usr/bin/custosctl）。"
+      fi
       ;;
     *) node_usage ;;
   esac

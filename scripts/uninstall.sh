@@ -120,6 +120,24 @@ if [ -f /etc/custos/node.env ]; then
     _KEEP_NODE=1
   fi
 fi
+# 兜底：老版本引导未登记 node.env（或登记失效）时，按常见基目录探测本机真实节点包，
+# 避免把「本机同时是节点」漏判成纯管理器 —— 那样会真删掉节点还在用的 CLI。
+# ⚠ 必须排除本管理器的 generated_nodes/<ip>：那里放的是【待下发到远端节点】的部署单元，
+#   并非本机节点。若不排除，纯管理器会被误判为兼节点，从而错误保留 CLI。
+if [ "$_KEEP_NODE" != "1" ]; then
+  _gen="$CUSTOS_HOME/generated_nodes"
+  for _base in /home/docker /opt /data /srv /home; do
+    for _d in "$_base"/*; do
+      [ -d "$_d" ] || continue
+      case "$_d" in "$_gen"/*) continue ;; esac
+      if { [ -f "$_d/docker-compose.yaml" ] || [ -f "$_d/docker-compose.yml" ]; } \
+         && { [ -d "$_d/mariadb12.3.3/conf" ] || [ -d "$_d/mysql8.0/conf" ]; }; then
+        _KEEP_NODE=1
+        break 2
+      fi
+    done
+  done
+fi
 rm -f /usr/share/bash-completion/completions/custosctl 2>/dev/null || true
 rm -f /etc/bash_completion.d/custosctl 2>/dev/null || true
 rm -f /usr/local/share/zsh/site-functions/_custosctl 2>/dev/null || true
