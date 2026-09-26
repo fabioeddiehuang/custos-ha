@@ -942,12 +942,21 @@ def api_bootstrap_script(token: str, request: Request):
                         status_code=403, media_type="text/plain; charset=utf-8")
     ip = row["ip"]
     try:
-        rows = query("SELECT node_type FROM nodes WHERE ip=%s", (ip,))
+        rows = query("SELECT node_type, compose_path FROM nodes WHERE ip=%s", (ip,))
         node_type = (rows[0].get("node_type") if rows else "") or "mariadb-docker"
+        node_dir_val = (rows[0].get("compose_path") if rows else "") or ""
     except Exception:
         node_type = "docker"
+        node_dir_val = ""
+    # 安装目录来源（优先级）：签发引导命令时填的 install_dir（随 token 落库）
+    # → 添加节点时填的「节点安装目录」（nodes.compose_path）→ 默认 base/统一名。
+    # 此前这里根本没传 install_dir，导致运维填的自定义目录无效、实际仍装到默认目录。
+    _dir = (row.get("install_dir") or "").strip() or (node_dir_val or "").strip()
+    if _dir and not _dir.startswith("/"):
+        _dir = ""                      # 仅接受绝对路径，脏数据回退默认
     try:
-        script = bootstrap.render_bootstrap_script(ip, token, node_type)
+        script = bootstrap.render_bootstrap_script(ip, token, node_type,
+                                                   install_dir=_dir or None)
     except Exception as e:
         return Response(f"生成引导脚本失败：{e}", status_code=500,
                         media_type="text/plain; charset=utf-8")

@@ -96,6 +96,7 @@ SCHEMA_SQL = [
         token_hash VARCHAR(64) NOT NULL UNIQUE,
         ip VARCHAR(64) NOT NULL,
         cluster_id INT DEFAULT NULL,
+        install_dir VARCHAR(255) DEFAULT NULL,
         issued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         expires_at DATETIME NOT NULL,
         used_at DATETIME DEFAULT NULL,
@@ -252,21 +253,35 @@ def init_schema():
                 c.execute("ALTER TABLE hosts MODIFY port INT NOT NULL DEFAULT 3306")
             except Exception:
                 pass
-            # 兼容目录调整：将已生成节点的 compose_path 刷新为新基路径
-            # （generated_nodes 移到项目根目录、仓库改名为 custos-ha 后旧路径已失效）。
-            # 仅更新「当前值与目标值不一致」的行：既保留迁移能力，又避免每次启动
-            # 都对所有节点跑一遍 UPDATE（无谓写库 + 大集群启动变慢）。
+            # 兼容目录调整：仅把【旧的服务端生成目录】形态刷为新基路径，
+            # 绝不覆盖运维自定义的部署目录（如 /opt、/data/xxx）。
+            #
+            # 为什么必须限定范围：早期版本把 compose_path 写成服务端相对路径
+            # （如 custos-ha/generated_nodes/<ip>、mysql-ha/<ip>），这些已失效需要迁移；
+            # 但 v2.5.0 起 compose_path 就是「节点在目标机上的安装目录」，可以在添加节点时
+            # 按节点指定。若像以前那样「凡与默认值不同就刷回默认」，运维自定义的 /opt
+            # 会在每次管理器重启后被静默改回 /home/docker/custos-node —— 配置莫名丢失。
             try:
                 from .config import NODE_INSTALL_BASE, NODE_DIR_NAME
+                want = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}"
                 for r in query("SELECT ip, compose_path FROM nodes"):
-                    want = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}"
-                    if (r.get("compose_path") or "") != want:
+                    cur = (r.get("compose_path") or "").strip()
+                    _is_legacy = (not cur) or (not cur.startswith("/")) \
+                        or ("generated_nodes" in cur) or cur.startswith("custos-ha")
+                    if _is_legacy and cur != want:
                         execute(
                             "UPDATE nodes SET compose_path=%s WHERE ip=%s",
                             (want, r["ip"]),
                         )
             except Exception:
                 pass
+            # 旧库补列：bootstrap_tokens.install_dir（引导命令按节点指定的安装目录）。
+            # 新增列用于让「curl | bash」实际拉到的脚本也用上该目录（否则会回退默认）。
+            try:
+                c.execute("ALTER TABLE bootstrap_tokens "
+                          "ADD COLUMN install_dir VARCHAR(255) DEFAULT NULL")
+            except Exception:
+                pass          # 列已存在（1060 duplicate column）即忽略
             # 空闲优化：为历史表的 ts 列补单列索引。
             # metric_history / config_drift 的保留期清理按 ts 删除，而原索引
             # (cluster_id,host,port,ts) 与 (cluster_id,ts) 的最左前缀都不是 ts，

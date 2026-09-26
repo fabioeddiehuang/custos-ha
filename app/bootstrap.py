@@ -157,11 +157,16 @@ def build_bundle(ip):
 
 # ---------------------------------------------------------------- token 签发/校验
 
-def issue_token(ip, cluster_id=None, actor="", ttl_hours=DEFAULT_TTL_HOURS):
+def issue_token(ip, cluster_id=None, actor="", ttl_hours=DEFAULT_TTL_HOURS,
+                install_dir=None):
     """签发引导 token，落库并返回 token 字符串。
 
     token 形如 ``<jti>.<sig>``——**不含 IP**（避免 URL 泄露拓扑），
     IP 由服务端按 jti 查库得到后参与验签。
+
+    install_dir：随 token 一并落库。必须持久化，因为节点 `curl … | bash` 拉脚本时
+    走的是 GET /api/node/bootstrap/<token>，该端点此刻已拿不到「签发时传的参数」；
+    不落库的话脚本里的 DEST 会回退成默认目录，运维填的自定义目录形同无效。
     """
     from .db import execute
     ip = str(ip).strip()
@@ -179,9 +184,9 @@ def issue_token(ip, cluster_id=None, actor="", ttl_hours=DEFAULT_TTL_HOURS):
     token = "%s.%s" % (jti, _sig(jti, ip, exp))
     execute(
         "INSERT INTO bootstrap_tokens "
-        "(token_hash, ip, cluster_id, expires_at, issued_by) "
-        "VALUES (%s,%s,%s,FROM_UNIXTIME(%s),%s)",
-        (_jti_hash(jti), ip, cluster_id, exp, actor or ""),
+        "(token_hash, ip, cluster_id, install_dir, expires_at, issued_by) "
+        "VALUES (%s,%s,%s,%s,FROM_UNIXTIME(%s),%s)",
+        (_jti_hash(jti), ip, cluster_id, install_dir or None, exp, actor or ""),
     )
     return token
 
@@ -431,7 +436,8 @@ def issue_for_node(ip, node_type="docker", cluster_id=None, actor="",
                    ttl_hours=DEFAULT_TTL_HOURS, images=None, sidecar_only=False,
                    install_dir=None):
     """一次性产出「命令 + 脚本 + token」，供 API/页面直接使用。"""
-    token = issue_token(ip, cluster_id=cluster_id, actor=actor, ttl_hours=ttl_hours)
+    token = issue_token(ip, cluster_id=cluster_id, actor=actor, ttl_hours=ttl_hours,
+                        install_dir=install_dir)
     dest = _install_dest(install_dir)
     return {
         "ip": ip,
