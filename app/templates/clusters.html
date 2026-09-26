@@ -237,9 +237,9 @@
         <label>VIP 端口<input name="vip_port" type="number" min="1" max="65535" value="3307"></label>
         <label>节点类型（部署形态）
           <select name="node_type">
-            <option value="docker" selected>MySQL（容器化 MySQL + keepalived）</option>
+            <option value="docker">MySQL（容器化 MySQL + keepalived）</option>
             <option value="mariadb">MariaDB（裸机全量安装；可与原容器 MariaDB 同集群混部）</option>
-            <option value="mariadb-docker">MariaDB（容器化，官方镜像首选；可与原裸机 MariaDB 同集群混部）</option>
+            <option value="mariadb-docker" selected>MariaDB（容器化，官方镜像首选；可与原裸机 MariaDB 同集群混部）</option>
           </select>
           <span class="hint">按引擎族校验：MySQL 与 MariaDB 禁止混部；MariaDB 各形态（容器 / 裸机）可混部</span>
         </label>

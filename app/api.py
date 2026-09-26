@@ -154,7 +154,7 @@ TEMPLATES.globals["APP_VERSION"] = APP_VERSION
 
 def display_node_type(nt):
     """部署形态（node_type）对外展示名：docker 形态即「容器化 MySQL」，统一显示为 MySQL。"""
-    nt = (nt or "docker").strip()
+    nt = (nt or "mariadb-docker").strip()
     if nt == "docker":
         return "MySQL"
     if nt in ("mariadb", "mariadb-docker"):
@@ -518,7 +518,7 @@ def api_vip_status(user=Depends(auth_required)):
                     p = 0
                 info["nodes"].append({
                     "host": nr["ip"], "port": p,
-                    "node_type": nr.get("node_type") or "docker",
+                    "node_type": nr.get("node_type") or "mariadb-docker",
                     "reachable": _port_online(nr["ip"], p) if p else False,
                 })
             return cid, info
@@ -903,7 +903,7 @@ def api_node_bootstrap(ip: str = Form(...), ttl_hours: int = Form(24),
     ttl = max(1, min(ttl, 24 * 7))
     try:
         rows = query("SELECT node_type, cluster_id FROM nodes WHERE ip=%s", (ip,))
-        node_type = (rows[0].get("node_type") if rows else "") or "docker"
+        node_type = (rows[0].get("node_type") if rows else "") or "mariadb-docker"
         cluster_id = (rows[0].get("cluster_id") if rows else None)
     except Exception:
         node_type, cluster_id = "docker", None
@@ -935,7 +935,7 @@ def api_bootstrap_script(token: str, request: Request):
     ip = row["ip"]
     try:
         rows = query("SELECT node_type FROM nodes WHERE ip=%s", (ip,))
-        node_type = (rows[0].get("node_type") if rows else "") or "docker"
+        node_type = (rows[0].get("node_type") if rows else "") or "mariadb-docker"
     except Exception:
         node_type = "docker"
     try:
@@ -2149,7 +2149,7 @@ def _cluster_js(c):
         "vip_port": _s(c.get("vip_port")),
         "vip_prefix": _s(c.get("vip_prefix")),
         "interface": _s(c.get("interface")),
-        "node_type": _s(c.get("node_type") or "docker"),
+        "node_type": _s(c.get("node_type") or "mariadb-docker"),
         "mysql_version": _s(c.get("mysql_version")),
         "creds": {
             "ha_user": _s(cr.get("ha_user")),
@@ -3771,7 +3771,7 @@ def clusters_create(
             interface=interface.strip() or None,
             vrid=vrid.strip() or None,
             vip_port=vip_port_val,
-            node_type=node_type.strip() or "docker",
+            node_type=node_type.strip() or "mariadb-docker",
             mysql_version=mysql_version.strip() or None,
         )
     except Exception as e:
@@ -3935,7 +3935,7 @@ def _node_type_summary(nodes):
     组头若直接展示集群级 node_type，会让用户误以为集群内所有节点都是该形态。
     """
     from collections import Counter
-    cnt = Counter((n.get("node_type") or "docker") for n in nodes)
+    cnt = Counter((n.get("node_type") or "mariadb-docker") for n in nodes)
     return " · ".join("%s×%d" % (_NODE_TYPE_LABEL.get(t, t), c) for t, c in cnt.most_common())
 
 
@@ -3975,7 +3975,7 @@ def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", err
         groups.append({
             "id": cid,
             "name": c.get("name") or f"集群{cid}",
-            "node_type": c.get("node_type") or "docker",
+            "node_type": c.get("node_type") or "mariadb-docker",
             "type_summary": _node_type_summary(members),
             "vip": c.get("vip") or "",
             "nodes": members,
@@ -4039,13 +4039,13 @@ def nodes_add(
         return RedirectResponse("/nodes?error=请先在「集群管理」创建集群，再选择所属集群", status_code=303)
     # 同集群「同构」校验：禁止 docker/mariadb 混部、主版本须一致
     try:
-        validate_node_version(cid, node_type.strip() or "docker", mysql_version.strip() or None)
+        validate_node_version(cid, node_type.strip() or "mariadb-docker", mysql_version.strip() or None)
     except Exception as e:
         return RedirectResponse(f"/nodes?error={e}", status_code=303)
     try:
         info = generate_node(
             ip, port, root_user, root_pass, initial_role, cid,
-            node_type=node_type.strip() or "docker", mysql_version=mysql_version.strip() or None,
+            node_type=node_type.strip() or "mariadb-docker", mysql_version=mysql_version.strip() or None,
             server_id=server_id.strip() or None,
         )
         audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
@@ -4106,7 +4106,7 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
         info = generate_node(
             n["ip"], n["port"], n["root_user"], n["root_pass"],
             initial_role, int(n["cluster_id"] or 0),
-            node_type=n.get("node_type") or "docker",
+            node_type=n.get("node_type") or "mariadb-docker",
             mysql_version=n.get("mysql_version"),
         )
         # 计算生成目录内各文件的 md5，便于核对
@@ -4171,7 +4171,7 @@ def _render_node_fix_sql(n, creds, manager_ip, manager_subnet=None):
         except Exception:
             flavour = None
     if flavour is None:
-        flavour = flavour_from_node_type(n.get("node_type") or "docker")
+        flavour = flavour_from_node_type(n.get("node_type") or "mariadb-docker")
 
     if flavour == F_MARIADB:
         return render_fix_node_creds_sql_mariadb(

@@ -1335,7 +1335,7 @@ def regenerate_cluster_compose(cluster_id):
         (cluster_id,))
     for r in rows:
         ip = r["ip"]
-        node_type = r.get("node_type") or "docker"
+        node_type = r.get("node_type") or "mariadb-docker"
         kd = _safe_node_path(ip) / "keepalived"
         if not kd.exists():
             continue
@@ -1896,7 +1896,7 @@ def _auto_push_changed(ip, changed, unit_dir):
 
 
 def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None,
-                  node_type="docker", mysql_version=None, server_id=None):
+                  node_type="mariadb-docker", mysql_version=None, server_id=None):
     ip = (ip or "").strip()
     if not ip:
         raise ValueError("节点 IP 不能为空")
@@ -2339,7 +2339,7 @@ def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_r
             port = int(n["port"])
             root_user = n.get("root_user") or "root"
             root_pass = n.get("root_pass") or ""
-            node_type = n.get("node_type") or "docker"
+            node_type = n.get("node_type") or "mariadb-docker"
             mysql_version = n.get("mysql_version") or ""
 
             # 只读副本：账号密码由主库经复制自动同步，严禁在副本上直接执行

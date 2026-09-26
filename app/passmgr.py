@@ -286,7 +286,7 @@ def _regen_node(ip):
     n = row[0]
     generate_node(n["ip"], n["port"], n["root_user"], n["root_pass"],
                   n.get("initial_role") or "slave", int(n["cluster_id"] or 0),
-                  node_type=n.get("node_type") or "docker",
+                  node_type=n.get("node_type") or "mariadb-docker",
                   mysql_version=n.get("mysql_version"))
 
 

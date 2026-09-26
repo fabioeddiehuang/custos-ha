@@ -190,9 +190,9 @@
         </label>
         <label>节点类型
           <select name="node_type" id="nodeType" onchange="onNodeTypeChange()">
-            <option value="docker" selected>MySQL（容器化 MySQL + keepalived 客户端）</option>
+            <option value="docker">MySQL（容器化 MySQL + keepalived 客户端）</option>
             <option value="mariadb">MariaDB（裸机全量安装；可与原容器 MariaDB 同集群混部）</option>
-            <option value="mariadb-docker">MariaDB（容器化，官方镜像首选；可与原裸机 MariaDB 同集群混部）</option>
+            <option value="mariadb-docker" selected>MariaDB（容器化，官方镜像首选；可与原裸机 MariaDB 同集群混部）</option>
           </select>
         </label>
         <label>MySQL 版本<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=自动探测）"></label>
@@ -303,6 +303,8 @@
     if(maria)maria.style.display=(t==="mariadb")?"block":"none";
     if(mariaDocker)mariaDocker.style.display=(t==="mariadb-docker")?"block":"none";
   }
+  // 默认节点类型为 MariaDB（mariadb-docker），加载即按默认态显示对应部署提示
+  onNodeTypeChange();
   function openAddNode(){document.getElementById("addOverlay").classList.add("show");}
   function closeAddNode(){document.getElementById("addOverlay").classList.remove("show");}
 

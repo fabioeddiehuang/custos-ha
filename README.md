@@ -78,7 +78,10 @@ cp env.example .env            # 改 MGMT_MYSQL_* / WEB_PASS / SECRET_KEY / VIP 
 
 > **v2.3.9 节点包布局**：生成的 `generated_nodes/<ip>/` 内，配置/SQL 在 `mysql8.0/conf/`（MySQL）或 `mariadb12.3.3/conf/`（MariaDB），脚本在 `<db>/scripts/`，agent 在 `agent/`，keepalived 在根 `keepalived/`，裸机日志软链 `logs -> /data/custos-ha/logs/mariadb`。**存量节点须 regen + 重装才用新布局。**
 
-#### 形态一：docker（容器化 MySQL 8.0，推荐新环境）
+#### 形态一：docker（容器化 MySQL 8.0）
+
+> ⚠ MySQL 与 MariaDB **禁止同集群混部**；**MariaDB 是主线**（官方镜像 `mariadb:12.3.3`，纯 compose 即「形态二」）。新环境推荐直接用形态二（mariadb-docker），避免后续因引擎差异受限；仅确有 MySQL 8.0 需求时选本形态。Web「添加节点 / 建集群」默认节点类型已改为 `mariadb-docker`。
+
 1. 「节点管理」选 `node_type=docker`，填节点 IP、MySQL **容器端口**（默认 3307）、root 密码、初始角色；
 2. 生成目录含 `docker-compose.yaml`（MySQL + keepalived，host 网络 + `NET_RAW`）、`mysql8.0/conf/`（init.sql、ha-overrides.cnf）；
 3. 整体拷到目标机 `/home/docker/<ip>/`，执行：
