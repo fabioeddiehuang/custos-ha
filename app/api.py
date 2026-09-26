@@ -1747,7 +1747,7 @@ def settings_page(request: Request, user=Depends(auth_required), msg: str = "", 
         # binlog 空间守卫
         binlog_alert_mb=get_setting("BINLOG_SIZE_ALERT_MB", "20480"),
         auto_purge_binlog=get_setting("AUTO_PURGE_BINLOG", "0") == "1",
-        binlog_keep_hours=get_setting("BINLOG_KEEP_HOURS", "24"),
+        binlog_keep_hours=get_setting("BINLOG_KEEP_HOURS", "240"),
         # 切换前交叉验证（防脑裂）
         require_witness=get_setting("REQUIRE_WITNESS_FOR_FAILOVER", "1") == "1",
     )

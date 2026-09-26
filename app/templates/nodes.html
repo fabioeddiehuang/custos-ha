@@ -122,7 +122,7 @@
         <td data-f="status"><span class="badge" style="background:var(--surface-3);color:var(--muted);">检测中…</span></td>
         <td style="white-space:nowrap">
           <button class="btn btn-sm btn-ghost" onclick="copyNodeBoot(this)" title="复制一行安装命令到节点执行">复制安装命令</button>
-          <button class="btn btn-sm" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button>
+          <button class="btn btn-sm dt-toggle" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button>
         </td>
       </tr>
       <tr id="d{{ n.ip }}" class="detail-panel">
@@ -217,8 +217,8 @@
           </select>
         </label>
         <label class="full">节点安装目录（可选）
-          <input id="addInstallDir" name="install_dir" placeholder="/home/docker/custos-node" style="font-family:var(--mono)">
-          <span class="hint">节点在目标机上的部署目录；留空使用默认 /home/docker/custos-node。引导安装与手动部署都会用这个目录，添加后可在「引导安装」里修改。</span>
+          <input id="addInstallDir" name="install_dir" placeholder="/home/docker" style="font-family:var(--mono)">
+          <span class="hint">节点包会装到该目录下的 custos-node 子目录（如填 /opt → 实际为 /opt/custos-node）；留空用默认 /home/docker。引导安装与手动部署都用这个目录，添加后可在「引导安装」里修改。</span>
         </label>
         <div id="mariadbTip" class="full" style="display:none;padding:10px 12px;border:1px dashed rgba(96,165,250,.45);border-radius:10px;background:rgba(37,99,235,.14);font-size:13px;color:#93c5fd;">
           <strong>MariaDB 裸机节点：</strong>把生成的目录连同 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 一起传到目标机（放同一目录），执行 <code class="mono">sudo bash Install-ha-mariadb-Node.sh</code> 即完成全量安装（解压→初始化→systemd 启动→起 keepalived）。装好后管理器自动建复制、选主、漂移 VIP。
@@ -278,7 +278,8 @@
           </select>
         </label>
         <label style="margin:0">安装目录（可选）
-          <input id="bootDir" placeholder="/home/docker/custos-node" style="width:220px"
+          <input id="bootDir" placeholder="/home/docker" style="width:220px"
+                 title="节点包会装到该目录下的 custos-node 子目录"
                  onchange="genBootstrap()">
         </label>
         <span id="bootMeta" style="color:var(--muted);font-size:12px"></span>
@@ -419,7 +420,10 @@
     var row=document.getElementById(id);
     var show=!row.classList.contains("show");
     row.classList.toggle("show",show);
-    var btn=row.previousElementSibling.querySelector("button");
+    // 必须用专属选择器：操作列里「复制安装命令」排在「展开详情」之前，
+    // 若用 querySelector("button") 会拿到第一个按钮，把它的文案改掉
+    // ——表现为「复制安装命令」消失、出现两个「展开详情」。
+    var btn=row.previousElementSibling.querySelector("button.dt-toggle");
     if(btn)btn.textContent=show?"收起详情":"展开详情";
     if(show)loadNodeDetail(id);
   }

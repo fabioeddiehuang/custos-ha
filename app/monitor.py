@@ -259,9 +259,9 @@ def _binlog_guard(cid, cluster_name, host, port, creds, ru, rp, cache):
         print(f"[monitor] 跳过 binlog 清理 {host}:{port}：从库未全部追平 -> {'; '.join(lagging)}")
         return
     try:
-        keep_hours = int(get_setting("BINLOG_KEEP_HOURS", "24") or 24)
+        keep_hours = int(get_setting("BINLOG_KEEP_HOURS", "240") or 240)
     except (TypeError, ValueError):
-        keep_hours = 24
+        keep_hours = 240
     if keep_hours <= 0:
         return
     dt = (datetime.now() - timedelta(hours=keep_hours)).strftime("%Y-%m-%d %H:%M:%S")

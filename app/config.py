@@ -254,6 +254,24 @@ NODE_INSTALL_BASE = env("NODE_INSTALL_BASE", "/home/docker")
 # 节点目录统一名（不再用 IP）：一台机器通常只跑一个 Custos 节点，
 # 统一为 custos-node 后路径更整洁、也避免不同节点目录互相覆盖。
 NODE_DIR_NAME = "custos-node"
+
+
+def node_install_dest(install_dir=None):
+    """节点在目标机上的【最终安装目录】= <基目录>/<NODE_DIR_NAME>。
+
+    运维填的是「基目录」（如 /opt），节点包统一装到其下的 custos-node 子目录，
+    **不会**把配置文件直接铺在 /opt 根目录（否则 /opt 下会散落 docker-compose.yaml、
+    my.cnf 等一堆文件，与机器上其它程序混在一起）。
+
+    若传入的已经是 .../custos-node（如历史节点的 compose_path=/home/docker/custos-node，
+    或运维就填了完整目录），则原样返回，避免拼成 .../custos-node/custos-node。
+    """
+    base = str(install_dir or "").strip().rstrip("/")
+    if not base:
+        base = NODE_INSTALL_BASE.strip().rstrip("/")
+    if base == NODE_DIR_NAME or base.endswith("/" + NODE_DIR_NAME):
+        return base
+    return "%s/%s" % (base, NODE_DIR_NAME)
 # v2.5.0 F2：节点镜像 tar 目录（由 compose 挂载宿主 ./images），
 # 供 curl 引导脚本下载后 docker load，解决内网节点拉不到镜像的问题。
 IMAGES_DIR = env("IMAGES_DIR", "/app/images")

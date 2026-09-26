@@ -25,7 +25,10 @@ import pymysql
 
 from .db import get_setting, query, execute
 from .mysql_compat import default_auth_plugin, is_mariadb_node
-from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, NODE_INSTALL_BASE, NODE_DIR_NAME, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, is_semi_sync_enabled
+from .config import (APP_VERSION, NODES_DIR, NODES_HOST_BASE, NODE_INSTALL_BASE, NODE_DIR_NAME,
+                     node_install_dest, get_manager_public_ip,
+                     get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID,
+                     VIP_PORT, is_semi_sync_enabled)
 from . import mariadb_matrix
 from . import crypto as _crypto
 from .ha_client import get_status, ensure_ha_creds, db_uptime, repair_ha_shadow_grants
@@ -1518,11 +1521,10 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
     if fresh:
         if node_type == "mariadb":
             add("manual", "首次部署：安装 MariaDB 并拉起 keepalived",
-                "裸机形态需先执行安装脚本（全量安装 MariaDB + 初始化账号），再拉起 "
-                "keepalived 与节点 agent；安装脚本会自动重放 fix-node-creds.sql。",
-                "cd %s/%s && sudo bash mariadb12.3.3/scripts/Install-ha-mariadb-Node.sh "
-                "&& docker compose up -d keepalived custos-node-agent"
-                % (NODE_INSTALL_BASE, NODE_DIR_NAME), [], "db_alive")
+                "先跑安装脚本（全量安装 MariaDB + 初始化账号），再拉起 keepalived 与节点 agent。",
+                "cd %s && sudo bash mariadb12.3.3/scripts/Install-ha-mariadb-Node.sh "
+                "&& docker compose up -d keepalived custos-node-agent" % d,
+                [], "db_alive")
         else:
             add("manual", "首次部署：启动节点容器（数据库 + keepalived 合一）",
                 "把整个目录拷到目标机后执行一次即可；数据目录为空时会自动执行 init SQL 初始化账号。",
@@ -1872,13 +1874,22 @@ def _auto_push_changed(ip, changed, unit_dir):
     from pathlib import Path
     from . import agent_hub
 
+    # 文件要写到【该节点真实的安装目录】。写死默认目录会导致自定义目录的节点
+    # 被下发到 /home/docker/custos-node（agent 建出一套不生效的副本，配置漂移依旧）。
+    try:
+        _cp = query("SELECT compose_path FROM nodes WHERE ip=%s", (ip,))
+        _dest = ((_cp[0] or {}).get("compose_path") if _cp else "") or ""
+    except Exception:
+        _dest = ""
+    _dest = node_install_dest(_dest) if _dest else node_install_dest(None)
+
     files, restart = {}, set()
     for rel in changed or []:
         p = Path(unit_dir) / rel
         if not p.is_file():
             continue
         try:
-            files["%s/%s/%s" % (NODE_INSTALL_BASE, NODE_DIR_NAME, rel)] = base64.b64encode(p.read_bytes()).decode()
+            files["%s/%s" % (_dest, rel)] = base64.b64encode(p.read_bytes()).decode()
         except OSError:
             continue
         r = str(rel)
@@ -1902,6 +1913,9 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     ip = (ip or "").strip()
     if not ip:
         raise ValueError("节点 IP 不能为空")
+    # 节点在目标机上的最终安装目录（install_dir 视为【基目录】→ 统一落到 <基>/custos-node）。
+    # 本函数内所有「节点侧绝对路径」都必须用它，避免自定义目录时仍写死默认路径。
+    _install_dest = node_install_dest(install_dir)
     port = int(port)
     if not cluster_id:
         # 缺省归入首个集群
@@ -2009,7 +2023,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port,
             manager_subnet)
         _write(d / MARIADB_NODE_CONF_DIR / "conf" / "fix-node-creds.sql", fix_sql, mode=0o644)
-        extra_files["init_mariadb_sql"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/conf/init_mariadb.sql"
+        extra_files["init_mariadb_sql"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/conf/init_mariadb.sql"
         # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
         # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
         if node_type == "mariadb-docker":
@@ -2019,8 +2033,8 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             _write(d / MARIADB_NODE_CONF_DIR / "conf" / "docker-my.cnf",
                    render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=server_id),
                    mode=0o644)
-            extra_files["docker_my_cnf"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/conf/docker-my.cnf"
-            extra_files["uninstall_script"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-docker-Node.sh"
+            extra_files["docker_my_cnf"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/conf/docker-my.cnf"
+            extra_files["uninstall_script"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-docker-Node.sh"
             src = NODE_SCRIPTS / "Uninstall-mariadb-docker-Node.sh"
             if src.exists():
                 _write(d / MARIADB_NODE_CONF_DIR / "scripts" / "Uninstall-mariadb-docker-Node.sh", src.read_text(), mode=0o755)
@@ -2029,9 +2043,9 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
             my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=server_id)
             _write(d / MARIADB_NODE_CONF_DIR / "conf" / "my.cnf", my_cnf, mode=0o644)
-            extra_files["my_cnf"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/conf/my.cnf"
-            extra_files["install_script"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/scripts/Install-ha-mariadb-Node.sh"
-            extra_files["uninstall_script"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-Node.sh"
+            extra_files["my_cnf"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/conf/my.cnf"
+            extra_files["install_script"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/scripts/Install-ha-mariadb-Node.sh"
+            extra_files["uninstall_script"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-Node.sh"
             # 裸机包【只适配裸机】：不再交付 Install-mariadb-docker-Node.sh 容器回退脚本。
             # 原因：该脚本把裸机完整 my.cnf（仅剔除 datadir/socket/pid_file）喂给官方镜像容器，
             # 残留裸机专属参数（缺失 log_error → 官方镜像默认写 stdout，管理器「错误日志」
@@ -2129,7 +2143,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         agent_token = _rand_secret(24)
     from .config import WEB_PORT as _WEB_PORT
     _mgr_url = "http://%s:%d" % (get_manager_public_ip() or "", int(_WEB_PORT))
-    _unit_dir = "%s/%s" % (NODE_INSTALL_BASE, NODE_DIR_NAME)
+    _unit_dir = _install_dest
     _anchor = "  custos-node-agent:\n    image: python:3-slim"
     if _anchor in compose:
         compose = compose.replace(
@@ -2161,11 +2175,10 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     #    <NODE_INSTALL_BASE>/<NODE_DIR_NAME>（默认 /home/docker/custos-node）即可运行。
     #    root_pass 一并入库：节点 MySQL root 密码在容器创建时固定，作为 ha_monitor 凭证
     #    自愈与切换回退的权威凭据（不随 HA_PASS 漂移）。
-    host_compose = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}"
-    # 节点安装目录：添加节点时可按节点指定（install_dir，绝对路径），否则用默认 base/统一名。
+    # 节点安装目录：添加节点时可按节点指定（install_dir 为【基目录】，绝对路径），否则默认。
+    # 统一走 node_install_dest：基目录 /opt → 实际目录 /opt/custos-node（不把文件散在 /opt 根）。
     # 该值仅作为「宿主机部署目录」元数据（compose_path）与引导命令默认目录，不影响管理器本地生成路径。
-    if install_dir and str(install_dir).startswith("/"):
-        host_compose = str(install_dir).strip().rstrip("/") or host_compose
+    host_compose = _install_dest
     # v2.3.1：root 口令落库前加密（后续写 ha_check.conf 等仍用局部明文变量，不受影响）
     _root_pass_enc = _crypto.encrypt(root_pass)
     execute(

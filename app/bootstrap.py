@@ -30,7 +30,8 @@ import tarfile
 import time
 from pathlib import Path
 
-from .config import NODES_DIR, WEB_PORT, get_manager_public_ip, NODE_INSTALL_BASE, NODE_DIR_NAME
+from .config import (NODES_DIR, WEB_PORT, get_manager_public_ip, NODE_INSTALL_BASE,
+                     NODE_DIR_NAME, node_install_dest)
 
 log = logging.getLogger(__name__)
 
@@ -289,10 +290,13 @@ def manager_base_url():
 
 
 def _install_dest(install_dir=None):
-    """节点在目标机上的安装目录：install_dir 优先，否则 base/统一名。"""
+    """节点在目标机上的安装目录：install_dir 优先（视为【基目录】），否则默认 base/统一名。
+
+    基目录语义：填 /opt → 实际装到 /opt/custos-node，节点文件不会散落在 /opt 根目录。
+    """
     if install_dir:
-        return install_dir
-    return "%s/%s" % (NODE_INSTALL_BASE, NODE_DIR_NAME)
+        return node_install_dest(install_dir)
+    return node_install_dest(NODE_INSTALL_BASE)
 
 
 def node_install_cmds(ip, node_type, sidecar_only=False, install_dir=None):
