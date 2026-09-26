@@ -30,15 +30,17 @@ import tarfile
 import time
 from pathlib import Path
 
-from .config import NODES_DIR, WEB_PORT, get_manager_public_ip
+from .config import NODES_DIR, WEB_PORT, get_manager_public_ip, NODE_INSTALL_BASE, NODE_DIR_NAME
 
 log = logging.getLogger(__name__)
 
 # token 默认有效期（小时）。运维拿到命令后可能隔天才上机，24h 是可用性下限。
 DEFAULT_TTL_HOURS = 24
 
-# 节点上的安装根目录。node_gen 的单元目录约定：自包含，拷到 <base>/<ip>/ 即可运行。
-INSTALL_BASE = "/home/docker"
+# 节点上的安装根目录。node_gen 的单元目录约定：自包含，拷到 <base>/<name>/ 即可运行。
+# 默认基目录 + 统一目录名（不再用 IP），可通过 NODE_INSTALL_BASE 环境变量覆盖，
+# 或签发引导命令时按节点传入 install_dir 覆盖。
+INSTALL_BASE = NODE_INSTALL_BASE
 
 _SECRET_CACHE = None
 
@@ -281,7 +283,14 @@ def manager_base_url():
     return "http://%s:%d" % (ip, int(WEB_PORT))
 
 
-def node_install_cmds(ip, node_type, sidecar_only=False):
+def _install_dest(install_dir=None):
+    """节点在目标机上的安装目录：install_dir 优先，否则 base/统一名。"""
+    if install_dir:
+        return install_dir
+    return "%s/%s" % (NODE_INSTALL_BASE, NODE_DIR_NAME)
+
+
+def node_install_cmds(ip, node_type, sidecar_only=False, install_dir=None):
     """按节点形态给出安装/启动命令序列。
 
     裸机 MariaDB（mariadb）：数据库本体由 Install-ha-mariadb-Node.sh 全量安装
@@ -290,15 +299,19 @@ def node_install_cmds(ip, node_type, sidecar_only=False):
 
     sidecar_only=True（**接管场景**）：只在已有数据库上装 keepalived + agent。
     必须跳过 Install 脚本——接管的是**正在跑业务的库**，跑安装脚本等于重装数据库。
+
+    安装脚本位于单元目录的 <MARIADB_NODE_CONF_DIR>/scripts/ 下（与 node_gen 生成一致），
+    此前误写成 scripts/ 顶层导致裸机形态引导后不自动安装，已修正。
     """
+    dest = _install_dest(install_dir)
     if node_type == "mariadb" or sidecar_only:
-        cmds = ["cd %s/%s && docker compose up -d keepalived custos-node-agent"
-                % (INSTALL_BASE, ip)]
+        cmds = ["cd %s && docker compose up -d keepalived custos-node-agent" % dest]
         if node_type == "mariadb" and not sidecar_only:
+            from .node_gen import MARIADB_NODE_CONF_DIR
             cmds.insert(0, "bash %s/%s/scripts/Install-ha-mariadb-Node.sh"
-                        % (INSTALL_BASE, ip))
+                        % (dest, MARIADB_NODE_CONF_DIR))
         return cmds
-    return ["cd %s/%s && docker compose up -d" % (INSTALL_BASE, ip)]
+    return ["cd %s && docker compose up -d" % dest]
 
 
 def available_images():
@@ -322,16 +335,19 @@ def available_images():
 
 
 def render_bootstrap_script(ip, token, node_type="docker", images=None,
-                            sidecar_only=False):
+                            sidecar_only=False, install_dir=None):
     """渲染引导安装脚本（bash）。
 
     脚本是**幂等**的：重复执行会覆盖单元并重新 up，便于失败重试与后续升级
     （这正是存量老节点升级 agent 的路径）。
 
     sidecar_only：接管已有数据库时只装 keepalived + agent，跳过数据库安装。
+    install_dir：节点在目标机上的安装目录（覆盖默认 base/统一名）。
     """
     mgr = manager_base_url()
-    cmds = node_install_cmds(ip, node_type, sidecar_only=sidecar_only)
+    dest = _install_dest(install_dir)
+    cmds = node_install_cmds(ip, node_type, sidecar_only=sidecar_only,
+                             install_dir=install_dir)
 
     # 镜像分发（F2）：服务端托管 tar，节点 docker load。未配置时跳过。
     if images is None:
@@ -357,7 +373,7 @@ set -euo pipefail
 IP="__IP__"
 TOKEN="__TOKEN__"
 MGR="__MGR__"
-DEST="__BASE__/__IP__"
+DEST="__DEST__"
 TMP="$(mktemp -d)"
 UNIT="$TMP/custos-unit.tgz"
 
@@ -381,6 +397,11 @@ mkdir -p "$DEST"
 tar -xzf "$UNIT" -C "$DEST" --strip-components=1 \
   || die "解压失败"
 
+step "登记节点目录（供 custosctl node 任意目录调用）"
+mkdir -p /etc/custos
+printf '# Custos 节点包目录（custosctl node 自动发现用）\nNODE_DIR=%s\n' "$DEST" > /etc/custos/node.env
+chmod 644 /etc/custos/node.env
+
 __INSTALL__
 
 step "上报部署结果"
@@ -394,7 +415,7 @@ printf '请回到管理端「节点管理」确认状态变为「在线」。\n'
     out = tpl.replace("__IP__", str(ip))
     out = out.replace("__TOKEN__", str(token))
     out = out.replace("__MGR__", mgr)
-    out = out.replace("__BASE__", INSTALL_BASE)
+    out = out.replace("__DEST__", dest)
     out = out.replace("__IMAGES__", img_block)
     out = out.replace("__INSTALL__", install_block)
     return out
@@ -407,17 +428,20 @@ def bootstrap_command(ip, token):
 
 
 def issue_for_node(ip, node_type="docker", cluster_id=None, actor="",
-                   ttl_hours=DEFAULT_TTL_HOURS, images=None, sidecar_only=False):
+                   ttl_hours=DEFAULT_TTL_HOURS, images=None, sidecar_only=False,
+                   install_dir=None):
     """一次性产出「命令 + 脚本 + token」，供 API/页面直接使用。"""
     token = issue_token(ip, cluster_id=cluster_id, actor=actor, ttl_hours=ttl_hours)
+    dest = _install_dest(install_dir)
     return {
         "ip": ip,
         "token": token,
         "command": bootstrap_command(ip, token),
         "script": render_bootstrap_script(ip, token, node_type, images,
-                                          sidecar_only=sidecar_only),
+                                          sidecar_only=sidecar_only,
+                                          install_dir=install_dir),
         "expires_in_hours": ttl_hours,
         "manager": manager_base_url(),
-        "install_base": "%s/%s" % (INSTALL_BASE, ip),
+        "install_base": dest,
         "sidecar_only": bool(sidecar_only),
     }

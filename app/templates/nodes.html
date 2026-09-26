@@ -216,14 +216,14 @@
         </label>
         <div id="mariadbTip" class="full" style="display:none;padding:10px 12px;border:1px dashed rgba(96,165,250,.45);border-radius:10px;background:rgba(37,99,235,.14);font-size:13px;color:#93c5fd;">
           <strong>MariaDB 节点部署流程（全量安装）：</strong>生成后目录内含 <code class="mono">Install-ha-mariadb-Node.sh</code>（唯一全量安装脚本，自包含）、<code class="mono">Uninstall-mariadb-Node.sh</code>、<code class="mono">my.cnf</code>、<code class="mono">init_mariadb.sql</code>。推荐顺序 ——
-          ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/ha-node/&lt;本机IP&gt;/</code>），并把 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 放到同一目录（脚本会优先用本地包，跳过下载）；
+          ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/custos-node</code>），并把 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 放到同一目录（脚本会优先用本地包，跳过下载）；
           ② 执行 <code class="mono">sudo bash Install-ha-mariadb-Node.sh</code>（自动：解压 → 初始化 → 落盘 my.cnf → systemd 启动 → 跑 init/fix SQL → 起 keepalived）；
           ③ 各节点都装好后，管理器自动建复制、选主、漂移 VIP。
           <strong>注意：MariaDB 与 MySQL GTID 机制不兼容，MariaDB 集群所有节点必须都是 MariaDB 类型。</strong>
         </div>
         <div id="mariadbDockerTip" class="full" style="display:none;padding:10px 12px;border:1px dashed rgba(96,165,250,.45);border-radius:10px;background:rgba(37,99,235,.14);font-size:13px;color:#93c5fd;">
           <strong>MariaDB 容器版部署流程（官方镜像，无需宿主装 MariaDB，纯 compose）：</strong>生成后目录内含 <code class="mono">docker-compose.yaml</code>、<code class="mono">docker-my.cnf</code>、<code class="mono">init_mariadb.sql</code>、<code class="mono">Uninstall-mariadb-docker-Node.sh</code>。推荐顺序 ——
-          ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/ha-node/&lt;本机IP&gt;/</code>）；
+          ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/custos-node</code>）；
           ② 执行 <code class="mono">docker compose up -d</code>（自动：拉镜像 <code class="mono">mariadb:12.3.3</code>，失败自动退 <code class="mono">mariadb:12.3.2</code> → 起 MariaDB + keepalived 容器 → 挂配置 → 跑 init/fix SQL）；
           ③ 各节点都起来后，管理器自动建复制、选主、漂移 VIP。
           <strong>可与「MariaDB 裸机」节点同集群混部</strong>（同为 MariaDB GTID 复制路径），适合新机跑裸机、老机（glibc 过低）跑容器的混合环境。
@@ -268,13 +268,17 @@
         <span style="color:var(--danger)">⚠ 该命令含一次性凭据</span>：仅对这一个节点 IP 有效、有效期有限、
         部署成功后自动作废，请勿转发他人。
       </div>
-      <div style="display:flex;align-items:center;gap:10px;margin:12px 0 8px">
+      <div style="display:flex;align-items:center;gap:10px;margin:12px 0 8px;flex-wrap:wrap">
         <label style="margin:0">有效期
           <select id="bootTtl" onchange="genBootstrap()">
             <option value="24" selected>24 小时</option>
             <option value="6">6 小时</option>
             <option value="72">72 小时</option>
           </select>
+        </label>
+        <label style="margin:0">安装目录（可选）
+          <input id="bootDir" placeholder="/home/docker/custos-node" style="width:220px"
+                 onchange="genBootstrap()">
         </label>
         <span id="bootMeta" style="color:var(--muted);font-size:12px"></span>
       </div>
@@ -335,7 +339,9 @@
   function genBootstrap(){
     if(!_bootIp)return;
     var ttl=document.getElementById("bootTtl").value||"24";
+    var dir=(document.getElementById("bootDir").value||"").trim();
     var fd=new URLSearchParams();fd.set("ip",_bootIp);fd.set("ttl_hours",ttl);
+    if(dir)fd.set("install_dir",dir);
     var box=document.getElementById("bootCmd"), meta=document.getElementById("bootMeta");
     box.textContent="生成中…"; meta.textContent="";
     fetch("/api/node/bootstrap",{method:"POST",

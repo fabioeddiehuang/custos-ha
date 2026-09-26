@@ -243,11 +243,17 @@ NODES_DIR = env("NODES_DIR", "/app/generated_nodes")
 # ./generated_nodes 挂载到容器内的 /app/generated_nodes，因此节点文件在宿主机上的
 # 实际落盘路径为 <项目根>/generated_nodes/<ip>。每个 <ip> 子目录是自包含的部署单元
 # （docker-compose.yaml / init.sql / keepalived/ 均相对本目录，MySQL 数据落在 ./MySQL-data），
-# 可直接拷贝到目标主机的 /home/docker/<ip>/ 运行，路径不会越级。
+# 可直接拷贝到目标主机的 /home/docker/custos-node（统一目录名，非 IP）运行，路径不会越级。
 # 该值用于 Web 展示与「到目标主机执行」命令，可通过 NODES_HOST_BASE 覆盖（如项目目录改名时）。
 # 仓库目录改名为 custos-ha 后此处默认值同步更新；也可在 docker-compose.yml 里显式设置
 # NODES_HOST_BASE 覆盖，无需改代码。
 NODES_HOST_BASE = env("NODES_HOST_BASE", "custos-ha/generated_nodes")
+# 节点在【目标机】上的安装基目录：引导脚本把部署单元解压到这里。
+# 可通过 NODE_INSTALL_BASE 覆盖（如想装到 /data、/opt 等自定义分区）。
+NODE_INSTALL_BASE = env("NODE_INSTALL_BASE", "/home/docker")
+# 节点目录统一名（不再用 IP）：一台机器通常只跑一个 Custos 节点，
+# 统一为 custos-node 后路径更整洁、也避免不同节点目录互相覆盖。
+NODE_DIR_NAME = "custos-node"
 # v2.5.0 F2：节点镜像 tar 目录（由 compose 挂载宿主 ./images），
 # 供 curl 引导脚本下载后 docker load，解决内网节点拉不到镜像的问题。
 IMAGES_DIR = env("IMAGES_DIR", "/app/images")

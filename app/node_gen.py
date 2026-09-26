@@ -25,7 +25,7 @@ import pymysql
 
 from .db import get_setting, query, execute
 from .mysql_compat import default_auth_plugin, is_mariadb_node
-from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, is_semi_sync_enabled
+from .config import APP_VERSION, NODES_DIR, NODES_HOST_BASE, NODE_INSTALL_BASE, NODE_DIR_NAME, get_manager_public_ip, get_manager_docker_subnet_wildcard, VIP, VIP_PREFIX, INTERFACE, VRID, VIP_PORT, is_semi_sync_enabled
 from . import mariadb_matrix
 from . import crypto as _crypto
 from .ha_client import get_status, ensure_ha_creds, db_uptime, repair_ha_shadow_grants
@@ -1520,8 +1520,9 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
             add("manual", "首次部署：安装 MariaDB 并拉起 keepalived",
                 "裸机形态需先执行安装脚本（全量安装 MariaDB + 初始化账号），再拉起 "
                 "keepalived 与节点 agent；安装脚本会自动重放 fix-node-creds.sql。",
-                "cd %s && sudo bash mariadb12.3.3/scripts/Install-ha-mariadb-Node.sh "
-                "&& docker compose up -d keepalived custos-node-agent" % d, [], "db_alive")
+                "cd %s/%s && sudo bash mariadb12.3.3/scripts/Install-ha-mariadb-Node.sh "
+                "&& docker compose up -d keepalived custos-node-agent"
+                % (NODE_INSTALL_BASE, NODE_DIR_NAME), [], "db_alive")
         else:
             add("manual", "首次部署：启动节点容器（数据库 + keepalived 合一）",
                 "把整个目录拷到目标机后执行一次即可；数据目录为空时会自动执行 init SQL 初始化账号。",
@@ -1877,7 +1878,7 @@ def _auto_push_changed(ip, changed, unit_dir):
         if not p.is_file():
             continue
         try:
-            files["/home/docker/%s/%s" % (ip, rel)] = base64.b64encode(p.read_bytes()).decode()
+            files["%s/%s/%s" % (NODE_INSTALL_BASE, NODE_DIR_NAME, rel)] = base64.b64encode(p.read_bytes()).decode()
         except OSError:
             continue
         r = str(rel)
@@ -2007,7 +2008,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port,
             manager_subnet)
         _write(d / MARIADB_NODE_CONF_DIR / "conf" / "fix-node-creds.sql", fix_sql, mode=0o644)
-        extra_files["init_mariadb_sql"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/conf/init_mariadb.sql"
+        extra_files["init_mariadb_sql"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/conf/init_mariadb.sql"
         # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
         # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
         if node_type == "mariadb-docker":
@@ -2017,8 +2018,8 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             _write(d / MARIADB_NODE_CONF_DIR / "conf" / "docker-my.cnf",
                    render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=server_id),
                    mode=0o644)
-            extra_files["docker_my_cnf"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/conf/docker-my.cnf"
-            extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-docker-Node.sh"
+            extra_files["docker_my_cnf"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/conf/docker-my.cnf"
+            extra_files["uninstall_script"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-docker-Node.sh"
             src = NODE_SCRIPTS / "Uninstall-mariadb-docker-Node.sh"
             if src.exists():
                 _write(d / MARIADB_NODE_CONF_DIR / "scripts" / "Uninstall-mariadb-docker-Node.sh", src.read_text(), mode=0o755)
@@ -2027,9 +2028,9 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
             my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=server_id)
             _write(d / MARIADB_NODE_CONF_DIR / "conf" / "my.cnf", my_cnf, mode=0o644)
-            extra_files["my_cnf"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/conf/my.cnf"
-            extra_files["install_script"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/scripts/Install-ha-mariadb-Node.sh"
-            extra_files["uninstall_script"] = f"{NODES_HOST_BASE}/{ip}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-Node.sh"
+            extra_files["my_cnf"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/conf/my.cnf"
+            extra_files["install_script"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/scripts/Install-ha-mariadb-Node.sh"
+            extra_files["uninstall_script"] = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-Node.sh"
             # 裸机包【只适配裸机】：不再交付 Install-mariadb-docker-Node.sh 容器回退脚本。
             # 原因：该脚本把裸机完整 my.cnf（仅剔除 datadir/socket/pid_file）喂给官方镜像容器，
             # 残留裸机专属参数（缺失 log_error → 官方镜像默认写 stdout，管理器「错误日志」
@@ -2127,7 +2128,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         agent_token = _rand_secret(24)
     from .config import WEB_PORT as _WEB_PORT
     _mgr_url = "http://%s:%d" % (get_manager_public_ip() or "", int(_WEB_PORT))
-    _unit_dir = "/home/docker/%s" % ip
+    _unit_dir = "%s/%s" % (NODE_INSTALL_BASE, NODE_DIR_NAME)
     _anchor = "  custos-node-agent:\n    image: python:3-slim"
     if _anchor in compose:
         compose = compose.replace(
@@ -2155,10 +2156,11 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # 6) 登记到 nodes 表 + hosts 表（供监控自动接入）
     #    compose_path 记录「宿主机路径」（便于 Web 展示与到目标主机执行），
     #    实际文件仍写入容器内的 NODES_DIR（由 docker-compose 挂载到 ./generated_nodes）。
-    #    注意：每个 <ip> 子目录是自包含部署单元，拷贝到目标主机的 /home/docker/<ip>/ 即可运行。
+    #    注意：每个 <ip> 子目录是自包含部署单元，拷贝到目标主机的
+    #    <NODE_INSTALL_BASE>/<NODE_DIR_NAME>（默认 /home/docker/custos-node）即可运行。
     #    root_pass 一并入库：节点 MySQL root 密码在容器创建时固定，作为 ha_monitor 凭证
     #    自愈与切换回退的权威凭据（不随 HA_PASS 漂移）。
-    host_compose = f"{NODES_HOST_BASE}/{ip}"
+    host_compose = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}"
     # v2.3.1：root 口令落库前加密（后续写 ha_check.conf 等仍用局部明文变量，不受影响）
     _root_pass_enc = _crypto.encrypt(root_pass)
     execute(

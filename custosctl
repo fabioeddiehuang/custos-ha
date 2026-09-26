@@ -44,21 +44,53 @@ fi
 #   docker 节点：DB 在容器；裸机节点：DB 由 systemd(mariadb.service) 管理，
 #   包内 compose 仅含 keepalived + custos-node-agent 容器。
 # ===========================================================================
+# 节点包目录判定：含 compose 且含某风味 conf（确认是节点包而非其它 compose 项目）
+_node_dir_ok() {
+  { [ -f "$1/docker-compose.yaml" ] || [ -f "$1/docker-compose.yml" ]; } \
+    && { [ -d "$1/mariadb12.3.3/conf" ] || [ -d "$1/mysql8.0/conf" ]; }
+}
+
+# 自动发现节点包目录（custosctl node 未显式 --dir 时），按可靠性降序：
+#   ① NODE_DIR 环境变量  ② /etc/custos/node.env（install / 引导脚本写入）
+#   ③ 常见安装基目录 + 统一目录名 custos-node  ④ NODE_UNIT_DIR（与管理器下发给 agent 一致）
+#   ⑤ 当前目录（兼容旧用法：在节点包内执行）
+_node_dir_find() {
+  if [ -n "${NODE_DIR:-}" ] && _node_dir_ok "$NODE_DIR"; then
+    echo "$NODE_DIR"; return 0
+  fi
+  if [ -r /etc/custos/node.env ]; then
+    _nd=$(. /etc/custos/node.env 2>/dev/null; echo "${NODE_DIR:-}")
+    if [ -n "$_nd" ] && _node_dir_ok "$_nd"; then echo "$_nd"; return 0; fi
+  fi
+  for _cand in /home/docker/custos-node /opt/custos-node /srv/custos-node /data/custos-node /home/custos-node; do
+    if _node_dir_ok "$_cand"; then echo "$_cand"; return 0; fi
+  done
+  if [ -n "${NODE_UNIT_DIR:-}" ] && _node_dir_ok "$NODE_UNIT_DIR"; then
+    echo "$NODE_UNIT_DIR"; return 0
+  fi
+  return 1
+}
+
 node_main() {
   local ndir sub data_base flavor is_docker db_svc dump_args sock_path target out ts f force tmp
-  ndir=$(pwd)
+  ndir=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --dir) ndir=$2; shift 2 || true ;;
       *) break ;;
     esac
   done
-  sub=${1:-}; [ $# -gt 0 ] && shift || true
-
-  if [ ! -d "$ndir" ]; then
-    echo "错误：节点包目录不存在：$ndir" >&2; exit 1
+  # 未显式 --dir 时多层自动发现，使「custosctl node <cmd>」可在任意目录执行
+  if [ -z "$ndir" ]; then
+    ndir=$(_node_dir_find) || ndir=$(pwd)
   fi
+  ndir=$(cd "$ndir" 2>/dev/null && pwd) || {
+    echo "错误：无法确定节点包目录：$ndir" >&2
+    echo "请在节点包目录执行，或显式指定：custosctl node <cmd> --dir <节点包目录>" >&2
+    exit 1
+  }
   cd "$ndir" || exit 1
+  sub=${1:-}; [ $# -gt 0 ] && shift || true
 
   # 节点包 compose 文件名：node_gen 生成 docker-compose.yaml；个别/历史场景可能是 .yml。
   # 统一用本函数拿当前目录的 compose 文件，避免 .yaml/.yml 混用导致检测失效。
@@ -220,6 +252,13 @@ EOF
         install -m 0755 "$(command -v custosctl 2>/dev/null || echo "$0")" /usr/bin/custosctl 2>/dev/null \
           || install -m 0755 "$0" /usr/bin/custosctl 2>/dev/null || true
         echo "已自装 custosctl 到 /usr/bin/custosctl"
+        # 记录节点包目录，供之后任意目录直接 custosctl node <cmd>
+        if _node_dir_ok "$ndir"; then
+          mkdir -p /etc/custos
+          printf '# Custos 节点包目录（custosctl node 自动发现用）\nNODE_DIR=%s\n' "$ndir" > /etc/custos/node.env
+          chmod 644 /etc/custos/node.env
+          echo "已记录节点包目录：$ndir（写入 /etc/custos/node.env）"
+        fi
       else
         echo "提示：非 root，未自装 custosctl；如需请 sudo custosctl node install"
       fi
@@ -333,6 +372,9 @@ EOF
         inst_bin=$(command -v bash 2>/dev/null || echo sh)
         "$inst_bin" "$flavor"12.3.3/scripts/Uninstall-mariadb-Node.sh "$@"
       fi
+      # 清理节点登记：仅删节点专属的 node.env，绝不碰管理器的 custosctl.env / /usr/bin/custosctl
+      rm -f /etc/custos/node.env 2>/dev/null || true
+      echo "已清理节点登记 /etc/custos/node.env（管理器不受影响）"
       ;;
     *) node_usage ;;
   esac

@@ -886,16 +886,23 @@ def api_rebuild_status(task: str = "", user=Depends(auth_required)):
 # ==================================================================
 @app.post("/api/node/bootstrap")
 def api_node_bootstrap(ip: str = Form(...), ttl_hours: int = Form(24),
+                       install_dir: str = Form(""),
                        user=Depends(auth_required)):
     """生成节点引导命令（含一次性 token）。
 
     ttl_hours 默认 24 小时：运维拿到命令后可能隔天才上机，太短会白跑一趟；
     安全性由「绑定 IP + 完成后作废」兜底，而不是靠把有效期压到几分钟。
+    install_dir：可选，指定节点在目标机上的安装目录（覆盖默认 base/统一名 custos-node）；
+    必须是绝对路径，否则忽略回退默认。
     """
     from . import bootstrap
+    from .config import NODE_INSTALL_BASE, NODE_DIR_NAME
     ip = (ip or "").strip()
     if not ip:
         return _json_ok({"ok": False, "error": "节点 IP 不能为空"})
+    install_dir = (install_dir or "").strip()
+    if install_dir and not install_dir.startswith("/"):
+        install_dir = ""          # 仅接受绝对路径，避免落到不可预期的相对目录
     try:
         ttl = int(ttl_hours)
     except (TypeError, ValueError):
@@ -909,7 +916,8 @@ def api_node_bootstrap(ip: str = Form(...), ttl_hours: int = Form(24),
         node_type, cluster_id = "docker", None
     try:
         info = bootstrap.issue_for_node(ip, node_type=node_type, cluster_id=cluster_id,
-                                        actor=str(user), ttl_hours=ttl)
+                                        actor=str(user), ttl_hours=ttl,
+                                        install_dir=install_dir or None)
     except Exception as e:
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
     try:
@@ -3874,8 +3882,9 @@ def cluster_update(
         from .node_gen import regenerate_cluster_compose
         regenerate_cluster_compose(cid)
         msg += ("；已刷新各节点部署文件（keepalived.conf + notify 脚本 + docker-compose），"
-                "请把各节点目录下 keepalived/keepalived.conf 同步到目标机并重载 keepalived 生效"
-                "（如：scp keepalived/keepalived.conf 目标机:/home/docker/<ip>/keepalived/ 后 "
+                "请把各节点目录（默认 /home/docker/custos-node）下 keepalived/keepalived.conf "
+                "同步到目标机并重载 keepalived 生效"
+                "（如：scp keepalived/keepalived.conf 目标机:/home/docker/custos-node/keepalived/ 后 "
                 "docker compose restart keepalived）")
     except Exception:
         pass

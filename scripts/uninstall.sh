@@ -6,6 +6,7 @@
 #
 #   默认       停止并移除容器 + 删除本项目镜像（custos-server:<VERSION>）与匿名卷
 #              + 删除 /usr/bin/custosctl 与 /etc/custos
+#              （例外：本机同时是节点时，仅删管理器配置 custosctl.env，保留 node.env 与命令，custosctl node 仍可用）
 #              （保留 backups/ data/ generated_nodes/）
 #   -f|--purge 额外【永久删除】backups/ data/（含 data/custos-ha/）generated_nodes/
 #              需输入 DELETE 二次确认（--yes 可跳过确认，供脚本化使用）
@@ -110,14 +111,30 @@ if [ "$PURGE" = "1" ]; then
 fi
 
 # 3) 删除命令行工具与配置（实现「随卸载脚本一同卸载」）
-rm -f /usr/bin/custosctl
+#    本机若同时为节点（存在有效 node.env → 指向真实节点包），则仅移除【管理器】配置，
+#    保留 node.env 与 /usr/bin/custosctl，使 custosctl node 仍可正常使用（极边缘场景保护）。
+_KEEP_NODE=0
+if [ -f /etc/custos/node.env ]; then
+  _nd=$(. /etc/custos/node.env 2>/dev/null; echo "${NODE_DIR:-}")
+  if [ -n "$_nd" ] && { [ -f "$_nd/docker-compose.yaml" ] || [ -f "$_nd/docker-compose.yml" ]; }; then
+    _KEEP_NODE=1
+  fi
+fi
 rm -f /usr/share/bash-completion/completions/custosctl 2>/dev/null || true
 rm -f /etc/bash_completion.d/custosctl 2>/dev/null || true
 rm -f /usr/local/share/zsh/site-functions/_custosctl 2>/dev/null || true
 rm -f /usr/share/zsh/site-functions/_custosctl 2>/dev/null || true
-rm -rf /etc/custos
+if [ "$_KEEP_NODE" = "1" ]; then
+  # 仅删管理器配置，保留节点配置与命令
+  rm -f /etc/custos/custosctl.env
+  echo "    本机同时为节点：已保留 /etc/custos/node.env 与 /usr/bin/custosctl（custosctl node 仍可用）。" >&2
+  echo "          如需彻底移除节点，请到节点包目录执行卸载脚本，或手动 rm -f /etc/custos/node.env。" >&2
+else
+  rm -f /usr/bin/custosctl
+  rm -rf /etc/custos
+fi
 
-echo "==> 卸载完成：容器与本项目镜像已移除，custosctl 已删除。"
+echo "==> 卸载完成：容器与本项目镜像已移除${_KEEP_NODE:+；本机兼为节点，custosctl 与节点配置已保留}。"
 if [ "$PURGE" = "1" ]; then
   echo "    数据目录已删除：backups/ data/ generated_nodes/"
 else

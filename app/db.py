@@ -257,9 +257,9 @@ def init_schema():
             # 仅更新「当前值与目标值不一致」的行：既保留迁移能力，又避免每次启动
             # 都对所有节点跑一遍 UPDATE（无谓写库 + 大集群启动变慢）。
             try:
-                from .config import NODES_HOST_BASE
+                from .config import NODE_INSTALL_BASE, NODE_DIR_NAME
                 for r in query("SELECT ip, compose_path FROM nodes"):
-                    want = f"{NODES_HOST_BASE}/{r['ip']}"
+                    want = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}"
                     if (r.get("compose_path") or "") != want:
                         execute(
                             "UPDATE nodes SET compose_path=%s WHERE ip=%s",
