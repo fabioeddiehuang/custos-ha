@@ -1897,7 +1897,8 @@ def _auto_push_changed(ip, changed, unit_dir):
 
 
 def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_id=None,
-                  node_type="mariadb-docker", mysql_version=None, server_id=None):
+                  node_type="mariadb-docker", mysql_version=None, server_id=None,
+                  install_dir=None):
     ip = (ip or "").strip()
     if not ip:
         raise ValueError("节点 IP 不能为空")
@@ -2161,6 +2162,10 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     #    root_pass 一并入库：节点 MySQL root 密码在容器创建时固定，作为 ha_monitor 凭证
     #    自愈与切换回退的权威凭据（不随 HA_PASS 漂移）。
     host_compose = f"{NODE_INSTALL_BASE}/{NODE_DIR_NAME}"
+    # 节点安装目录：添加节点时可按节点指定（install_dir，绝对路径），否则用默认 base/统一名。
+    # 该值仅作为「宿主机部署目录」元数据（compose_path）与引导命令默认目录，不影响管理器本地生成路径。
+    if install_dir and str(install_dir).startswith("/"):
+        host_compose = str(install_dir).strip().rstrip("/") or host_compose
     # v2.3.1：root 口令落库前加密（后续写 ha_check.conf 等仍用局部明文变量，不受影响）
     _root_pass_enc = _crypto.encrypt(root_pass)
     execute(

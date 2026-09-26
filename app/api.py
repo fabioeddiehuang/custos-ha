@@ -4023,10 +4023,15 @@ def nodes_add(
     node_type: str = Form("docker"),
     mysql_version: str = Form(""),
     server_id: str = Form(""),
+    install_dir: str = Form(""),
     user=Depends(auth_required),
 ):
     initial_role = "master" if initial_role == "master" else "slave"
     ip = (ip or "").strip()
+    # 节点安装目录：仅接受绝对路径，否则忽略回退默认（与引导命令 install_dir 规则一致）
+    install_dir = (install_dir or "").strip()
+    if install_dir and not install_dir.startswith("/"):
+        install_dir = ""
     # 防护：管理端后台 MySQL（MGMT_MYSQL_HOST）仅管理器自身存储使用，绝不能作为集群节点；
     # 否则会把「管理库地址」误当节点 IP 写入集群配置（违反「1.88 的 MySQL 只负责服务端管理后台，
     # 不参与集群」）。仅当管理库为外部真实 IP 时才拦截，回环/auto 不拦截（便于单机开发）。
@@ -4056,29 +4061,21 @@ def nodes_add(
             ip, port, root_user, root_pass, initial_role, cid,
             node_type=node_type.strip() or "mariadb-docker", mysql_version=mysql_version.strip() or None,
             server_id=server_id.strip() or None,
+            install_dir=install_dir or None,
         )
         audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
                         "add_node", f"{ip}:{port}",
                         f"type={node_type} ver={mysql_version}", cluster_id=cid)
     except Exception as e:
         return RedirectResponse(f"/nodes?error={e}", status_code=303)
-    role_tip = "（已设为初始主库，VIP 将优先在此节点绑定）" if initial_role == "master" else ""
-    # 节点类型特定提示
-    extra_tip = ""
-    nt = node_type.strip()
-    if nt == "baremetal":
-        extra_tip = ("（裸机 MySQL 节点已废弃，请改用 MariaDB 节点类型）")
-    elif nt == "mariadb":
-        extra_tip = ("（MariaDB 裸机节点：把目录与 MariaDB 安装包 mariadb-*-linux-*.tar.gz 放同一目录，"
-                     "执行 sudo bash Install-ha-mariadb-Node.sh 全量安装；"
-                     "各节点就绪后管理器自动建复制/选主/VIP 漂移；"
-                     "卸载用 sudo bash Uninstall-mariadb-Node.sh，重装/改密直接重跑 Install 即可）")
-    elif nt == "mariadb-docker":
-        extra_tip = ("（MariaDB 容器版节点：纯 compose 部署，把目录拷到目标机后执行 docker compose up -d 即可"
-                     "（镜像 mariadb:12.3.3，自动兼容 Anolis/Ubuntu/老 CPU）；"
-                     "可与 MariaDB 裸机节点同集群混部；卸载用 sudo bash Uninstall-mariadb-docker-Node.sh）")
+    role_tip = "（已设为初始主库）" if initial_role == "master" else ""
+    # 安装说明精简为两种通用方式（curl 引导安装 / 手动上传节点包），不再按类型堆砌长文。
+    msg = (f"已生成节点 {info['node_name']}{role_tip}。"
+           "安装方式二选一：① 点该节点「引导安装」复制一行命令，到目标机以 root 执行即可自动完成部署；"
+           "② 或把生成的节点目录传到目标机，按类型手动部署"
+           "（裸机跑 Install 脚本 / 容器跑 docker compose up -d）。")
     return RedirectResponse(
-        f"/nodes?msg=已生成节点 {info['node_name']}{role_tip}{extra_tip}，到目标主机执行：{info['run_cmd']}",
+        f"/nodes?msg={msg}",
         status_code=303,
     )
 

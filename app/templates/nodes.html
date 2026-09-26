@@ -107,7 +107,7 @@
     </thead>
     <tbody id="g{{ g.id }}">
       {% for n in g.nodes %}
-      <tr data-host="{{ n.ip }}:{{ n.port }}" data-cluster="{{ n.cluster_id or '' }}">
+      <tr data-host="{{ n.ip }}:{{ n.port }}" data-cluster="{{ n.cluster_id or '' }}" data-install="{{ n.compose_path }}">
         <td><input type="checkbox" class="node-sel" value="{{ n.ip }}" onchange="syncBatchBar()" title="选择该节点"></td>
         <td class="mono">{{ n.ip }}:{{ n.port }}
           {% if n.pending_actions %}<span class="badge pending-badge" style="margin-left:6px;background:#E11D74;color:#fff;cursor:pointer"
@@ -120,7 +120,10 @@
           {% if n.mysql_version %}<span class="mono">{{ n.mysql_version }}</span>{% endif %}
         </td>
         <td data-f="status"><span class="badge" style="background:var(--surface-3);color:var(--muted);">检测中…</span></td>
-        <td><button class="btn btn-sm" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button></td>
+        <td style="white-space:nowrap">
+          <button class="btn btn-sm btn-ghost" onclick="copyNodeBoot(this)" title="复制一行安装命令到节点执行">复制安装命令</button>
+          <button class="btn btn-sm" onclick="toggleDetail('d{{ n.ip }}')">展开详情</button>
+        </td>
       </tr>
       <tr id="d{{ n.ip }}" class="detail-panel">
         <td colspan="5"><div class="dd na-{{ loop.index0 % 5 }}">
@@ -150,7 +153,7 @@
             <button class="btn btn-sm btn-primary" onclick="showSelfhealSql({{ n.cluster_id or 0 }}, '{{ n.ip }}', {{ n.port }})">查看/下载自愈 SQL</button>
             {% endif %}
             <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
-            <button class="btn btn-sm" style="background:linear-gradient(135deg,#0ABAB5,#22d3ee);color:#04121a;font-weight:600" onclick="openBootstrap('{{ n.ip }}')" title="生成一行命令，在节点主机上执行即可自动完成部署">引导安装</button>
+            <button class="btn btn-sm" style="background:linear-gradient(135deg,#0ABAB5,#22d3ee);color:#04121a;font-weight:600" onclick="openBootstrap('{{ n.ip }}','{{ n.compose_path }}')" title="生成一行命令，在节点主机上执行即可自动完成部署">引导安装</button>
             {% if n.pending_actions %}<button class="btn btn-sm pending-btn" style="background:#E11D74;color:#fff" onclick="showPending('{{ n.ip }}')">待生效操作</button>{% endif %}
             <a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none" href="/nodes/{{ n.ip }}/creds_sql" download>下载修复SQL</a>
             <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delNode('{{ n.ip }}')">删除节点</button>
@@ -202,9 +205,9 @@
         </label>
         <input type="hidden" name="node_type" id="nodeTypeHidden" value="mariadb-docker">
         <label id="addNodeVerWrap" style="display:none">MySQL 版本<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=自动探测）"></label>
-        <label>server_id（可选）
-          <span style="font-size:12px;color:var(--muted,#94a3b8);font-weight:400;line-height:1.4">复制拓扑内必须全局唯一，明确指定可避免撞 id；留空自动分配{% if next_server_id %}（当前建议 {{ next_server_id }}）{% endif %}</span>
-          <input name="server_id" type="number" min="1" max="4294967295" step="1" placeholder="{% if next_server_id %}{{ next_server_id }}{% endif %}">
+        <label class="full" style="flex-direction:row;align-items:baseline;gap:8px;flex-wrap:wrap">server_id（可选）
+          <input name="server_id" type="number" min="1" max="4294967295" step="1" placeholder="{% if next_server_id %}{{ next_server_id }}{% endif %}" style="width:160px">
+          <span class="hint">复制集群内必须唯一，留空自动分配{% if next_server_id %}（建议 {{ next_server_id }}）{% endif %}</span>
         </label>
         <label>所属集群
           <select name="cluster_id" required>
@@ -214,19 +217,18 @@
             {% endfor %}
           </select>
         </label>
+        <label class="full">节点安装目录（可选）
+          <input id="addInstallDir" name="install_dir" placeholder="/home/docker/custos-node" style="font-family:var(--mono)">
+          <span class="hint">节点在目标机上的部署目录；留空使用默认 /home/docker/custos-node。引导安装与手动部署都会用这个目录，添加后可在「引导安装」里修改。</span>
+        </label>
         <div id="mariadbTip" class="full" style="display:none;padding:10px 12px;border:1px dashed rgba(96,165,250,.45);border-radius:10px;background:rgba(37,99,235,.14);font-size:13px;color:#93c5fd;">
-          <strong>MariaDB 节点部署流程（全量安装）：</strong>生成后目录内含 <code class="mono">Install-ha-mariadb-Node.sh</code>（唯一全量安装脚本，自包含）、<code class="mono">Uninstall-mariadb-Node.sh</code>、<code class="mono">my.cnf</code>、<code class="mono">init_mariadb.sql</code>。推荐顺序 ——
-          ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/custos-node</code>），并把 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 放到同一目录（脚本会优先用本地包，跳过下载）；
-          ② 执行 <code class="mono">sudo bash Install-ha-mariadb-Node.sh</code>（自动：解压 → 初始化 → 落盘 my.cnf → systemd 启动 → 跑 init/fix SQL → 起 keepalived）；
-          ③ 各节点都装好后，管理器自动建复制、选主、漂移 VIP。
-          <strong>注意：MariaDB 与 MySQL GTID 机制不兼容，MariaDB 集群所有节点必须都是 MariaDB 类型。</strong>
+          <strong>MariaDB 裸机节点：</strong>把生成的目录连同 MariaDB 安装包 <code class="mono">mariadb-*-linux-*.tar.gz</code> 一起传到目标机（放同一目录），执行 <code class="mono">sudo bash Install-ha-mariadb-Node.sh</code> 即完成全量安装（解压→初始化→systemd 启动→起 keepalived）。装好后管理器自动建复制、选主、漂移 VIP。
         </div>
         <div id="mariadbDockerTip" class="full" style="display:none;padding:10px 12px;border:1px dashed rgba(96,165,250,.45);border-radius:10px;background:rgba(37,99,235,.14);font-size:13px;color:#93c5fd;">
-          <strong>MariaDB 容器版部署流程（官方镜像，无需宿主装 MariaDB，纯 compose）：</strong>生成后目录内含 <code class="mono">docker-compose.yaml</code>、<code class="mono">docker-my.cnf</code>、<code class="mono">init_mariadb.sql</code>、<code class="mono">Uninstall-mariadb-docker-Node.sh</code>。推荐顺序 ——
-          ① 把生成的整个目录拷到目标机某目录（如 <code class="mono">/opt/custos-node</code>）；
-          ② 执行 <code class="mono">docker compose up -d</code>（自动：拉镜像 <code class="mono">mariadb:12.3.3</code>，失败自动退 <code class="mono">mariadb:12.3.2</code> → 起 MariaDB + keepalived 容器 → 挂配置 → 跑 init/fix SQL）；
-          ③ 各节点都起来后，管理器自动建复制、选主、漂移 VIP。
-          <strong>可与「MariaDB 裸机」节点同集群混部</strong>（同为 MariaDB GTID 复制路径），适合新机跑裸机、老机（glibc 过低）跑容器的混合环境。
+          <strong>MariaDB 容器节点：</strong>把生成的目录传到目标机，执行 <code class="mono">docker compose up -d</code> 即可（自动拉 mariadb:12.3.3 镜像并起 MariaDB + keepalived）。装好后管理器自动建复制、选主、漂移 VIP。可与裸机节点同集群混部。
+        </div>
+        <div id="mysqlTip" class="full" style="display:none;padding:10px 12px;border:1px dashed rgba(96,165,250,.45);border-radius:10px;background:rgba(37,99,235,.14);font-size:13px;color:#93c5fd;">
+          <strong>MySQL 节点：</strong>把生成的目录传到目标机，执行 <code class="mono">docker compose up -d</code> 即可（官方 MySQL 8.0 镜像）。注意：MySQL 与 MariaDB 的 GTID 不兼容，MySQL 集群所有节点必须都是 MySQL 类型。
         </div>
         <div class="form-foot">
           <button type="button" class="btn" onclick="closeAddNode()">取消</button>
@@ -315,8 +317,10 @@
     var ver=document.getElementById("addNodeVerWrap"); if(ver)ver.style.display=(e==="mysql")?"block":"none";
     var maria=document.getElementById("mariadbTip");
     var mariaDocker=document.getElementById("mariadbDockerTip");
+    var my=document.getElementById("mysqlTip");
     if(maria)maria.style.display=(e==="mariadb"&&dep==="baremetal")?"block":"none";
     if(mariaDocker)mariaDocker.style.display=(e==="mariadb"&&dep==="docker")?"block":"none";
+    if(my)my.style.display=(e==="mysql")?"block":"none";
   }
   // 默认节点类型为 MariaDB 容器化（mariadb-docker），加载即按默认态显示对应部署提示
   syncAddNodeType();
@@ -325,12 +329,44 @@
 
   // ===== 节点引导安装（v2.5.0 F1）：一行 curl 完成部署 =====
   var _bootIp="";
-  function openBootstrap(ip){
+  function openBootstrap(ip, dir){
     _bootIp=ip;
     document.getElementById("bootIp").textContent=ip;
+    var bd=document.getElementById("bootDir");
+    if(bd && dir) bd.value=dir;          // 预填该节点的安装目录（添加时填写的值）
     document.getElementById("bootOverlay").classList.add("show");
     document.body.style.overflow="hidden";           // 锁 body 滚动
     genBootstrap();
+  }
+  // 操作列「复制安装命令」：直接请求引导接口并复制一行命令，无需打开弹窗
+  function copyNodeBoot(btn){
+    var tr=btn.closest?btn.closest("tr"):null;
+    var ip=tr?String(tr.getAttribute("data-host")||"").split(":")[0]:"";
+    var dir=tr?tr.getAttribute("data-install")||"":"";
+    if(!ip){toast("无法确定节点 IP","err");return;}
+    var fd=new URLSearchParams();fd.set("ip",ip);fd.set("ttl_hours","24");
+    if(dir)fd.set("install_dir",dir);
+    toast("正在生成安装命令…");
+    fetch("/api/node/bootstrap",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:fd.toString(),credentials:"same-origin"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d||!d.command){toast((d&&d.error)||"生成失败","err");return;}
+        if(navigator.clipboard&&navigator.clipboard.writeText){
+          navigator.clipboard.writeText(d.command).then(
+            function(){toast("已复制一行安装命令，到节点主机 root 执行");},
+            function(){fallbackCopy(d.command);});
+        } else { fallbackCopy(d.command); }
+      })
+      .catch(function(e){toast("请求失败："+e,"err");});
+  }
+  function fallbackCopy(t){
+    var ta=document.createElement("textarea");ta.value=t;ta.style.position="fixed";ta.style.opacity="0";
+    document.body.appendChild(ta);ta.select();
+    try{document.execCommand("copy");toast("已复制一行安装命令，到节点主机 root 执行");}
+    catch(e){toast("复制失败，请手动复制","err");}
+    document.body.removeChild(ta);
   }
   function closeBootstrap(){
     document.getElementById("bootOverlay").classList.remove("show");
