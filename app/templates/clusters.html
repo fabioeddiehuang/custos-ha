@@ -245,7 +245,7 @@
         <label id="clusterDeployWrap" style="display:none">MariaDB 部署方式
           <select name="deploy" id="clusterDeploy" onchange="syncClusterNodeType()">
             <option value="docker" selected>容器化（官方镜像，纯 compose，首选）</option>
-            <option value="baremetal">裸机全量安装（宿主 systemd 管理 mysqld）</option>
+            <option value="baremetal">裸机全量安装（宿主 systemd 管理 mariadbd）</option>
           </select>
           <span class="hint">仅 MariaDB 可选；MySQL 仅容器化一种形态</span>
         </label>
@@ -256,10 +256,11 @@
             document.getElementById("clusterDeployWrap").style.display=(e==="mariadb")?"block":"none";
             var dep=(e==="mariadb")?document.getElementById("clusterDeploy").value:"docker";
             document.getElementById("clusterNodeType").value=(e==="mysql")?"docker":(dep==="baremetal"?"mariadb":"mariadb-docker");
+            var ver=document.getElementById("clusterVerWrap"); if(ver)ver.style.display=(e==="mysql")?"block":"none";
           }
           syncClusterNodeType();
         </script>
-        <label>MySQL 版本（可选）<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0"></label>
+        <label id="clusterVerWrap" style="display:none">MySQL 版本（可选）<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0"></label>
         <label>HA 监控账号<input name="ha_user" placeholder="ha_monitor"></label>
         <label>HA 监控密码<input class="pw" type="password" name="ha_pass" placeholder="留空则自动生成"></label>
         <label>复制账号<input name="repl_user" placeholder="replication"></label>

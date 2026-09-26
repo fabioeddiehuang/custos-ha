@@ -197,11 +197,11 @@
         <label id="addNodeDeployWrap" style="display:none">MariaDB 部署方式
           <select name="deploy" id="addNodeDeploy" onchange="syncAddNodeType()">
             <option value="docker" selected>容器化（官方镜像，纯 compose，首选）</option>
-            <option value="baremetal">裸机全量安装（宿主 systemd 管理 mysqld）</option>
+            <option value="baremetal">裸机全量安装（宿主 systemd 管理 mariadbd）</option>
           </select>
         </label>
         <input type="hidden" name="node_type" id="nodeTypeHidden" value="mariadb-docker">
-        <label>MySQL 版本<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=自动探测）"></label>
+        <label id="addNodeVerWrap" style="display:none">MySQL 版本<input name="mysql_version" placeholder="如 8.0.36 / 8.4.0（留空=自动探测）"></label>
         <label>server_id（可选）
           <span style="font-size:12px;color:var(--muted,#94a3b8);font-weight:400;line-height:1.4">复制拓扑内必须全局唯一，明确指定可避免撞 id；留空自动分配{% if next_server_id %}（当前建议 {{ next_server_id }}）{% endif %}</span>
           <input name="server_id" type="number" min="1" max="4294967295" step="1" placeholder="{% if next_server_id %}{{ next_server_id }}{% endif %}">
@@ -308,6 +308,7 @@
     if(wrap)wrap.style.display=(e==="mariadb")?"block":"none";
     var dep=(e==="mariadb")?document.getElementById("addNodeDeploy").value:"docker";
     document.getElementById("nodeTypeHidden").value=(e==="mysql")?"docker":(dep==="baremetal"?"mariadb":"mariadb-docker");
+    var ver=document.getElementById("addNodeVerWrap"); if(ver)ver.style.display=(e==="mysql")?"block":"none";
     var maria=document.getElementById("mariadbTip");
     var mariaDocker=document.getElementById("mariadbDockerTip");
     if(maria)maria.style.display=(e==="mariadb"&&dep==="baremetal")?"block":"none";
