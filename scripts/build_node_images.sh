@@ -81,8 +81,26 @@ build_keepalived() {
     echo "[错误] 未找到 $ctx/Dockerfile" >&2
     return 1
   fi
-  echo "==> 构建 custos-node:${TAG}（上下文 $ctx）"
-  docker build -t "custos-node:${TAG}" "$ctx"
+  # ⚠ 铁律：基础镜像国内源优先。依次尝试国内镜像源作为 FROM 来源拉取 debian 基础镜像，
+  #   全部不可达才回退官方源。base 仅决定 FROM 来源，产物仍打标 custos-node:${TAG}
+  #   （节点 compose 用的就是这个名字），与 base 来自哪个源无关。
+  local built=""
+  for base in \
+    "registry.cn-hangzhou.aliyuncs.com/library/debian:bookworm-slim" \
+    "hub-mirror.c.163.com/library/debian:bookworm-slim" \
+    "docker.m.daocloud.io/library/debian:bookworm-slim" \
+    "dockerproxy.com/library/debian:bookworm-slim" ; do
+    echo "==> 尝试国内源基础镜像构建 custos-node:${TAG}（base=$base）"
+    if docker build --build-arg "NODE_BASE_IMAGE=$base" -t "custos-node:${TAG}" "$ctx" >/dev/null 2>&1; then
+      built=1
+      echo "==> 已从国内源构建 custos-node:${TAG}"
+      break
+    fi
+  done
+  if [ -z "$built" ]; then
+    echo "==> 国内源基础镜像均不可用，回退官方源（debian:bookworm-slim）构建 custos-node:${TAG}"
+    docker build -t "custos-node:${TAG}" "$ctx"
+  fi
   echo "==> 导出 $IMAGES_DIR/custos-node-${TAG}.tar"
   # 只导出【这一个】包（带 v）。不再另存不带版本的同名副本：
   # available_images() 会把目录下每个 tar 都列出来让节点逐个 docker load，
@@ -93,10 +111,29 @@ build_keepalived() {
 }
 
 save_agent_image() {
-  # agent 容器用 python:3-slim；离线环境节点拉不到，这里一并托管
-  echo "==> 拉取并导出 python:3-slim（agent 基础镜像）"
-  docker pull python:3-slim
-  save_compressed python:3-slim "$IMAGES_DIR/python-3-slim.tar"
+  # agent 容器用 python:3-slim；离线/国内环境节点拉不到，这里一并托管。
+  # ⚠ 铁律：国内源优先。先尝试国内镜像源拉取，全部不可达才回退官方源；
+  #   拉到后 retag 为 python:3-slim（节点 compose 用的就是这个名字），再 save。
+  local img="python:3-slim"
+  local pulled=""
+  for src in \
+    "registry.cn-hangzhou.aliyuncs.com/library/python:3-slim" \
+    "hub-mirror.c.163.com/library/python:3-slim" \
+    "docker.m.daocloud.io/library/python:3-slim" \
+    "dockerproxy.com/library/python:3-slim" ; do
+    echo "==> 尝试国内源拉取 agent 基础镜像：$src"
+    if docker pull "$src" >/dev/null 2>&1; then
+      docker tag "$src" "$img"
+      pulled=1
+      echo "==> 已从国内源拉取并打标 $img"
+      break
+    fi
+  done
+  if [ -z "$pulled" ]; then
+    echo "==> 国内源均不可用，回退官方源拉取 $img"
+    docker pull "$img"
+  fi
+  save_compressed "$img" "$IMAGES_DIR/python-3-slim.tar"
 }
 
 case "${1:-all}" in

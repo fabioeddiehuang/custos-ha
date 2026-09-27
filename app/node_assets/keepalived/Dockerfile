@@ -1,5 +1,9 @@
 # 极简 keepalived 镜像：在宿主机网卡挂载 VIP（VRRP 单播）+ check_mysql_master.sh 探活。
-FROM debian:bookworm-slim
+# 基础镜像：国内源优先（铁律）。默认官方 debian:bookworm-slim，构建时由
+# scripts/build_node_images.sh 经 --build-arg NODE_BASE_IMAGE=<国内镜像> 覆盖为国内源，
+# 不可达时回退官方源；产物仍打标 custos-node:<版本>（与 base 来源无关）。
+ARG NODE_BASE_IMAGE=debian:bookworm-slim
+FROM ${NODE_BASE_IMAGE}
 
 # 构建时可指定 keepalived 版本：docker compose build --build-arg KEEPALIVED_VERSION=2.2.7
 ARG KEEPALIVED_VERSION=2.2.7

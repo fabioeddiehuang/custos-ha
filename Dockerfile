@@ -134,9 +134,9 @@ RUN ln -sf /usr/bin/mariadb-dump /usr/bin/mysqldump && ln -sf /usr/bin/mariadb /
 #   仅告警、不阻断构建/启动（退回「服务端预构建 ./images」的既有路径）。
 # ---------------------------------------------------------------------------
 RUN set -e; \
-  VER=27.5.1; \
-  python3 - <<PY
+  python3 - <<'PY'
 import urllib.request, tarfile, io, os, sys
+VER = "27.5.1"
 urls = [
   "https://download.docker.com/linux/static/stable/x86_64/docker-%s.tgz" % VER,
   "https://mirrors.tencent.com/docker-ce/linux/static/stable/x86_64/docker-%s.tgz" % VER,
