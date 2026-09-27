@@ -344,6 +344,39 @@ def available_images():
         return []
 
 
+def check_bootstrap_prereqs(node_type="docker", sidecar_only=False, images=None):
+    """生成引导命令前的预检（不阻断，仅告警）。
+
+    所有节点形态都有 keepalived(custos-node) + agent(python:3-slim) 两个 docker sidecar，
+    这两个镜像必须由服务端托管（./images/*.tar）供节点 docker load：
+    - custos-node 是本地构建镜像、公网没有，缺失则节点引导必在「校正 keepalived 镜像标签」失败；
+    - python:3-slim 是公共镜像，但离线节点拉不到，缺失则 agent 起不来（心跳上报失败）。
+    若服务端未托管，渲染出的脚本会跳过 docker load，节点须本地已存在对应镜像才能成功——
+    这正是曾踩到的「服务端没构建镜像却生成了会失败的命令」隐患，故在此提前暴露。
+    """
+    if images is None:
+        images = available_images()
+    have = set(images or [])
+
+    def _has(base):
+        return any(n == base or n.startswith(base + "-") or n.startswith(base + ":")
+                   for n in have)
+
+    warns = []
+    if not _has("custos-node"):
+        warns.append(
+            "服务端未托管 custos-node 镜像包：节点必须本地已存在 custos-node 镜像，"
+            "否则引导会在「校正 keepalived 镜像标签」步骤失败。请先在服务端执行 "
+            "scripts/build_node_images.sh 生成 ./images/custos-node-<ver>.tar"
+            "（并确认 docker-compose.yml 已把 ./images 挂载进管理器容器）。")
+    if not _has("python-3-slim"):
+        warns.append(
+            "服务端未托管 python-3-slim 镜像包：离线节点将无法拉取 agent 镜像"
+            "（custos-node-agent），导致心跳上报失败。可在有网节点自然拉取，"
+            "或执行 scripts/build_node_images.sh 一并托管。")
+    return warns
+
+
 def render_bootstrap_script(ip, token, node_type="docker", images=None,
                             sidecar_only=False, install_dir=None):
     """渲染引导安装脚本（bash）。
@@ -516,15 +549,20 @@ def issue_for_node(ip, node_type="docker", cluster_id=None, actor="",
     token = issue_token(ip, cluster_id=cluster_id, actor=actor, ttl_hours=ttl_hours,
                         install_dir=install_dir)
     dest = _install_dest(install_dir)
+    if images is None:
+        images = available_images()
+    warnings = check_bootstrap_prereqs(node_type, sidecar_only=sidecar_only,
+                                       images=images)
     return {
         "ip": ip,
         "token": token,
         "command": bootstrap_command(ip, token),
-        "script": render_bootstrap_script(ip, token, node_type, images,
+        "script": render_bootstrap_script(ip, token, node_type, images=images,
                                           sidecar_only=sidecar_only,
                                           install_dir=install_dir),
         "expires_in_hours": ttl_hours,
         "manager": manager_base_url(),
         "install_base": dest,
         "sidecar_only": bool(sidecar_only),
+        "warnings": warnings,
     }

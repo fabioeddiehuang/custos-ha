@@ -285,6 +285,7 @@
         <span id="bootMeta" style="color:var(--muted);font-size:12px"></span>
       </div>
       <div id="bootCmd" class="mono" style="background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px 14px;font-size:12.5px;line-height:1.7;word-break:break-all;user-select:all;max-height:30vh;overflow:auto">生成中…</div>
+      <div id="bootWarn" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid var(--danger);border-radius:10px;background:rgba(225,29,116,.10);color:var(--danger);font-size:12.5px;line-height:1.7;white-space:pre-wrap"></div>
       <div style="margin-top:10px;color:var(--muted);font-size:12px">
         提示：命令可重复执行（幂等）。若提示已过期，点「重新生成」即可拿到新命令。
       </div>
@@ -353,6 +354,7 @@
       .then(function(r){return r.json();})
       .then(function(d){
         if(!d||!d.command){toast((d&&d.error)||"生成失败","err");return;}
+        if(d.warnings&&d.warnings.length){toast("⚠ 服务端缺镜像包："+d.warnings[0],"warn");}
         if(navigator.clipboard&&navigator.clipboard.writeText){
           navigator.clipboard.writeText(d.command).then(
             function(){toast("已复制一行安装命令，到节点主机 root 执行");},
@@ -391,6 +393,11 @@
         }
         box.textContent=d.command;
         meta.textContent="安装目录 "+d.install_base+" ｜ 有效期 "+d.expires_in_hours+" 小时 ｜ 管理端 "+d.manager;
+        var warn=document.getElementById("bootWarn");
+        if(d.warnings&&d.warnings.length){
+          warn.style.display="block";
+          warn.textContent="⚠ 预检告警（节点可能引导失败）：\n\n"+d.warnings.join("\n\n");
+        }else{warn.style.display="none";warn.textContent="";}
       })
       .catch(function(e){box.textContent="请求失败："+e;toast("请求失败","err");});
   }
