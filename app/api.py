@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, date, time, timedelta, timezone
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from itsdangerous import URLSafeTimedSerializer, BadSignature
@@ -1033,10 +1033,10 @@ def api_node_image(name: str, token: str = ""):
     if not os.path.isfile(path):
         return Response("服务端未托管该镜像包：%s（请先在服务端执行 scripts/build_node_images.sh）"
                         % safe, status_code=404, media_type="text/plain; charset=utf-8")
-    with open(path, "rb") as f:
-        data = f.read()
-    return Response(data, media_type="application/x-tar",
-                    headers={"Content-Disposition": f'attachment; filename="{safe}"'})
+    # 流式下发（FileResponse）：镜像包可能上百 MB，read() 整读进内存会在
+    # 多节点同时引导时挤爆管理器容器内存；FileResponse 边读边发并自动带
+    # Content-Length / Content-Disposition(attachment)。
+    return FileResponse(path, media_type="application/x-tar", filename=safe)
 
 
 @app.post("/api/nodes/{ip}/ready")

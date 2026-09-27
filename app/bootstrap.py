@@ -374,6 +374,31 @@ def check_bootstrap_prereqs(node_type="docker", sidecar_only=False, images=None)
             "服务端未托管 python-3-slim 镜像包：离线节点将无法拉取 agent 镜像"
             "（custos-node-agent），导致心跳上报失败。可在有网节点自然拉取，"
             "或执行 scripts/build_node_images.sh 一并托管。")
+
+    # 体积哨兵（根治「tar 体积膨胀 3 倍」）：某些 Docker 环境的 docker save
+    # 会导出【未压缩】镜像层，同一镜像 tar 从 ~66MB 膨胀到 ~228MB，节点
+    # 白下约 3 倍流量。正常 gzip 压缩后 custos-node ~66MB / python-3-slim
+    # ~44MB，故 >150MB 几乎必然是未压缩导出——在此提前暴露，提示重跑新
+    # build_node_images.sh（其 save_compressed 会 gzip 压缩并自校验魔数）。
+    try:
+        import os as _os
+        from .config import IMAGES_DIR as _imgdir
+        if _os.path.isdir(_imgdir):
+            for f in sorted(_os.listdir(_imgdir)):
+                if not f.endswith(".tar"):
+                    continue
+                try:
+                    sz = _os.path.getsize(_os.path.join(_imgdir, f))
+                except OSError:
+                    continue
+                if sz > 150 * 1024 * 1024:
+                    warns.append(
+                        "镜像包 %s 体积异常（%.0fMB > 150MB），几乎肯定是 docker save "
+                        "导出了未压缩层，节点将白下约 3 倍流量。请在服务端重跑 "
+                        "scripts/build_node_images.sh 覆盖旧包（新脚本会 gzip 压缩并自校验）。"
+                        % (f, sz / 1048576))
+    except Exception:
+        pass
     return warns
 
 

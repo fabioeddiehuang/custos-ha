@@ -39,6 +39,25 @@ TAG="$VERSION"
 IMAGES_DIR="./images"
 mkdir -p "$IMAGES_DIR"
 
+# ---------------------------------------------------------------------------
+# 导出镜像 tar（根治「tar 体积膨胀 3 倍」）：
+#   部分 Docker 环境导出的镜像层是【未压缩】的（经典 docker save 格式，或
+#   containerd 存储对本地构建镜像按原始层保存），同一镜像 tar 会从 ~66MB
+#   膨胀到 ~228MB，每个节点白白多下约 3 倍流量。
+#   ⚠ 管道 gzip 压缩内容，但文件名保持 .tar——available_images() 只认
+#     *.tar、下载端点强制补 .tar 后缀，文件名不变则全链路零改动；docker
+#     load 对 gzip 内容自动解压（与扩展名无关）。
+#   导出后立即校验 gzip 魔数（1f 8b），防止未来任何 docker 版本/导出方式
+#   变化悄悄退回未压缩导出。
+save_compressed() {  # $1=镜像名  $2=输出 .tar 路径
+  docker save "$1" | gzip > "$2"
+  if [ "$(head -c2 "$2" | od -An -tx1 | tr -d ' \n')" != "1f8b" ]; then
+    echo "[错误] $2 导出内容未压缩（体积会膨胀约 3 倍），已删除。请检查 docker save 行为后重试。" >&2
+    rm -f "$2"
+    return 1
+  fi
+}
+
 build_keepalived() {
   local ctx="app/node_assets/keepalived"
   if [ ! -f "$ctx/Dockerfile" ]; then
@@ -51,14 +70,14 @@ build_keepalived() {
   # 只导出【这一个】包（带 v）。不再另存不带版本的同名副本：
   # available_images() 会把目录下每个 tar 都列出来让节点逐个 docker load，
   # 存两份同内容的包等于让每个节点多下载约 70MB 并重复 load 一次。
-  docker save "custos-node:${TAG}" -o "$IMAGES_DIR/custos-node-${TAG}.tar"
+  save_compressed "custos-node:${TAG}" "$IMAGES_DIR/custos-node-${TAG}.tar"
 }
 
 save_agent_image() {
   # agent 容器用 python:3-slim；离线环境节点拉不到，这里一并托管
   echo "==> 拉取并导出 python:3-slim（agent 基础镜像）"
   docker pull python:3-slim
-  docker save python:3-slim -o "$IMAGES_DIR/python-3-slim.tar"
+  save_compressed python:3-slim "$IMAGES_DIR/python-3-slim.tar"
 }
 
 case "${1:-all}" in
