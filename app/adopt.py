@@ -216,7 +216,7 @@ def probe_node(host, port, user, password, timeout=5):
             cur.execute(
                 "SELECT IFNULL(SUM(data_length + index_length), 0) FROM information_schema.tables "
                 "WHERE table_schema NOT IN "
-                "('information_schema','mysql','performance_schema','sys')")
+                "('information_schema','mysql','performance_schema','sys','test')")
             r = cur.fetchone()
             out["data_size_bytes"] = int(r[0]) if r and r[0] is not None else 0
         except Exception:

@@ -3066,14 +3066,14 @@ def api_term_complete(cluster_id: int = Form(...), host: str = Form(...), port: 
             pass
         try:
             cur.execute("SELECT table_name FROM information_schema.tables "
-                        "WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') "
+                        "WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys','test') "
                         "LIMIT 400")
             cands += [r[0] for r in cur.fetchall()]
         except Exception:
             pass
         try:
             cur.execute("SELECT DISTINCT column_name FROM information_schema.columns "
-                        "WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') "
+                        "WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys','test') "
                         "LIMIT 600")
             cands += [r[0] for r in cur.fetchall()]
         except Exception:

@@ -38,8 +38,8 @@ from .mysql_compat import (detect_flavour, change_replication_sql,
                            start_replication_sql, F_MYSQL8)
 
 # ---- 库范围常量 ----
-# MariaDB 系统库（永远不迁移、桥接也须忽略）
-SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys", "ndbinfo"}
+# MariaDB 系统库（永远不迁移、桥接也须忽略）。test 为安装默认带出的空库，属安装产物而非业务库，一并排除
+SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys", "ndbinfo", "test"}
 # Custos 自有库（不迁移、桥接忽略）
 CUSTOS_DBS = {"ha_local"}
 IGNORE_DBS = SYSTEM_DBS | CUSTOS_DBS

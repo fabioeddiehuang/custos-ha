@@ -223,9 +223,11 @@ def _slave_missing_master_dbs(cluster_id, h, cur_h, cur_p, creds):
     这类节点绝不能走「GTID 对齐到主库当前位点」的重挂载路径 —— 那会跳过全部
     历史建表事务，表现为复制 IO/SQL 都 Yes、一遇主库对存量表的写入就 1146。
     ha_local 是节点本地状态库（不参与复制），排除在比较之外。
+    test 为 MariaDB/MySQL 安装默认带出的空库（裸机有、容器版没有），属安装产物而非业务库，
+    排除以避免 bare-metal/容器混合部署时误判「从库缺失业务库 test」触发全量克隆。
     """
     host, port = h["host"], int(h["port"])
-    sys_dbs = {"information_schema", "mysql", "performance_schema", "sys", "ha_local"}
+    sys_dbs = {"information_schema", "mysql", "performance_schema", "sys", "ha_local", "test"}
     sru, srp = node_root(host, cluster_id)
     mru, mrp = node_root(cur_h, cluster_id)
     sconn = connect_robust(host, port, creds["ha_user"], creds["ha_pass"], sru, srp)

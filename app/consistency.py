@@ -65,8 +65,10 @@ from .ha_client import connect_robust
 #   REPLICATE_IGNORE_DB=ha_local；因此主从的 ha_local 本就不一致——纳入比对会
 #   恒定产生伪差异（典型表现：主库比从库多 1 行）。属设计使然，必须排除。
 # - custos：管理器自身元数据库，若落在集群节点上同样不具业务一致性意义，排除。
+# - test：MariaDB/MySQL 安装默认带出的空库（裸机有、容器版没有），属安装产物而非业务库，
+#   排除以免 bare-metal/容器混合部署时把默认 test 的异质误判为业务分叉。
 SYSTEM_DBS = ("mysql", "information_schema", "performance_schema", "sys",
-              "ha_local", "custos")
+              "ha_local", "custos", "test")
 
 # 保护阈值：超过则跳过该表的 checksum（行数比对不受此限，代价极低）
 MAX_TABLES = 300

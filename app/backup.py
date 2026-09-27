@@ -49,8 +49,8 @@ from pymysql.cursors import SSCursor
 # 备份根目录：容器内 /app/backups（docker-compose 挂到项目根 ./backups 持久化）
 BACKUP_ROOT = Path(os.environ.get("BACKUPS_DIR") or "/app/backups")
 
-# 系统库不参与备份
-SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys", "ndbinfo"}
+# 系统库不参与备份（test 为 MariaDB/MySQL 安装默认带出的空库，属安装产物而非业务库，一并排除）
+SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys", "ndbinfo", "test"}
 
 # 单条 INSERT 的近似体积上限（字节）。超过就切一条新 INSERT，
 # 避免单条语句超过 max_allowed_packet 导致恢复失败。
