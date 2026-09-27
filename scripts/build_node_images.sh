@@ -115,6 +115,13 @@ save_agent_image() {
   # ⚠ 铁律：国内源优先。先尝试国内镜像源拉取，全部不可达才回退官方源；
   #   拉到后 retag 为 python:3-slim（节点 compose 用的就是这个名字），再 save。
   local img="python:3-slim"
+  # 本地已有则直接复用：既避免每次安装都重下一遍，也保证「只保留一个镜像」——
+  # 否则下面摘掉国内源标签后，下次 pull 会因本地无该 repo 记录而重新下载一份。
+  if docker image inspect "$img" >/dev/null 2>&1; then
+    echo "==> 本地已有 $img，跳过拉取（如需更新基础镜像，请先 docker rmi $img 再重跑）"
+    save_compressed "$img" "$IMAGES_DIR/python-3-slim.tar"
+    return 0
+  fi
   local pulled=""
   for src in \
     "registry.cn-hangzhou.aliyuncs.com/library/python:3-slim" \
@@ -126,6 +133,11 @@ save_agent_image() {
       docker tag "$src" "$img"
       pulled=1
       echo "==> 已从国内源拉取并打标 $img"
+      # 只保留一个镜像：docker tag 【不会】删除源标签，会留下「同一 IMAGE ID 两条记录」
+      #（如 docker.m.daocloud.io/library/python:3-slim 与 python:3-slim）——看似两个镜像、
+      # 实为同一份数据。这里摘掉国内源标签，只留节点 compose 实际使用的名字。
+      # ⚠ 顺序必须「先 tag 再 untag」：此时数据由 $img 持有，rmi 只删标签、不删数据。
+      docker rmi "$src" >/dev/null 2>&1 || true
       break
     fi
   done

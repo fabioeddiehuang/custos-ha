@@ -4185,7 +4185,7 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
     try:
         row = query(
             "SELECT n.ip, n.port, n.root_user, n.root_pass, n.cluster_id, h.initial_role, "
-            "n.node_type, n.mysql_version "
+            "n.node_type, n.mysql_version, n.compose_path "
             "FROM nodes n LEFT JOIN hosts h ON h.host=n.ip AND h.cluster_id=n.cluster_id "
             "WHERE n.ip=%s", (ip,)
         )
@@ -4196,11 +4196,18 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
         initial_role = n.get("initial_role") or "slave"
         # 必须沿用节点已保存的 node_type / mysql_version，否则会按默认 docker 重建，
         # 把裸机节点错误地重生成成「MySQL 容器 + keepalived」合一部署（覆盖掉裸机专属文件）。
+        # 同理必须沿用【自定义安装目录】：此前 regen 不传 install_dir，generate_node 走
+        # node_install_dest(None) 退回默认 /home/docker/custos-node 并写回 nodes.compose_path，
+        # 把运维填的 /opt/custos-node 之类自定义目录静默重置（节点包内嵌路径一并错位）。
+        # node_install_dest 幂等：传入已是 .../custos-node 的完整路径会原样返回，
+        # 不会拼成 .../custos-node/custos-node。
+        _saved_dir = (n.get("compose_path") or "").strip()
         info = generate_node(
             n["ip"], n["port"], n["root_user"], n["root_pass"],
             initial_role, int(n["cluster_id"] or 0),
             node_type=n.get("node_type") or "mariadb-docker",
             mysql_version=n.get("mysql_version"),
+            install_dir=_saved_dir or None,
         )
         # 计算生成目录内各文件的 md5，便于核对
         import hashlib
