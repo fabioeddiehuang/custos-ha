@@ -2,10 +2,56 @@
 import hashlib
 import secrets
 from .db import init_schema, get_conn, startup_credential_check
-from .config import WEB_USER, WEB_PASS, hash_pwd
+from .config import WEB_USER, WEB_PASS, hash_pwd, WEB_PORT
+from .selfcheck import selfcheck_manager
+from .preflight import preflight_install
+
+
+def _boot_gates():
+    """启动期双闸门：自检 + 安装预检（Phase 3，稳定+安全）。
+
+    任一不过都**显式打印**并给出修复指引，绝不静默带病运行。
+    预检默认不阻断启动（避免磁盘瞬时告警把管理端打死），但 error 级会醒目提示。
+    """
+    try:
+        issues = selfcheck_manager()
+        for level, msg in issues:
+            if level == "error":
+                print("[selfcheck][ERROR] %s" % msg)
+            elif level == "warn":
+                print("[selfcheck][WARN] %s" % msg)
+            else:
+                print("[selfcheck][OK] %s" % msg)
+    except Exception as e:
+        print("[selfcheck] 自检异常(可忽略): %s" % e)
+
+    try:
+        import os
+        from .config import DATA_DIR
+        spec = {
+            "device_free_gb_min": float(os.environ.get("PREFLIGHT_FREE_GB_MIN", "5")),
+            "ports": [int(WEB_PORT)],
+            # 离线优先策略：显式要求镜像时未载入才报错；否则仅提示
+            "image_loaded": None if os.environ.get("OFFLINE_IMAGES_REQUIRED") == "1"
+                            else True,
+            "flavour_supported": True,
+        }
+        ok, pf = preflight_install(spec)
+        for level, msg in pf:
+            if level == "error":
+                print("[preflight][ERROR] %s" % msg)
+            elif level == "warn":
+                print("[preflight][WARN] %s" % msg)
+            else:
+                print("[preflight][OK] %s" % msg)
+        if not ok:
+            print("[preflight] 预检未通过：请按上述指引修复后再继续。")
+    except Exception as e:
+        print("[preflight] 预检异常(可忽略): %s" % e)
 
 
 def main():
+    _boot_gates()
     init_schema()
     # v2.3.10：启动即自检凭证可解密性。存在「解不开」的凭证必须立刻告警，
     # 否则要等到复制建立时密文被当口令报 1470 才会暴露（现象与密钥毫无关联，极难定位）。

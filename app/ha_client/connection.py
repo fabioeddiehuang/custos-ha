@@ -16,6 +16,7 @@ from pymysql import OperationalError, ProgrammingError, DatabaseError
 
 from app.config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, is_semi_sync_enabled
 from app import mariadb_matrix
+from .db_ops import ident_clause
 
 
 import os as _os
@@ -149,8 +150,8 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             # MariaDB 10.6 不支持 `IDENTIFIED VIA ... BY '明文'`，须用
             # `IDENTIFIED VIA mysql_native_password USING PASSWORD('明文')`
             # （PASSWORD() 函数对明文再哈希，与 init_mariadb.sql 一致，已验证可用）。
-            idn = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
-            idn_root = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
+            idn = ident_clause(F_MARIADB, "mysql_native_password")
+            idn_root = ident_clause(F_MARIADB, "mysql_native_password")
             # F13（2026-09-16 真机）：MariaDB 分支此前**漏定义 idn_repl**，而下方 accts 循环
             # 在 u==repl_user 时引用它 → NameError → ensure_ha_creds 对**所有 MariaDB 节点**
             # 恒失败（返回 False），凭证漂移自愈整条链路静默失效（表现为日志恒
@@ -175,12 +176,12 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             repl_grant = ("GRANT %s ON *.* TO '%s'@'%%'"
                           % (mariadb_matrix.repl_privs(_avail), _esc_sql(repl_user)))
         else:
-            idn = "IDENTIFIED WITH " + auth_plugin + " BY %s"
-            idn_root = "IDENTIFIED WITH " + auth_plugin + " BY %s"
+            idn = ident_clause(flavour, auth_plugin)
+            idn_root = ident_clause(flavour, auth_plugin)
             # replication 账号强制 mysql_native_password：MySQL 8.0 下非 SSL 复制 IO 线程
             # 对 caching_sha2_password 的握手与客户端 JDBC/驱动不同，常报 Access Denied，
             # 改为 native 后非 SSL 复制即可稳定连通（与节点 init 配方一致）。
-            idn_repl = "IDENTIFIED WITH mysql_native_password BY %s"
+            idn_repl = ident_clause(flavour, "mysql_native_password")
             ha_grant = ("GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
                         "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* "
                         f"TO '{_esc_sql(ha_user)}'@'%'")
@@ -265,8 +266,10 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                 try:
                     if extra.upper() not in _granted_privs(cur, ha_user, _h):
                         cur.execute("GRANT %s ON *.* TO '%s'@'%s'" % (extra, _esc_sql(ha_user), _h))
-                except Exception:
-                    pass
+                except Exception as _e:
+                    import logging as _lg
+                    # 补授失败→后续 enable_semisync 的 SET GLOBAL 会 Access Denied，必须露出
+                    _lg.getLogger(__name__).warning("补授半同步额外权限 %s 失败(ha_monitor@%s): %s", extra, _h, _e)
         # ---- F11：消除「精确 host 影子账号」造成的能力落差（2026-09-16 真机）----
         # 现象：节点上残留 ha_monitor@'<管理器IP>'（历史 fix 脚本交叉污染 / 旧版本遗留），
         #   MariaDB / MySQL 按 host **精确度优先**匹配 —— 管理器从管理器主机 IP 连入时
@@ -319,8 +322,9 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         if _binlog_off:
             try:
                 cur.execute("SET SESSION sql_log_bin=1")
-            except Exception:
-                pass
+            except Exception as _e:
+                import logging as _lg
+                _lg.getLogger(__name__).warning("恢复会话 binlog 失败(SET SESSION sql_log_bin=1): %s", _e)
         # 节点本地状态库 ha_local 的读写授权（见 _ensure_local_state_grant 说明）
         local_state_ok[0] = _ensure_local_state_grant(cur, ha_user)
 
@@ -400,8 +404,9 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         if used_for_connect == "ha_monitor" and root_pass:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as _e:
+                import logging as _lg
+                _lg.getLogger(__name__).debug("关闭连接异常: %s", _e)
             try:
                 conn = connect(host, port, root_user, root_pass, timeout=5)
                 cur = conn.cursor()
@@ -419,16 +424,20 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             _rc = connect(host, port, root_user, root_pass, timeout=5)
             _ensure_local_state_grant(_rc.cursor(), ha_user)
             _rc.close()
-        except Exception:
-            pass
+        except Exception as _e:
+            import logging as _lg
+            # 此处失败会导致 ha_local 授权未补全 → keepalived 读不到 current_master → VIP 无法归属
+            _lg.getLogger(__name__).warning("root 回退补全 ha_local 授权失败: %s", _e)
     try:
         cur.execute("FLUSH PRIVILEGES")
-    except Exception:
-        pass
+    except Exception as _e:
+        import logging as _lg
+        _lg.getLogger(__name__).warning("FLUSH PRIVILEGES 失败: %s", _e)
     try:
         conn.close()
-    except Exception:
-        pass
+    except Exception as _e:
+        import logging as _lg
+        _lg.getLogger(__name__).debug("关闭连接异常: %s", _e)
     return True, "ok (via %s)" % used
 
 
@@ -488,8 +497,10 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
         try:
             cur.execute("SET SESSION sql_log_bin=0")
             _binlog_off = True
-        except Exception:
-            pass
+        except Exception as _e:
+            import logging as _lg
+            # 关 binlog 失败则后续 GRANT 会进 binlog（被复制到从库），值得告警
+            _lg.getLogger(__name__).warning("关闭会话 binlog 失败(SET SESSION sql_log_bin=0): %s", _e)
         repaired = 0
         for h in cand:
             try:
@@ -506,8 +517,10 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
         if _binlog_off:
             try:
                 cur.execute("SET SESSION sql_log_bin=1")
-            except Exception:
-                pass
+            except Exception as _e:
+                import logging as _lg
+                # 恢复 binlog 失败意味着本会话后续写不进 binlog（复制/审计缺失），值得告警而非静默
+                _lg.getLogger(__name__).warning("恢复会话 binlog 失败(SET SESSION sql_log_bin=1): %s", _e)
         return repaired, ("已修复 %d 个影子账号" % repaired if repaired else "无需修复")
     except Exception as e:
         return 0, "异常: %s" % e
@@ -515,8 +528,9 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
         try:
             if conn:
                 conn.close()
-        except Exception:
-            pass
+        except Exception as _e:
+            import logging as _lg
+            _lg.getLogger(__name__).debug("关闭连接异常: %s", _e)
 
 """底层连接与游标工具（与节点建连、root 回退、元组/Dict 游标辅助）。"""
 
@@ -536,8 +550,9 @@ def _tiny_sleep(seconds=0.3):
     """自愈循环里重启复制后给 SQL 线程一点时间应用/再次停下，便于下一轮检测冲突。"""
     try:
         time.sleep(seconds)
-    except Exception:
-        pass
+    except Exception as _e:
+        import logging as _lg
+        _lg.getLogger(__name__).debug("tiny_sleep 被打断: %s", _e)
 
 
 

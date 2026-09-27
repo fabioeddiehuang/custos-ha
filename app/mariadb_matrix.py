@@ -84,10 +84,16 @@ def support_level(version_str):
 
     未列出的更高系列（如未来的 12.4/13.x）按 supported 处理 —— 向前兼容，
     不因为矩阵没更新就把新版本误判成不支持。
+    **MariaDB 与 MySQL 必须分清（对应 MR1）**：MariaDB 版本号带 ``-MariaDB`` 后缀，
+    一律走上方 MariaDB 矩阵；MySQL 8/9 系列（不带 ``-MariaDB``、主版本 >= 8）项目明确
+    支持，按 supported 处理，不可因「不在 MariaDB 矩阵」误判为不支持。
     """
     s = series_of(version_str)
     if s == (0, 0):
         return LEVEL_UNKNOWN
+    # MySQL 8/9：项目支持（与 MariaDB 是不同风味，不能共用 MariaDB 矩阵，也不能误判）
+    if "-mariadb" not in (version_str or "").lower() and s[0] >= 8:
+        return LEVEL_SUPPORTED
     if s in _SERIES:
         return _SERIES[s][0]
     if s < MARIADB_MIN:

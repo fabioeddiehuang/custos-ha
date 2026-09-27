@@ -383,12 +383,13 @@ services:
     restart: "no"
 
   keepalived:
-    # 模板化镜像：优先使用已编译并导入的镜像 custos-node:<VERSION>（无需联网编译）。
-    # 若目标主机无法编译（如离线），可在可编译的机器上 `docker compose build keepalived`
-    # 后 `docker save custos-node:latest -o custos-node.tar` 拷贝过来
-    # `docker load -i custos-node.tar`，再 `docker compose up --no-build` 启动。
+    # keepalived 镜像 custos-node:<VERSION> 由【服务端】本地构建并托管在 ./images/，
+    # 节点经 curl 引导脚本从服务端下载 tar 后 `docker load` 载入（F2 离线镜像方案）。
+    # 【严禁】保留 build: ./keepalived 兜底——当服务端 tar 未载入时，节点会退化到公网拉取
+    # debian:bookworm-slim 基础镜像再编译，恰是「keepalived 从公网 pull」的来源。此处只声明
+    # image，镜像必须已由服务端下发并 docker load 成功；否则 docker compose up 会明确报
+    # "image not found"（故障清晰、不静默走公网）。镜像缺失时在服务端跑 build_node_images.sh。
     image: {KEEPALIVED_IMAGE_NAME}:{PKG_VERSION}
-    build: ./keepalived
     restart: always
     network_mode: host
     cap_add:
@@ -775,7 +776,6 @@ def render_baremetal_compose(node_name, vip_port=None, data_dir=None):
         "services:\n"
         "  keepalived:\n"
         "    image: {KEEPALIVED_IMAGE_NAME}:{PKG_VERSION}\n"
-        "    build: ./keepalived\n"
         "    restart: always\n"
         "    network_mode: host\n"
         "    cap_add:\n"
@@ -896,7 +896,6 @@ services:
 
   keepalived:
     image: {KEEPALIVED_IMAGE_NAME}:{PKG_VERSION}
-    build: ./keepalived
     restart: always
     network_mode: host
     cap_add:

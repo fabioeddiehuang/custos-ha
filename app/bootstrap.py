@@ -327,7 +327,8 @@ def available_images():
     """列出服务端已托管的节点镜像（F2）。
 
     没有镜像包时返回空列表，引导脚本会跳过 docker load——
-    此时依赖节点本地构建（compose 里带 build: ./keepalived）或节点已有镜像。
+    此时节点需先从服务端 docker load 镜像（keepalived/agent 均不得从公网拉取）；若目录下无对应
+    tar，节点必须已存在该镜像，否则引导会在 compose up 阶段明确失败（不再静默退化到公网 build）。
     """
     import os
     try:
@@ -374,8 +375,8 @@ def render_bootstrap_script(ip, token, node_type="docker", images=None,
 
     # keepalived 镜像标签校正：compose 要求 `custos-node:<PKG_VERSION>`（如 v2.5.0，带 v），
     # 而服务端托管的 tar 可能是历史版本导出的 `custos-node:2.5.0`（不带 v）。
-    # 标签对不上时 compose 会退回 build ./keepalived（需联网编译，离线节点直接失败，
-    # 表现为「mariadb/agent 都起来了，只有 keepalived 没有」）。
+    # 节点 compose 已移除 build: ./keepalived 兜底（避免退化到公网拉 debian:bookworm-slim 编译），
+    # 故标签对不上时本脚本补打标签；若完全无 custos-node 系列镜像则直接报错退出（不再走公网 build）。
     # 这里在 load 之后、compose up 之前按需补标签，旧镜像包也能直接用。
     try:
         from .node_gen import PKG_VERSION, KEEPALIVED_IMAGE_NAME
@@ -390,7 +391,7 @@ def render_bootstrap_script(ip, token, node_type="docker", images=None,
         '  if [ -n "$_src" ]; then\n'
         '    docker tag "$_src" "%s" && echo "  已将 $_src 另标为 %s"\n'
         '  else\n'
-        '    echo "  未找到 %s 系列镜像，compose 将尝试本地编译 build: ./keepalived"\n'
+        '    die "未找到 %s 镜像：keepalived 必须来自服务端。请在服务端执行 scripts/build_node_images.sh 生成 ./images/custos-node-<ver>.tar，并确认 docker-compose.yml 已将 ./images 挂载进管理器容器（节点引导会自动 docker load）。"\n'
         '  fi\n'
         'else\n'
         '  echo "  镜像 %s 已存在，无需处理"\n'
@@ -420,6 +421,19 @@ trap 'rm -rf "$TMP"' EXIT
 command -v docker >/dev/null 2>&1 || die "未检测到 docker。本版本仅支持已安装 docker 的节点。"
 docker compose version >/dev/null 2>&1 || die "未检测到 docker compose（v2 插件）。"
 
+# ---- 环境预检：磁盘空间（安装前先暴露，避免下到一半才炸）----
+# 复用 preflight.py 的同一阈值（5GB），与「管理端启动预检」口径一致（MR4：安装假设健壮化）。
+step "环境预检：磁盘空间"
+_PF_GB=5
+for _d in "$DEST" "$TMP"; do
+  mkdir -p "$_d" 2>/dev/null || true
+  _free_mb=$(df -Pm "$_d" 2>/dev/null | awk 'NR==2{print $4+0}')
+  if [[ -z "$_free_mb" || "$_free_mb" -lt $((_PF_GB*1024)) ]]; then
+    die "目标目录 $_d 可用空间不足 ${_PF_GB}GB（当前 ${_free_mb:-未知}MB），请清理后重试"
+  fi
+done
+log "磁盘预检通过（目标目录均 ≥ ${_PF_GB}GB 可用）"
+
 step "下载节点部署单元"
 curl -fsSL "$MGR/api/node/bundle/$TOKEN" -o "$UNIT" \
   || die "下载失败：token 可能已过期或已使用，请在管理端重新生成引导命令。"
@@ -432,6 +446,26 @@ step "解压到 $DEST"
 mkdir -p "$DEST"
 tar -xzf "$UNIT" -C "$DEST" --strip-components=1 \
   || die "解压失败"
+
+# ---- 环境预检：端口占用（解压后从 compose 解析发布端口并检查，best-effort）----
+# compose 端口为 "host:container" 数字映射，直接提取 host 侧即可；解析失败仅告警不阻断。
+step "环境预检：端口占用"
+if [[ -f "$DEST/docker-compose.yml" || -f "$DEST/docker-compose.yaml" ]]; then
+  _cf="$DEST/docker-compose.yml"; [[ -f "$_cf" ]] || _cf="$DEST/docker-compose.yaml"
+  _ports=$(grep -oE '"[0-9]+:[0-9]+"' "$_cf" 2>/dev/null | cut -d: -f1 | tr -d '"' | sort -u)
+  if [[ -n "$_ports" ]]; then
+    for _p in $_ports; do
+      if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE "[.:]${_p}([[:space:]]|$)"; then
+        die "端口 $_p 已被占用（ss -ltn 可见），请释放后重试"
+      fi
+    done
+    log "端口预检通过（发布端口：$(echo $_ports | tr '\n' ' ') 均未占用）"
+  else
+    warn "未能从 compose 解析发布端口，跳过端口预检（安装后若冲突会在 compose up 阶段报错）"
+  fi
+else
+  warn "未找到 docker-compose.yml，跳过端口预检"
+fi
 
 step "登记节点目录（供 custosctl node 任意目录调用）"
 mkdir -p /etc/custos

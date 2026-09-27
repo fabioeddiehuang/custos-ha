@@ -149,8 +149,8 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             # MariaDB 10.6 不支持 `IDENTIFIED VIA ... BY '明文'`，须用
             # `IDENTIFIED VIA mysql_native_password USING PASSWORD('明文')`
             # （PASSWORD() 函数对明文再哈希，与 init_mariadb.sql 一致，已验证可用）。
-            idn = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
-            idn_root = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
+            idn = ident_clause(F_MARIADB, "mysql_native_password")
+            idn_root = ident_clause(F_MARIADB, "mysql_native_password")
             # F13（2026-09-16 真机）：MariaDB 分支此前**漏定义 idn_repl**，而下方 accts 循环
             # 在 u==repl_user 时引用它 → NameError → ensure_ha_creds 对**所有 MariaDB 节点**
             # 恒失败（返回 False），凭证漂移自愈整条链路静默失效（表现为日志恒
@@ -175,12 +175,12 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             repl_grant = ("GRANT %s ON *.* TO '%s'@'%%'"
                           % (mariadb_matrix.repl_privs(_avail), _esc_sql(repl_user)))
         else:
-            idn = "IDENTIFIED WITH " + auth_plugin + " BY %s"
-            idn_root = "IDENTIFIED WITH " + auth_plugin + " BY %s"
+            idn = ident_clause(flavour, auth_plugin)
+            idn_root = ident_clause(flavour, auth_plugin)
             # replication 账号强制 mysql_native_password：MySQL 8.0 下非 SSL 复制 IO 线程
             # 对 caching_sha2_password 的握手与客户端 JDBC/驱动不同，常报 Access Denied，
             # 改为 native 后非 SSL 复制即可稳定连通（与节点 init 配方一致）。
-            idn_repl = "IDENTIFIED WITH mysql_native_password BY %s"
+            idn_repl = ident_clause(flavour, "mysql_native_password")
             ha_grant = ("GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
                         "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* "
                         f"TO '{_esc_sql(ha_user)}'@'%'")
@@ -522,6 +522,7 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
 
 from ._const import *
 from ..mysql_compat import (detect_syntax, detect_flavour, F_MARIADB, F_MYSQL8, default_auth_plugin, change_replication_filter_sql, reset_replica_sql, stop_replication_sql, start_replication_sql, change_replication_sql)
+from .db_ops import (ident_clause, set_read_only, gtid_slave_is_subset)
 
 
 from .connection import (connect, connect_robust, _esc_sql)
@@ -574,9 +575,9 @@ def _fence_readonly(host, port, user, password, root_user="root", root_pass=""):
         cur = conn.cursor()
         flavour = detect_flavour(cur)
         try:
-            if flavour == F_MYSQL8:
-                cur.execute("SET GLOBAL super_read_only=ON")
-            cur.execute("SET GLOBAL read_only=ON")
+            ok_ro, err_ro = set_read_only(cur, True, flavour)
+            if not ok_ro:
+                return False, err_ro
             return True, None
         except Exception as e:
             # MariaDB 可能需 READ_ONLY ADMIN；MySQL 需 SUPER / SYSTEM_VARIABLES_ADMIN。
@@ -588,6 +589,41 @@ def _fence_readonly(host, port, user, password, root_user="root", root_pass=""):
         except Exception:
             pass
 
+
+
+def _gtid_covered_positions(master_pos, slave_pos):
+    """纯 Python 的 GTID 子集比较（MariaDB 口径）：从库 slave_pos 是否已包含主库
+    master_pos 的全部事务（按 (domain, server) 的 seq 比较）。与 syncgate 的
+    _covered_by_positions 同逻辑，内联于此避免跨包导入循环。"""
+    if not master_pos:
+        return True
+    if not slave_pos:
+        return False
+
+    def _parse(s):
+        out = {}
+        for part in (s or "").split(","):
+            bits = part.strip().split("-")
+            if len(bits) != 3:
+                continue
+            try:
+                d, srv, seq = int(bits[0]), int(bits[1]), int(bits[2])
+            except ValueError:
+                continue
+            k = (d, srv)
+            if seq > out.get(k, -1):
+                out[k] = seq
+        return out
+
+    m, s = _parse(master_pos), _parse(slave_pos)
+    if not m:
+        return True
+    return all(s.get(k, -1) >= v for k, v in m.items())
+
+
+def _gtid_slave_is_subset(cur, slave_pos, master_pos, flavour):
+    """见 db_ops.gtid_slave_is_subset（已收敛到单一出口，杜绝直拼 GTID_SUBSET）。"""
+    return gtid_slave_is_subset(cur, slave_pos, master_pos, flavour)
 
 
 def make_slave_of(host, port, user, password, master_host, master_port,
@@ -756,16 +792,16 @@ def make_slave_of(host, port, user, password, master_host, master_port,
         # 已应用位点续传、重放主库其余 domain 最终一致）。仅当 gtid_slave_pos 本身也非子集
         # （极少见：从库应用过主库没有的事务）才把 gtid_slave_pos 对齐到主库当前位置跳过重放。
         try:
-            # MariaDB 不支持 GTID_SUBSET / GTID_SUBTRACT（12.3.3 实测报
-            # 1305 FUNCTION GTID_SUBSET does not exist）。下面这套不一致检测一执行到
-            # GTID_SUBSET 就抛异常、被 except 静默吞掉 ⇒ 在 MariaDB 上**从未真正生效**。
-            # 但「gtid_slave_pos 为空」时不会调用 GTID_SUBSET，反而会走到 RESET MASTER +
-            # 设置起点的分支 ⇒ 原主库（100）被跳过历史、数据永久不一致。
-            # 2.2.20 的实际效果恒为「不做任何特殊处理」的最简路径，这正是它稳定的原因。
-            # 与其依赖「抛异常被吞」这种偶然行为，不如显式跳过：MariaDB 的 GTID 自动定位
-            # (MASTER_USE_GTID=slave_pos) 本身即可正确定位位点，无需这套 MySQL 语义逻辑。
-            if flavour == F_MARIADB or _file_pos:
-                raise RuntimeError("MariaDB 不支持 GTID_SUBSET / file_pos 路径，显式跳过不一致检测")
+            # 不一致检测：MySQL 用原生 GTID_SUBSET；MariaDB 12.x 无该函数
+            # （实测 1305 FUNCTION GTID_SUBSET does not exist），改用 Python 侧位点比较
+            # （_gtid_slave_is_subset → syncgate._covered_by_positions，与就绪/强制同步判定
+            # 同一套），使「曾为源需 RESET MASTER」「已应用集非子集需对齐」的收敛逻辑在
+            # MariaDB 上同样生效，不再因跳过检测而失明。
+            # 旧实现靠「抛异常被吞」偶然跳过，导致 MariaDB 前主重入的乱序冲突无 RESET MASTER
+            # 兜底；现显式对 MariaDB 跑 Python 侧子集判定，行为确定。
+            # file_pos 接管路径（v2.4.1）按给定位点挂载，跳过 GTID 专属检测。
+            if _file_pos:
+                raise RuntimeError("file_pos 接管路径，跳过 GTID 不一致检测")
             cur.execute("SELECT @@gtid_slave_pos, @@gtid_binlog_pos")
             _sr = cur.fetchone() or [None, None]
             _slave_gt = _sr[0] or ""
@@ -779,8 +815,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                 if _master_gt and (_slave_gt or _own_gt):
                     _pos_ok = False
                     if _slave_gt:
-                        cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
-                        _pos_ok = bool((cur.fetchone() or [0])[0])
+                        _pos_ok = _gtid_slave_is_subset(cur, _slave_gt, _master_gt, flavour)
                     # 从库「自有 binlog GTID」(gtid_binlog_pos) 非空 = 它曾为源（曾是主库）。
                     # 重指向其他主库时，其自有 GTID 与该主库同 domain-server 序列在
                     # gtid_strict_mode 下必然冲突（out-of-order）；而 GTID_SUBSET(自有,主库)
@@ -803,8 +838,7 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                             # 仅当已应用集非空且确实不一致时，才对齐主库当前位点以避免 1236。
                             # 若主库早期 binlog 已清理，重放会报 1236，由上层自动全量克隆兜底。
                             if _slave_gt and _master_gt:
-                                cur.execute("SELECT GTID_SUBSET(%s, %s)", (_slave_gt, _master_gt))
-                                if bool((cur.fetchone() or [0])[0]):
+                                if _gtid_slave_is_subset(cur, _slave_gt, _master_gt, flavour):
                                     # 已应用集为主库子集：保留以免从头重放报 1062
                                     cur.execute("SET GLOBAL gtid_slave_pos=%s", (_slave_gt,))
                                 else:

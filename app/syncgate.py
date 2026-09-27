@@ -195,10 +195,11 @@ def _covered(master_pos, slave_pos, host, port):
         return None
     try:
         cur = c.cursor()
-        cur.execute("SELECT GTID_SUBSET('%s','%s')" % (master_pos.replace("'", ""),
-                                                       slave_pos.replace("'", "")))
-        r = cur.fetchone()
-        return int(r[0] or 0) == 1
+        # 统一走 db_ops.gtid_slave_is_subset：MySQL 用原生 GTID_SUBSET，MariaDB 用 Python 解析，
+        # 不再在逻辑层直拼风味 SQL（对应 MR1 / Phase 1）。
+        from app.ha_client.db_ops import gtid_slave_is_subset
+        from app.mysql_compat import F_MYSQL8
+        return gtid_slave_is_subset(cur, slave_pos, master_pos, F_MYSQL8)
     except Exception:
         return _covered_by_positions(master_pos, slave_pos)
     finally:
@@ -297,12 +298,11 @@ def _set_ro(host, port, on):
                 break
             except Exception:
                 continue
-        try:
-            cur.execute("SET GLOBAL super_read_only=%s" % ("ON" if on else "OFF"))
-        except Exception as e:
-            if "1193" not in str(e) and "super_read_only" not in str(e):
-                raise
-            cur.execute("SET GLOBAL read_only=%s" % ("ON" if on else "OFF"))
+        # 统一走 db_ops.set_read_only（MySQL 同步 super_read_only，MariaDB 仅 read_only）
+        from app.ha_client.db_ops import set_read_only
+        ok_ro, err_ro = set_read_only(cur, on)
+        if not ok_ro:
+            raise RuntimeError(err_ro)
         return orig
     finally:
         try:

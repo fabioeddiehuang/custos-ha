@@ -16,6 +16,7 @@ from pymysql import OperationalError, ProgrammingError, DatabaseError
 
 from app.config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, is_semi_sync_enabled
 from app import mariadb_matrix
+from .db_ops import ident_clause
 
 
 import os as _os
@@ -149,8 +150,8 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             # MariaDB 10.6 不支持 `IDENTIFIED VIA ... BY '明文'`，须用
             # `IDENTIFIED VIA mysql_native_password USING PASSWORD('明文')`
             # （PASSWORD() 函数对明文再哈希，与 init_mariadb.sql 一致，已验证可用）。
-            idn = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
-            idn_root = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
+            idn = ident_clause(F_MARIADB, "mysql_native_password")
+            idn_root = ident_clause(F_MARIADB, "mysql_native_password")
             # F13（2026-09-16 真机）：MariaDB 分支此前**漏定义 idn_repl**，而下方 accts 循环
             # 在 u==repl_user 时引用它 → NameError → ensure_ha_creds 对**所有 MariaDB 节点**
             # 恒失败（返回 False），凭证漂移自愈整条链路静默失效（表现为日志恒
@@ -175,12 +176,12 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             repl_grant = ("GRANT %s ON *.* TO '%s'@'%%'"
                           % (mariadb_matrix.repl_privs(_avail), _esc_sql(repl_user)))
         else:
-            idn = "IDENTIFIED WITH " + auth_plugin + " BY %s"
-            idn_root = "IDENTIFIED WITH " + auth_plugin + " BY %s"
+            idn = ident_clause(flavour, auth_plugin)
+            idn_root = ident_clause(flavour, auth_plugin)
             # replication 账号强制 mysql_native_password：MySQL 8.0 下非 SSL 复制 IO 线程
             # 对 caching_sha2_password 的握手与客户端 JDBC/驱动不同，常报 Access Denied，
             # 改为 native 后非 SSL 复制即可稳定连通（与节点 init 配方一致）。
-            idn_repl = "IDENTIFIED WITH mysql_native_password BY %s"
+            idn_repl = ident_clause(flavour, "mysql_native_password")
             ha_grant = ("GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
                         "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* "
                         f"TO '{_esc_sql(ha_user)}'@'%'")

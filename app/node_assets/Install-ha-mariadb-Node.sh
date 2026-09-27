@@ -68,6 +68,28 @@ if [[ $EUID -ne 0 ]]; then
   die "请使用 root 执行：sudo bash Install-ha-mariadb-Node.sh"
 fi
 
+# ---------- 0.5) 安装前环境预检（磁盘 / 端口，避免装到一半才炸）----------
+# 端口取自服务端生成的 my.cnf 与 ha_check.conf（与步骤 4/8.5 同源，提前解析以便预检）；
+# 阈值与管理端启动预检（preflight.py）一致（MR4：安装假设健壮化）。
+PORT="$(grep -E '^[[:space:]]*port[[:space:]]*=' "$CONF_DIR/my.cnf" 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' ' || true)"
+PORT="${PORT:-3306}"
+VIP_PORT="$(conf_get "$NODE_ROOT/keepalived/ha_check.conf" VIP_PORT || true)"
+_PF_GB=5
+for _d in "$DATA_DIR" "$INSTALL_DIR" /tmp; do
+  mkdir -p "$_d" 2>/dev/null || true
+  _free_mb=$(df -Pm "$_d" 2>/dev/null | awk 'NR==2{print $4+0}')
+  if [[ -z "$_free_mb" || "$_free_mb" -lt $((_PF_GB*1024)) ]]; then
+    die "磁盘空间不足：目录 $_d 可用 ${_free_mb:-未知}MB，需至少 ${_PF_GB}GB（清理后重试）"
+  fi
+done
+for _p in "$PORT" "$VIP_PORT"; do
+  [[ -z "$_p" ]] && continue
+  if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE "[.:]${_p}([[:space:]]|$)"; then
+    die "端口 $_p 已被占用（ss -ltn 可见），请释放后重试（或改 my.cnf / ha_check.conf 端口）"
+  fi
+done
+log "环境预检通过（磁盘≥${_PF_GB}GB；DB 端口=$PORT；VIP 端口=${VIP_PORT:-未配置}）"
+
 # ---------- 0) 环境依赖检测 ----------
 for bin in curl tar gzip; do
   command -v "$bin" >/dev/null 2>&1 || { die "缺少必要命令：$bin，请先安装（apt/yum install $bin）"; }

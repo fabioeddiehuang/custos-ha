@@ -19,7 +19,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from urllib.parse import quote
 
-from .config import (APP_VERSION, SECRET_KEY, WEB_USER, ROLE_ADMIN, ROLE_VIEWER, rand_secret, get_manager_public_ip, get_manager_public_ip_source, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT, validate_config, hash_pwd, verify_pwd, FAILOVER_COOLDOWN_SEC)
+from .config import (APP_VERSION, SECRET_KEY, WEB_USER, ROLE_ADMIN, ROLE_VIEWER, rand_secret, get_manager_public_ip, get_manager_public_ip_source, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT, validate_config, hash_pwd, verify_pwd, is_weak_password, FAILOVER_COOLDOWN_SEC)
 from .db import (query, execute, get_conn, get_setting, upsert_setting,
                  get_user_role, list_users, get_user, create_user, set_user_role,
                  delete_user, count_admins)
@@ -145,6 +145,24 @@ except Exception:
     _console_stream = None
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """安全响应头（Phase 4 安全基线，呼应渗透测试整改）：防点击劫持/嗅探/Referrer 泄露。"""
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'",
+    )
+    resp.headers.setdefault("Permissions-Policy", "geolocation=(), camera=(), microphone=()")
+    if "Server" in resp.headers:
+        del resp.headers["Server"]
+    return resp
 TEMPLATES = Environment(
     loader=FileSystemLoader(str(Path(__file__).parent / "templates")),
     autoescape=select_autoescape(["html"]),
@@ -198,6 +216,10 @@ def auth_required(request: Request):
                        "（重新生成配置 / 故障切换 / 备份恢复 / 修改设置 等）。"
                        "请退出登录后，改用管理员账号重新登录再试。",
             )
+        # 首登弱口令强制改密：弱口令未改前，所有写操作被拦截（Phase 4 安全基线）
+        if request.cookies.get("ha_must_change") == "1":
+            raise HTTPException(status_code=403,
+                                detail="请先修改密码（当前为默认/弱口令），改密后方可操作")
     return user
 
 
@@ -329,6 +351,11 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
         return render("login.html", request, error=f"管理库错误: {e}")
     resp = RedirectResponse("/", status_code=303)
     resp.set_cookie(COOKIE, serializer.dumps(username), httponly=True)
+    # 首登弱口令强制改密：弱口令登录后打标记，后端拦截写操作，前端弹改密框
+    if is_weak_password(password):
+        resp.set_cookie("ha_must_change", "1", httponly=True, max_age=60 * 60 * 24 * 365)
+    else:
+        resp.delete_cookie("ha_must_change")
     return resp
 
 
@@ -1036,6 +1063,24 @@ def api_node_ready(ip: str, request: Request, token: str = Form(""),
     except Exception as e:
         return _json_ok({"ok": False, "error": f"回执写入失败：{e}"})
     bootstrap.consume_token(token, src_ip=src_ip)
+    # 节点接入自检（best-effort，不阻断就绪）：校验关键特权，漂移可见
+    try:
+        from .selfcheck import selfcheck_node
+        r = query("SELECT cluster_id, port FROM nodes WHERE ip=%s", (ip,))
+        if r:
+            cid = r[0].get("cluster_id")
+            nport = int(r[0].get("port") or 3306)
+            creds = load_creds(cid) if cid else {}
+            ok, issues = selfcheck_node(ip, nport, creds.get("ha_user"), creds.get("ha_pass"))
+            for level, msg in issues:
+                print("[node-ready][selfcheck][%s] %s" % (level, msg), flush=True)
+            try:
+                upsert_setting("node_selfcheck_%s" % ip,
+                               json.dumps([list(x) for x in issues], ensure_ascii=False)[:500])
+            except Exception:
+                pass
+    except Exception as e:
+        print("[node-ready] 接入自检异常(可忽略): %s" % e, flush=True)
     return _json_ok({"ok": True, "deploy_state": state})
 
 
@@ -2065,7 +2110,9 @@ def change_password(
         conn.commit()
     finally:
         conn.close()
-    return RedirectResponse("/settings?msg=密码已修改", status_code=303)
+    resp = RedirectResponse("/settings?msg=密码已修改", status_code=303)
+    resp.delete_cookie("ha_must_change")
+    return resp
 
 
 # ---------------- 集群管理（多集群：每集群独立账号/复制账号/密码/VIP） ----------------
@@ -3776,6 +3823,11 @@ def clusters_create(
         except ValueError:
             return RedirectResponse(
                 "/clusters?error=vip端口必须是 1-65535 之间的整数", status_code=303)
+    node_type = node_type.strip()
+    if node_type not in ("docker", "mariadb", "mariadb-docker"):
+        return RedirectResponse(
+            "/clusters?error=节点类型(node_type)非法或为空，请从 docker / mariadb / mariadb-docker 中选择",
+            status_code=303)
     try:
         new_id = create_cluster(
             name,
@@ -3790,7 +3842,7 @@ def clusters_create(
             interface=interface.strip() or None,
             vrid=vrid.strip() or None,
             vip_port=vip_port_val,
-            node_type=node_type.strip() or "mariadb-docker",
+            node_type=node_type,
             mysql_version=mysql_version.strip() or None,
         )
     except Exception as e:
@@ -4062,15 +4114,21 @@ def nodes_add(
     cid = int(cluster_id) if cluster_id else None
     if not cid:
         return RedirectResponse("/nodes?error=请先在「集群管理」创建集群，再选择所属集群", status_code=303)
+    # 节点类型必须显式合法，禁止静默回退默认（BUG-003：曾静默回退 mariadb-docker）
+    node_type = node_type.strip()
+    if node_type not in ("docker", "mariadb", "mariadb-docker"):
+        return RedirectResponse(
+            "/nodes?error=节点类型(node_type)非法或为空，请从 docker / mariadb / mariadb-docker 中选择",
+            status_code=303)
     # 同集群「同构」校验：禁止 docker/mariadb 混部、主版本须一致
     try:
-        validate_node_version(cid, node_type.strip() or "mariadb-docker", mysql_version.strip() or None)
+        validate_node_version(cid, node_type, mysql_version.strip() or None)
     except Exception as e:
         return RedirectResponse(f"/nodes?error={e}", status_code=303)
     try:
         info = generate_node(
             ip, port, root_user, root_pass, initial_role, cid,
-            node_type=node_type.strip() or "mariadb-docker", mysql_version=mysql_version.strip() or None,
+            node_type=node_type, mysql_version=mysql_version.strip() or None,
             server_id=server_id.strip() or None,
             install_dir=install_dir or None,
         )
@@ -4153,9 +4211,9 @@ def _render_node_fix_sql(n, creds, manager_ip, manager_subnet=None):
     """按节点真实风味（MySQL / MariaDB）生成 fix-node-creds.sql。
 
     管理后台需同时支持 MySQL 与 MariaDB 集群，而两者账号/权限语法**不兼容**：
-      - MariaDB：`IDENTIFIED VIA mysql_native_password USING PASSWORD()`，
+      - MariaDB：用 `VIA ... USING PASSWORD()` 形式（native 插件 + 明文再哈希），
         特权为 REPLICATION SLAVE ADMIN / SLAVE MONITOR / READ_ONLY ADMIN
-      - MySQL 8 ：`IDENTIFIED WITH mysql_native_password BY`，
+      - MySQL 8 ：用 `WITH <plugin> BY` 形式，
         特权为 REPLICATION_SLAVE_ADMIN / SYSTEM_VARIABLES_ADMIN
     用错会直接 1064（语法错）或 1227（特权名不存在），故必须按 flavour 选渲染器。
 

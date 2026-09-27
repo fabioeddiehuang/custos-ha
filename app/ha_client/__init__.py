@@ -11,6 +11,8 @@ from app.ha_client.gtid import *
 from app.ha_client.credentials import *
 from app.ha_client.local_state import *
 from app.ha_client.replication import *
+from app.ha_client.db_ops import (ident_clause, set_read_only, gtid_slave_is_subset,
+                                  has_privilege)
 # 内部下划线辅助函数也显式再导出，保持与原单文件 app/ha_client.py 完全等价
 from app.ha_client.connection import (_pymysql_at_least, _tiny_sleep, _one_dict, _esc_sql)
 from app.ha_client.gtid import (_derive_stuck_gtid, _io_error_is_auth, _start_io_thread, _stop_io_thread, _stop_replica)

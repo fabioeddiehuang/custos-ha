@@ -110,6 +110,15 @@ def detect_flavour(cur):
     """给定节点游标，按 SELECT VERSION() 判定风味（mysql8/mariadb/old）。
 
     这是 v2.2 新增的核心分派函数：MariaDB 与 MySQL 走各自独立的复制路径。
+
+    **探测失败必须 fail-safe（对应 MR2）**：VERSION() 读不到（连接瞬断 / 权限）
+    时**返回 F_MARIADB（项目主线）**，绝不回退成 F_OLD（=按 MySQL 走）。
+    根因：全代码约 30 处 `if flavour == F_MARIADB … else MySQL` 的 else 分支即 MySQL，
+    若探测失败落入 F_OLD，真实 MariaDB 会被误下 MySQL 方言 SQL（CHANGE MASTER 用
+    MASTER_AUTO_POSITION / START REPLICA 等）→ 1064/复制建不起来，且**静默无感**。
+    项目主线是 MariaDB，「误判成 MySQL」远比「老 MySQL 被按 MariaDB 处理」危险，
+    故与 ``db_ops.set_read_only`` 的已定铁律一致：探测失败默认 MariaDB。
+    真正的老 MySQL（5.x 等）由 ``flavour_from_version`` 正常解析为 F_OLD，仍走 MySQL 分支。
     """
     try:
         cur.execute("SELECT VERSION()")
@@ -117,7 +126,7 @@ def detect_flavour(cur):
         v = (row[0] if row else "") or ""
         return flavour_from_version(v)
     except Exception:
-        return F_OLD
+        return F_MARIADB
 
 
 def flavour_from_version(version_str):
@@ -158,17 +167,6 @@ def default_auth_plugin(version_str=None, node_type=None, prefer="auto"):
     if parse_version(version_str) >= _CSHA2_MIN:
         return "caching_sha2_password"
     return "mysql_native_password"
-
-
-def identify_clause(plugin, password, mariadb=False):
-    """生成 CREATE/ALTER USER 的认证子句（明文密码）。
-
-    MariaDB 10.6 不支持 ``IDENTIFIED VIA <plugin> BY '明文'``，必须用
-    ``IDENTIFIED VIA <plugin> USING PASSWORD('明文')``。
-    """
-    if mariadb:
-        return "IDENTIFIED VIA %s USING PASSWORD('%s')" % (plugin, password)
-    return "IDENTIFIED WITH %s BY '%s'" % (plugin, password)
 
 
 def flavour_from_node_type(node_type):

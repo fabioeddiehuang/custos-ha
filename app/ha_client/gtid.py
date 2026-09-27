@@ -16,6 +16,7 @@ from pymysql import OperationalError, ProgrammingError, DatabaseError
 
 from app.config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, is_semi_sync_enabled
 from app import mariadb_matrix
+from .db_ops import ident_clause
 
 
 import os as _os
@@ -149,8 +150,8 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             # MariaDB 10.6 不支持 `IDENTIFIED VIA ... BY '明文'`，须用
             # `IDENTIFIED VIA mysql_native_password USING PASSWORD('明文')`
             # （PASSWORD() 函数对明文再哈希，与 init_mariadb.sql 一致，已验证可用）。
-            idn = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
-            idn_root = "IDENTIFIED VIA mysql_native_password USING PASSWORD(%s)"
+            idn = ident_clause(F_MARIADB, "mysql_native_password")
+            idn_root = ident_clause(F_MARIADB, "mysql_native_password")
             # F13（2026-09-16 真机）：MariaDB 分支此前**漏定义 idn_repl**，而下方 accts 循环
             # 在 u==repl_user 时引用它 → NameError → ensure_ha_creds 对**所有 MariaDB 节点**
             # 恒失败（返回 False），凭证漂移自愈整条链路静默失效（表现为日志恒
@@ -175,12 +176,12 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             repl_grant = ("GRANT %s ON *.* TO '%s'@'%%'"
                           % (mariadb_matrix.repl_privs(_avail), _esc_sql(repl_user)))
         else:
-            idn = "IDENTIFIED WITH " + auth_plugin + " BY %s"
-            idn_root = "IDENTIFIED WITH " + auth_plugin + " BY %s"
+            idn = ident_clause(flavour, auth_plugin)
+            idn_root = ident_clause(flavour, auth_plugin)
             # replication 账号强制 mysql_native_password：MySQL 8.0 下非 SSL 复制 IO 线程
             # 对 caching_sha2_password 的握手与客户端 JDBC/驱动不同，常报 Access Denied，
             # 改为 native 后非 SSL 复制即可稳定连通（与节点 init 配方一致）。
-            idn_repl = "IDENTIFIED WITH mysql_native_password BY %s"
+            idn_repl = ident_clause(flavour, "mysql_native_password")
             ha_grant = ("GRANT REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
                         "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE ON *.* "
                         f"TO '{_esc_sql(ha_user)}'@'%'")
@@ -1057,15 +1058,18 @@ def heal_io_auth(slave_host, slave_port, ha_user, ha_pass,
                            f"做降级处理（当前错误：{io_err2 or '未知'}）")
         try:
             mcur = mconn.cursor()
-            quser = _esc_sql(repl_user)
-            qpass = _esc_sql(repl_pass or "")
             last_err = None
-            # 常见两种 host 形态：'%' 与从库 IP
-            for host_part in ("'%'", f"'{slave_host}'"):
+            # MariaDB 不支持 MySQL 8 的 `IDENTIFIED WITH <plugin> BY '明文'`（实测 12.3.3 报
+            # 1064 语法错）；统一走 db_ops.ident_clause（密码参数化，杜绝拼进 SQL 字符串的注入隐患）。
+            from app.mysql_compat import detect_flavour
+            _mfl = detect_flavour(mcur)
+            _idn_repl = ident_clause(_mfl, "mysql_native_password")
+            # 常见两种 host 形态：'%' 与从库 IP（参数化执行，密码不再拼进字符串）
+            for host_part in ("%", slave_host):
                 try:
                     mcur.execute(
-                        f"ALTER USER '{quser}'@{host_part} "
-                        f"IDENTIFIED WITH mysql_native_password BY '{qpass}'")
+                        "ALTER USER %s@%s " + _idn_repl,
+                        (repl_user, host_part, repl_pass))
                     last_err = None
                     break
                 except Exception as e:
@@ -1074,8 +1078,7 @@ def heal_io_auth(slave_host, slave_port, ha_user, ha_pass,
                 # 账号可能根本不存在：直接按 native 插件创建并授权
                 try:
                     mcur.execute(
-                        f"CREATE USER '{quser}'@'%' "
-                        f"IDENTIFIED WITH mysql_native_password BY '{qpass}'")
+                        f"CREATE USER '{quser}'@'%' {_idn_repl}")
                     mcur.execute(f"GRANT REPLICATION SLAVE ON *.* TO '{quser}'@'%'")
                     last_err = None
                 except Exception as e2:

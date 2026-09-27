@@ -13,7 +13,9 @@ from .ha_client import (get_status, ensure_semisync_runtime, heal_replication, h
                         set_read_only, get_node_utc_time, is_gtid_purged_error)
 from .state import get_current_master
 from .failover import (do_failover, do_failover_to, ensure_topology, load_creds,
-                      node_root, _repoint_slave, promote_to_master)
+                      node_root, promote_to_master)
+from .selfheal import repoint_slave_to_current  # 自愈收敛核心动作统一走 selfheal.py
+from .selfcheck import selfcheck_cluster_grants  # 启动期授权漂移观测（grants_spec）
 from .alerts import send_alert, cancel_alert, record_alert
 from .clusters import list_clusters
 from . import node_gen
@@ -47,6 +49,8 @@ _STUCK_NEXT_AT = {}
 _PURGE_LOGGED = set()
 # 自动重建触发冷却（AUTO_REBUILD_ON_PURGE=1 时），避免同节点重复触发
 _AUTO_REBUILD_AT = {}
+# 源≠当前主时「重指向当前主」的限频时间戳（避免每周期对从库反复 RESET SLAVE + CHANGE MASTER）
+_REPOINT_SRC_AT = {}
 # 已因「重建完成」清理过退避状态的节点（值=该次重建完成时间戳）
 _REBUILT_CLEARED = {}
 _HEAL_MIN_BACKOFF = 30      # 连续失败后首次冷却秒数（按失败次数线性放大）
@@ -953,17 +957,50 @@ def _act_once():
                               else f"自动纠正失败（{_ro_err}），请立即人工处理！"),
                            cluster_id=cid)
             # ---- 自愈前置守卫（仅从库）----
-            # ① 源库不可达（宕机/断网）：根本无从自愈，直接跳过，避免每周期对从库反复
-            #    START SLAVE / CHANGE MASTER 把 CPU 打满（源库不可用期间的主要放大源）。
+            # ① 源库不可达（宕机/断网）：得区分两类，否则故障切换后会卡死——
+            #    (a) 本从库指向的源 == 当前主库：当前主真宕机/断网，无从自愈，跳过等恢复（旧行为）。
+            #    (b) 本从库指向的源 != 当前主库（如切换后旧主 203 已退位、当前主是 177）：
+            #        这是「从库还挂在已退位旧主上」的残留，应改指当前主恢复复制，
+            #        而非傻等旧主复活（旧逻辑只认错误文案、不比源地址，正是 213 卡死的根因）。
             # ② 退避期内：上次自愈失败后冷却时间未到，不重复尝试。
             if not is_master:
                 if _repl_err_is_connectivity(st):
-                    _sh_stat("skip_unreachable")
+                    _src_h = (st.get("master_host") or "").strip()
+                    _src_p = int(st.get("master_port") or 0)
+                    _cur_h = (cur_h or "").strip()
+                    _points_to_current = bool(_cur_h) and _src_h == _cur_h and _src_p == int(cur_p or 0)
+                    if _points_to_current or not cur_h:
+                        # 情况(a)：源就是当前主，真不可达 → 跳过，等当前主恢复
+                        _sh_stat("skip_unreachable")
+                        if key not in _HEAL_SKIP_LOGGED:
+                            _HEAL_SKIP_LOGGED.add(key)
+                            _e = (st.get("slave_io_err") or st.get("slave_sql_err") or "IO 线程已停")
+                            print(f"[monitor] 跳过自愈 {h_host}:{h_port}：复制错误为「源库不可达」"
+                                  f"（{str(_e)[:120]}），等对端恢复后自动继续")
+                        continue
+                    # 情况(b)：源≠当前主（旧主残留）→ 改指当前主恢复复制
+                    if get_setting("AUTO_REPAIR", "1") == "1":
+                        _srk = ("repoint_src", cid, h_host, h_port)
+                        if time.monotonic() >= _REPOINT_SRC_AT.get(_srk, 0.0):
+                            _REPOINT_SRC_AT[_srk] = time.monotonic() + 60  # 限频 60s
+                            try:
+                                ok_r, msg_r = repoint_slave_to_current(
+                                    cid, {"host": h_host, "port": h_port, "status": "up"},
+                                    cur_h, cur_p, creds)
+                            except Exception as _rpe:
+                                ok_r, msg_r = False, f"{type(_rpe).__name__}: {_rpe}"
+                            if ok_r:
+                                print(f"[monitor] 源库不可达但指向旧主 {_src_h}:{_src_p}，"
+                                      f"已重指向当前主 {cur_h}:{cur_p} 恢复复制：{msg_r}")
+                                _HEAL_SKIP_LOGGED.discard(key)
+                            else:
+                                print(f"[monitor] 源库不可达(旧主)重指向当前主失败 {h_host}:{h_port}：{msg_r}")
+                        continue
+                    # AUTO_REPAIR 关闭：仍跳过，但提示需人工重指向
                     if key not in _HEAL_SKIP_LOGGED:
                         _HEAL_SKIP_LOGGED.add(key)
-                        _e = (st.get("slave_io_err") or st.get("slave_sql_err") or "IO 线程已停")
-                        print(f"[monitor] 跳过自愈 {h_host}:{h_port}：复制错误为「源库不可达」"
-                              f"（{str(_e)[:120]}），等对端恢复后自动继续")
+                        print(f"[monitor] 跳过自愈 {h_host}:{h_port}：源(旧主 {_src_h}:{_src_p})不可达，"
+                              f"当前主为 {cur_h}:{cur_p}（AUTO_REPAIR 关闭，待人工重指向）")
                     continue
                 _HEAL_SKIP_LOGGED.discard(key)
                 if time.monotonic() < _HEAL_NEXT_AT.get(key, 0.0):
@@ -1012,7 +1049,7 @@ def _act_once():
                             # ensure_topology 永不执行 —— 表现为「节点装完不自动加入、
                             # 复制断了也没人自愈」。任何异常都不得逃出本循环。
                             try:
-                                ok_r, msg_r = _repoint_slave(
+                                ok_r, msg_r = repoint_slave_to_current(
                                     cid, {"host": h_host, "port": h_port, "status": "up"},
                                     cur_h, cur_p, creds)
                             except Exception as _rpe:
@@ -1062,7 +1099,7 @@ def _act_once():
                 if "anonymous transaction" in io_err and cur_h:
                     # (A) 匿名事务 1236：强制重挂载（带 ASSIGN_GTIDS），不治本则永久循环
                     try:
-                        ok_r, msg_r = _repoint_slave(
+                        ok_r, msg_r = repoint_slave_to_current(
                             cid, {"host": h_host, "port": h_port, "status": "up"},
                             cur_h, cur_p, creds)
                     except Exception as _rpe:
@@ -1380,9 +1417,42 @@ def _safe_check_interval():
         return fb
 
 
+_STARTUP_CHECKED = False
+
+
+def _startup_selfcheck():
+    """监控线程首轮跑一次：按 grants_spec 单一真相源核验各集群授权漂移。
+
+    仅观测、不阻断——自愈（ensure_ha_creds）负责实际补齐，本函数让漂移「看得见」。
+    任一集群异常都显式打印，确保「带病运行」能被发现而非静默。
+    """
+    global _STARTUP_CHECKED
+    if _STARTUP_CHECKED:
+        return
+    _STARTUP_CHECKED = True
+    try:
+        for cl in list_clusters():
+            cid = cl.get("id")
+            try:
+                cur_m = get_current_master(cid)
+                if not cur_m:
+                    continue
+                creds = load_creds(cid)
+                mh, mp = cur_m.split(":", 1) if ":" in cur_m else (cur_m, "3306")
+                ok, issues = selfcheck_cluster_grants(cid, mh, mp, creds)
+                for level, msg in issues:
+                    print("[monitor][grants-selfcheck][%s] %s" % (level, msg), flush=True)
+            except Exception as e:
+                print("[monitor][grants-selfcheck] 集群 %s 自检异常(可忽略): %s"
+                      % (cid, e), flush=True)
+    except Exception as e:
+        print("[monitor][grants-selfcheck] 整体异常(可忽略): %s" % e, flush=True)
+
+
 def run_forever():
     print("[monitor] 监控线程启动", flush=True)
     while True:
+        _startup_selfcheck()
         # 三重加固，确保**任何**异常都不会让后台监控线程退出：
         #   ① 各阶段独立 try/except（原有）；
         #   ② 间隔读取走 _safe_check_interval（不抛）+ sleep 再兜一层；

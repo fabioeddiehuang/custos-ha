@@ -84,6 +84,19 @@ MGMT = dict(
 WEB_PORT = int(env("WEB_PORT", 28888))
 WEB_USER = env("WEB_USER", "admin")
 WEB_PASS = env("WEB_PASS", "admin")  # 为空则首次启动随机生成并打印
+# 弱口令清单（首登强制改密）：含常见默认/弱口令，admin/admin 即在此列（对应 Phase 4 安全基线）。
+WEAK_PASSWORDS = {"", "admin", "admin123", "password", "123456", "root",
+                  "custos", "ha", "mysql", "test", "111111", "000000"}
+
+
+def is_weak_password(p):
+    """判断是否为弱口令（首登强制改密依据）。长度<8 或命中弱口令清单即弱。"""
+    p = (p or "").strip()
+    if len(p) < 8:
+        return True
+    if p.lower() in WEAK_PASSWORDS:
+        return True
+    return False
 DEFAULT_SECRET_KEY = "change-me-in-production"
 # 密钥持久化目录（建议挂卷，使容器重建后仍复用同一密钥，避免会话全部失效）。
 DATA_DIR = env("DATA_DIR", "/app/data")
