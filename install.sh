@@ -430,6 +430,11 @@ if [ -n "$OLD_SECRET_KEY" ] && [ ! -f data/secret_key ]; then
   info "已将旧 .env 的 SECRET_KEY 迁移持久化到 data/secret_key（凭据密钥保持不变，升级无感）"
 fi
 
+# 弱口令开关：重跑 install.sh 时沿用 .env 既有值（幂等，不被重置）；全新部署/缺省 = 1（允许弱口令）
+# 写法与 CUR_VER 一致：管道以 tr 收尾，grep 无匹配时退出码仍为 0，不会触发 set -e 中断。
+CUR_ALLOW_WEAK=$(grep -E '^ALLOW_WEAK_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \t\r\n')
+[ -n "$CUR_ALLOW_WEAK" ] || CUR_ALLOW_WEAK=1
+
 umask 077
 cat > .env <<EOF
 # Custos 运行配置（由 install.sh 生成；SECRET_KEY、WEB_PASS、MGMT_MYSQL_PASS 均不写入本文件：SECRET_KEY 由 data/secret_key 持久化，WEB_PASS 与 MGMT_MYSQL_PASS 由 docker-compose.yml 驱动）
@@ -445,6 +450,8 @@ MGMT_MYSQL_DB=$MGMT_DB
 # Web / 网络
 WEB_PORT=$WEB_PORT
 WEB_USER=$WEB_USER
+# 弱口令开关：1=允许（默认，弱口令登录不强制改密、写操作不拦截）；0=安全基线（强制改密+拦截写操作）
+ALLOW_WEAK_PASSWORD=$CUR_ALLOW_WEAK
 MANAGER_PUBLIC_IP=$MGR_IP
 INTERFACE=$IFACE
 VIP=$VIP
