@@ -540,7 +540,13 @@ tar -xzf "$UNIT" -C "$DEST" --strip-components=1 \
 step "环境预检：端口占用"
 if [[ -f "$DEST/docker-compose.yml" || -f "$DEST/docker-compose.yaml" ]]; then
   _cf="$DEST/docker-compose.yml"; [[ -f "$_cf" ]] || _cf="$DEST/docker-compose.yaml"
-  _ports=$(grep -oE '"[0-9]+:[0-9]+"' "$_cf" 2>/dev/null | cut -d: -f1 | tr -d '"' | sort -u)
+  # ⚠ set -euo pipefail 陷阱：裸机节点的 compose 常【没有任何端口映射】（keepalived
+  #   走 network_mode: host、agent 不发布端口），此时 grep 无匹配返回 1，pipefail 让整条
+  #   管道返回 1 → 命令替换赋值失败 → set -e 令脚本【静默退出】：
+  #   不报错、不 die、不上报回执，日志就停在这一步，表现为「安装卡住/失败但无原因」
+  #   （177 裸机安装即死于此处）。必须 || true 兜底，让「解析不到端口」落到下面的
+  #   warn 分支跳过预检，而不是把整个安装杀死。
+  _ports=$(grep -oE '"[0-9]+:[0-9]+"' "$_cf" 2>/dev/null | cut -d: -f1 | tr -d '"' | sort -u || true)
   if [[ -n "$_ports" ]]; then
     for _p in $_ports; do
       if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE "[.:]${_p}([[:space:]]|$)"; then

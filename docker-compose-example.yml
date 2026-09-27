@@ -130,6 +130,12 @@ services:
       # 挂载宿主 docker.sock：使管理器能读取兄弟容器（keepalived / monitor 等）日志。
       # 无需在镜像内安装 docker CLI，直接经 Unix Socket 调 Docker HTTP API。
       - /var/run/docker.sock:/var/run/docker.sock
+      # v2.5.0 F2：节点镜像 tar 托管目录（custos-node-<版本>.tar / python-3-slim.tar）。
+      # 由 scripts/build_node_images.sh 生成在宿主 ./images/，经此挂载供服务端 HTTP
+      # 下发给节点（curl 引导脚本下载后 docker load，解决内网节点拉不到镜像）。
+      # ★缺此挂载＝容器内 /app/images 目录不存在，节点引导下载镜像必然 404
+      #   （镜像包在宿主明明存在、available_images() 也读不到）——新装环境务必保留本行。
+      - ./images:/app/images
     networks:
       - ha_net
 
