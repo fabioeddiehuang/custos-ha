@@ -1031,8 +1031,22 @@ def api_node_image(name: str, token: str = ""):
                         status_code=403, media_type="text/plain; charset=utf-8")
     path = os.path.join(IMAGES_DIR, safe)
     if not os.path.isfile(path):
-        return Response("服务端未托管该镜像包：%s（请先在服务端执行 scripts/build_node_images.sh）"
-                        % safe, status_code=404, media_type="text/plain; charset=utf-8")
+        # 404 分层诊断：「容器内目录不存在＝缺 ./images 挂载」与「目录在但无该
+        # tar＝未构建」是两种完全不同的修法，必须在报错里区分开。
+        if not os.path.isdir(IMAGES_DIR):
+            hint = ("服务端未托管该镜像包：%s。管理器容器内 %s 目录不存在——"
+                    "docker-compose.yml 的 ./images 挂载未生效，请重建管理器容器："
+                    "./scripts/deploy.sh up -d --force-recreate custos-server"
+                    % (safe, IMAGES_DIR))
+        else:
+            try:
+                _have = ", ".join(sorted(os.listdir(IMAGES_DIR))) or "（目录为空）"
+            except OSError:
+                _have = "（目录存在但不可读，请检查挂载目录权限）"
+            hint = ("服务端未托管该镜像包：%s（%s 内现有：%s）。"
+                    "请在服务端宿主机执行 scripts/build_node_images.sh 生成"
+                    % (safe, IMAGES_DIR, _have))
+        return Response(hint, status_code=404, media_type="text/plain; charset=utf-8")
     # 流式下发（FileResponse）：镜像包可能上百 MB，read() 整读进内存会在
     # 多节点同时引导时挤爆管理器容器内存；FileResponse 边读边发并自动带
     # Content-Length / Content-Disposition(attachment)。

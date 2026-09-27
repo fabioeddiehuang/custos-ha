@@ -10,6 +10,7 @@ from app.config import is_weak_password, WEB_PASS
 from app.db import get_conn
 from app.ha_client import connect
 from app.ha_client.db_ops import has_privilege
+from app.bootstrap import available_images
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,26 @@ def selfcheck_manager():
             conn.close()
     except Exception as e:
         issues.append(("error", "管理库不可连或缺失 users 表：%s" % e))
+    # 节点镜像托管自检（v2.5.0 F2）：所有节点形态的 keepalived/agent 都依赖
+    # 服务端托管的 ./images/*.tar。管理器容器若缺 ./images 挂载或未构建镜像包，
+    # 节点引导会在「校正 keepalived 镜像标签」一步失败——必须在启动时就暴露，
+    # 而不是等节点装到一半才报「未找到 custos-node 镜像」。
+    try:
+        import os as _os
+        from .config import IMAGES_DIR
+        if not _os.path.isdir(IMAGES_DIR):
+            issues.append(("warn",
+                           "管理器容器内 %s 不存在：节点引导将拿不到 custos-node/agent "
+                           "镜像包（多半是 docker-compose.yml 的 ./images 挂载未生效，"
+                           "老容器未重建）。请执行 ./scripts/deploy.sh up -d "
+                           "--force-recreate custos-server 重建容器" % IMAGES_DIR))
+        elif not available_images():
+            issues.append(("warn",
+                           "%s 目录为空：未托管任何节点镜像包。请在服务端宿主机执行 "
+                           "scripts/build_node_images.sh 生成 custos-node-<版本>.tar "
+                           "与 python-3-slim.tar" % IMAGES_DIR))
+    except Exception:
+        pass
     if not issues:
         issues.append(("ok", "服务端启动自检通过"))
     return issues

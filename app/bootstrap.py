@@ -428,6 +428,20 @@ def render_bootstrap_script(ip, token, node_type="docker", images=None,
             '  curl -fsSL "$MGR/api/node/image/%s?token=$TOKEN" -o "$TMP/%s.tar" \\\n'
             '    && docker load -i "$TMP/%s.tar"' % (name, name, name))
     img_block = "\n".join(img_lines) if img_lines else "  # 未配置服务端镜像包，节点需本地已有对应镜像"
+    # agent 基础镜像兜底（自愈）：python:3-slim 由服务端按规范名 python-3-slim.tar 托管。
+    # 即使渲染时 available_images() 为空（服务端目录异常/刚补包），这里也按需拉取一次。
+    # 失败不阻断——联网节点 compose up 会自动拉取，仅离线节点受影响（有明确警告）。
+    agent_ensure = (
+        'if ! docker image inspect "python:3-slim" >/dev/null 2>&1; then\n'
+        '  if curl -fsSL "$MGR/api/node/image/python-3-slim?token=$TOKEN" \\\n'
+        '       -o "$TMP/python-3-slim.tar" && docker load -i "$TMP/python-3-slim.tar"; then\n'
+        '    log "已从服务端按需载入 python:3-slim"\n'
+        '  else\n'
+        '    warn "服务端未托管 python-3-slim.tar 且节点本地无该镜像：联网节点会在 compose up 时自动拉取，离线节点的 agent 将起不来"\n'
+        '  fi\n'
+        'fi'
+    )
+    img_block = img_block + "\n" + agent_ensure
 
     install_block = "\n".join('  step "%s"\n  %s' % (c, c) for c in cmds)
 
@@ -439,9 +453,15 @@ def render_bootstrap_script(ip, token, node_type="docker", images=None,
     try:
         from .node_gen import PKG_VERSION, KEEPALIVED_IMAGE_NAME
         _want = "%s:%s" % (KEEPALIVED_IMAGE_NAME, PKG_VERSION)
+        _pkg = "%s-%s" % (KEEPALIVED_IMAGE_NAME, PKG_VERSION)
     except Exception:
         _want = "custos-node:v2.5.0"
+        _pkg = "custos-node-v2.5.0"
     _repo = _want.split(":", 1)[0]
+    # keepalived 镜像标签校正 + 自愈：本地无该镜像时先尝试给旧标签另名；仍无则
+    # 【按规范名从服务端按需拉取】（脚本运行时才渲染，服务端此刻补了包也能救活，
+    # 不必回管理端重新生成命令）。按需拉取也失败才退出，且给出分层诊断：
+    # 「容器内目录不存在＝缺挂载」与「宿主机无 tar＝未构建」是两种不同修法。
     tagfix_block = (
         'step "校正 keepalived 镜像标签（需要 %s）"\n'
         'if ! docker image inspect "%s" >/dev/null 2>&1; then\n'
@@ -449,11 +469,19 @@ def render_bootstrap_script(ip, token, node_type="docker", images=None,
         '  if [ -n "$_src" ]; then\n'
         '    docker tag "$_src" "%s" && echo "  已将 $_src 另标为 %s"\n'
         '  else\n'
-        '    die "未找到 %s 镜像：keepalived 必须来自服务端。请在服务端执行 scripts/build_node_images.sh 生成 ./images/custos-node-<ver>.tar，并确认 docker-compose.yml 已将 ./images 挂载进管理器容器（节点引导会自动 docker load）。"\n'
+        '    step "本地无 %s，尝试从服务端按需载入 %s.tar"\n'
+        '    if curl -fsSL "$MGR/api/node/image/%s?token=$TOKEN" \\\n'
+        '         -o "$TMP/%s.tar" && docker load -i "$TMP/%s.tar" \\\n'
+        '       && docker image inspect "%s" >/dev/null 2>&1; then\n'
+        '      log "已从服务端按需载入 %s"\n'
+        '    else\n'
+        '      die "节点本地与服务端均无 %s 镜像。请在服务端检查：① docker exec custos-server ls /app/images——目录不存在＝管理器容器缺 ./images 挂载，执行 ./scripts/deploy.sh up -d --force-recreate custos-server 重建容器；② 宿主机 ls images/——无 custos-node-<版本>.tar＝未构建，执行 scripts/build_node_images.sh"\n'
+        '    fi\n'
         '  fi\n'
         'else\n'
         '  echo "  镜像 %s 已存在，无需处理"\n'
-        'fi' % (_want, _want, _repo, _want, _want, _repo, _want)
+        'fi' % (_want, _want, _repo, _want, _want, _want, _pkg,
+                _pkg, _pkg, _want, _want, _want, _want, _want)
     )
 
     tpl = r"""#!/usr/bin/env bash
