@@ -414,6 +414,8 @@ UNIT="$TMP/custos-unit.tgz"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
 die()  { printf '\n\033[1;31m[失败] %s\033[0m\n' "$1" >&2; exit 1; }
+log()  { printf '\033[1;32m[信息] %s\033[0m\n' "$1"; }
+warn() { printf '\033[1;33m[警告] %s\033[0m\n' "$1" >&2; }
 trap 'rm -rf "$TMP"' EXIT
 
 # 1) 环境检查：本期仅支持 docker 环境（无 docker 节点的安装留后续版本）
