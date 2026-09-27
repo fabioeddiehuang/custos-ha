@@ -84,6 +84,10 @@ MGMT = dict(
 WEB_PORT = int(env("WEB_PORT", 28888))
 WEB_USER = env("WEB_USER", "admin")
 WEB_PASS = env("WEB_PASS", "admin")  # 为空则首次启动随机生成并打印
+# 是否允许弱口令（默认 1=允许）。设为 1 时关闭「首登强制改密」：
+# 登录弱口令也不再打 ha_must_change cookie，所有写操作不再被拦截。
+# 内网/自测环境可直接使用默认；安全基线要求较高的部署设为 0，弱口令即强制改密且拦截写操作。
+ALLOW_WEAK_PASSWORD = env("ALLOW_WEAK_PASSWORD", "1") == "1"
 # 弱口令清单（首登强制改密）：含常见默认/弱口令，admin/admin 即在此列（对应 Phase 4 安全基线）。
 WEAK_PASSWORDS = {"", "admin", "admin123", "password", "123456", "root",
                   "custos", "ha", "mysql", "test", "111111", "000000"}

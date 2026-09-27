@@ -19,7 +19,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from urllib.parse import quote
 
-from .config import (APP_VERSION, SECRET_KEY, WEB_USER, ROLE_ADMIN, ROLE_VIEWER, rand_secret, get_manager_public_ip, get_manager_public_ip_source, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT, validate_config, hash_pwd, verify_pwd, is_weak_password, FAILOVER_COOLDOWN_SEC)
+from .config import (APP_VERSION, SECRET_KEY, WEB_USER, ROLE_ADMIN, ROLE_VIEWER, rand_secret, get_manager_public_ip, get_manager_public_ip_source, get_manager_docker_subnet_wildcard, get_mgmt_host, MGMT, validate_config, hash_pwd, verify_pwd, is_weak_password, FAILOVER_COOLDOWN_SEC, ALLOW_WEAK_PASSWORD)
 from .db import (query, execute, get_conn, get_setting, upsert_setting,
                  get_user_role, list_users, get_user, create_user, set_user_role,
                  delete_user, count_admins)
@@ -217,7 +217,10 @@ def auth_required(request: Request):
                        "请退出登录后，改用管理员账号重新登录再试。",
             )
         # 首登弱口令强制改密：弱口令未改前，所有写操作被拦截（Phase 4 安全基线）
-        if request.cookies.get("ha_must_change") == "1":
+        # ⚠ 但「修改密码」接口本身必须放行，否则登录弱口令被打上 ha_must_change=1 后，
+        #   该 cookie 又把改密接口自己挡掉 → 用户永远无法改密解锁（死锁），所有写操作永久不可用。
+        #   改密接口仍需校验「当前密码」，放行不会造成越权，是安全且必要的逃生口。
+        if request.cookies.get("ha_must_change") == "1" and request.url.path != "/change_password":
             raise HTTPException(status_code=403,
                                 detail="请先修改密码（当前为默认/弱口令），改密后方可操作")
     return user
@@ -352,7 +355,8 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     resp = RedirectResponse("/", status_code=303)
     resp.set_cookie(COOKIE, serializer.dumps(username), httponly=True)
     # 首登弱口令强制改密：弱口令登录后打标记，后端拦截写操作，前端弹改密框
-    if is_weak_password(password):
+    #   允许弱口令模式（ALLOW_WEAK_PASSWORD=1，内网/测试自便）下不打标记，写操作不被拦截。
+    if is_weak_password(password) and not ALLOW_WEAK_PASSWORD:
         resp.set_cookie("ha_must_change", "1", httponly=True, max_age=60 * 60 * 24 * 365)
     else:
         resp.delete_cookie("ha_must_change")

@@ -76,6 +76,10 @@ services:
       WEB_PORT: 28888
       WEB_USER: admin
       WEB_PASS: ""   # 留空=首次启动随机生成并打印到日志；填写=固定密码（生产务必修改）
+      # 弱口令开关（默认 1=允许）：1=弱口令登录不强制改密、写操作不拦截（内网/自测图省事）；
+      #                          0=恢复安全基线（弱口令首登强制改密 + 拦截写操作）。
+      # 可由 .env 的 ALLOW_WEAK_PASSWORD=0 覆盖（安全要求高的部署建议置 0）。
+      ALLOW_WEAK_PASSWORD: "${ALLOW_WEAK_PASSWORD:-1}"
       SECRET_KEY: "${SECRET_KEY}"   # 留空（不在 .env 设置）则首次启动自动生成随机密钥并持久化到 ./data/secret_key；或在 .env 设置 SECRET_KEY=<强随机值> 固定
       # 管理库凭证（root/ha/repl/app 口令）静态加密开关：
       #   "off"（默认）—— 明文落库，**完全不依赖任何密钥**，SECRET_KEY 变动 / 重装 / 重建镜像
