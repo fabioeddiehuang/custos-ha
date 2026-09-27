@@ -124,39 +124,6 @@ COPY --from=mysqlcli-dump /usr/bin/mariadb-dump /usr/bin/mariadb-dump
 # 供 engine_adapter 在 mysql 方言下按名字查找；真实方言由 tool_dialect 实测 --help 参数决定）。
 RUN ln -sf /usr/bin/mariadb-dump /usr/bin/mysqldump && ln -sf /usr/bin/mariadb /usr/bin/mysql
 
-# ---------------------------------------------------------------------------
-# 节点镜像自助生成（v2.5.0 F2 根治）：根治「服务端忘跑 build_node_images.sh →
-# ./images 为空 → 节点引导卡在 keepalived 镜像标签」。
-#   compose 已把 ./images 挂进容器、并把 /var/run/docker.sock 挂进容器；本步只
-#   需在镜像内放入【docker 客户端】，entrypoint 便可在启动时若缺包则驱动宿主
-#   Docker 重新 build+save（复用 scripts/build_node_images.sh，逻辑与手工一致）。
-#   仅下载客户端二进制（~25MB，不含 dockerd/containerd），多镜像源兜底；下载失败
-#   仅告警、不阻断构建/启动（退回「服务端预构建 ./images」的既有路径）。
-# ---------------------------------------------------------------------------
-RUN set -e; \
-  python3 - <<'PY'
-import urllib.request, tarfile, io, os, sys
-VER = "27.5.1"
-urls = [
-  "https://download.docker.com/linux/static/stable/x86_64/docker-%s.tgz" % VER,
-  "https://mirrors.tencent.com/docker-ce/linux/static/stable/x86_64/docker-%s.tgz" % VER,
-  "https://mirrors.aliyun.com/docker-ce/linux/static/stable/x86_64/docker-%s.tgz" % VER,
-  "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/x86_64/docker-%s.tgz" % VER,
-]
-for u in urls:
-    try:
-        print("下载 docker CLI:", u, flush=True)
-        data = urllib.request.urlopen(u, timeout=60).read()
-        tarfile.open(fileobj=io.BytesIO(data)).extract("docker/docker", "/usr/local/bin")
-        os.chmod("/usr/local/bin/docker", 0o755)
-        print("docker CLI 已安装 ->", os.path.realpath("/usr/local/bin/docker"), flush=True)
-        break
-    except Exception as e:
-        print("  失败:", e, flush=True)
-else:
-    print("WARN: 未能下载 docker CLI，节点镜像自助生成将不可用（依赖服务端预构建 ./images）", file=sys.stderr)
-PY
-
 # 依赖装完后再引入随版本变化的元数据：LABEL 内含 ${VERSION}，
 # 若放在 pip 之前，每次升版都会使该层及其后所有层缓存失效 → 依赖被反复重装。
 ARG VERSION
