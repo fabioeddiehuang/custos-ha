@@ -22,9 +22,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="$(grep -E '^VERSION=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r' | xargs || true)"
+VERSION="${VERSION:-$(grep -E '^VERSION=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r' | xargs || true)}"
 if [ -z "${VERSION:-}" ]; then
-  echo "[错误] 未能从 .env 读取 VERSION=，请先设置（升版只改这一处）" >&2
+  echo "[错误] 未能从环境变量 VERSION 或 .env 读取 VERSION=，请先设置（升版只改这一处）" >&2
   exit 1
 fi
 # 镜像标签必须与 compose 里 keepalived 的 image **逐字符一致**，否则
@@ -58,6 +58,23 @@ save_compressed() {  # $1=镜像名  $2=输出 .tar 路径
   fi
 }
 
+prune_old() {
+  # 删除旧版本 custos-node tar，仅保留当前 custos-node-${TAG}.tar：
+  # 否则 available_images() 会把过期版本也一起下发给节点、导致重复 docker load
+  # （既浪费流量，又可能让节点误 load 到非当前版本镜像）。python-3-slim.tar
+  # 不带版本号、永远只有一个且被覆盖写，无需清理。
+  local keep="custos-node-${TAG}.tar"
+  local removed=0
+  for f in "$IMAGES_DIR"/custos-node-*.tar; do
+    [ -e "$f" ] || continue
+    [ "$(basename "$f")" = "$keep" ] && continue
+    echo "==> 清理旧版本镜像包：$(basename "$f")"
+    rm -f "$f"
+    removed=1
+  done
+  [ "$removed" = 0 ] || echo "==> 已用新版本 ${TAG} 覆盖旧 tar"
+}
+
 build_keepalived() {
   local ctx="app/node_assets/keepalived"
   if [ ! -f "$ctx/Dockerfile" ]; then
@@ -71,6 +88,8 @@ build_keepalived() {
   # available_images() 会把目录下每个 tar 都列出来让节点逐个 docker load，
   # 存两份同内容的包等于让每个节点多下载约 70MB 并重复 load 一次。
   save_compressed "custos-node:${TAG}" "$IMAGES_DIR/custos-node-${TAG}.tar"
+  # 导出完成后，删掉目录里残留的旧版本 tar（自动「旧→新」替换）
+  prune_old
 }
 
 save_agent_image() {

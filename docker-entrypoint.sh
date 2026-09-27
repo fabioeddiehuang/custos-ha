@@ -37,6 +37,11 @@ fi
 echo "[entrypoint] 初始化库表与管理员账号..."
 python -m app.init_db
 
+# v2.5.0 F2 根治：启动期自检节点镜像包，缺失则经 docker.sock 自助生成
+# （复用 scripts/build_node_images.sh）。非阻断——失败时仅告警，节点引导会给出精确诊断。
+echo "[entrypoint] 自检节点镜像包（缺失则经 docker.sock 自助生成）..."
+bash scripts/ensure_node_images.sh || echo "[entrypoint] 节点镜像自检未完全（见上方日志）；若节点引导报缺镜像，请服务端执行 scripts/build_node_images.sh"
+
 WEB_PORT=${WEB_PORT:-28888}
 echo "[entrypoint] 启动 Web 管理后台 (端口 ${WEB_PORT})..."
 echo "[entrypoint] 注：后台监控线程已改为随 Web 进程内常驻（uvicorn 加载 app.api 时自动拉起），无需单独启动。"
