@@ -488,65 +488,16 @@ def run_backup(cid, host, port, databases=None, with_data: bool = True,
                 snap_conn = None
 
         total = {"tables": 0, "views": 0, "rows": 0}
-        # v2.3.4：多库全备改为「目录模式」——每库一个 .sql.gz + index.json。
-        # 价值：恢复指定库时只读对应文件，不必解压整库全集（库多/库大时差异显著）；
-        # 单库备份与「指定库」备份仍走单文件，保持兼容。
-        multi = (len(targets) >= 2 and scope == "all")
-        if multi:
-            set_dir = bdir / f"{label}_{ts}"
-            set_dir.mkdir(parents=True, exist_ok=True)
-            index = {
-                "ts": ts,
-                "time": now_cn().strftime("%Y-%m-%d %H:%M:%S"),
-                "timezone": "Asia/Shanghai (UTC+8)",
-                "cluster_id": int(cid),
-                "cluster_name": _cluster_dir_name(cid),
-                "label": label,
-                "host": host, "port": int(port),
-                "scope": scope,
-                "kind": "set",
-                "databases": [],
-                "with_data": bool(with_data),
-                "tables": 0, "views": 0, "rows": 0, "size": 0,
-                "file": set_dir.name,
-                "position": position,
-                "consistent": bool(snap_ok and with_data),
-            }
-            with conn.cursor() as cur:
-                for db in targets:
-                    db_path = set_dir / f"{db}.sql.gz"
-                    with gzip.open(db_path, "wt", encoding="utf-8", newline="\n") as f:
-                        def w(s):
-                            f.write(s)
-                        _write_backup_header(w, cid, host, port, scope, [db],
-                                             with_data, position, snap_ok, snap_err)
-                        st = _dump_database(conn, cur, w, db, with_data,
-                                            host=host, port=port, cid=cid,
-                                            data_conn=snap_conn)
-                        total["tables"] += st["tables"]
-                        total["views"] += st["views"]
-                        total["rows"] += st["rows"]
-                        w("SET FOREIGN_KEY_CHECKS=1;\n")
-                        w("SET UNIQUE_CHECKS=1;\n")
-                        w("COMMIT;\n")
-                        w("-- 备份结束\n")
-                    index["databases"].append(db)
-                    index["size"] += db_path.stat().st_size
-            # 数据全部导出完毕后才提交快照事务，释放一致性视图
-            if snap_conn is not None:
-                try:
-                    with snap_conn.cursor() as _c:
-                        _c.execute("COMMIT")
-                except Exception:
-                    pass
-            index["tables"] = total["tables"]
-            index["views"] = total["views"]
-            index["rows"] = total["rows"]
-            (set_dir / "index.json").write_text(
-                json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
-            return {"ok": True, "file": set_dir.name, "meta": index}
+        # ★ 全库备份必须是【一个完整文件】（与 backup.py 顶部声明的产物格式一致）：
+        #     /app/backups/<集群名称>/All-Databases_<YYYYmmdd-HHMMSS>.sql.gz
+        # v2.3.4 曾把「业务库 >= 2 个的全备」改成【分库集目录】（每库一个 .sql.gz +
+        # index.json），偏离了该要求：产物不再是单一文件，备份页「下载」按钮直接 500
+        # （下载端点对目录 read_bytes 会抛 IsADirectoryError，见 /api/backup/download）。
+        # 现统一走单文件模式：全备 / 单库 / 指定库都产出单个 .sql.gz，便于下载、归档与恢复。
+        # 注：历史上已生成的分库集目录仍可被列出 / 预览 / 恢复 / 下载（list_backups、
+        # restore_backup、api_backup_download 均已兼容目录形态），不受本次变更影响。
 
-        # 单文件模式（单库 / 指定库并集）——兼容老备份格式
+        # 单文件模式（全库 / 单库 / 指定库并集）
         meta_path = bdir / f"{label}_{ts}.meta.json"
         with conn.cursor() as cur:
             with gzip.open(sql_path, "wt", encoding="utf-8", newline="\n") as f:
