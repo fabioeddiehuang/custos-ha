@@ -2495,15 +2495,48 @@ def api_backup_preview(cluster_id: int = 0, file: str = "",
 @app.get("/api/backup/download")
 def api_backup_download(cluster_id: int = 0, file: str = "",
                         user=Depends(auth_required)):
-    """下载备份文件。"""
+    """下载备份产物。
+
+    ⚠ 必须同时支持两种形态（v2.3.4 起）：
+      - 单文件备份：<name>.sql.gz
+      - 分库集备份：<name>/ 目录（全库备份且业务库 >= 2 个时走这种，
+        内部每库一个 .sql.gz + index.json，kind="set"）
+    旧实现统一 `p.read_bytes()`：对目录必然抛 IsADirectoryError([Errno 21])，
+    且该异常在 try 之外 → 直接 500，「备份/恢复」页下载按钮点了没反应
+    （生产 1.100 实测：All-Databases_20260929-020834 即目录形态，无法下载）。
+    现在：目录 → 打包成 <name>.tar.gz 流式下发；单文件 → 同样改流式，
+    避免把整份备份（可能上 GB）一次性读进管理器容器内存。
+    """
     try:
         p = backup.get_backup_path(int(cluster_id), file)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)})
-    data = p.read_bytes()
-    return Response(
-        content=data, media_type="application/gzip",
-        headers={"Content-Disposition": f'attachment; filename="{p.name}"'})
+    try:
+        if p.is_dir():
+            import tarfile
+            import tempfile
+            from starlette.background import BackgroundTask
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="bkdl-", suffix=".tar.gz", delete=False)
+            tmp.close()
+            try:
+                # arcname 用目录名：解压后得到同名目录，与备份目录结构一致
+                with tarfile.open(tmp.name, "w:gz") as tf:
+                    tf.add(str(p), arcname=p.name)
+            except Exception as _te:
+                try:
+                    os.remove(tmp.name)
+                except OSError:
+                    pass
+                return JSONResponse(
+                    {"ok": False, "error": f"打包分库集备份失败：{_te}"})
+            return FileResponse(
+                tmp.name, media_type="application/gzip",
+                filename="%s.tar.gz" % p.name,
+                background=BackgroundTask(os.remove, tmp.name))
+        return FileResponse(str(p), media_type="application/gzip", filename=p.name)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
 
 
 @app.get("/api/cred_status")

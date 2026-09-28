@@ -609,10 +609,17 @@
                             : ("失败："+ (x.error||"未知"));
             var resBadge = ok ? '<span class="badge sky">成功</span>'
                               : '<span class="badge warn">失败</span>';
+            // 记录里有、磁盘上已没有：这是一份【不可用】的备份，必须醒目标出，
+            // 否则会让人误以为还有可用备份（真正要恢复时才发现文件根本不存在）。
+            var fileCell = esc(x.file||"—");
+            if(x.file_missing){
+              fileCell += ' <span class="badge warn" title="该备份文件已不在备份目录中（可能被清理或手工删除），不可用于恢复">文件已不存在</span>';
+              resBadge = '<span class="badge warn">不可用</span>';
+            }
             return '<tr>'
               +'<td class="mono">'+esc(x.time)+'</td>'
               +'<td class="mono">'+esc(x.source)+'</td>'
-              +'<td class="mono wrap">'+esc(x.file||"—")+'</td>'
+              +'<td class="mono wrap">'+fileCell+'</td>'
               +'<td>'+esc(scope)+' <span class="bk-scope">'+esc(dbs)+'</span></td>'
               +'<td>'+resBadge+' '+esc(resTxt)+'</td>'
               +'<td>'+esc(x.operator||"—")+'</td>'

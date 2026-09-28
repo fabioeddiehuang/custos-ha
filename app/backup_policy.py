@@ -130,14 +130,36 @@ def purge(cluster_id, retention_days, retention_count):
         cnt = int(retention_count or 0)
         if cnt > 0:
             files = _list_backup_files(cluster_id)
-            # 按时间倒序，保留最新 cnt 份
+            # 按时间倒序，保留最新 cnt 份（最新一份永不在 extra 里）
             extra = files[cnt:]
+            removed = []
             for f in extra:
                 try:
-                    os.remove(f)
+                    if os.path.isdir(f):
+                        # 分库集备份（目录）：os.remove 会报 IsADirectoryError
+                        import shutil as _sh
+                        _sh.rmtree(f, ignore_errors=True)
+                    else:
+                        os.remove(f)
+                        # 连带删除配套元信息，避免留下孤儿 .meta.json
+                        mp = (f[:-len(".sql.gz")] + ".meta.json"
+                              if f.endswith(".sql.gz") else None)
+                        if mp and os.path.exists(mp):
+                            try:
+                                os.remove(mp)
+                            except OSError:
+                                pass
+                    removed.append(os.path.basename(f))
                     out["by_count"].append(os.path.basename(f))
                 except Exception as e:
                     log.warning("删除过期备份失败 %s：%s", f, e)
+            # 同步清理备份记录：否则「备份记录」页签会继续列出这些已删除的备份
+            if removed:
+                try:
+                    from . import backup as _bk
+                    _bk._remove_history_entries(cluster_id, removed)
+                except Exception as e:
+                    log.warning("清理备份记录失败（集群 %s）：%s", cluster_id, e)
             out["kept"] = min(len(files), cnt)
     except Exception as e:
         log.warning("按份数清理备份失败（集群 %s）：%s", cluster_id, e)
@@ -145,7 +167,14 @@ def purge(cluster_id, retention_days, retention_count):
 
 
 def _list_backup_files(cluster_id):
-    """列出该集群备份文件（按修改时间倒序）。"""
+    """列出该集群备份产物（按修改时间倒序）。
+
+    ⚠ 必须同时覆盖两种形态：
+      - 单文件备份：<name>.sql.gz
+      - 分库集备份：<name>/ 目录（全库备份在「业务库 >= 2 个」时走这种，
+        内部每库一个 .sql.gz + index.json）
+    早期版本只认第一种，导致**分库集永远不参与按份数保留**，只增不减直至撑爆备份盘。
+    """
     from . import backup
     try:
         d = backup._dir(cluster_id)
@@ -158,16 +187,26 @@ def _list_backup_files(cluster_id):
         p = os.path.join(d, name)
         if os.path.isfile(p) and name.endswith((".sql", ".sql.gz", ".gz")):
             files.append(p)
+        elif os.path.isdir(p) and os.path.isfile(os.path.join(p, "index.json")):
+            files.append(p)          # 分库集备份（目录形态）
     files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
     return files
 
 
 def usage_bytes(cluster_id):
-    """备份占用字节数（磁盘预警用）。"""
+    """备份占用字节数（磁盘预警用）。分库集（目录）递归求和，避免预警严重低报。"""
     total = 0
     for f in _list_backup_files(cluster_id):
         try:
-            total += os.path.getsize(f)
+            if os.path.isdir(f):
+                for root, _dirs, names in os.walk(f):
+                    for n in names:
+                        try:
+                            total += os.path.getsize(os.path.join(root, n))
+                        except OSError:
+                            pass
+            else:
+                total += os.path.getsize(f)
         except OSError:
             pass
     return total
