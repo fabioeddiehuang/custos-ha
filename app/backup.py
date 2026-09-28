@@ -50,7 +50,12 @@ from pymysql.cursors import SSCursor
 BACKUP_ROOT = Path(os.environ.get("BACKUPS_DIR") or "/app/backups")
 
 # 系统库不参与备份
-SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys", "ndbinfo"}
+# ha_local：Custos 的【节点本地状态库】（keepalived 检查脚本据其 current_master 判定 VIP 归属）。
+#   它由管理端逐节点直连写入、绝不参与复制，**不是业务数据**。若被备份进去，恢复时会把
+#   备份时刻【过期的 current_master】一并写回节点 —— 该节点可能因此自认为主库，与真正的
+#   当前主库形成双主 / VIP 乱漂（脑裂）。故必须与系统库同等对待、排除在备份之外。
+SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys", "ndbinfo",
+              "ha_local"}
 
 # 单条 INSERT 的近似体积上限（字节）。超过就切一条新 INSERT，
 # 避免单条语句超过 max_allowed_packet 导致恢复失败。
@@ -670,10 +675,16 @@ def list_backups(cid):
 
 
 def purge_old_backups(cid, days):
-    """按保留天数清理过期备份（连带删除配套 .meta.json）。
+    """按保留天数清理过期备份（连带删除配套 .meta.json / 分库集目录）。
 
     days<=0 表示不清理。以文件 mtime 判定（与备份时间戳同为本地时间）。
     返回 {"deleted": [文件名...], "kept": 保留份数}。
+
+    ⚠ 修复（此前只扫单文件）：全库备份在「业务库 >= 2 个」时是**分库集目录**
+    （<label>_<ts>/，内部每库一个 .sql.gz + index.json），而旧实现只在父目录 glob
+    `*.sql.gz` —— 父目录根本匹配不到这些嵌套文件，于是**默认的全库备份永远不会被
+    按天数清理**，只增不减直至撑爆备份盘（盘满后新备份必然失败＝「不能备份」）。
+    这里把分库集目录一并纳入判定。
     """
     try:
         days = int(days or 0)
@@ -683,7 +694,8 @@ def purge_old_backups(cid, days):
         return {"deleted": [], "kept": 0}
     cutoff = time.time() - days * 86400
     deleted, kept = [], 0
-    for p in _dir(cid).glob("*.sql.gz"):
+    d = _dir(cid)
+    for p in d.glob("*.sql.gz"):
         try:
             if p.stat().st_mtime < cutoff:
                 meta_p = p.with_suffix("").with_suffix(".meta.json")
@@ -695,7 +707,50 @@ def purge_old_backups(cid, days):
                 kept += 1
         except Exception:
             kept += 1
+    # 分库集备份（目录形态）
+    import shutil as _sh
+    for idx in d.glob("*/index.json"):
+        set_dir = idx.parent
+        try:
+            if set_dir.stat().st_mtime < cutoff:
+                _sh.rmtree(set_dir, ignore_errors=True)
+                deleted.append(set_dir.name)
+            else:
+                kept += 1
+        except Exception:
+            kept += 1
+    if deleted:
+        _remove_history_entries(cid, deleted)
     return {"deleted": deleted, "kept": kept}
+
+
+def _remove_history_entries(cid, names) -> int:
+    """删除备份产物后，同步移除 backup_history.json 中的对应条目。
+
+    为什么必须做：备份记录（「备份记录」页签）与磁盘文件是两份独立数据。删除/清理
+    备份时若只删文件、不动记录，页面会继续显示一份【磁盘上已不存在】的备份
+    （生产 1.100 实测：记录里显示备份成功、backup 目录下却没有文件）——运维据此
+    误以为存在可用备份，真正需要恢复时才发现文件根本不存在。删文件必须连带清记录。
+    """
+    try:
+        want = {str(n) for n in (names or []) if n}
+        if not want:
+            return 0
+        p = _dir(cid) / _BACKUP_HISTORY
+        if not p.exists():
+            return 0
+        arr = json.loads(p.read_text(encoding="utf-8")) or []
+        if not isinstance(arr, list):
+            return 0
+        kept = [r for r in arr
+                if not (isinstance(r, dict) and str(r.get("file") or "") in want)]
+        removed = len(arr) - len(kept)
+        if removed:
+            p.write_text(json.dumps(kept, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+        return removed
+    except Exception:
+        return 0
 
 
 def get_backup_path(cid, filename: str) -> Path:
@@ -716,6 +771,12 @@ def delete_backup(cid, filename: str):
         shutil.rmtree(p, ignore_errors=True)
     else:
         p.unlink()
+    # 连带清理备份记录：否则「备份记录」页签会继续显示这份已删除的备份，
+    # 让人误以为还有可用备份（见 _remove_history_entries 说明）。
+    try:
+        _remove_history_entries(cid, [p.name])
+    except Exception:
+        pass
     # 元数据可能以 <name>.meta.json（单文件）或 <name>/index.json（目录）形式存在
     for cand in (p.with_suffix("").with_suffix(".meta.json"), p / "index.json",
                  p / ".meta.json"):
@@ -1248,7 +1309,13 @@ def record_backup(cid, record: dict) -> None:
 
 
 def list_backup_records(cid, limit: int = 100) -> list:
-    """读取备份记录（倒序，最新在前）。"""
+    """读取备份记录（倒序，最新在前）。
+
+    ⚠ 记录与磁盘并非原子同步（历史存量条目 / 早期版本删除未联动清理 / 外部手工删文件），
+    故每条都回查一次磁盘并标出 `file_missing`：页面据此把「记录里有、磁盘上已没有」的
+    条目明确标为【文件已不存在】，避免运维误以为存在可用备份——这正是生产 1.100
+    「备份记录显示成功、backup 目录下却没有文件」的表现。
+    """
     try:
         p = _dir(cid) / _BACKUP_HISTORY
         if not p.exists():
@@ -1256,6 +1323,16 @@ def list_backup_records(cid, limit: int = 100) -> list:
         arr = json.loads(p.read_text(encoding="utf-8")) or []
         if not isinstance(arr, list):
             return []
-        return arr[:limit]
+        d = _dir(cid)
+        out = []
+        for r in arr[:limit]:
+            if not isinstance(r, dict):
+                out.append(r)
+                continue
+            fn = str(r.get("file") or "")
+            rr = dict(r)
+            rr["file_missing"] = bool(fn) and not (d / fn).exists()
+            out.append(rr)
+        return out
     except Exception:
         return []
