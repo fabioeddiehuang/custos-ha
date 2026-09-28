@@ -626,6 +626,49 @@ def _gtid_slave_is_subset(cur, slave_pos, master_pos, flavour):
     return gtid_slave_is_subset(cur, slave_pos, master_pos, flavour)
 
 
+def _reset_master(cur, host=None, port=None, attempts=3):
+    """执行 RESET MASTER；遇「binlog 正被从库读取」时清理 Binlog Dump 连接后重试。
+
+    根治 4243（MariaDB）/ 等价错误：
+      'Cannot execute RESET MASTER as the binlog is in use by a connected slave
+       or other binlog reader ... use KILL to stop such readers'
+    场景：把【刚退位的旧主】重挂为新主库的从库时，它可能仍有下游从库（旧拓扑的
+    213）正在拉取它的 binlog，此时 RESET MASTER 必然失败 → 旧主无法干净重入，
+    只能落到「常规重链」的降级路径，复制长期不稳。
+    处理：按服务端错误提示，KILL 掉本节点上的 Binlog Dump 线程（从库 IO 线程会
+    自动重连，不影响已重指向的节点），稍等后重试。
+    MariaDB / MySQL 通用（SHOW PROCESSLIST + KILL 两者都支持）。
+    """
+    for _i in range(1, int(attempts) + 1):
+        try:
+            cur.execute("RESET MASTER")
+            return True, None
+        except Exception as e:
+            _msg = str(e)
+            if not (_msg.__contains__("in use by a connected slave")
+                    or _msg.__contains__("binlog reader")
+                    or "4243" in _msg):
+                return False, _msg
+            _killed = 0
+            try:
+                cur.execute("SHOW PROCESSLIST")
+                for row in (cur.fetchall() or []):
+                    # (Id, User, Host, db, Command, Time, State, Info, ...)
+                    _cmd = str(row[4]).lower() if len(row) > 4 else ""
+                    if "binlog dump" in _cmd:
+                        try:
+                            cur.execute("KILL %s" % int(row[0]))
+                            _killed += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            print("[gtid] %s:%s RESET MASTER 被从库占用(4243)，已 KILL %d 个 Binlog Dump 连接，"
+                  "重试 %d/%d" % (host, port, _killed, _i, attempts))
+            time.sleep(2)
+    return False, "RESET MASTER 重试耗尽：binlog 仍被从库占用"
+
+
 def make_slave_of(host, port, user, password, master_host, master_port,
                   repl_user, repl_pass, root_user="root", root_pass="",
                   repl_mode=None, log_file=None, log_pos=None):
@@ -805,7 +848,38 @@ def make_slave_of(host, port, user, password, master_host, master_port,
             cur.execute("SELECT @@gtid_slave_pos, @@gtid_binlog_pos")
             _sr = cur.fetchone() or [None, None]
             _slave_gt = _sr[0] or ""
-            _own_gt = _sr[1] or ""
+            _own_gt_all = _sr[1] or ""
+            # ★「曾为源」判定修正（2026-09-28 根治）：
+            #   旧实现把 gtid_binlog_pos【非空】直接当作「本节点曾为主库」。但启用
+            #   log_slave_updates 的普通从库，其 binlog 里必然含【中继自主库】的事务
+            #   ——实测 213 的 binlog 含 "223-223-30"，而 223 是 203 的 server_id，
+            #   它从未当过主库。于是每个普通从库都被误判成「曾为源」并遭 RESET MASTER
+            #   清空 binlog，这正是「切换后某些从库莫名被清 binlog、下游复制被掐断」
+            #   的真正源头。
+            #   正确判据：只统计【本节点自己产生】的 GTID——
+            #     MariaDB: GTID 形如 domain-server-seq，取 server 分量 == @@server_id
+            #     MySQL  : GTID 形如 uuid:区间，取 uuid == @@server_uuid
+            #   （两 flavour 各自的「自身标识」不同，必须分开取，不能混用。）
+            _own_gt = ""
+            try:
+                _mine = []
+                if flavour == F_MARIADB:
+                    cur.execute("SELECT @@server_id")
+                    _sid = str((cur.fetchone() or [None])[0] or "").strip()
+                    for _p in [x.strip() for x in (_own_gt_all or "").split(",") if x.strip()]:
+                        _f = _p.split("-")
+                        if _sid and len(_f) >= 2 and _f[1].strip() == _sid:
+                            _mine.append(_p)
+                else:
+                    cur.execute("SELECT @@server_uuid")
+                    _uuid = str((cur.fetchone() or [None])[0] or "").strip().lower()
+                    for _p in [x.strip() for x in (_own_gt_all or "").split(",") if x.strip()]:
+                        if ":" in _p and _p.split(":", 1)[0].strip().lower() == _uuid:
+                            _mine.append(_p)
+                _own_gt = ",".join(_mine)
+            except Exception as _e:
+                print("[gtid] 自身GTID判定失败(回退旧判据): %s" % _e)
+                _own_gt = _own_gt_all
             _mconn = connect_robust(master_host, int(master_port), user, password, root_user, root_pass)
             if _mconn is not None:
                 _mcur = _mconn.cursor()
@@ -826,7 +900,10 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                         try:
                             cur.execute(stop_replication_sql(flavour))
                             cur.execute(reset_replica_sql(flavour))
-                            cur.execute("RESET MASTER")
+                            _ok_rm, _err_rm = _reset_master(cur, host, port)
+                            if not _ok_rm:
+                                print("[gtid] %s:%s RESET MASTER 失败(可忽略，继续常规重链): %s"
+                                      % (host, port, _err_rm))
                             # 【回归 2.2.20 行为 2026-09-24】复制起点的设定：
                             # 2.4.x 曾先后改为「对齐主库当前位点」和「用自有 GTID 作起点」，两者在
                             # 已应用集(gtid_slave_pos)为空时都会**跳过本节点缺失的事务** ⇒ 复制
@@ -860,7 +937,10 @@ def make_slave_of(host, port, user, password, master_host, master_port,
                         try:
                             cur.execute(stop_replication_sql(flavour))
                             cur.execute(reset_replica_sql(flavour))
-                            cur.execute("RESET MASTER")
+                            _ok_rm, _err_rm = _reset_master(cur, host, port)
+                            if not _ok_rm:
+                                print("[gtid] %s:%s RESET MASTER 失败(可忽略，继续常规重链): %s"
+                                      % (host, port, _err_rm))
                             if _slave_gt and not _pos_ok:
                                 # 已应用集也不一致：对齐到主库当前位置，跳过重放避免 1236
                                 cur.execute("SET GLOBAL gtid_slave_pos=%s", (_master_gt,))

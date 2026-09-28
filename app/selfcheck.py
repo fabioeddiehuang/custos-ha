@@ -5,6 +5,7 @@
 对应 MR3/MR4：初始化与运行时一致、权限齐备、弱口令暴露。
 """
 import logging
+import time
 
 from app.config import is_weak_password, WEB_PASS
 from app.db import get_conn
@@ -60,13 +61,32 @@ def selfcheck_manager():
     return issues
 
 
-def selfcheck_node(host, port, user, password):
-    """节点接入自检：关键特权齐备。返回 (ok, [(level, msg)])。"""
+def selfcheck_node(host, port, user, password, retries=3, retry_delay=3):
+    """节点接入自检：关键特权齐备。返回 (ok, [(level, msg)])。
+
+    连接阶段带【有限重试】：刚装完 / 刚重启的节点，mariadbd 可能仍在初始化或正被
+    systemd 重启，此时连接会被掐断，典型报错正是
+    `(2013, 'Lost connection to MySQL server during query')`（或 2003）。
+    这属【瞬时故障】而非真不可连——一次失败就判 error，会在节点 ready 回执时刷出
+    误导性报错（节点其实已装好），甚至让 deploy_state 停在 registered。
+    故连接失败按固定间隔重试若干次再定性；健康节点首次即成功，不增加任何开销。
+    """
     issues = []
-    try:
-        conn = connect(host, port, user, password)
-    except Exception as e:
-        return False, [("error", "节点不可连：%s" % e)]
+    conn = None
+    last_err = None
+    _n = max(1, int(retries or 1))
+    for attempt in range(1, _n + 1):
+        try:
+            conn = connect(host, port, user, password)
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < _n:
+                log.warning("节点 %s 自检连接失败（第 %d/%d 次：%s），%ss 后重试",
+                            host, attempt, _n, e, retry_delay)
+                time.sleep(retry_delay)
+    if conn is None:
+        return False, [("error", "节点不可连（已重试 %d 次）：%s" % (_n, last_err))]
     try:
         cur = conn.cursor()
         for priv in NODE_REQUIRED_PRIVS:

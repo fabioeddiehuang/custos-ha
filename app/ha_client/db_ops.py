@@ -93,10 +93,21 @@ def gtid_slave_is_subset(cur, slave_pos, master_pos, flavour):
     return _covered_by_positions(master_pos, slave_pos)
 
 
+def _norm_priv(name):
+    """特权名归一化：大小写不敏感，且【空格/连字符与下划线等价】。
+
+    MariaDB 的 SHOW PRIVILEGES / SHOW GRANTS 用下划线形式（READ_ONLY ADMIN），
+    而代码里的特权清单常写成空格形式（READ ONLY ADMIN）——它们是同一个特权。
+    此前按字符串精确比对，会把「已授权」误判为「缺少特权」，刷出误导性告警
+    （203/177 实际已授权 READ_ONLY ADMIN，却一直告警缺失）。统一归一化后比对。
+    """
+    return (name or "").strip().upper().replace(" ", "_").replace("-", "_")
+
+
 def has_privilege(cur, priv_name):
     """用 ``SHOW PRIVILEGES`` 能力探测（不按版本号硬编码，对应 TODO 1.1 / MR1）。
 
-    返回 True 表示当前连接账号实际拥有该特权名（大小写不敏感匹配）。
+    返回 True 表示当前连接账号实际拥有该特权名（大小写不敏感、空格/下划线等价匹配）。
     用于「按服务器真实支持的特权集过滤授权」，避免猜错即 1064/1227。
     """
     try:
@@ -105,10 +116,9 @@ def has_privilege(cur, priv_name):
     except Exception as e:
         log.debug("has_privilege: SHOW PRIVILEGES 失败: %s", e)
         return False
-    want = (priv_name or "").upper()
+    want = _norm_priv(priv_name)
     for r in (rows or []):
         # 每行: (Privilege, Context, Comment)
-        name = (r[0] if r else "").upper()
-        if name == want:
+        if _norm_priv(r[0] if r else "") == want:
             return True
     return False

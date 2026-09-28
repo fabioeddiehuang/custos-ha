@@ -665,6 +665,46 @@ def confirm_master_down(cluster_id, master_host, master_port, creds, node_root_f
 
 
 @_failover_guarded
+def _sort_repoint_targets(others, st_map):
+    """待重指向节点排序：【叶子从库先】→【仍被他人当作上游的节点后】。
+
+    ⚠ 顺序铁律（根治「切换后某个从库突然复制中断」）：
+      make_slave_of 对「曾为源（自有 binlog GTID 非空）」的节点会执行 **RESET MASTER**
+      清空其 binlog，以解除 gtid_strict_mode 下的 out-of-order 乱序冲突——刚退位的
+      旧主必然命中该分支。若该节点此时仍是其它从库的上游（旧拓扑 177/213 → 203），
+      清空 binlog 会让那些下游【瞬间丢失数据源】，IO 线程报错停止，表现为
+      「213 突然复制中断」且此后长期挂在幽灵旧主上。
+      因此必须先把下游（叶子节点）摘走挂到新主，最后才动仍被他人依赖的上游节点。
+      本函数对 MariaDB 与 MySQL 一视同仁（只看 master_host 指向，不涉及方言）。
+    """
+    def _is_upstream(h):
+        key_ip = h["host"]
+        key_ipport = "%s:%s" % (h["host"], int(h["port"]))
+        for o in others:
+            if (o["host"], int(o["port"])) == (h["host"], int(h["port"])):
+                continue
+            mh = (st_map.get((o["host"], int(o["port"]))) or {}).get("master_host")
+            if mh and (str(mh) == key_ip or str(mh) == key_ipport):
+                return True
+        return False
+
+    return sorted(others, key=lambda h: 1 if _is_upstream(h) else 0)
+
+
+def _collect_status(cluster_id, hosts, creds):
+    """批量取节点状态（失败记空 dict，不中断），供排序与陈旧主库判定复用。"""
+    st_map = {}
+    for h in hosts:
+        key = (h["host"], int(h["port"]))
+        try:
+            _ru, _rp = node_root(h["host"], cluster_id)
+            st_map[key] = get_status(h["host"], int(h["port"]),
+                                     creds["ha_user"], creds["ha_pass"], _ru, _rp)
+        except Exception:
+            st_map[key] = {}
+    return st_map
+
+
 def do_failover(cluster_id, reason="auto"):
     """主库判定宕机后执行切换：写入隔离 -> 提升延迟最小从库 -> 更新 current_master -> 其余节点重指向。"""
     cur_h, cur_p = get_current_master(cluster_id)
@@ -732,11 +772,11 @@ def do_failover(cluster_id, reason="auto"):
     push_current_master_to_nodes(cluster_id, f"{new_h}:{new_p}", force=True)
 
     # 4) 其余存活节点重指向新主（并重试自愈复制冲突）
-    for h in hosts:
-        if (h["host"], int(h["port"])) == (new_h, new_p):
-            continue
-        if h["status"] != "up":
-            continue  # 宕机节点恢复后由监控自动处理
+    #    ⚠ 顺序：叶子从库先、仍被他人当作上游的节点后（详见 _sort_repoint_targets）
+    others = [h for h in hosts
+              if (h["host"], int(h["port"])) != (new_h, new_p) and h["status"] == "up"]
+    st_map = _collect_status(cluster_id, others, creds)
+    for h in _sort_repoint_targets(others, st_map):
         _repoint_slave(cluster_id, h, new_h, new_p, creds)
 
     execute("UPDATE hosts SET is_current_master=0 WHERE cluster_id=%s", (cluster_id,))
@@ -795,14 +835,12 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
     set_current_master(cluster_id, target_host, target_port)
     push_current_master_to_nodes(cluster_id, f"{target_host}:{target_port}", force=True)
     # 3) 其余存活节点重指向新主（并重试自愈复制冲突）
-    for h in list_hosts(cluster_id):
-        if (h["host"], int(h["port"])) == (target_host, target_port):
-            continue
-        if h["status"] != "up":
-            continue
-        ru, rp = node_root(h["host"], cluster_id)
-        st = get_status(h["host"], int(h["port"]), creds["ha_user"], creds["ha_pass"], ru, rp)
-        was_stale = is_stale_master(st)
+    #    ⚠ 顺序：叶子从库先、仍被他人当作上游的节点后（详见 _sort_repoint_targets）
+    others = [h for h in list_hosts(cluster_id)
+              if (h["host"], int(h["port"])) != (target_host, target_port) and h["status"] == "up"]
+    st_map = _collect_status(cluster_id, others, creds)
+    for h in _sort_repoint_targets(others, st_map):
+        was_stale = is_stale_master(st_map.get((h["host"], int(h["port"]))))
         _repoint_slave(cluster_id, h, target_host, target_port, creds)
         if was_stale:
             send_alert("节点重新加入集群",
