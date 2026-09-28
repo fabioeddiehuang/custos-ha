@@ -6,7 +6,7 @@ from .ha_client import (set_read_only, promote_to_master, make_slave_of,
                         set_local_master_flag_ex, is_stale_master, get_status,
                         heal_replication, heal_io_gtid_gap, get_gtid_executed,
                         parse_gtid_set, fix_node_mysql_params, ensure_ha_creds,
-                        ensure_connect_creds,
+                        ensure_connect_creds, repair_ha_shadow_grants,
                         heal_anonymous_gtid_io, is_read_only,
                         connect_robust, is_gtid_purged_error,
                         is_gtid_missing_error)
@@ -469,6 +469,16 @@ def _repoint_slave(cluster_id, h, target_host, target_port, creds):
     """
     host, port = h["host"], int(h["port"])
     ru, rp = node_root(host, cluster_id)
+    # 重指向前先确保本节点 ha_monitor 各 host 变体具备完整特权（尤其 REPLICATION SLAVE ADMIN，
+    # 这是 CHANGE REPLICATION SOURCE 的必需权限）。管理器以「精确 host 账号」（如
+    # ha_monitor@'<管理器IP>'）连入节点，若该账号缺权会直接 1227，复制永久无法重指 →
+    # 表现为「某从库连续复制中断」。repair_ha_shadow_grants 仅 GRANT（不改密/不建号）+ sql_log_bin=0，
+    # 对只读副本同样安全；幂等（已具备全集则零写操作）。
+    try:
+        repair_ha_shadow_grants(host, port, creds["ha_user"], creds["ha_pass"],
+                               ru, rp, manager_ip=get_manager_public_ip())
+    except Exception as _e:
+        print(f"[repoint] {host}:{port} 权限自愈失败(可忽略): {_e}")
     ok, err = make_slave_of(host, port, creds["ha_user"], creds["ha_pass"],
                             target_host, int(target_port), creds["repl_user"],
                             creds["repl_pass"], ru, rp)
@@ -911,6 +921,17 @@ def _selfheal_cluster(cluster_id):
                 did_cred = True
                 if not cok:
                     print(f"[selfheal] {ip}:{port}(副本) 连接凭证校正失败: {cmsg}")
+                # 副本同样需要 ha_monitor 各 host 变体具备完整特权（REPLICATION SLAVE ADMIN 等），
+                # 否则管理器以「精确 host 账号」（ha_monitor@'<管理器IP>'）连入执行 CHANGE
+                # REPLICATION SOURCE 时会 1227，复制永远无法重指 → 表现为「该从库连续复制中断」。
+                # 注意：上方 ensure_connect_creds 只校正口令、【不授特权】，故此处必须补一道
+                # GRANT-only 的影子账号修复（sql_log_bin=0，对只读副本安全，不会与复制线程争用元数据锁）。
+                try:
+                    repair_ha_shadow_grants(
+                        ip, port, creds["ha_user"], creds["ha_pass"], ru, rp,
+                        manager_ip=get_manager_public_ip())
+                except Exception as _e:
+                    print(f"[selfheal] {ip}:{port}(副本) 影子账号权限修复失败(可忽略): {_e}")
             continue
         # 参数自愈限频（见 PARAM_SELFHEAL_INTERVAL 注释）
         _pk = (cluster_id, ip, port)
