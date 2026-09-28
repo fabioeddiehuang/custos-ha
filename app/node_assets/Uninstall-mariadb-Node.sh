@@ -159,6 +159,26 @@ if command -v docker >/dev/null 2>&1 && [[ -f "$NODE_ROOT/docker-compose.yaml" |
   log "已停止 keepalived 客户端容器（保留本目录安装脚本/compose，便于重装）"
 fi
 
+# ---------- 2.5) 删除 keepalived 节点镜像（容忍版本漂移 / 缺失）----------
+# 节点 compose 内 keepalived 镜像标签由「生成该节点时的管理器版本」写死，可能与实际加载
+# 镜像版本不一致（如 compose 写 custos-node:v2.4.0、实际加载 v2.5.0）。直接 rmi 写死标签
+# 会因标签不存在硬报错（No such image: custos-node:v2.4.0）。故：① 删除本节点 keepalived
+# 容器实际使用的镜像（容器已停止，安全）；② 再按 compose 写死标签删除（缺失则 || true 跳过）。
+_KIMG=""
+if command -v docker >/dev/null 2>&1; then
+  _cid=$(docker ps -a --filter "label=com.docker.compose.service=keepalived" -q 2>/dev/null | head -1 || true)
+  [[ -n "$_cid" ]] && _KIMG=$(docker inspect -f '{{.Config.Image}}' "$_cid" 2>/dev/null || true)
+fi
+[[ -n "$_KIMG" ]] && docker rmi "$_KIMG" >/dev/null 2>&1 || true
+if command -v docker >/dev/null 2>&1; then
+  _cf="$NODE_ROOT/docker-compose.yaml"; [[ -f "$_cf" ]] || _cf="$NODE_ROOT/docker-compose.yml"
+  if [[ -f "$_cf" ]]; then
+    _kpin=$(grep -oE 'image:[[:space:]]*custos-node:[^[:space:]]+' "$_cf" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"' || true)
+    [[ -n "$_kpin" ]] && docker rmi "$_kpin" >/dev/null 2>&1 || true
+  fi
+  log "已清理 keepalived 节点镜像（如版本漂移导致标签缺失已自动跳过）"
+fi
+
 # ---------- 3) 回退防火墙（MySQL 端口 + VRRP） ----------
 revert_port_vrrp() {
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then

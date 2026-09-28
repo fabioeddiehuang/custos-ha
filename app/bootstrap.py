@@ -457,6 +457,11 @@ def render_bootstrap_script(ip, token, node_type="docker", images=None,
     except Exception:
         _want = "custos-node:v2.5.0"
         _pkg = "custos-node-v2.5.0"
+    # 节点 compose 内 keepalived 镜像标签的统一目标（即本节点实际确保存在的镜像）。
+    # bootstrap 末尾会把解压后的 compose 里所有 custos-node:<任意版本> 改写为它，
+    # 根治「旧管理器生成的节点包写死旧版本标签、实际加载新版本镜像」导致的版本漂移
+    # （表现为 docker compose down --rmi local 报 No such image: custos-node:<旧版本>）。
+    _keep_img = _want
     _repo = _want.split(":", 1)[0]
     # keepalived 镜像标签校正 + 自愈：本地无该镜像时先尝试给旧标签另名；仍无则
     # 【按规范名从服务端按需拉取】（脚本运行时才渲染，服务端此刻补了包也能救活，
@@ -535,6 +540,21 @@ mkdir -p "$DEST"
 tar -xzf "$UNIT" -C "$DEST" --strip-components=1 \
   || die "解压失败"
 
+# ---- 校正节点 compose 镜像标签（根治版本漂移）----
+# 节点包可能由【旧版本管理器】生成，compose 里写死 custos-node:<旧版本>，而本节点实际加载
+# 运行的是 <新版本>。两者不一致时，任何 docker compose down --rmi local / docker rmi 旧标签都会
+# 因「标签不存在」硬报错（No such image: custos-node:<旧版本>）。此处把解压后的 compose 中所有
+# custos-node:<任意> 统一改写为本次已确保存在的镜像标签，保证 compose 与实际镜像一致。
+step "校正节点 compose 镜像标签"
+_cf="$DEST/docker-compose.yml"; [[ -f "$_cf" ]] || _cf="$DEST/docker-compose.yaml"
+if [[ -f "$_cf" ]]; then
+  sed -i -E "s#custos-node:[^[:space:]]+#__KEEPALIVED_IMAGE__#g" "$_cf" \
+    && echo "  已将 compose 内 custos-node 镜像标签统一为 __KEEPALIVED_IMAGE__" \
+    || echo "  跳过 compose 镜像标签校正（sed 不可用）"
+else
+  echo "  未找到 docker-compose 文件，跳过镜像标签校正"
+fi
+
 # ---- 环境预检：端口占用（解压后从 compose 解析发布端口并检查，best-effort）----
 # compose 端口为 "host:container" 数字映射，直接提取 host 侧即可；解析失败仅告警不阻断。
 step "环境预检：端口占用"
@@ -592,6 +612,7 @@ printf '请回到管理端「节点管理」确认状态变为「在线」。\n'
     out = out.replace("__IMAGES__", img_block)
     out = out.replace("__TAGFIX__", tagfix_block)
     out = out.replace("__INSTALL__", install_block)
+    out = out.replace("__KEEPALIVED_IMAGE__", _keep_img)
     return out
 
 
