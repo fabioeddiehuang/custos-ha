@@ -363,7 +363,7 @@
     var isC=(document.getElementById('fxf'+idx)||{}).value==='c';
     var cn=((document.getElementById('fxc'+idx)||{}).value||'').trim();
     if(isC&&!cn){
-      alert('请先填容器名：在宿主机上跑 docker ps --format "{{.Names}}" 就能看到');
+      alert('请先填容器名：在宿主机上跑 docker ps 就能看到（NAME 那一列）');
       return;
     }
     var c=(_creds&&_creds[n.host+':'+n.port])||{};
