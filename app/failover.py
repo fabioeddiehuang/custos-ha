@@ -674,7 +674,9 @@ def confirm_master_down(cluster_id, master_host, master_port, creds, node_root_f
     return False, detail
 
 
-@_failover_guarded
+# ⚠ 禁止给本函数加 @_failover_guarded：它在 do_failover/do_failover_to（已持锁）内部被调用，
+#   而 _FAILOVER_LOCK 是不可重入的 threading.Lock——二次拿锁会死锁，表现为「第一次手动切换
+#   提主成功但请求无声挂起、之后所有切换连日志都没有」（2026-09-29 二次切换失败根因）。与 2.4.0 对齐。
 def _sort_repoint_targets(others, st_map):
     """待重指向节点排序：【叶子从库先】→【仍被他人当作上游的节点后】。
 
@@ -822,7 +824,12 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
     if cur_h:
         ru, rp = node_root(cur_h, cluster_id)
         try:
-            set_read_only(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], True, ru, rp)
+            ok_f, err_f = set_read_only(cur_h, int(cur_p), creds["ha_user"], creds["ha_pass"], True, ru, rp)
+            # set_read_only 失败返回 (False, err) 而非抛异常，必须显式判定——
+            # 否则 fenced 恒为 True，隔离失败被静默放行（脑裂双写窗口）。
+            if not ok_f:
+                fenced = False
+                print(f"[failover] 旧主 {cur_h}:{cur_p} 写入隔离失败: {err_f}")
         except Exception as e:
             fenced = False
             print(f"[failover] 无法连接旧主做 写入隔离(可能已宕机): {e}")
