@@ -1753,12 +1753,14 @@ def api_failover_to(host: str = Form(...), port: int = Form(...),
     _last = _LAST_FAILOVER_TS.get(cid, 0)
     _cd = _failover_cooldown_sec()
     if _time.time() - _last < _cd:
+        print(f"[failover] 手动切换被冷却拦截: cluster={cid} 距上次切换 {int(_time.time() - _last)}s "
+              f"(冷却 {_cd}s)", flush=True)
         return JSONResponse({"ok": False,
                              "msg": f"切换冷却中：距上次切换仅 {int(_time.time() - _last)}s"
                                     f"（冷却 {_cd}s），请稍后再试"})
     try:
         ok = do_failover_to(cid, host, int(port), "manual: 指定主库")
-        msg = ("已将 %s:%s 设为主库" % (host, port)) if ok else "设置失败(确认节点在线且已配置账号)"
+        msg = ("已将 %s:%s 设为主库" % (host, port)) if ok else "设置失败（详见服务端日志：failover/权限/连接）"
     except Exception as e:
         ok, msg = False, f"切换失败: {e}"
     try:

@@ -455,7 +455,10 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
 
     返回 (repaired_count, msg)。
     """
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
     conn = None
+    used_root = False
     try:
         # GRANT 需要 **GRANT OPTION**，而 ha_monitor 刻意不带该权限（最小权限原则）。
         # 故本修复**优先用 root**（节点上 root@'<管理器IP>' / root@'%' 均为
@@ -464,6 +467,7 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
         if root_pass:
             try:
                 conn = connect(host, int(port), root_user, root_pass, timeout=5)
+                used_root = True
             except Exception:
                 conn = None
         if conn is None:
@@ -492,6 +496,7 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
         except Exception:
             pass
         repaired = 0
+        missing = []  # 未能补齐授权的 host（缺口），不再「可忽略」
         for h in cand:
             try:
                 if target_set and target_set.issubset(_granted_privs(cur, ha_user, h)):
@@ -502,13 +507,41 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
                 print("[ha-shadow] %s:%s 的 ha_monitor@%s 已补齐全集特权"
                       % (host, port, h), flush=True)
             except Exception as e:
-                print("[ha-shadow] %s:%s ha_monitor@%s 授权失败(可忽略): %s"
-                      % (host, port, h, e))
+                missing.append((h, str(e)))
+                # 缺口会导致 1227（CHANGE REPLICATION / SET read_only 失败），必须露出
+                print("[ha-shadow] %s:%s ha_monitor@%s 授权失败: %s"
+                      % (host, port, h, e), flush=True)
+                _logger.warning("[ha-shadow] %s:%s ha_monitor@%s 授权失败(缺口): %s",
+                                host, port, h, e)
         if _binlog_off:
             try:
                 cur.execute("SET SESSION sql_log_bin=1")
             except Exception:
                 pass
+        # 治本告警：存在授权缺口时明确暴露根因，避免「连得上却没权限」长期潜伏。
+        # - root 不可达(used_root=False)是缺口主因：回退 ha_monitor 无 GRANT OPTION 无法补齐
+        #   → 提示运维检查管理器 root_pass，否则手动/自动切换可能 1227 失败。
+        # - root 可达仍失败属罕见（权限模型异常），同样需人工介入。
+        if missing:
+            _detail = "；".join("%s(%s)" % (h, e) for h, e in missing)
+            if used_root:
+                _subj = "ha_monitor 授权自愈未完全成功"
+                _body = ("%s:%s 的 ha_monitor 精确 host 影子账号存在授权缺口"
+                         "（root 可达但仍授权失败，疑似权限模型异常）：%s。"
+                         "复制/切换可能因 1227 权限不足失败，请人工核查。"
+                         % (host, port, _detail))
+            else:
+                _subj = "ha_monitor 授权自愈失败(根因: 管理器 root 不可达)"
+                _body = ("%s:%s 的 ha_monitor 精确 host 影子账号授权不完整"
+                         "（管理器 root 口令不可达，已回退 ha_monitor 但无 GRANT OPTION 无法补齐）。"
+                         "缺授权 host: %s。"
+                         "请检查管理器 root_pass 配置；否则手动/自动切换可能因 1227 权限不足失败。"
+                         % (host, port, _detail))
+            try:
+                from app.alerts import send_alert
+                send_alert(_subj, _body)
+            except Exception as _ae:
+                _logger.warning("send_alert 失败(授权缺口告警未发出): %s", _ae)
         return repaired, ("已修复 %d 个影子账号" % repaired if repaired else "无需修复")
     except Exception as e:
         return 0, "异常: %s" % e

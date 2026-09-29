@@ -806,12 +806,16 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
     """手动将指定节点提升为主库（保留手动指定 + 自动选延迟最小两种切换方式）。"""
     target_port = int(target_port)
     cur_h, cur_p = get_current_master(cluster_id)
+    print(f"[failover] 手动切换开始: cluster={cluster_id} 当前主={cur_h}:{cur_p} "
+          f"目标={target_host}:{target_port} reason={reason}", flush=True)
     reset_topo_throttle(cluster_id)   # 手动切换同样放行后续立即修复
     creds = load_creds(cluster_id)
     if not creds["ha_user"]:
         send_alert("切换中止", "未配置 ha_monitor 账号，无法切换。")
+        print(f"[failover] 手动切换中止: cluster={cluster_id} 未配置 ha_monitor 账号", flush=True)
         return False
     if (cur_h, int(cur_p or 0)) == (target_host, target_port):
+        print(f"[failover] 手动切换: {target_host}:{target_port} 已是当前主库，无需切换", flush=True)
         return True  # 已是主库
     # 1) 对旧主写入隔离（置只读），若已宕机则忽略
     fenced = True
@@ -841,7 +845,9 @@ def do_failover_to(cluster_id, target_host, target_port, reason="manual: 指定�
     if not ok_m:
         send_alert("切换失败", f"无法将 {target_host}:{target_port} 提升为主库：{err_m}",
                    cluster_id=cluster_id)
+        print(f"[failover] 手动切换失败: 提升 {target_host}:{target_port} 为主库出错: {err_m}", flush=True)
         return False
+    print(f"[failover] 已提升 {target_host}:{target_port} 为主库", flush=True)
     set_current_master(cluster_id, target_host, target_port)
     push_current_master_to_nodes(cluster_id, f"{target_host}:{target_port}", force=True)
     # 3) 其余存活节点重指向新主（并重试自愈复制冲突）
