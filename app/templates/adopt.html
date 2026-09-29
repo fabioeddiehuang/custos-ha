@@ -160,9 +160,20 @@
       if(ni) h+='<ul class="issues">'+ni+'</ul>';
       if(n.fix_cmd){
         var cid='fxcmd'+idx;
-        h+='<div style="margin:8px 0"><button class="btn btn-sm" onclick="copyCmd(\''+cid+'\',this)">复制修复命令</button>'
-          +'<span style="color:var(--muted);font-size:12px;margin-left:6px">拿到数据库主机上以 root 执行，改完重启</span></div>'
-          +'<pre class="cmd" id="'+cid+'">'+esc(n.fix_cmd)+'</pre>';
+        // 端口不是 3306（如 1Panel 的 3307）多半是容器/面板装的，默认勾容器让用户确认
+        var isC=!!(n.port&&n.port!=3306);
+        h+='<div style="display:flex;gap:8px;align-items:end;margin:8px 0;flex-wrap:wrap">'
+          +'<label>这台数据库跑在哪<select id="fxf'+idx+'" onchange="toggleCtn('+idx+')" style="width:180px">'
+          +'<option value=""'+(isC?'':' selected')+'>裸机（系统服务）</option>'
+          +'<option value="c"'+(isC?' selected':'')+'>容器（Docker / 1Panel）</option></select></label>'
+          +'<label id="fxcn'+idx+'" style="display:'+(isC?'':'none')+'">容器名'
+          +'<input id="fxc'+idx+'" placeholder="宿主机上 docker ps 能看到" style="width:190px"></label>'
+          +'<button class="btn btn-sm" onclick="regenFix('+idx+')">按这个重新生成命令</button></div>'
+          +(isC?'<div style="font-size:12px;color:#a16207;margin-bottom:6px">端口不是 3306，看着像容器/面板装的，已默认选「容器」，请确认</div>':'')
+          +'<div style="margin:8px 0"><button class="btn btn-sm" onclick="copyCmd(\''+cid+'\',this)">复制修复命令</button>'
+          +'<span style="color:var(--muted);font-size:12px;margin-left:6px">改完重启，再点「重新探测」验证</span></div>'
+          +'<pre class="cmd" id="'+cid+'">'+esc(n.fix_cmd)+'</pre>'
+          +'<div id="fxm'+idx+'" style="font-size:12px;color:var(--muted)"></div>';
         if(n.can_tune){
           h+='<div style="margin:8px 0;padding:8px 10px;border:1px dashed var(--border);border-radius:8px">'
             +'<label style="display:flex;gap:6px;align-items:center;font-size:12.5px">'
@@ -342,6 +353,31 @@
       return false;
     }
     return true;
+  }
+  function toggleCtn(idx){
+    var sel=document.getElementById('fxf'+idx), box=document.getElementById('fxcn'+idx);
+    if(box) box.style.display=(sel&&sel.value==='c')?'':'none';
+  }
+  function regenFix(idx){
+    var n=((_probe&&_probe.nodes)||[])[idx]; if(!n) return;
+    var isC=(document.getElementById('fxf'+idx)||{}).value==='c';
+    var cn=((document.getElementById('fxc'+idx)||{}).value||'').trim();
+    if(isC&&!cn){
+      alert('请先填容器名：在宿主机上跑 docker ps --format "{{.Names}}" 就能看到');
+      return;
+    }
+    var c=(_creds&&_creds[n.host+':'+n.port])||{};
+    var sid=parseInt((document.getElementById('fxs'+idx)||{}).value||'0',10);
+    var fd=new URLSearchParams();
+    fd.set('host',n.host); fd.set('port',n.port||3306);
+    fd.set('db_user',c.user||'root'); fd.set('db_pass',c.password||'');
+    fd.set('server_id',sid||0); fd.set('container',isC?cn:'');
+    var pre=document.getElementById('fxcmd'+idx); if(pre) pre.textContent='生成中…';
+    var mbox=document.getElementById('fxm'+idx); if(mbox) mbox.textContent='';
+    post('/api/adopt/fix_cmd',fd).then(function(r){
+      if(pre) pre.textContent=r.command||r.msg||'';
+      if(mbox) mbox.textContent=r.msg||'';
+    }).catch(function(e){ if(pre) pre.textContent='生成失败：'+e; });
   }
   function onCidChange(){
     var v=document.getElementById('cid').value;

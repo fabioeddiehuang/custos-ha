@@ -1419,6 +1419,26 @@ def api_adopt_test_root(host: str = Form(...), port: int = Form(3306),
         return _json_ok({"ok": False, "msg": f"{type(e).__name__}: {e}"})
 
 
+@app.post("/api/adopt/fix_cmd")
+def api_adopt_fix_cmd(host: str = Form(...), port: int = Form(3306),
+                      db_user: str = Form("root"), db_pass: str = Form(""),
+                      server_id: int = Form(0), container: str = Form(""),
+                      user=Depends(auth_required)):
+    """按形态（裸机 / 容器）重新生成修复命令。**只读**，不改任何东西。
+
+    container 填容器名（Docker / 1Panel 面板装的都算）→ 生成「进容器执行」的命令；
+    留空 → 生成裸机那条（宿主机配置目录 + systemctl restart）。
+    """
+    from . import adopt
+    try:
+        return _json_ok(adopt.fix_command_for(
+            host, int(port), db_user, db_pass,
+            server_id=(int(server_id) or None),
+            container=(container or "").strip()))
+    except Exception as e:
+        return _json_ok({"ok": False, "msg": f"{type(e).__name__}: {e}"})
+
+
 @app.post("/api/adopt/run")
 def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
                   name: str = Form(""), vip: str = Form(""),

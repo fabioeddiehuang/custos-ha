@@ -83,7 +83,7 @@ def suggest_server_id(host, used=None):
     return base
 
 
-def build_fix_command(server_id=None, log_bin=False, binlog_format=False):
+def build_fix_command(server_id=None, log_bin=False, binlog_format=False, container=""):
     """生成「改配置 + 重启」的修复命令（MariaDB，绝不覆盖旧库现有配置）。
 
     生产铁律（防范最高级事故）：
@@ -92,7 +92,43 @@ def build_fix_command(server_id=None, log_bin=False, binlog_format=False):
       3. 动手前先 `cp -a` 备份，随时可回滚。
 
     log_bin 是只读变量，SQL 改不了 —— 只能改配置 + 重启，命令里如实说明，不假装能在线开。
+
+    container 非空 = 数据库跑在容器里（Docker / 1Panel 面板装的都算）：宿主机的 my.cnf
+    和 systemctl 都管不到容器，必须进容器写配置 + docker restart；纯 SQL 只够改 server_id。
     """
+    if container:
+        cn = str(container).strip()
+        sql = []
+        if server_id:
+            sql.append("SET GLOBAL server_id=%d;" % int(server_id))
+        sql.append("SELECT @@log_bin, @@server_id, @@binlog_format;")
+        sql_line = "docker exec -it %s mysql -uroot -p -e \"%s\"\n" % (cn, " ".join(sql))
+        if log_bin or binlog_format:
+            cnf_lines = ["[mysqld]"]
+            if server_id:
+                cnf_lines.append("server_id=%d" % int(server_id))
+            if log_bin:
+                cnf_lines.append("log_bin=%s" % _BINLOG_NAME)
+            if binlog_format:
+                cnf_lines.append("binlog_format=ROW")
+            cnf = "\\n".join(cnf_lines) + "\\n"
+            return (
+                "# ---- 数据库跑在容器里：在【宿主机】上执行（1Panel / Docker 都一样）----\n"
+                "# 开 binlog 用 SQL 做不到，只能写配置：往容器里只新增这一个文件，不动它原有配置\n"
+                + ("docker exec %s sh -c 'printf \"%s\" > /etc/mysql/conf.d/99-custos-adopt.cnf'\n"
+                   % (cn, cnf))
+                + "docker restart %s\n" % cn
+                + "\n# 重启后进容器用 SQL 确认结果\n"
+                + sql_line
+                + "# 注意：写进容器内的配置，容器重建会丢；想持久请改面板映射到宿主机的那个配置目录\n"
+            )
+        return (
+            "# ---- 数据库跑在容器里：在【宿主机】上执行（1Panel / Docker 都一样）----\n"
+            "# 只差 server_id：进容器执行一条 SQL 就行，不用重启\n"
+            + sql_line
+            + "# 若提示 server_id 是只读变量，就写进容器配置再 docker restart %s\n" % cn
+        )
+
     head = (
         "# ---- 在【数据库所在主机】上以 root 执行（MariaDB）----\n"
         "# 只新增一个独立配置文件，不动旧库现有的任何 my.cnf；改前自动备份\n"
@@ -118,6 +154,52 @@ def build_fix_command(server_id=None, log_bin=False, binlog_format=False):
         "# 未被 my.cnf 的 !includedir 引用，把上面几行写进主 my.cnf 的 [mysqld] 段即可\n"
     )
     return head + ("\n".join(lines) + "\n" if lines else "") + tail
+
+
+def fix_command_for(host, port, user, password, server_id=None, container="", timeout=5):
+    """连上去看这台还差什么，按形态（裸机 / 容器）生成修复命令。
+
+    **只读**：只查变量，不改任何东西。形态必须由用户在页面上选 —— 管理器只连得上
+    数据库端口，猜不出它是裸机进程还是容器（1Panel 面板装的尤其看不出来）。
+    """
+    out = {"ok": False, "command": "", "msg": ""}
+    conn = None
+    try:
+        conn = connect(host, int(port), user, password, timeout=timeout)
+        if conn is None:
+            out["msg"] = "连不上这台，没法判断还差什么"
+            return out
+        cur = conn.cursor()
+        sid = _scalar(cur, "SELECT @@server_id")
+        log_bin = str(_scalar(cur, "SELECT @@log_bin") or "")
+        fmt = str(_scalar(cur, "SELECT @@binlog_format") or "")
+        try:
+            want = int(server_id) if server_id else 0
+        except Exception:
+            want = 0
+        need_sid = sid in (None, 0) or (want > 0 and want != sid)
+        need_bin = log_bin.upper() in ("OFF", "0", "NONE")
+        need_fmt = bool(fmt) and fmt.upper() != _ROW_FORMAT
+        if not (need_sid or need_bin or need_fmt):
+            out["ok"] = True
+            out["msg"] = "这台的 log_bin / server_id / binlog_format 都没问题，不用改"
+            return out
+        want_sid = want if want > 0 else (sid if sid else suggest_server_id(host))
+        out["command"] = build_fix_command(
+            server_id=(want_sid if need_sid else None),
+            log_bin=need_bin, binlog_format=need_fmt, container=container)
+        out["ok"] = True
+        out["msg"] = ("已按「容器」形态生成（进容器执行）" if container
+                      else "已按「裸机」形态生成")
+        return out
+    except Exception as e:
+        out["msg"] = "生成失败：%s" % e
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _can_tune(node):
