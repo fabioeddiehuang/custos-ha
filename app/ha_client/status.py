@@ -780,8 +780,20 @@ def get_status(host, port, user, password, root_user="root", root_pass="", timeo
 
 
 def set_read_only(host, port, user, password, on=True, root_user="root", root_pass=""):
-    from .connection import (connect_robust)
-    conn = connect_robust(host, port, user, password, root_user, root_pass)
+    from .connection import (connect, connect_robust)
+    # 写入隔离需要 READ_ONLY ADMIN 等特权；root 恒为 ALL PRIVILEGES，故**优先用 root**
+    # （root 不可达时回退 ha_monitor）。与 promote_to_master 一致——否则 ha_monitor 精确 host
+    # 影子账号缺特权时，SET GLOBAL read_only 报 1227 → 隔离失败 → 切换被交叉验证(witness)误判
+    # 为脑裂风险而中止（见 do_failover_to 1.5）。这是「手动切换第一次成功、第二次失败」的根因：
+    # 第一次旧主权限全、隔离成功；第二次旧主（从库节点）缺特权、隔离失败被 witness 中止。
+    conn = None
+    if root_pass:
+        try:
+            conn = connect(host, port, root_user, root_pass, timeout=5)
+        except Exception:
+            conn = None
+    if conn is None:
+        conn = connect_robust(host, port, user, password, root_user, root_pass)
     try:
         cur = conn.cursor()
         ok_ro, err_ro = db_ops.set_read_only(cur, on)
