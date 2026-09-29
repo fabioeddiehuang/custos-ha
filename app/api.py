@@ -1386,15 +1386,53 @@ def api_adopt_probe(nodes: str = Form(...), l2_prefix: int = Form(24),
         return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
+@app.post("/api/adopt/fix_switch")
+def api_adopt_fix_switch(host: str = Form(...), port: int = Form(3306),
+                         db_user: str = Form("root"), db_pass: str = Form(""),
+                         server_id: int = Form(0),
+                         user=Depends(auth_required)):
+    """接管向导「快速修复」：在线设 server_id；log_bin 只能给命令由人工重启。
+
+    用**探测时填的那套账号**（第 1 步节点表），它已连通且权限已探明；
+    第 3 步的 root 口令只用于建 Custos 账号，不在这里用。
+    """
+    from . import adopt
+    try:
+        return _json_ok(adopt.apply_switch_fix(
+            host, int(port), db_user, db_pass, int(server_id)))
+    except Exception as e:
+        return _json_ok({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/adopt/test_root")
+def api_adopt_test_root(host: str = Form(...), port: int = Form(3306),
+                        db_user: str = Form("root"), db_pass: str = Form(""),
+                        user=Depends(auth_required)):
+    """验证某台节点填的数据库 root 口令：连不连得上、权限够不够（只读，不建账号）。
+
+    接管要用这套口令在该节点上建 Custos 账号，先测通再执行，避免带病接管。
+    """
+    from . import adopt
+    try:
+        return _json_ok(adopt.test_root_credential(host, int(port), db_user, db_pass))
+    except Exception as e:
+        return _json_ok({"ok": False, "msg": f"{type(e).__name__}: {e}"})
+
+
 @app.post("/api/adopt/run")
 def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
                   name: str = Form(""), vip: str = Form(""),
                   vip_prefix: str = Form("24"), vip_port: int = Form(3306),
                   root_user: str = Form("root"), root_pass: str = Form(""),
+                  node_roots: str = Form(""),
                   user=Depends(auth_required)):
     """执行接管：建 Custos 账号 → 登记 nodes/hosts → 生成 sidecar 引导命令。
 
     cluster_id=0 时按 name/vip 新建集群。返回每个节点的引导命令。
+
+    node_roots: 每台节点各自的数据库 root 凭据（生产环境各机口令常不同），
+        JSON 数组 [{"host":"...","port":3306,"user":"root","password":"..."}, ...]；
+        没给到的节点回落到统一的 root_user / root_pass。
     """
     from . import adopt
     try:
@@ -1426,13 +1464,38 @@ def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
     if not any(n.get("ok") for n in probe.get("nodes", [])):
         return _json_ok({"ok": False, "error": "所有节点都无法连接", "probe": probe})
 
+    # 每台节点各自的 root 凭据（生产环境各机口令常不同）；解析失败不阻断，
+    # 全部回落统一的 root_user / root_pass。
+    per_node = {}
+    if (node_roots or "").strip():
+        try:
+            nr = json.loads(node_roots)
+            if isinstance(nr, list):
+                for it in nr:
+                    if not isinstance(it, dict):
+                        continue
+                    h = str(it.get("host") or "").strip()
+                    u = str(it.get("user") or "").strip()
+                    if not h or not u:
+                        continue
+                    try:
+                        pt = int(it.get("port") or 3306)
+                    except Exception:
+                        pt = 3306
+                    per_node["%s:%d" % (h, pt)] = {
+                        "user": u, "password": it.get("password") or ""}
+        except Exception:
+            per_node = {}
+
     # 2) 建 Custos 账号（复用 ensure_ha_creds，自动处理 root 回退与 host 集合）
     creds = get_cluster_creds(cid) or {}
-    cred_res = adopt.adopt_cluster(probe, root_user, root_pass, creds)
+    cred_res = adopt.adopt_cluster(probe, root_user, root_pass, creds,
+                                   per_node_roots=per_node)
 
     # 3) 登记 + 生成引导命令（sidecar only，绝不重装数据库）
     reg = adopt.register_and_bootstrap(probe, cid, root_user=root_user,
-                                       root_pass=root_pass, actor=actor)
+                                       root_pass=root_pass, actor=actor,
+                                       per_node_roots=per_node)
     try:
         audit.add_audit(actor, "adopt", "cluster=%s" % cid,
                         "接管节点：" + "、".join(r["ip"] for r in reg), cluster_id=cid)

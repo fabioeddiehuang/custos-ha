@@ -57,6 +57,148 @@ LV_WARN = "warn"
 # binlog 非 ROW 时的风险提示（非阻断：老库大量存在 STATEMENT，纳管本身可行）
 _ROW_FORMAT = "ROW"
 
+# 「快速修复」用到的配置默认值（MariaDB 专用）
+_BINLOG_NAME = "mysql-bin"
+
+
+def suggest_server_id(host, used=None):
+    """给节点建议一个 server_id：优先取 IP 末段；为 0 或已被占用就顺延。
+
+    server_id 撞号会直接搞坏复制，所以建议值必须在本次探测到的节点里去重。
+    """
+    used = set(int(x) for x in (used or []) if str(x).lstrip("-").isdigit())
+    try:
+        base = int(str(host).strip().split(".")[-1])
+    except Exception:
+        base = 0
+    if base <= 0:
+        base = 101
+    sid = base
+    for _ in range(10000):
+        if sid != 0 and sid not in used:
+            return sid
+        sid += 1
+        if sid > 4294967295:
+            sid = 1
+    return base
+
+
+def build_fix_command(server_id=None, log_bin=False, binlog_format=False):
+    """生成「改配置 + 重启」的修复命令（MariaDB，绝不覆盖旧库现有配置）。
+
+    生产铁律（防范最高级事故）：
+      1. 只**新增**一个独立配置文件（99-custos-adopt.cnf），绝不改动旧库任何现有 my.cnf；
+      2. 该文件里同一项已存在就**原地替换**（含被 # 注释掉的），不存在才**追加到文件末尾**；
+      3. 动手前先 `cp -a` 备份，随时可回滚。
+
+    log_bin 是只读变量，SQL 改不了 —— 只能改配置 + 重启，命令里如实说明，不假装能在线开。
+    """
+    head = (
+        "# ---- 在【数据库所在主机】上以 root 执行（MariaDB）----\n"
+        "# 只新增一个独立配置文件，不动旧库现有的任何 my.cnf；改前自动备份\n"
+        "D=/etc/mysql/conf.d; [ -d \"$D\" ] || D=/etc/my.cnf.d; mkdir -p \"$D\"\n"
+        "F=\"$D/99-custos-adopt.cnf\"\n"
+        "cp -a \"$F\" \"$F.bak.$(date +%F-%H%M%S)\" 2>/dev/null || true\n"
+        "grep -q '^\\[mysqld\\]' \"$F\" 2>/dev/null || printf '[mysqld]\\n' >> \"$F\"\n"
+        "set_kv(){ k=$1; v=$2; if grep -qE \"^[[:space:]]*#?[[:space:]]*${k}[[:space:]]*=\" \"$F\"; then "
+        "sed -i \"s|^[[:space:]]*#\\?[[:space:]]*${k}[[:space:]]*=.*|${k}=${v}|\" \"$F\"; "
+        "else printf '%s=%s\\n' \"$k\" \"$v\" >> \"$F\"; fi; }\n"
+    )
+    lines = []
+    if server_id:
+        lines.append("set_kv server_id %d" % int(server_id))
+    if log_bin:
+        lines.append("set_kv log_bin %s" % _BINLOG_NAME)
+    if binlog_format:
+        lines.append("set_kv binlog_format ROW")
+    tail = (
+        "\n# 让配置生效（服务名按实际，常见 mariadb / mysqld）\n"
+        "systemctl restart mariadb\n"
+        "# 重启后回本页面点「重新探测」确认。若 log_bin 仍为 OFF，说明该目录\n"
+        "# 未被 my.cnf 的 !includedir 引用，把上面几行写进主 my.cnf 的 [mysqld] 段即可\n"
+    )
+    return head + ("\n".join(lines) + "\n" if lines else "") + tail
+
+
+def _can_tune(node):
+    """探测账号够不够格在线改全局参数（root 级 + 非只读副本）。
+
+    只读副本上改 server_id 不安全（很可能正在跑复制），一律不放行，只给命令。
+    """
+    ro = str(node.get("read_only") or "")
+    sro = str(node.get("super_read_only") or "")
+    if ro.upper() in ("1", "ON") or sro.upper() in ("1", "ON"):
+        return False
+    g = " ".join(node.get("grants") or []).upper()
+    if not g:
+        return False
+    return ("ALL PRIVILEGES" in g) or ("SUPER" in g)
+
+
+def apply_switch_fix(host, port, user, password, server_id, timeout=5):
+    """接管向导「快速修复」：在线设 server_id，其余只能给命令 + 人工重启。
+
+    log_bin 是只读变量，SQL 改不动 —— 如实标记为「需重启」并给出命令，
+    绝不假装改成功（否则用户下一步就是带病接管）。
+
+    返回 {ok, applied:[], need_restart:[], command, error}
+    """
+    out = {"ok": False, "applied": [], "need_restart": [], "command": "", "error": ""}
+    try:
+        sid = int(server_id)
+    except Exception:
+        out["error"] = "server_id 必须是数字"
+        return out
+    if sid <= 0:
+        out["error"] = "server_id 必须大于 0（0 无法建复制）"
+        return out
+
+    conn = None
+    try:
+        conn = connect(host, int(port), user, password, timeout=timeout)
+        if conn is None:
+            out["error"] = "连接失败"
+            return out
+        cur = conn.cursor()
+
+        # 只读副本不在线改（可能正在跑复制），只给命令
+        ro = str(_scalar(cur, "SELECT @@read_only") or "")
+        if ro.upper() in ("1", "ON"):
+            out["need_restart"].append(
+                "server_id=%d（该节点是只读副本，在线改不安全，请改配置并重启）" % sid)
+        else:
+            try:
+                cur.execute("SET GLOBAL server_id = %d" % sid)
+                out["applied"].append(
+                    "server_id=%d 已在线生效（重启会回退，仍需写进配置）" % sid)
+            except Exception as e:
+                out["need_restart"].append(
+                    "server_id=%d（该版本不支持在线改，需改配置并重启：%s）"
+                    % (sid, str(e)[:80]))
+
+        log_bin = str(_scalar(cur, "SELECT @@log_bin") or "")
+        fmt = str(_scalar(cur, "SELECT @@binlog_format") or "")
+        need_bin = log_bin.upper() in ("OFF", "0", "NONE")
+        need_fmt = bool(fmt) and fmt.upper() != _ROW_FORMAT
+        if need_bin:
+            out["need_restart"].append(
+                "log_bin=%s（只读变量，SQL 改不了，必须改配置并重启）" % _BINLOG_NAME)
+        if need_fmt:
+            out["need_restart"].append("binlog_format=ROW（需改配置并重启）")
+
+        out["command"] = build_fix_command(
+            server_id=sid, log_bin=need_bin, binlog_format=need_fmt)
+        out["ok"] = True
+        return out
+    except Exception as e:
+        out["error"] = "执行失败：%s" % e
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def _issue(level, code, msg, fix=""):
     return {"level": level, "code": code, "msg": msg, "fix": fix}
@@ -119,6 +261,7 @@ def probe_node(host, port, user, password, timeout=5):
         "role": "standalone", "replica": None, "replicas": 0,
         "gtid_executed": "", "data_size_bytes": 0,
         "grants": [], "issues": [],
+        "can_tune": False, "fix_cmd": "", "suggested_server_id": None,
     }
     try:
         conn = connect(host, int(port), user, password, timeout=timeout)
@@ -238,24 +381,28 @@ def probe_node(host, port, user, password, timeout=5):
                 % (out["version"] or "?")[:40],
                 "确认该版本的复制/权限行为后再启用切主；或先升级到已登记版本"))
 
+        # 说明只写「要改什么」，具体命令统一放在节点级 fix_cmd（避免同一条命令重复展示）
         sid = out["server_id"]
         if sid in (None, 0):
             out["issues"].append(_issue(
                 LV_BLOCKER, "server_id_missing",
                 "server_id 为 0 或未设置，无法建立复制",
-                "在 my.cnf 设置 server_id（非 0 且集群内唯一）后重启数据库"))
+                "配置里补 server_id（非 0、集群内唯一）→ 见下方修复命令"))
 
         if str(out["log_bin"]).upper() in ("OFF", "0", "NONE"):
             out["issues"].append(_issue(
                 LV_BLOCKER, "binlog_off",
                 "未开启 binlog，无法做复制（单机扩从库场景必须先开）",
-                "在 my.cnf 开启 log_bin 与 server_id 后**重启数据库**（有停机窗口）"))
+                "配置里开 log_bin（只读变量，须重启）→ 见下方修复命令"))
 
         if out["binlog_format"] and out["binlog_format"].upper() != _ROW_FORMAT:
             out["issues"].append(_issue(
                 LV_WARN, "binlog_format_not_row",
                 "binlog_format=%s，非 ROW 格式在部分语句下复制不安全" % out["binlog_format"],
-                "建议改为 ROW（需重启；STATEMENT 老库需先评估）"))
+                "建议改为 ROW（须重启）→ 见下方修复命令"))
+
+        # 探测账号够不够格「在线改全局参数」（root 级且非只读副本）→ 决定 UI 是否给快速修复开关
+        out["can_tune"] = _can_tune(out)
 
         r = out["replica"]
         if r and (str(r.get("io_running")).upper() != "YES" or str(r.get("sql_running")).upper() != "YES"):
@@ -375,6 +522,30 @@ def probe_cluster(nodes, l2_prefix=24):
         else:
             seen[sid] = p.get("host")
 
+    # ---- 为需要整改的节点生成「可直接复制」的修复命令 ----
+    # server_id 建议值在本次集群内去重（撞号会直接搞坏复制）；命令只写独立的新配置文件，
+    # 绝不改动旧库现有 my.cnf（生产铁律）。
+    used = set()
+    for p in alive:
+        try:
+            v = int(p.get("server_id") or 0)
+        except Exception:
+            v = 0
+        if v > 0:
+            used.add(v)
+    for p in alive:
+        need_sid = p.get("server_id") in (None, 0)
+        sug = suggest_server_id(p.get("host"), used) if need_sid else p.get("server_id")
+        if need_sid:
+            used.add(sug)
+        p["suggested_server_id"] = sug
+        need_bin = str(p.get("log_bin")).upper() in ("OFF", "0", "NONE")
+        need_fmt = bool(p.get("binlog_format")) and str(p.get("binlog_format")).upper() != _ROW_FORMAT
+        if need_sid or need_bin or need_fmt:
+            p["fix_cmd"] = build_fix_command(
+                server_id=(sug if need_sid else None),
+                log_bin=need_bin, binlog_format=need_fmt)
+
     # ---- 场景识别 ----
     slaves = [p for p in alive if p.get("role") == "slave"]
     masters = [p for p in alive if p.get("role") == "master"]
@@ -452,15 +623,91 @@ def adopt_node(node, root_user, root_pass, creds, manager_ip="", manager_subnet=
     return ok, msg
 
 
-def adopt_cluster(probe, root_user, root_pass, creds, manager_ip="", manager_subnet=None):
+def test_root_credential(host, port, user, password, timeout=5):
+    """验证「某台节点填的数据库 root 口令」连不连得上、够不够权限。
+
+    只读：只连一下、读版本和权限，**不建任何账号、不改任何数据**。
+    接管要靠这套口令在每台库上建 Custos 账号，所以除了连通，还要确认它有
+    SUPER / ALL PRIVILEGES，且该节点不是只读的（只读库建不了账号）。
+
+    返回 {ok, host, port, version, root_like, read_only, msg}
+    """
+    out = {"ok": False, "host": host, "port": int(port), "version": "",
+           "root_like": False, "read_only": False, "msg": ""}
+    conn = None
+    try:
+        conn = connect(host, int(port), user, password, timeout=timeout)
+        if conn is None:
+            out["msg"] = "连不上（地址/端口不对，或账号密码不对，或节点拒绝连接）"
+            return out
+        cur = conn.cursor()
+        out["version"] = str(_scalar(cur, "SELECT VERSION()") or "")
+        ro = str(_scalar(cur, "SELECT @@read_only") or "")
+        out["read_only"] = ro.upper() in ("1", "ON")
+        grants = []
+        try:
+            cur.execute("SHOW GRANTS FOR CURRENT_USER()")
+            grants = [str(g[0] if isinstance(g, (tuple, list)) else g)
+                      for g in (cur.fetchall() or [])]
+        except Exception:
+            grants = []
+        up = " ".join(grants).upper()
+        out["root_like"] = bool(up) and (("ALL PRIVILEGES" in up) or ("SUPER" in up))
+
+        out["ok"] = True
+        if out["read_only"]:
+            out["msg"] = "能连上，但该节点是只读的（多半是从库），在这上面建账号会失败"
+        elif not out["root_like"]:
+            out["msg"] = "能连上，但权限不够（缺 SUPER / ALL PRIVILEGES），建不了 Custos 账号"
+        else:
+            out["msg"] = "连通正常，权限足够" + ("（%s）" % out["version"] if out["version"] else "")
+        return out
+    except Exception as e:
+        out["msg"] = "连不上：%s" % e
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def node_root_for(per_node_roots, node, root_user, root_pass):
+    """取该节点的数据库 root 凭据：**优先用这台单独填的**，没填才回落到统一那份。
+
+    生产环境每台库的 root 口令往往不一样，接管必须支持逐台指定，否则口令不同的
+    节点会建账号失败。per_node_roots 形如
+    {"192.168.1.50:3306": {"user": "root", "password": "..."}}（键也允许只写 host）。
+    """
+    host = str(node.get("host") or "").strip()
+    try:
+        port = int(node.get("port") or 3306)
+    except Exception:
+        port = 3306
+    if per_node_roots:
+        for key in ("%s:%d" % (host, port), host):
+            v = per_node_roots.get(key)
+            if not isinstance(v, dict):
+                continue
+            u = str(v.get("user") or "").strip()
+            if u:
+                return u, v.get("password") or ""
+    return root_user, root_pass
+
+
+def adopt_cluster(probe, root_user, root_pass, creds, manager_ip="", manager_subnet=None,
+                  per_node_roots=None):
     """对 probe_cluster 结果逐个节点建立接管账号。
 
     :param probe: probe_cluster 返回（含 nodes 列表）
+    :param per_node_roots: 每台节点各自的 root 凭据（生产环境口令常不同）；
+        没给的节点回落到 root_user / root_pass。
     :return: [{"host","ok","msg"}, ...]
     """
     results = []
     for node in probe.get("nodes", []):
-        ok, msg = adopt_node(node, root_user, root_pass, creds, manager_ip, manager_subnet)
+        u, p = node_root_for(per_node_roots, node, root_user, root_pass)
+        ok, msg = adopt_node(node, u, p, creds, manager_ip, manager_subnet)
         results.append({"host": node.get("host"), "ok": ok, "msg": msg})
     return results
 
@@ -486,9 +733,10 @@ def _node_type_for(probed):
 
 
 def register_and_bootstrap(probe, cluster_id, root_user="root", root_pass="",
-                           actor="", ttl_hours=24):
+                           actor="", ttl_hours=24, per_node_roots=None):
     """登记被接管节点并生成「一行引导命令」。
 
+    :param per_node_roots: 每台节点各自的 root 凭据，登记时按节点取用（同 adopt_cluster）。
     :return: [{"ip","ok","command","msg"}, ...]
     """
     from . import node_gen, bootstrap
@@ -502,9 +750,10 @@ def register_and_bootstrap(probe, cluster_id, root_user="root", root_pass="",
             continue
         role = "master" if (master and ip == master) else "slave"
         ntype = _node_type_for(p)
+        u, pw = node_root_for(per_node_roots, p, root_user, root_pass)
         try:
             node_gen.generate_node(
-                ip, int(p.get("port") or 3306), root_user, root_pass,
+                ip, int(p.get("port") or 3306), u, pw,
                 role, int(cluster_id),
                 node_type=ntype,
                 mysql_version=(p.get("version") or "")[:48] or None,
