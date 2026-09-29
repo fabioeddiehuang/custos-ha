@@ -102,7 +102,14 @@ def build_fix_command(server_id=None, log_bin=False, binlog_format=False, contai
         if server_id:
             sql.append("SET GLOBAL server_id=%d;" % int(server_id))
         sql.append("SELECT @@log_bin, @@server_id, @@binlog_format;")
-        sql_line = "docker exec -it %s mysql -uroot -p -e \"%s\"\n" % (cn, " ".join(sql))
+        # 客户端命令名不统一：MariaDB 11.x 官方镜像只有 `mariadb`（没有 `mysql` 这个名字），
+        # 老镜像/部分面板镜像相反。这里两个都试，避免用户踩「executable file not found」。
+        _sql_text = " ".join(sql)
+        sql_line = (
+            "docker exec -it %s sh -c 'if command -v mariadb >/dev/null 2>&1; then "
+            "exec mariadb -uroot -p -e \"%s\"; else exec mysql -uroot -p -e \"%s\"; fi'\n"
+            % (cn, _sql_text, _sql_text)
+        )
         if log_bin or binlog_format:
             cnf_lines = ["[mysqld]"]
             if server_id:
