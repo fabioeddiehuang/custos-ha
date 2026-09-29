@@ -178,8 +178,8 @@ def fix_command_for(host, port, user, password, server_id=None, container="", ti
             return out
         cur = conn.cursor()
         sid = _scalar(cur, "SELECT @@server_id")
-        log_bin = str(_scalar(cur, "SELECT @@log_bin") or "")
-        fmt = str(_scalar(cur, "SELECT @@binlog_format") or "")
+        log_bin = _scalar_str(cur, "SELECT @@log_bin")
+        fmt = _scalar_str(cur, "SELECT @@binlog_format")
         try:
             want = int(server_id) if server_id else 0
         except Exception:
@@ -251,7 +251,7 @@ def apply_switch_fix(host, port, user, password, server_id, timeout=5):
         cur = conn.cursor()
 
         # 只读副本不在线改（可能正在跑复制），只给命令
-        ro = str(_scalar(cur, "SELECT @@read_only") or "")
+        ro = _scalar_str(cur, "SELECT @@read_only")
         if ro.upper() in ("1", "ON"):
             out["need_restart"].append(
                 "server_id=%d（该节点是只读副本，在线改不安全，请改配置并重启）" % sid)
@@ -265,8 +265,8 @@ def apply_switch_fix(host, port, user, password, server_id, timeout=5):
                     "server_id=%d（该版本不支持在线改，需改配置并重启：%s）"
                     % (sid, str(e)[:80]))
 
-        log_bin = str(_scalar(cur, "SELECT @@log_bin") or "")
-        fmt = str(_scalar(cur, "SELECT @@binlog_format") or "")
+        log_bin = _scalar_str(cur, "SELECT @@log_bin")
+        fmt = _scalar_str(cur, "SELECT @@binlog_format")
         need_bin = log_bin.upper() in ("OFF", "0", "NONE")
         need_fmt = bool(fmt) and fmt.upper() != _ROW_FORMAT
         if need_bin:
@@ -301,6 +301,17 @@ def _scalar(cur, sql):
         return row[0] if row else None
     except Exception:
         return None
+
+
+def _scalar_str(cur, sql):
+    """取单值转字符串：**只把 None 转成空串，绝不吞掉 0**。
+
+    踩过的实锤坑：`str(_scalar(...) or "")` 会把整型的 0 也吞成空串 ——
+    `@@log_bin` 返回 0（表示没开）时会被误判成「没值/不用管」，于是提示"没问题不用改"，
+    用户照着重启后才发现根本没生效。判空必须显式判 None。
+    """
+    v = _scalar(cur, sql)
+    return "" if v is None else str(v)
 
 
 def _dict_cursor(conn):
