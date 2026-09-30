@@ -63,15 +63,26 @@
       <label>VIP 端口<input id="cvipport" value="3306"></label>
     </div>
 
-    <h3 style="margin:16px 0 8px;font-size:14px">③ 每台节点的数据库 root（各填各的）</h3>
+    <div class="note" style="font-size:12.5px;margin-top:8px">
+      接管 = 把第 ① 步填的那些<b>旧库</b>登记成这个集群的节点。所以下面要填的是
+      <b>旧库每台机器的 IP、端口和数据库管理员口令</b>，<b>不是</b>集群里已有节点的
+      （那些由 Custos 自己管理，不需要在这里填）。
+    </div>
+    <div class="note" style="font-size:12.5px;margin-top:6px;color:#a16207">
+      ⚠ 如果上面选的是<b>已有集群、且里面已经有节点</b>，把一台单机旧库接进去会因两边数据不一致而建不了复制。
+      这种情况请改选「＋ 新建集群」（例如把 177 纳管成独立集群）。
+    </div>
+
+    <h3 style="margin:16px 0 8px;font-size:14px">③ 被接管节点的数据库管理员账号</h3>
     <div class="note" style="font-size:12.5px">
-      填的是<b>数据库账号</b>（有全部权限的那个，通常叫 root），<b>不是服务器的系统 root</b>。
-      生产环境每台口令往往不同，所以<b>按主机逐台填</b>；主机从下拉框选（只列已探测到的节点），不用手填。
-      某一台没单独填的，会自动用下面的「统一 root」兜底。
+      为每台被接管节点填写其数据库的<b>管理员账号与口令</b>（通常叫 root，是<b>数据库账号</b>，
+      不是服务器的系统 root）。Custos 将用它在对应节点上创建专用账号并完成登记。
+      主机从下拉框选择（只列第 ① 步探测成功的节点，不用手填），
+      <b>端口默认带出该节点的端口，可按需修改</b>；未单独填写的项会用下面的「统一管理员账号 / 统一口令」兜底。
     </div>
     <div style="display:flex;gap:8px;align-items:end;margin:10px 0;flex-wrap:wrap">
-      <label>统一 root 用户<input id="ruserAll" value="root" style="width:130px"></label>
-      <label>统一 root 密码<input id="rpassAll" type="password" placeholder="兜底用，可留空" style="width:180px"></label>
+      <label>统一管理员账号<input id="ruserAll" value="root" style="width:140px"></label>
+      <label>统一口令（兜底）<input id="rpassAll" type="password" placeholder="各台都一样时填，可留空" style="width:190px"></label>
       <button class="btn btn-sm" onclick="fillAllRoots()">应用到全部</button>
       <button class="btn btn-sm" onclick="testAllRoots()">全部测试连通性</button>
     </div>
@@ -248,24 +259,39 @@
   function renderNodeRoots(d){
     var box=document.getElementById('nodeRootList'); if(!box) return;
     _rootTest={};   // 重新探测后节点集合可能变了，旧测试结果全部作废
-    var hosts=((d&&d.nodes)||[]).filter(function(n){return n.ok;})
-      .map(function(n){return n.host+':'+n.port;});
-    if(!hosts.length){
+    var okNodes=((d&&d.nodes)||[]).filter(function(n){return n.ok;});
+    if(!okNodes.length){
       box.innerHTML='<div style="color:var(--muted);font-size:12.5px">还没有可连接的节点，请先完成探测</div>';
       return;
     }
+    // 下拉只列 IP；端口单独一个输入框，默认带出该节点探测到的端口（可改）
+    var ips=[];
+    okNodes.forEach(function(n){
+      var h=String(n.host);
+      if(ips.indexOf(h)<0) ips.push(h);
+    });
     var h='';
-    hosts.forEach(function(hp){
-      h+='<div class="node-row" style="grid-template-columns:1.5fr .8fr 1.1fr auto auto">'
-        +'<label>主机<select class="rh" onchange="resetTest(this)">'
-        +hosts.map(function(x){return '<option'+(x===hp?' selected':'')+'>'+esc(x)+'</option>';}).join('')
+    okNodes.forEach(function(n){
+      var ip=String(n.host), pt=n.port||3306;
+      h+='<div class="node-row" style="grid-template-columns:1.4fr .6fr .8fr 1fr auto auto">'
+        +'<label>主机 IP<select class="rh" onchange="onHostPick(this)">'
+        +ips.map(function(x){return '<option'+(x===ip?' selected':'')+'>'+esc(x)+'</option>';}).join('')
         +'</select></label>'
-        +'<label>root 用户<input class="ru" value="root" oninput="resetTest(this)"></label>'
-        +'<label>root 密码<input class="rp" type="password" placeholder="这台机的 root 口令" oninput="resetTest(this)"></label>'
+        +'<label>端口<input class="rpt" value="'+esc(pt)+'" oninput="resetTest(this)"></label>'
+        +'<label>管理员账号<input class="ru" value="root" oninput="resetTest(this)"></label>'
+        +'<label>口令<input class="rp" type="password" placeholder="这台机的数据库口令" oninput="resetTest(this)"></label>'
         +'<button class="btn btn-sm rtBtn" onclick="testRoot(this)">测试</button>'
         +'<button class="btn btn-sm" onclick="this.parentNode.remove()">删除</button></div>';
     });
     box.innerHTML=h;
+  }
+  function onHostPick(sel){
+    // 换了主机就把端口带成那台探测到的端口（端口本身仍可手改）
+    var row=(sel&&sel.closest)?sel.closest('.node-row'):null; if(!row) return;
+    var m=((_probe&&_probe.nodes)||[]).filter(function(n){return String(n.host)===sel.value;})[0];
+    var p=row.querySelector('.rpt');
+    if(p) p.value=(m&&m.port)||3306;
+    resetTest(sel);
   }
   function fillAllRoots(){
     var u=(document.getElementById('ruserAll')||{}).value||'root';
@@ -288,17 +314,18 @@
   function resetTest(el){
     var row=(el&&el.closest)?el.closest('.node-row'):null;
     if(!row) return;
-    delete _rootTest[(row.querySelector('.rh')||{}).value||''];
+    var _ip=((row.querySelector('.rh')||{}).value||'').trim();
+    var _pt=parseInt((row.querySelector('.rpt')||{}).value||'0',10)||3306;
+    delete _rootTest[_ip+':'+_pt];
     var b=row.querySelector('.rtBtn');
     if(b){b.textContent='测试'; b.style.color=''; b.title='';}
   }
   function testRoot(btn){
     var row=(btn&&btn.closest)?btn.closest('.node-row'):null; if(!row) return;
-    var hp=(row.querySelector('.rh')||{}).value||'';
-    if(!hp){alert('请先选主机');return;}
+    var host=((row.querySelector('.rh')||{}).value||'').trim();
+    if(!host){alert('请先选主机');return;}
+    var port=parseInt((row.querySelector('.rpt')||{}).value||'0',10)||3306;
     var u=rootUserOf(row), p=rootPassOf(row);
-    var i=hp.lastIndexOf(':');
-    var host=hp.slice(0,i), port=parseInt(hp.slice(i+1),10)||3306;
     btn.textContent='测试中…'; btn.disabled=true;
     var fd=new URLSearchParams();
     fd.set('host',host); fd.set('port',port); fd.set('db_user',u); fd.set('db_pass',p);
@@ -322,34 +349,33 @@
   function collectNodeRoots(){
     var out=[];
     document.querySelectorAll('#nodeRootList .node-row').forEach(function(r){
-      var hp=(r.querySelector('.rh')||{}).value||'';
+      var ip=((r.querySelector('.rh')||{}).value||'').trim();
+      var pt=parseInt((r.querySelector('.rpt')||{}).value||'0',10)||3306;
       var u=rootUserOf(r);
-      if(!hp||!u) return;
-      var i=hp.lastIndexOf(':');
-      out.push({host:hp.slice(0,i), port:parseInt(hp.slice(i+1),10)||3306,
-                user:u, password:rootPassOf(r)});
+      if(!ip||!u) return;
+      out.push({host:ip, port:pt, user:u, password:rootPassOf(r)});
     });
     return out;
   }
   function validateRoots(){
-    var covered={};
-    collectNodeRoots().forEach(function(r){covered[r.host+':'+r.port]=1;});
+    var rows=collectNodeRoots();
+    var byHost={}; rows.forEach(function(r){byHost[r.host]=1;});
     var miss=((_probe&&_probe.nodes)||[]).filter(function(n){
-      return n.ok && !covered[n.host+':'+n.port];
+      return n.ok && !byHost[String(n.host)];
     }).map(function(n){return n.host+':'+n.port;});
     if(miss.length){
-      alert('这些节点还没填 root 口令：'+miss.join('、')+'\n请补齐后再执行。');
+      alert('这些节点还没填管理员口令：'+miss.join('、')+'\n请补齐后再执行。');
       return false;
     }
-    // 铁律：root 口令必须逐台测通，没测过或测失败的都不许接管
+    // 铁律：每一行的口令都必须逐台测通，没测过或测失败的都不许接管
     var un=[], bad=[];
-    ((_probe&&_probe.nodes)||[]).filter(function(n){return n.ok;}).forEach(function(n){
-      var k=n.host+':'+n.port, t=_rootTest[k];
+    rows.forEach(function(r){
+      var k=r.host+':'+r.port, t=_rootTest[k];
       if(!t) un.push(k);
       else if(!t.ok) bad.push(k+'（'+t.msg+'）');
     });
     if(un.length||bad.length){
-      alert('root 口令还没验证通过，不能接管：'
+      alert('管理员口令还没验证通过，不能接管：'
         +(bad.length?'\n测试失败：'+bad.join('、'):'')
         +(un.length?'\n还没测试：'+un.join('、'):'')
         +'\n请点「全部测试连通性」逐台验证。');
