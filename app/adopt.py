@@ -83,7 +83,9 @@ def suggest_server_id(host, used=None):
     return base
 
 
-def build_fix_command(server_id=None, log_bin=False, binlog_format=False, container=""):
+def build_fix_command(server_id=None, log_bin=False, binlog_format=False, container="",
+                      gtid_strict=False, bind_addr=False, read_only_rel=False,
+                      log_bin_name=None):
     """生成「改配置 + 重启」的修复命令（MariaDB，绝不覆盖旧库现有配置）。
 
     生产铁律（防范最高级事故）：
@@ -110,14 +112,21 @@ def build_fix_command(server_id=None, log_bin=False, binlog_format=False, contai
             "exec mariadb -uroot -p -e \"%s\"; else exec mysql -uroot -p -e \"%s\"; fi'\n"
             % (cn, _sql_text, _sql_text)
         )
-        if log_bin or binlog_format:
+        if log_bin or binlog_format or gtid_strict or bind_addr or read_only_rel:
             cnf_lines = ["[mysqld]"]
             if server_id:
                 cnf_lines.append("server_id=%d" % int(server_id))
             if log_bin:
-                cnf_lines.append("log_bin=%s" % _BINLOG_NAME)
+                cnf_lines.append("log_bin=%s" % (log_bin_name or _BINLOG_NAME))
             if binlog_format:
                 cnf_lines.append("binlog_format=ROW")
+            if gtid_strict:
+                cnf_lines.append("gtid_strict_mode=ON")
+            if bind_addr:
+                cnf_lines.append("bind_address=0.0.0.0")
+            if read_only_rel:
+                cnf_lines.append("read_only=0")
+                cnf_lines.append("super_read_only=0")
             cnf = "\\n".join(cnf_lines) + "\\n"
             return (
                 "# ---- 数据库跑在容器里：在【宿主机】上执行（1Panel / Docker 都一样）----\n"
@@ -138,22 +147,39 @@ def build_fix_command(server_id=None, log_bin=False, binlog_format=False, contai
 
     head = (
         "# ---- 在【数据库所在主机】上以 root 执行（MariaDB）----\n"
-        "# 只新增一个独立配置文件，不动旧库现有的任何 my.cnf；改前自动备份\n"
+        "# 优先只新增一个独立配置文件（不动旧库现有 my.cnf）；\n"
+        "# 但若该目录【并未】被主 my.cnf 的 !includedir 引用（实测 Anolis/RHEL 精简装会出现：\n"
+        "#   文件写进去了却完全不生效，用户重启后重新探测仍是阻断项，且无从判断原因），\n"
+        "#   则回退为写进主 my.cnf 的 [mysqld] 段。两种情况都先 cp -a 备份。\n"
+        "MYCNF=/etc/my.cnf\n"
+        "for c in /etc/my.cnf /etc/mysql/my.cnf; do [ -f \"$c\" ] && MYCNF=\"$c\" && break; done\n"
+        "# 两个都不存在（精简装）时回落到 /etc/my.cnf 并由后续语句创建\n"
         "D=/etc/mysql/conf.d; [ -d \"$D\" ] || D=/etc/my.cnf.d; mkdir -p \"$D\"\n"
         "F=\"$D/99-custos-adopt.cnf\"\n"
+        "if ! grep -qE \"^[[:space:]]*!includedir[[:space:]]+${D}\" \"$MYCNF\" 2>/dev/null; then\n"
+        "  echo \"[提示] ${D} 未被 ${MYCNF} 的 !includedir 引用，改为写入主配置 ${MYCNF}\"\n"
+        "  F=\"$MYCNF\"\n"
+        "fi\n"
         "cp -a \"$F\" \"$F.bak.$(date +%F-%H%M%S)\" 2>/dev/null || true\n"
         "grep -q '^\\[mysqld\\]' \"$F\" 2>/dev/null || printf '[mysqld]\\n' >> \"$F\"\n"
         "set_kv(){ k=$1; v=$2; if grep -qE \"^[[:space:]]*#?[[:space:]]*${k}[[:space:]]*=\" \"$F\"; then "
         "sed -i \"s|^[[:space:]]*#\\?[[:space:]]*${k}[[:space:]]*=.*|${k}=${v}|\" \"$F\"; "
-        "else printf '%s=%s\\n' \"$k\" \"$v\" >> \"$F\"; fi; }\n"
+        "else sed -i \"/^\\[mysqld\\]/a ${k}=${v}\" \"$F\"; fi; }\n"
     )
     lines = []
     if server_id:
         lines.append("set_kv server_id %d" % int(server_id))
     if log_bin:
-        lines.append("set_kv log_bin %s" % _BINLOG_NAME)
+        lines.append("set_kv log_bin %s" % (log_bin_name or _BINLOG_NAME))
     if binlog_format:
         lines.append("set_kv binlog_format ROW")
+    if gtid_strict:
+        lines.append("set_kv gtid_strict_mode ON")
+    if bind_addr:
+        lines.append("set_kv bind_address 0.0.0.0")
+    if read_only_rel:
+        lines.append("set_kv read_only 0")
+        lines.append("set_kv super_read_only 0")
     tail = (
         "\n# 让配置生效（服务名按实际，常见 mariadb / mysqld）\n"
         "systemctl restart mariadb\n"
@@ -185,19 +211,40 @@ def fix_command_for(host, port, user, password, server_id=None, container="", ti
         except Exception:
             want = 0
         need_sid = sid in (None, 0) or (want > 0 and want != sid)
-        need_bin = log_bin.upper() in ("OFF", "0", "NONE")
+        # ⚠ 实测坑：存在「@@log_bin=1 但配置里根本没固化」的情况（如 1Panel 容器由启动参数开启）。
+        # 若只按"当前是否缺失"判断，就不会写 log_bin，用户一重启 binlog 反而消失 ——
+        # 等于接管操作把旧库的复制能力弄丢了。故接管场景**一律显式固化 binlog**。
+        need_bin = True
+        # 已开启时沿用原 basename，避免改变既有 binlog 文件名影响已有复制
+        lbn = str(_scalar(cur, "SELECT @@log_bin_basename") or "").strip()
+        bin_name = lbn or _BINLOG_NAME
         need_fmt = bool(fmt) and fmt.upper() != _ROW_FORMAT
-        if not (need_sid or need_bin or need_fmt):
-            out["ok"] = True
-            out["msg"] = "这台的 log_bin / server_id / binlog_format 都没问题，不用改"
-            return out
+        gsm = _scalar_str(cur, "SELECT @@gtid_strict_mode")
+        need_gtid = gsm.upper() in ("OFF", "0")
+        ba = str(_scalar(cur, "SELECT @@bind_address") or "").strip()
+        need_bind = bool(ba) and ba not in ("0.0.0.0", "*", "::", "0.0.0.0/0")
+        ro = _scalar_str(cur, "SELECT @@read_only")
+        sro = _scalar_str(cur, "SELECT @@super_read_only")
+        need_ro = ro.upper() in ("1", "ON") or sro.upper() in ("1", "ON")
+        others = need_sid or need_fmt or need_gtid or need_bind or need_ro
+        bin_on = log_bin.upper() in ("ON", "1")
         want_sid = want if want > 0 else (sid if sid else suggest_server_id(host))
         out["command"] = build_fix_command(
             server_id=(want_sid if need_sid else None),
-            log_bin=need_bin, binlog_format=need_fmt, container=container)
+            log_bin=need_bin, binlog_format=need_fmt,
+            gtid_strict=need_gtid, bind_addr=need_bind, read_only_rel=need_ro,
+            container=container, log_bin_name=bin_name)
         out["ok"] = True
-        out["msg"] = ("已按「容器」形态生成（进容器执行）" if container
-                      else "已按「裸机」形态生成")
+        if not others and bin_on:
+            out["msg"] = ("其余项均正常；仍建议把 binlog 显式写入配置"
+                          "（当前虽已开启，但未固化，重启可能丢失）")
+        elif not others:
+            out["msg"] = "已生成开启并固化 binlog 的命令"
+        else:
+            out["msg"] = "已按「%s」形态生成" % ("容器" if container else "裸机")
+        out["needs"] = {"server_id": need_sid, "log_bin": need_bin, "binlog_format": need_fmt,
+                        "gtid_strict_mode": need_gtid, "bind_address": need_bind,
+                        "read_only": need_ro}
         return out
     except Exception as e:
         out["msg"] = "生成失败：%s" % e
@@ -289,6 +336,45 @@ def apply_switch_fix(host, port, user, password, server_id, timeout=5):
             pass
 
 
+def release_read_only(host, port, user, password, timeout=5):
+    """在线解除只读（read_only / super_read_only）。
+
+    ⚠ 调用前提：调用方必须先确认该实例**不是别人的从库**（role != slave）。
+    在从库上解除只读并写入会造成主从数据不一致，属高危操作，故把关责任在调用方
+    （API 层会先校验 role，still_slave 阻断项未清零时拒绝执行）。
+
+    在线生效但重启会回退，故持久化仍需把 read_only=0 写进 99-custos-adopt.cnf
+    （由 build_fix_command 的 read_only_rel 分支一并生成）。
+    """
+    out = {"ok": False, "applied": [], "msg": ""}
+    conn = None
+    try:
+        conn = connect(host, int(port), user, password, timeout=timeout)
+        if conn is None:
+            out["msg"] = "连不上，无法解除只读"
+            return out
+        cur = conn.cursor()
+        for var in ("read_only", "super_read_only"):
+            try:
+                cur.execute("SET GLOBAL %s = 0" % var)
+                out["applied"].append(
+                    "%s=0 已在线生效（重启会回退，仍需写进配置持久化）" % var)
+            except Exception as e:
+                out["applied"].append(
+                    "%s 未能在线解除：%s（需写配置并重启）" % (var, str(e)[:80]))
+        out["ok"] = True
+        out["msg"] = "已尝试在线解除只读"
+        return out
+    except Exception as e:
+        out["msg"] = "解除只读失败：%s" % e
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _issue(level, code, msg, fix=""):
     return {"level": level, "code": code, "msg": msg, "fix": fix}
 
@@ -357,6 +443,8 @@ def probe_node(host, port, user, password, timeout=5):
         "supported": False, "profile_note": "",
         "server_id": None, "read_only": None, "super_read_only": None,
         "log_bin": None, "binlog_format": "",
+        "bind_address": "", "gtid_strict_mode": "", "deploy_form": "bare",
+        "log_bin_basename": "",
         "gtid_enabled": False, "repl_mode": _vp.REPL_NONE, "gtid_domain_id": None,
         "role": "standalone", "replica": None, "replicas": 0,
         "gtid_executed": "", "data_size_bytes": 0,
@@ -400,6 +488,16 @@ def probe_node(host, port, user, password, timeout=5):
         out["super_read_only"] = _scalar(cur, "SELECT @@super_read_only")
         out["log_bin"] = _scalar(cur, "SELECT @@log_bin")
         out["binlog_format"] = str(_scalar(cur, "SELECT @@binlog_format") or "")
+        # bind_address：决定 VIP 漂移过来后能不能连上（只监听 127.0.0.1 会直接拒连）
+        out["bind_address"] = str(_scalar(cur, "SELECT @@bind_address") or "")
+        # binlog 文件名基线：修复命令沿用原 basename，避免改变既有 binlog 文件名
+        out["log_bin_basename"] = str(_scalar(cur, "SELECT @@log_bin_basename") or "")
+        # gtid_strict_mode：Custos 复制走 GTID(slave_pos)，MariaDB 默认为 OFF 必须显式开
+        if p["family"] == _vp.FAMILY_MARIADB:
+            out["gtid_strict_mode"] = _scalar_str(cur, "SELECT @@gtid_strict_mode")
+        # 部署形态（裸机/容器）管理器从数据库端口猜不出来，只能给建议值交由用户确认：
+        # 非 3306 端口多为面板/容器化部署（如 1Panel 的 3307），3306 多为裸机。
+        out["deploy_form"] = "container" if int(port) != 3306 else "bare"
 
         # ---- GTID 与复制模式 ----
         if p["family"] == _vp.FAMILY_MARIADB:
@@ -500,6 +598,41 @@ def probe_node(host, port, user, password, timeout=5):
                 LV_WARN, "binlog_format_not_row",
                 "binlog_format=%s，非 ROW 格式在部分语句下复制不安全" % out["binlog_format"],
                 "建议改为 ROW（须重启）→ 见下方修复命令"))
+
+        # ---- read_only / super_read_only：在这上面建 Custos 账号会失败，且不能当主库写入 ----
+        _ro = str(out.get("read_only") or "")
+        _sro = str(out.get("super_read_only") or "")
+        if _ro.upper() in ("1", "ON") or _sro.upper() in ("1", "ON"):
+            out["issues"].append(_issue(
+                LV_BLOCKER, "read_only_on",
+                "该实例处于只读状态（read_only=%s / super_read_only=%s）：建 Custos 账号会失败，"
+                "且无法作为主库接受写入" % (_ro or "?", _sro or "?"),
+                "解除只读（standalone 可自动解除；若它仍是从库须先停复制）→ 见下方修复命令"))
+
+        # ---- 仍是别人的从库：纳管为独立主库会造成数据分叉 ----
+        if out.get("role") == "slave":
+            _src = (out.get("replica") or {}).get("source_host") or "未知主库"
+            out["issues"].append(_issue(
+                LV_BLOCKER, "still_slave",
+                "该实例仍在从 %s 复制数据：纳管为独立集群主库会造成数据分叉" % _src,
+                "先断开与原主库的关系：STOP REPLICA; RESET REPLICA ALL;（不可逆，需确认）"
+                "→ 见下方修复命令"))
+
+        # ---- bind_address 受限：VIP 漂移后连不上 ----
+        _ba = (out.get("bind_address") or "").strip()
+        if _ba and _ba not in ("0.0.0.0", "*", "::", "0.0.0.0/0"):
+            out["issues"].append(_issue(
+                LV_BLOCKER, "bind_address_restricted",
+                "bind_address=%s：MariaDB 只监听该地址，VIP 漂移后将无法连接" % _ba,
+                "配置里设 bind-address=0.0.0.0（须重启）→ 见下方修复命令"))
+
+        # ---- gtid_strict_mode：Custos 复制用 GTID(slave_pos)，MariaDB 默认 OFF ----
+        _gsm = str(out.get("gtid_strict_mode") or "")
+        if p["family"] == _vp.FAMILY_MARIADB and _gsm.upper() in ("OFF", "0"):
+            out["issues"].append(_issue(
+                LV_BLOCKER, "gtid_strict_off",
+                "gtid_strict_mode=%s：Custos 复制使用 GTID（slave_pos），必须先开启" % _gsm,
+                "配置里开 gtid_strict_mode=ON（须重启）→ 见下方修复命令"))
 
         # 探测账号够不够格「在线改全局参数」（root 级且非只读副本）→ 决定 UI 是否给快速修复开关
         out["can_tune"] = _can_tune(out)
@@ -639,12 +772,21 @@ def probe_cluster(nodes, l2_prefix=24):
         if need_sid:
             used.add(sug)
         p["suggested_server_id"] = sug
-        need_bin = str(p.get("log_bin")).upper() in ("OFF", "0", "NONE")
+        # 一律显式固化 binlog（理由见 fix_command_for：@@log_bin=1 也可能没写进配置）
+        need_bin = True
         need_fmt = bool(p.get("binlog_format")) and str(p.get("binlog_format")).upper() != _ROW_FORMAT
-        if need_sid or need_bin or need_fmt:
+        need_gtid = str(p.get("gtid_strict_mode") or "").upper() in ("OFF", "0")
+        _ba = (p.get("bind_address") or "").strip()
+        need_bind = bool(_ba) and _ba not in ("0.0.0.0", "*", "::", "0.0.0.0/0")
+        need_ro = (str(p.get("read_only") or "").upper() in ("1", "ON")
+                   or str(p.get("super_read_only") or "").upper() in ("1", "ON"))
+        if need_sid or need_bin or need_fmt or need_gtid or need_bind or need_ro:
             p["fix_cmd"] = build_fix_command(
                 server_id=(sug if need_sid else None),
-                log_bin=need_bin, binlog_format=need_fmt)
+                log_bin=need_bin, binlog_format=need_fmt,
+                gtid_strict=need_gtid, bind_addr=need_bind, read_only_rel=need_ro,
+                container=(p.get("container") or ""),
+                log_bin_name=(p.get("log_bin_basename") or None))
 
     # ---- 场景识别 ----
     slaves = [p for p in alive if p.get("role") == "slave"]

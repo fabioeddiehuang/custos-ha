@@ -159,7 +159,7 @@ def build_bundle(ip):
 # ---------------------------------------------------------------- token 签发/校验
 
 def issue_token(ip, cluster_id=None, actor="", ttl_hours=DEFAULT_TTL_HOURS,
-                install_dir=None):
+                install_dir=None, sidecar_only=False):
     """签发引导 token，落库并返回 token 字符串。
 
     token 形如 ``<jti>.<sig>``——**不含 IP**（避免 URL 泄露拓扑），
@@ -185,9 +185,10 @@ def issue_token(ip, cluster_id=None, actor="", ttl_hours=DEFAULT_TTL_HOURS,
     token = "%s.%s" % (jti, _sig(jti, ip, exp))
     execute(
         "INSERT INTO bootstrap_tokens "
-        "(token_hash, ip, cluster_id, install_dir, expires_at, issued_by) "
-        "VALUES (%s,%s,%s,%s,FROM_UNIXTIME(%s),%s)",
-        (_jti_hash(jti), ip, cluster_id, install_dir or None, exp, actor or ""),
+        "(token_hash, ip, cluster_id, install_dir, sidecar_only, expires_at, issued_by) "
+        "VALUES (%s,%s,%s,%s,%s,FROM_UNIXTIME(%s),%s)",
+        (_jti_hash(jti), ip, cluster_id, install_dir or None,
+         1 if sidecar_only else 0, exp, actor or ""),
     )
     return token
 
@@ -314,13 +315,19 @@ def node_install_cmds(ip, node_type, sidecar_only=False, install_dir=None):
     """
     dest = _install_dest(install_dir)
     if node_type == "mariadb" or sidecar_only:
-        cmds = ["cd %s && docker compose up -d keepalived custos-node-agent" % dest]
+        # ⚠ 必须 --force-recreate：引导脚本是先「tar 解压覆盖」节点目录再 up。
+        # 解压会用【新 inode】替换 ha_check.conf / keepalived.conf，而 bind mount
+        # 绑定的是 inode——已运行的容器仍持有旧 inode，于是读到的是旧配置
+        # （实测：宿主 LOCAL_ROOT_PASS 已是 '123'，容器内仍是空 → 探活 1045 → VIP 永不上浮）。
+        # 强制重建容器才能重新绑定，拿到新配置。
+        cmds = ["cd %s && docker compose up -d --force-recreate "
+                "keepalived custos-node-agent" % dest]
         if node_type == "mariadb" and not sidecar_only:
             from .node_gen import MARIADB_NODE_CONF_DIR
             cmds.insert(0, "bash %s/%s/scripts/Install-ha-mariadb-Node.sh"
                         % (dest, MARIADB_NODE_CONF_DIR))
         return cmds
-    return ["cd %s && docker compose up -d" % dest]
+    return ["cd %s && docker compose up -d --force-recreate" % dest]
 
 
 def available_images():
@@ -500,6 +507,7 @@ IP="__IP__"
 TOKEN="__TOKEN__"
 MGR="__MGR__"
 DEST="__DEST__"
+SIDECAR_ONLY="__SIDECAR_ONLY__"
 TMP="$(mktemp -d)"
 UNIT="$TMP/custos-unit.tgz"
 
@@ -557,6 +565,11 @@ fi
 
 # ---- 环境预检：端口占用（解压后从 compose 解析发布端口并检查，best-effort）----
 # compose 端口为 "host:container" 数字映射，直接提取 host 侧即可；解析失败仅告警不阻断。
+# 接管 sidecar_only：只装 keepalived + agent，被接管库此刻就在跑、其端口（如 3307）被占用是
+# 【预期】而非冲突，必须跳过端口预检（否则接管引导必卡在端口检查，见用户 177 节点实战）。
+if [ -n "$SIDECAR_ONLY" ]; then
+  log "环境预检：端口占用（sidecar_only 跳过：已有数据库端口被占用属正常）"
+else
 step "环境预检：端口占用"
 if [[ -f "$DEST/docker-compose.yml" || -f "$DEST/docker-compose.yaml" ]]; then
   _cf="$DEST/docker-compose.yml"; [[ -f "$_cf" ]] || _cf="$DEST/docker-compose.yaml"
@@ -579,6 +592,7 @@ if [[ -f "$DEST/docker-compose.yml" || -f "$DEST/docker-compose.yaml" ]]; then
   fi
 else
   warn "未找到 docker-compose.yml，跳过端口预检"
+fi
 fi
 
 step "登记节点目录（供 custosctl node 任意目录调用）"
@@ -609,6 +623,7 @@ printf '请回到管理端「节点管理」确认状态变为「在线」。\n'
     out = out.replace("__TOKEN__", str(token))
     out = out.replace("__MGR__", mgr)
     out = out.replace("__DEST__", dest)
+    out = out.replace("__SIDECAR_ONLY__", "1" if sidecar_only else "")
     out = out.replace("__IMAGES__", img_block)
     out = out.replace("__TAGFIX__", tagfix_block)
     out = out.replace("__INSTALL__", install_block)
@@ -627,7 +642,7 @@ def issue_for_node(ip, node_type="docker", cluster_id=None, actor="",
                    install_dir=None):
     """一次性产出「命令 + 脚本 + token」，供 API/页面直接使用。"""
     token = issue_token(ip, cluster_id=cluster_id, actor=actor, ttl_hours=ttl_hours,
-                        install_dir=install_dir)
+                        install_dir=install_dir, sidecar_only=sidecar_only)
     dest = _install_dest(install_dir)
     if images is None:
         images = available_images()

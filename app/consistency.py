@@ -332,6 +332,25 @@ def check_consistency(cid, mode="rows", confirm=True, wait_sec=None):
                       "FROM hosts WHERE cluster_id=%s", (cid,)) or []
     slaves = [r for r in host_rows
               if not (r["host"] == m_host and int(r["port"]) == m_port)]
+    # 已删除节点的 hosts 残留行不参与校验（P1，2026-10-02 实测）：
+    # 这类行不在 nodes 表里、也永远连不上，会让「刚删掉一个节点」把整集群的一致性校验
+    # 直接顶成失败——用户看到的是「校验不可用」，而不是「那个节点不存在」。故先按
+    # nodes 表过滤，并在 notes 里说明跳过了什么（保持覆盖透明）。
+    try:
+        _valid = set((r["ip"], int(r["port"])) for r in (
+            query("SELECT ip, port FROM nodes WHERE cluster_id=%s", (cid,)) or []))
+    except Exception:
+        _valid = set()
+    _stale_note = None
+    if _valid:
+        _stale = [r for r in slaves if (r["host"], int(r["port"])) not in _valid]
+        if _stale:
+            _stale_note = (
+                "已跳过 %d 个不在节点表中的残留状态条目（%s）：多为已删除节点的历史行，"
+                "不参与本次一致性判定。" % (
+                    len(_stale),
+                    ", ".join("%s:%s" % (r["host"], r["port"]) for r in _stale[:5])))
+        slaves = [r for r in slaves if (r["host"], int(r["port"])) in _valid]
     # is_current_master 标记与权威口径不一致的节点（切换后 monitor 尚未校准的窗口期）。
     # 旧实现正是用这个标记挑从库，会在该窗口把新主当从库比、把真从库漏掉。
     flag_mismatch = ["%s:%s(标记=%d)" % (r["host"], r["port"], int(r["flag"] or 0))
@@ -345,6 +364,8 @@ def check_consistency(cid, mode="rows", confirm=True, wait_sec=None):
     diffs, transient, checked = [], [], 0
     slave_status, divergence_windows, done_slaves = {}, {}, []
     repl_broken, notes = [], []
+    if _stale_note:
+        notes.append(_stale_note)
     tables_total, skipped = 0, []
     try:
         all_tables = _fetch_tables(mconn, None)          # 全量（含估算行数），升序
@@ -376,14 +397,23 @@ def check_consistency(cid, mode="rows", confirm=True, wait_sec=None):
         for s in slaves:
             s_host, s_port = s["host"], int(s["port"])
             s_user, s_pass = _node_root(cid, s_host)
-            sconn = _connect(s_host, s_port, s_user, s_pass)
+            # _connect 失败会【抛异常】而非返回 None（连接库 connect_robust 的行为）。
+            # 旧代码只判空，异常直接冒泡到 API —— 一个连不上的节点会让整集群校验失败、
+            # 页面只看到一句连接错误。这里统一兜住，按「不可比对」处理，其余节点照常校验。
+            _conn_err = ""
+            try:
+                sconn = _connect(s_host, s_port, s_user, s_pass)
+            except Exception as e:
+                sconn = None
+                _conn_err = str(e)[:160]
             if not sconn:
                 # 连不上=无法比对，按阻碍性差异上报（会顶成 inconsistent，避免「静默放过」）
                 diffs.append({"host": s_host, "port": s_port, "table": "-",
                               "master": None, "slave": None, "kind": "connect",
                               "category": "unreachable", "severity": "high",
                               "confirmed": True,
-                              "note": "无法连接从库，本节点数据状态未知（并非「一致」）"})
+                              "note": ("无法连接从库，本节点数据状态未知（并非「一致」）"
+                                       + ("：%s" % _conn_err if _conn_err else ""))})
                 continue
             try:
                 st0 = _replica_status(sconn)

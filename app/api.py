@@ -986,8 +986,12 @@ def api_bootstrap_script(token: str, request: Request):
     if _dir and not _dir.startswith("/"):
         _dir = ""                      # 仅接受绝对路径，脏数据回退默认
     try:
+        # sidecar_only 必须随 token 读回：接管场景只装 keepalived + agent，
+        # 不传的话会回落成全量安装（跑 Install 脚本）并被旧库自身端口卡死。
+        _sidecar = bool(int(row.get("sidecar_only") or 0))
         script = bootstrap.render_bootstrap_script(ip, token, node_type,
-                                                   install_dir=_dir or None)
+                                                   install_dir=_dir or None,
+                                                   sidecar_only=_sidecar)
     except Exception as e:
         return Response(f"生成引导脚本失败：{e}", status_code=500,
                         media_type="text/plain; charset=utf-8")
@@ -1439,12 +1443,129 @@ def api_adopt_fix_cmd(host: str = Form(...), port: int = Form(3306),
         return _json_ok({"ok": False, "msg": f"{type(e).__name__}: {e}"})
 
 
+@app.post("/api/adopt/check_vip")
+def api_adopt_check_vip(vip: str = Form(""), cluster_id: int = Form(0),
+                        user=Depends(auth_required)):
+    """VIP 占用检测（第 1、2 层）。
+
+    ① 登记比对：与已登记节点 IP / 已有集群 VIP 冲突 → 硬阻断；
+    ② 管理器 ping：有响应 → 警告（禁 ICMP 的机器 ping 不通，故"不通"不等于空闲）；
+    ③ 节点本机 arping（最准）由引导脚本在装 keepalived 之前执行，此处不做
+       —— 管理器通常不在该二层网络，arping 结果不可信。
+    """
+    v = (vip or "").strip()
+    if not v:
+        return _json_ok({"ok": False, "level": "block", "msg": "请先填写 VIP"})
+    try:
+        for r in (query("SELECT ip FROM nodes") or []):
+            if str(r.get("ip") or "").strip() == v:
+                return _json_ok({"ok": True, "level": "block",
+                                 "msg": "该 IP 已被登记为节点，不能作为 VIP"})
+        for r in (query("SELECT id, vip FROM clusters") or []):
+            if str(r.get("vip") or "").strip() != v:
+                continue
+            if int(cluster_id or 0) and int(r.get("id") or 0) == int(cluster_id):
+                continue
+            return _json_ok({"ok": True, "level": "block",
+                             "msg": "该 IP 已被集群 %s 用作 VIP" % r.get("id")})
+    except Exception:
+        pass
+    try:
+        import subprocess
+        rc = subprocess.run(["ping", "-c", "1", "-W", "2", v],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=6)
+        if rc.returncode == 0:
+            return _json_ok({"ok": True, "level": "warn",
+                             "msg": "该 IP 有响应（可能已被占用，请确认）；"
+                                    "最终以节点本机 arping 为准（冲突将中止安装）"})
+    except Exception:
+        pass
+    return _json_ok({"ok": True, "level": "ok",
+                     "msg": "登记比对通过，ping 无响应。最终以节点本机 arping 为准"})
+
+
+@app.post("/api/adopt/check_vrid")
+def api_adopt_check_vrid(vrid: str = Form(""), vip: str = Form(""),
+                         prefix: int = Form(24), cluster_id: int = Form(0),
+                         user=Depends(auth_required)):
+    """VRID 同网段冲突检测。
+
+    VRRP 只在同二层广播域内冲突，故判据是"同网段 + 同 vrid"，而不是全局唯一。
+    冲突时直接推荐一个空闲值，减少用户试错。
+    """
+    import ipaddress as _ip
+    v = (vrid or "").strip()
+    if not v:
+        return _json_ok({"ok": False, "level": "block", "msg": "请填写 VRID"})
+    try:
+        iv = int(v)
+        if not (1 <= iv <= 255):
+            return _json_ok({"ok": True, "level": "block",
+                             "msg": "VRID 必须是 1–255 之间的整数"})
+    except ValueError:
+        return _json_ok({"ok": True, "level": "block", "msg": "VRID 必须是数字"})
+
+    net = None
+    if (vip or "").strip():
+        try:
+            net = _ip.ip_network("%s/%d" % (vip.strip(), int(prefix)), strict=False)
+        except Exception:
+            net = None
+    try:
+        rows = query("SELECT id, vip, vrid FROM clusters") or []
+        for r in rows:
+            if str(r.get("vrid") or "").strip() != v:
+                continue
+            if int(cluster_id or 0) and int(r.get("id") or 0) == int(cluster_id):
+                continue
+            if net is not None:
+                try:
+                    cn = _ip.ip_network(
+                        "%s/%d" % (str(r.get("vip") or "").strip(), int(prefix)), strict=False)
+                except Exception:
+                    cn = None
+                if cn is not None and cn != net:
+                    continue
+            used = {str(x.get("vrid") or "").strip() for x in rows}
+            sug = next((str(i) for i in range(1, 256) if str(i) not in used), "")
+            return _json_ok({"ok": True, "level": "block", "suggest": sug,
+                             "msg": "同网段已有集群使用 VRID %s，已推荐空闲值 %s" % (v, sug)})
+    except Exception:
+        pass
+    return _json_ok({"ok": True, "level": "ok", "msg": "VRID %s 在同网段内未被占用" % v})
+
+
+@app.post("/api/adopt/release_read_only")
+def api_adopt_release_read_only(host: str = Form(...), port: int = Form(3306),
+                                db_user: str = Form("root"), db_pass: str = Form(""),
+                                user=Depends(auth_required)):
+    """在线解除 read_only / super_read_only（用于建 Custos 账号 + 作为主库可写）。
+
+    ⚠ 前提：该实例**不能是别人的从库**。在从库上解除只读并写入会造成主从数据
+    不一致，故此处先探测 role，仍是 slave 时直接拒绝，要求先断开复制。
+    """
+    from . import adopt
+    try:
+        p = adopt.probe_node(host, int(port), db_user, db_pass)
+        if p.get("ok") and p.get("role") == "slave":
+            src = (p.get("replica") or {}).get("source_host") or "未知主库"
+            return _json_ok({"ok": False, "msg":
+                "该实例仍在从 %s 复制，禁止解除只读（会造成主从数据不一致）。"
+                "请先断开复制：STOP REPLICA; RESET REPLICA ALL;" % src})
+        return _json_ok(adopt.release_read_only(host, int(port), db_user, db_pass))
+    except Exception as e:
+        return _json_ok({"ok": False, "msg": f"{type(e).__name__}: {e}"})
+
+
 @app.post("/api/adopt/run")
 def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
                   name: str = Form(""), vip: str = Form(""),
                   vip_prefix: str = Form("24"), vip_port: int = Form(3306),
                   root_user: str = Form("root"), root_pass: str = Form(""),
                   node_roots: str = Form(""),
+                  deploy_form: str = Form(""), container: str = Form(""),
+                  vrid: str = Form(""), interface: str = Form(""),
                   user=Depends(auth_required)):
     """执行接管：建 Custos 账号 → 登记 nodes/hosts → 生成 sidecar 引导命令。
 
@@ -1464,6 +1585,22 @@ def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
 
     actor = user.get("username") if isinstance(user, dict) else str(user)
     cid = int(cluster_id or 0)
+
+    # ---- 部署形态 → 登记形态 ----
+    # 裸机 mariadb / 容器 mariadb-docker。未显式指定时按端口推断（非 3306 多为面板/容器化部署）。
+    _form = (deploy_form or "").strip().lower()
+    try:
+        _p0 = int((arr[0] or {}).get("port") or 3306)
+    except Exception:
+        _p0 = 3306
+    if _form not in ("bare", "container"):
+        _form = "container" if _p0 != 3306 else "bare"
+    _ntype = "mariadb" if _form == "bare" else "mariadb-docker"
+    # ---- VIP 端口 ----
+    # 裸机形态 keepalived 只漂 IP，不做端口映射（容器形态才是 compose 端口映射），
+    # 所以接管场景 VIP 端口默认必须等于旧库实际端口，否则业务连不上。
+    _vip_port = int(vip_port or 0) or _p0 or 3306
+
     if not cid:
         if not (name or "").strip():
             return _json_ok({"ok": False, "error": "新建集群必须给名称"})
@@ -1472,8 +1609,10 @@ def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
         try:
             cid = create_cluster((name or "").strip(), vip=(vip or "").strip(),
                                  vip_prefix=(vip_prefix or "24").strip(),
-                                 vip_port=int(vip_port or 3306),
-                                 node_type="mariadb")
+                                 vip_port=_vip_port,
+                                 vrid=(vrid or "").strip() or None,
+                                 interface=(interface or "").strip() or None,
+                                 node_type=_ntype)
         except Exception as e:
             return _json_ok({"ok": False, "error": "创建集群失败：%s" % e})
 
@@ -1484,9 +1623,58 @@ def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
     if not any(n.get("ok") for n in probe.get("nodes", [])):
         return _json_ok({"ok": False, "error": "所有节点都无法连接", "probe": probe})
 
+    # 容器形态：把容器名回填给探测结果，使 fix_cmd 生成「进容器执行」的分支
+    if _form == "container" and (container or "").strip():
+        for n in probe.get("nodes", []):
+            n["container"] = container.strip()
+    # 集群版本 = 旧库实际版本（后续加从库按此版本匹配，避免版本错配）
+    try:
+        _ver = ""
+        for n in probe.get("nodes", []):
+            if n.get("ok") and n.get("version"):
+                _ver = str(n["version"])[:48]
+                break
+        if _ver:
+            update_cluster(cid, mysql_version=_ver)
+    except Exception:
+        pass
+
+    # 防呆：接管（adopt）是「纳管外部已有数据库」，目标应是【新建集群】或【空集群】，
+    # 不允许把节点塞进一个已经有节点的存量集群。否则单机实例接入已有主从集群会让
+    # monitor 误判复制状态、甚至自动拉起错误的复制通道（如 177→213），详见 DESIGN-006。
+    if cid:
+        try:
+            _ex = query("SELECT COUNT(*) AS c FROM nodes WHERE cluster_id=%s", (cid,))
+            _cnt = int((_ex[0].get("c") if _ex and _ex[0] else 0) or 0)
+        except Exception:
+            _cnt = 0
+        if _cnt > 0:
+            return _json_ok({"ok": False, "error":
+                "接管不能把节点接入已有节点的集群（cluster_id=%s 已含 %d 个节点）。"
+                "接管＝纳管外部已有库，请选「＋ 新建集群」把它纳管为独立集群"
+                "（例如把单机 177 纳管成独立集群），或先清空该集群再接入。" % (cid, _cnt),
+                "probe": probe})
+
     # 每台节点各自的 root 凭据（生产环境各机口令常不同）；解析失败不阻断，
     # 全部回落统一的 root_user / root_pass。
     per_node = {}
+    if not (node_roots or "").strip():
+        # 未单独提供时，**回落到第 ① 步填的那套账号**：它已在探测阶段验证过
+        # 能连通且权限足够（root_like）。此前不回落会导致用空口令去建账号 →
+        # 1045 Access denied，接管卡在"建账号失败"，而用户明明填对了口令。
+        for it in arr:
+            if not isinstance(it, dict):
+                continue
+            h = str(it.get("host") or "").strip()
+            u = str(it.get("user") or "").strip()
+            if not h or not u:
+                continue
+            try:
+                pt = int(it.get("port") or 3306)
+            except Exception:
+                pt = 3306
+            per_node["%s:%d" % (h, pt)] = {
+                "user": u, "password": it.get("password") or ""}
     if (node_roots or "").strip():
         try:
             nr = json.loads(node_roots)
@@ -1988,6 +2176,16 @@ def settings_save(
         val = "1" if s in ("1", "true", "on", "True") else "0"
         upsert_setting(k, val)
         audit.add_audit(uname, "setting_set", k, val, None)
+    # 有「业务含义下界」的阈值：越界时【保持原值并明确提示】，而不是静默归零。
+    # 实测教训（2026-10-02）：填 -5 被 clamp 成 0 后，LAG_FAILOVER_SEC=0 会让
+    # 「从库延迟 ≥ 0s」恒成立 —— 延迟切换几乎每个周期都达标，集群被反复自动切换，
+    # 而页面上看不出阈值已经失效。故：小于下界视为无效输入，拒绝写入。
+    _MIN_INT = {
+        "LAG_FAILOVER_SEC": 10,       # 低于 10s 的延迟阈值没有实际意义
+        "LAG_FAILOVER_CYCLES": 1,
+        "FAILOVER_COOLDOWN_SEC": 30,  # 冷却过短会让切换反复发生
+    }
+    _rejected = []
     _ints = {
         "LAG_FAILOVER_SEC": lag_failover_sec,
         "LAG_FAILOVER_CYCLES": lag_failover_cycles,
@@ -2005,10 +2203,19 @@ def settings_save(
             iv = int(s)
         except ValueError:
             continue
+        _lo = _MIN_INT.get(k)
+        if _lo is not None and iv < _lo:
+            # 越界：保持原值，并在返回里明确告知（不静默改成 0）
+            _rejected.append("%s 不能小于 %d（已保持原值 %s）"
+                             % (k, _lo, get_setting(k, str(_lo))))
+            continue
         if iv < 0:
             iv = 0
         upsert_setting(k, str(iv))
         audit.add_audit(uname, "setting_set", k, str(iv), None)
+    if _rejected:
+        return JSONResponse({"ok": True,
+                             "msg": "✓ 已保存配置；以下项未生效：" + "；".join(_rejected)})
     return JSONResponse({"ok": True, "msg": "✓ 已保存配置"})
 
 
@@ -2142,7 +2349,13 @@ def email_add(email: str = Form(""), user=Depends(auth_required)):
         execute("INSERT INTO alert_emails (email, is_default) VALUES (%s, 0)", (email,))
         return JSONResponse({"ok": True, "msg": f"✓ 已添加 {email}"})
     except Exception as e:
-        return JSONResponse({"ok": False, "msg": f"✗ 添加失败（可能已存在）：{e}"}, status_code=200)
+        # 重复邮箱是常态操作（用户忘了已加过），直接把 MySQL 的 1062 原文抛给用户
+        # 既不专业也吓人；这里识别成「已存在」的明确提示。
+        _s = str(e)
+        if "1062" in _s or "Duplicate" in _s or "duplicate" in _s:
+            return JSONResponse({"ok": False, "msg": f"✗ 邮箱 {email} 已存在，无需重复添加"},
+                                status_code=200)
+        return JSONResponse({"ok": False, "msg": f"✗ 添加失败：{_s}"}, status_code=200)
 
 
 @app.post("/settings/email/delete")
@@ -3287,8 +3500,14 @@ def alerts_page(request: Request, user=Depends(auth_required), msg: str = "", er
         "receivers": get_setting("ALERT_RECEIVERS", ""),
         "grace": get_setting("ALERT_GRACE_SEC", "30"),
     }
+    # 邮件通道故障常驻提示：投递真失败过就在页面顶部显示，避免「告警静默丢失」无人知晓。
+    try:
+        from .alerts import channel_error as _channel_error
+        chan_err = _channel_error()
+    except Exception:
+        chan_err = None
     return render("alerts.html", request, user=user, cfg=cfg, alert_emails=alert_emails,
-                  clusters=clusters, rules=rules, msg=msg, error=error)
+                  clusters=clusters, rules=rules, msg=msg, error=error, chan_err=chan_err)
 
 
 @app.get("/api/active_alerts")
@@ -4256,6 +4475,14 @@ def nodes_add(
         return RedirectResponse(
             "/nodes?error=节点类型(node_type)非法或为空，请从 docker / mariadb / mariadb-docker 中选择",
             status_code=303)
+    # 版本跟随：页面未填版本时按集群登记版本补齐（旧主 10.6/11.4 → 新从库同版本），
+    # 否则「不传版本」会把校验绕过去、生成 12.3.3 的跨大版本节点。
+    if not (mysql_version or "").strip():
+        try:
+            from .clusters import get_cluster as _get_cluster
+            mysql_version = ((_get_cluster(int(cid)) or {}).get("mysql_version") or "").strip()
+        except Exception:
+            pass
     # 同集群「同构」校验：禁止 docker/mariadb 混部、主版本须一致
     try:
         validate_node_version(cid, node_type, mysql_version.strip() or None)
@@ -4272,6 +4499,15 @@ def nodes_add(
                         "add_node", f"{ip}:{port}",
                         f"type={node_type} ver={mysql_version}", cluster_id=cid)
     except Exception as e:
+        # 只把 str(e) 回给用户，服务端必须同时留下完整堆栈：否则像
+        # "unsupported operand type(s) for /: 'str' and 'str'" 这种报错（2026-10-02 实测：
+        # 新建集群后首次添加节点偶发，节点其实已建成、页面却显示失败）根本无从定位。
+        try:
+            logger = logging.getLogger("custos.api")
+            logger.exception("nodes_add 失败(ip=%s port=%s type=%s ver=%s): %s",
+                             ip, port, node_type, mysql_version, e)
+        except Exception:
+            pass
         return RedirectResponse(f"/nodes?error={e}", status_code=303)
     role_tip = "（已设为初始主库）" if initial_role == "master" else ""
     # 安装说明精简为两种通用方式（curl 引导安装 / 手动上传节点包），不再按类型堆砌长文。

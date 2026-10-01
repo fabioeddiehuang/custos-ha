@@ -166,6 +166,21 @@ def resolve_recipients(cluster_id=None):
                     emails.append(e)
     except Exception as e:
         print(f"[alert:resolve] 读取收件人失败: {e}")
+    # 未绑定任何集群的邮箱 = 接收【全部集群】告警。
+    # 不加这条，用户「新建邮箱」后（is_default 默认 0、又还没绑集群）将永远收不到
+    # 任何告警——所有告警都带 cluster_id，两个分支都命中不了它，页面却显示「已添加」，
+    # 表现为「明明加了邮箱却收不到报警邮件」（2026-10-02 实测确认）。
+    try:
+        for r in query(
+            "SELECT email FROM alert_emails e WHERE e.enabled=1 "
+            "AND NOT EXISTS (SELECT 1 FROM alert_email_map m WHERE m.email_id=e.id)"
+        ):
+            e = (r.get("email") or "").strip()
+            if e and e not in seen:
+                seen.add(e)
+                emails.append(e)
+    except Exception as e:
+        print(f"[alert:resolve] 读取未绑定邮箱失败(可忽略): {e}")
     # 回退：未配置任何邮箱时，使用旧的单邮箱设置
     if not emails:
         legacy = (get_setting("ALERT_EMAIL") or env("ALERT_EMAIL") or "").strip()
@@ -176,6 +191,15 @@ def resolve_recipients(cluster_id=None):
 
 # 记录最近一次发送失败的原因，便于前端展示
 last_error = ""
+
+# 最近一次「邮件通道故障」（投递阶段真发送失败）：与 last_error 不同，它只在
+# 真正尝试投递并失败时写入，用于设置页常驻提示「告警通道不可用」。
+_CHANNEL_ERROR = {}
+
+
+def channel_error():
+    """返回最近一次邮件通道故障 {ts, error, subject}；无故障返回 None。"""
+    return _CHANNEL_ERROR or None
 
 
 # v2.3.3：维护窗口内**仍然要发出去**的告警关键字。
@@ -291,4 +315,17 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
     except Exception as e:
         last_error = str(e)
         print(f"[alert:error] {e}")
+        # 发信失败必须留痕（2026-10-02）：否则 SMTP 配错 / DNS 不通 / 端口被墙时，
+        # 告警【静默丢失】——用户看到的是「没告警=一切正常」，实际告警通道早断了，
+        # 只有翻容器日志才能发现。这里：① 落一条告警中心记录（页面可见）；
+        # ② 记住通道错误，供设置页提示。
+        try:
+            record_alert(cluster_id, "-", 0, "alert_channel",
+                         "告警邮件发送失败（本次告警未送达）：%s | %s"
+                         % (subject, str(e)[:200]),
+                         status="failed")
+        except Exception:
+            pass
+        global _CHANNEL_ERROR
+        _CHANNEL_ERROR = {"ts": time.time(), "error": str(e)[:300], "subject": str(subject)[:120]}
         return False

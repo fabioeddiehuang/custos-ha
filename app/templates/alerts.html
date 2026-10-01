@@ -36,6 +36,7 @@
 
 {% if msg %}<div class="banner ok">✓ {{ msg }}</div>{% endif %}
 {% if error %}<div class="banner err">⚠ {{ error }}</div>{% endif %}
+{% if chan_err %}<div class="banner err">⚠ 告警邮件通道存在故障：最近一次投递失败（{{ chan_err.subject }}）——{{ chan_err.error }}。告警可能未送达，请检查 SMTP 配置与网络。</div>{% endif %}
 
 <div class="card">
   <div class="smtp-head">

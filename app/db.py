@@ -293,6 +293,15 @@ def init_schema():
                           "ADD COLUMN install_dir VARCHAR(255) DEFAULT NULL")
             except Exception:
                 pass          # 列已存在（1060 duplicate column）即忽略
+            # 旧库补列：bootstrap_tokens.sidecar_only（接管场景只装 keepalived + agent）。
+            # 不落库的话，节点「curl | bash」拉脚本时（GET /api/node/bootstrap/<token>）
+            # 拿不到签发时的这个标志，会回落成全量安装 —— 结果跑 Install-ha-mariadb-Node.sh，
+            # 把被接管库自身正在监听的端口（如 3307）当成冲突而报错失败。
+            try:
+                c.execute("ALTER TABLE bootstrap_tokens "
+                          "ADD COLUMN sidecar_only TINYINT(1) DEFAULT 0")
+            except Exception:
+                pass
             # 空闲优化：为历史表的 ts 列补单列索引。
             # metric_history / config_drift 的保留期清理按 ts 删除，而原索引
             # (cluster_id,host,port,ts) 与 (cluster_id,ts) 的最左前缀都不是 ts，

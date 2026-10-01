@@ -50,13 +50,48 @@ NODE_SCRIPTS = Path(__file__).parent / "node_assets"
 
 # 节点包内数据库配置/脚本归整目录名（节点部署目录归整改造：cnf/sql 进 <db>/conf，脚本进 <db>/scripts）
 MYSQL_NODE_CONF_DIR = "mysql8.0"
+# 旧常量：仅作兼容回退（bootstrap 等模块仍引用）；新逻辑一律走 _node_conf_dir(node_type, version)
+# 按版本动态取名（mariadb12.3.3 / mariadb11.4.13 / mariadb10.6.28 ...）。
 MARIADB_NODE_CONF_DIR = "mariadb12.3.3"
 AGENT_DIR = "agent"
 
+# 主线版本：节点与集群都没登记版本时的唯一回退值。
+MARIADB_MAINLINE_VERSION = "12.3.3"
 
-def _node_conf_dir(node_type):
-    """节点包内数据库配置目录名（mysql8.0 / mariadb12.3.3）。"""
-    return MARIADB_NODE_CONF_DIR if is_mariadb_node(node_type) else MYSQL_NODE_CONF_DIR
+
+def mariadb_version_tag(mysql_version=None):
+    """把各形态的版本串归一化成「主.次.补丁」（用于镜像 tag 与节点包目录名）。
+
+    常见输入：'11.4.13-MariaDB-ubu2404-log'（容器）、'10.6.28-MariaDB-log'（裸机）、
+    '12.3.3'。取不到或非法时回退主线 MARIADB_MAINLINE_VERSION。
+    """
+    v = (mysql_version or "").strip()
+    if not v:
+        return MARIADB_MAINLINE_VERSION
+    head = v.split("-")[0]
+    parts = [p for p in head.split(".") if p.isdigit()]
+    if len(parts) >= 3:
+        return ".".join(parts[:3])
+    if len(parts) == 2:
+        return ".".join(parts[:2])
+    return MARIADB_MAINLINE_VERSION
+
+
+def mariadb_image_for_version(mysql_version=None):
+    """容器化 MariaDB 节点镜像：**跟随版本**（如 mariadb:11.4.13）。
+
+    旧逻辑写死 mariadb:12.3.3 —— 接管 10.6/11.4 老库后新增从库会被强塞 12.3.3，
+    而跨大版本复制不是受支持组合、页面也无从选择。现在按「节点显式版本 → 集群登记
+    版本 → 主线」的顺序取镜像。
+    """
+    return "mariadb:%s" % mariadb_version_tag(mysql_version)
+
+
+def _node_conf_dir(node_type, mysql_version=None):
+    """节点包内数据库配置目录名（mysql8.0 / mariadb<版本>，如 mariadb11.4.13）。"""
+    if is_mariadb_node(node_type):
+        return "mariadb%s" % mariadb_version_tag(mysql_version)
+    return MYSQL_NODE_CONF_DIR
 
 # 容器化 MariaDB 节点（node_type='mariadb-docker'）使用的镜像。
 #
@@ -795,7 +830,8 @@ def render_baremetal_compose(node_name, vip_port=None, data_dir=None):
 
 
 def render_mariadb_compose(node_name, root_pass, port, server_id, vip_port=None,
-                           data_dir=None, image=None, buffer_pool="320M"):
+                           data_dir=None, image=None, buffer_pool="320M",
+                           mysql_version=None, conf_dir=None):
     """容器化 MariaDB 节点的【纯 compose】部署文件（推荐方式）。
 
     与 render_baremetal_compose()（只跑 keepalived、MariaDB 由安装脚本另起）不同，
@@ -820,7 +856,10 @@ def render_mariadb_compose(node_name, root_pass, port, server_id, vip_port=None,
     if data_dir is None:
         data_dir = MARIADB_DOCKER_DATA_DIR
     if image is None:
-        image = MARIADB_DOCKER_IMAGE
+        # 镜像跟随版本：集群/节点登记 11.4.13 就用 mariadb:11.4.13，不再一律 12.3.3。
+        image = mariadb_image_for_version(mysql_version)
+    if conf_dir is None:
+        conf_dir = _node_conf_dir("mariadb-docker", mysql_version)
     # 端口映射：节点自身端口 + VIP 端口 -> 容器内同一端口
     port_lines = f'      - "{port}:{port}"\n'
     if str(vip_port) != str(port):
@@ -869,11 +908,11 @@ services:
       - {data_dir}:/var/lib/mysql:z
       # 配置双挂：Debian 构建读 /etc/mysql/conf.d，UBI 构建读 /etc/my.cnf.d，两条都挂
       # 可让任一镜像都生效；99- 前缀保证最后加载、覆盖镜像默认值。
-      - ./mariadb12.3.3/conf/docker-my.cnf:/etc/my.cnf.d/99-ha.cnf:ro,z
-      - ./mariadb12.3.3/conf/docker-my.cnf:/etc/mysql/conf.d/99-ha.cnf:ro,z
+      - ./{conf_dir}/conf/docker-my.cnf:/etc/my.cnf.d/99-ha.cnf:ro,z
+      - ./{conf_dir}/conf/docker-my.cnf:/etc/mysql/conf.d/99-ha.cnf:ro,z
       # 初始化 SQL：仅在数据目录为空的首次启动执行；已初始化节点改由 fix-node-creds.sql
       # 或管理器 ensure_ha_creds 自愈校正账号（不会重复执行导致报错）。
-      - ./mariadb12.3.3/conf/init_mariadb.sql:/docker-entrypoint-initdb.d/init_mariadb.sql:ro,z
+      - ./{conf_dir}/conf/init_mariadb.sql:/docker-entrypoint-initdb.d/init_mariadb.sql:ro,z
       # 统一日志目录：error.log 等全部落到这里（宿主 logs/<基名> -> 容器 /var/log/custos-ha）
       - {_log_dir_host(data_dir)}:/var/log/custos-ha:z
     logging:
@@ -1593,7 +1632,12 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
         add("exec", "日志目录/logrotate 配置已更新：需在节点执行一次",
             "统一日志目录需预先创建并把属主改为容器内 mysql(uid 999)，否则 "
             "mariadbd/mysqld 写 error.log 会 Permission denied 启动失败。",
-            "cd %s && sudo bash %s" % (d, _node_conf_dir(node_type) / "conf" / "scripts" / "prepare-logs.sh"), lf)
+            # ⚠ _node_conf_dir() 返回的是**字符串**，不能直接 `/` 拼路径（str / str 会抛
+            # TypeError: unsupported operand type(s) for /: 'str' and 'str'）。
+            # 实测（2026-10-02）：该异常只在「首次生成节点包」时触发（此时 prepare-logs.sh
+            # 才属于变更文件、才会走到这一行），表现为「页面报 str/str 错误，但节点其实
+            # 已经建成」，重复点一次（文件不再是变更项）就正常 —— 极难定位。
+            "cd %s && sudo bash %s" % (d, Path(_node_conf_dir(node_type)) / "conf" / "scripts" / "prepare-logs.sh"), lf)
 
     # 8) 安装/卸载脚本：仅在重装/卸载场景执行
     inf = hit("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh",
@@ -1953,6 +1997,19 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         update_cluster(cluster_id, app_pass=app_pass)
         creds["app_pass"] = app_pass
 
+    # ---- 版本跟随：节点未显式指定版本时，跟随集群已登记的版本 ----
+    # 场景：接管了 10.6 / 11.4 老库之后再添加从库。旧逻辑镜像写死 12.3.3，会把跨大版本
+    # 节点塞进老集群（非受支持组合且页面无从选择）。此处补齐缺省版本，使后续
+    # 「镜像 / 节点包目录名 / my.cnf 版本分支」全部跟随集群版本。
+    if not (mysql_version or "").strip():
+        try:
+            from .clusters import get_cluster as _get_cluster
+            _cv = ((_get_cluster(cluster_id) or {}).get("mysql_version") or "").strip()
+        except Exception:
+            _cv = ""
+        if _cv:
+            mysql_version = _cv
+
     vip = creds["vip"]
     if not vip:
         raise ValueError("请先在「集群管理」中为该集群设置 VIP（节点同网段空闲 IP）后再添加节点")
@@ -2012,39 +2069,41 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
                                 auth_plugin=_auth_plugin_for(mysql_version, node_type))
     extra_files = {}
+    # 节点包内数据库配置目录名：跟随版本（mariadb11.4.13 / mariadb10.6.28 / mariadb12.3.3 ...）
+    _mconf = _node_conf_dir(node_type, mysql_version)
     if is_mariadb_node(node_type):
         # MariaDB 两种形态（裸机 / 容器）共用：init_mariadb.sql + fix-node-creds.sql。
         # 差异仅在「配置文件」与「部署脚本」，故此处先写公共部分，再按形态分支。
-        _write(d / MARIADB_NODE_CONF_DIR / "conf" / "init_mariadb.sql", render_mariadb_init_sql(
+        _write(d / _mconf /"conf" / "init_mariadb.sql", render_mariadb_init_sql(
             ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass), mode=0o644)
         # 账号/权限修复脚本（MariaDB 语法，native 密码）
         fix_sql = render_fix_node_creds_sql_mariadb(
             ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip, port,
             manager_subnet)
-        _write(d / MARIADB_NODE_CONF_DIR / "conf" / "fix-node-creds.sql", fix_sql, mode=0o644)
-        extra_files["init_mariadb_sql"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/conf/init_mariadb.sql"
+        _write(d / _mconf /"conf" / "fix-node-creds.sql", fix_sql, mode=0o644)
+        extra_files["init_mariadb_sql"] = f"{_install_dest}/{_mconf}/conf/init_mariadb.sql"
         # gtid_domain_id 显式指定为与 server_id 一致的非 0 值：MariaDB 一主多从/切换场景下，
         # 每个节点用各自独立域，避免切换后双主写入产生 GTID 冲突（预检不再报 domain_id=0）。
         if node_type == "mariadb-docker":
             # 容器化 MariaDB：纯 compose 部署（render_mariadb_compose 已含 mariadb + keepalived），
             # 故只交付配置片段（不含 datadir/socket）+ 卸载脚本，不再生成安装脚本
             # （部署入口即 docker compose up -d）；安装脚本仅作「裸机装不上 tarball」回退在裸机分支交付。
-            _write(d / MARIADB_NODE_CONF_DIR / "conf" / "docker-my.cnf",
+            _write(d / _mconf /"conf" / "docker-my.cnf",
                    render_mariadb_docker_my_cnf(server_id, port, gtid_domain_id=server_id),
                    mode=0o644)
-            extra_files["docker_my_cnf"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/conf/docker-my.cnf"
-            extra_files["uninstall_script"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-docker-Node.sh"
+            extra_files["docker_my_cnf"] = f"{_install_dest}/{_mconf}/conf/docker-my.cnf"
+            extra_files["uninstall_script"] = f"{_install_dest}/{_mconf}/scripts/Uninstall-mariadb-docker-Node.sh"
             src = NODE_SCRIPTS / "Uninstall-mariadb-docker-Node.sh"
             if src.exists():
-                _write(d / MARIADB_NODE_CONF_DIR / "scripts" / "Uninstall-mariadb-docker-Node.sh", src.read_text(), mode=0o755)
+                _write(d / _mconf /"scripts" / "Uninstall-mariadb-docker-Node.sh", src.read_text(), mode=0o755)
         else:
             # 裸机 MariaDB：完全独立安装，由 Install 脚本全量安装 tarball。
             # 完整 my.cnf（Install 脚本落盘到 ${MARIADB_INSTALL_DIR}/my.cnf 或 /etc/my.cnf）
             my_cnf = render_mariadb_my_cnf(server_id, port, gtid_domain_id=server_id)
-            _write(d / MARIADB_NODE_CONF_DIR / "conf" / "my.cnf", my_cnf, mode=0o644)
-            extra_files["my_cnf"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/conf/my.cnf"
-            extra_files["install_script"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/scripts/Install-ha-mariadb-Node.sh"
-            extra_files["uninstall_script"] = f"{_install_dest}/{MARIADB_NODE_CONF_DIR}/scripts/Uninstall-mariadb-Node.sh"
+            _write(d / _mconf /"conf" / "my.cnf", my_cnf, mode=0o644)
+            extra_files["my_cnf"] = f"{_install_dest}/{_mconf}/conf/my.cnf"
+            extra_files["install_script"] = f"{_install_dest}/{_mconf}/scripts/Install-ha-mariadb-Node.sh"
+            extra_files["uninstall_script"] = f"{_install_dest}/{_mconf}/scripts/Uninstall-mariadb-Node.sh"
             # 裸机包【只适配裸机】：不再交付 Install-mariadb-docker-Node.sh 容器回退脚本。
             # 原因：该脚本把裸机完整 my.cnf（仅剔除 datadir/socket/pid_file）喂给官方镜像容器，
             # 残留裸机专属参数（缺失 log_error → 官方镜像默认写 stdout，管理器「错误日志」
@@ -2057,7 +2116,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh"):
                 src = NODE_SCRIPTS / sf
                 if src.exists():
-                    _write(d / MARIADB_NODE_CONF_DIR / "scripts" / sf, src.read_text(), mode=0o755)
+                    _write(d / _mconf /"scripts" / sf, src.read_text(), mode=0o755)
     else:
         # init.sql 会被 MySQL 容器以非 root 的 mysql 用户读取执行，
         # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。
@@ -2125,7 +2184,8 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     if node_type == "mariadb":
         compose = render_baremetal_compose(node_name, vip_port)
     elif node_type == "mariadb-docker":
-        compose = render_mariadb_compose(node_name, root_pass, port, server_id, vip_port)
+        compose = render_mariadb_compose(node_name, root_pass, port, server_id, vip_port,
+                                         mysql_version=mysql_version, conf_dir=_mconf)
     else:
         compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
 
@@ -2251,7 +2311,7 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     return dict(
         dir=host_compose, node_name=node_name, server_id=server_id, peers=peers,
         node_type=node_type,
-        image=(MARIADB_DOCKER_IMAGE if node_type == "mariadb-docker" else ""),
+        image=(mariadb_image_for_version(mysql_version) if node_type == "mariadb-docker" else ""),
         run_cmd=run_cmd,
         actions=_actions,
         changed_files=_changed,
@@ -2427,7 +2487,7 @@ def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_r
             # 落盘到 <db>/conf/ 子目录（与 generate_node 一致；install 脚本与 compose 均从 conf/ 读取）。
             if is_mariadb_node(node_type):
                 init_sql = render_mariadb_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass)
-                _write(_safe_node_path(ip) / MARIADB_NODE_CONF_DIR / "conf" / "init_mariadb.sql", init_sql, mode=0o644)
+                _write(_safe_node_path(ip) / _node_conf_dir(node_type, mysql_version) / "conf" / "init_mariadb.sql", init_sql, mode=0o644)
             else:
                 init_sql = _render_init_sql(ha_user, ha_pass, repl_user, repl_pass, app_user, app_pass,
                                             auth_plugin=_auth_plugin_for(mysql_version, node_type))

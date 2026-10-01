@@ -1,450 +1,443 @@
 {% extends "base.html" %}
 {% block title %}集群接管 · Custos{% endblock %}
-{% block page_title %}集群接管{% endblock %}
+{% block page_title %}旧库单机 → 建集群容灾{% endblock %}
 
 {% block content %}
 <style>
-  .step-bar{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
-  .step-bar .st{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted)}
-  .step-bar .st .n{width:20px;height:20px;border-radius:50%;display:inline-flex;align-items:center;
-    justify-content:center;background:var(--surface-2);border:1px solid var(--border);font-size:11px}
-  .step-bar .st.on{color:var(--primary);font-weight:700}
-  .step-bar .st.on .n{background:var(--primary);color:#fff;border-color:var(--primary)}
-  .node-row{display:grid;grid-template-columns:1.4fr .7fr 1fr 1fr auto;gap:8px;margin-bottom:8px;align-items:end}
-  .issues{margin:8px 0 0;padding:0;list-style:none}
-  .issues li{padding:6px 10px;border-radius:8px;font-size:12.5px;margin-bottom:6px}
-  .issues li.blocker{background:rgba(225,29,116,.12);color:#E11D74;border:1px solid rgba(225,29,116,.3)}
-  .issues li.warn{background:rgba(234,179,8,.12);color:#a16207;border:1px solid rgba(234,179,8,.3)}
-  .verdict{display:inline-block;padding:5px 12px;border-radius:999px;font-size:12.5px;font-weight:700}
-  .verdict.ready{background:rgba(10,186,181,.16);color:#0ABAB5}
-  .verdict.needs_change{background:rgba(234,179,8,.16);color:#a16207}
-  .verdict.unsupported{background:rgba(225,29,116,.14);color:#E11D74}
-  pre.cmd{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;
-    padding:10px 12px;font-size:12px;line-height:1.7;word-break:break-all;white-space:pre-wrap;margin:6px 0 0}
+  .ad-wrap{max-width:1180px}
+  .ad-sub{color:var(--muted);font-size:13px;margin:0 0 18px}
+  /* 顶部横向步骤条（避免与全局左侧菜单形成双左栏） */
+  .hstep{display:flex;align-items:flex-start;background:var(--surface);border:1px solid var(--border);
+    border-radius:var(--radius);padding:16px 18px;margin-bottom:18px;overflow-x:auto}
+  .hs{display:flex;align-items:center;gap:10px;padding:6px 12px;border-radius:9px;cursor:pointer;
+    transition:.14s;flex-shrink:0}
+  .hs:hover{background:var(--primary-light)}
+  .hs .dot{width:30px;height:30px;border-radius:50%;background:var(--surface-2);
+    border:2px solid var(--border);display:flex;align-items:center;justify-content:center;
+    font-weight:700;font-size:13px;color:var(--muted);flex-shrink:0}
+  .hs.active .dot{border-color:var(--primary);background:var(--primary);color:#04121a}
+  .hs.done .dot{border-color:var(--primary-dark);background:var(--primary-dark);color:#04121a;font-size:0}
+  .hs.done .dot::after{content:"✓";font-size:14px}
+  .hs b{display:block;font-size:13.5px;color:var(--muted);white-space:nowrap}
+  .hs.active b,.hs.done b{color:var(--text)}
+  .hs small{display:block;font-size:11.5px;color:var(--muted);white-space:nowrap}
+  .hsline{flex:1;min-width:24px;height:2px;background:var(--border);margin-top:15px}
+  .hsline.done{background:var(--primary)}
+  .ad-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    padding:24px 26px;min-height:380px}
+  .ad-panel h2{margin:0 0 4px;font-size:18px}
+  .ad-panel .ph{color:var(--muted);font-size:13px;margin:0 0 20px}
+  .fld{display:block;margin-bottom:15px}
+  .fld>span{display:block;font-size:12.5px;color:var(--muted);margin-bottom:6px}
+  .fld input{width:100%;background:var(--surface-2);border:1px solid var(--border);border-radius:9px;
+    color:var(--text);padding:10px 12px;font-size:13.5px}
+  .fld input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-ring)}
+  .row{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+  .row.of3{grid-template-columns:repeat(3,1fr)}
+  .infobox{display:flex;gap:10px;background:var(--primary-light);border:1px solid var(--primary-ring);
+    border-radius:9px;padding:12px 14px;font-size:12.5px;color:var(--primary);margin-bottom:20px}
+  .btnrow{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:20px}
+  .verdict{display:inline-flex;align-items:center;gap:8px;padding:6px 15px;border-radius:30px;
+    font-weight:700;font-size:13.5px;background:var(--success-bg);color:var(--success);
+    border:1px solid var(--success-border)}
+  .verdict.bad{background:var(--danger-bg);color:var(--danger);border:1px solid var(--danger-border)}
+  .ver-tag{display:inline-flex;align-items:center;gap:7px;background:var(--primary-light);
+    border:1px solid var(--primary-ring);border-radius:999px;padding:5px 13px;font-size:12.5px;
+    color:var(--primary);font-weight:600;font-family:ui-monospace,Consolas,monospace}
+  .ver-tag .dot{width:6px;height:6px;border-radius:50%;background:var(--primary)}
+  .seedcard{display:flex;align-items:center;gap:10px;background:var(--surface-2);
+    border:1px solid var(--border);border-top:3px solid var(--primary);border-radius:12px;
+    padding:12px 14px;margin-bottom:20px}
+  .seedcard .k{color:var(--muted);font-size:13.5px}
+  .seedcard .v{color:var(--primary);font-weight:700;font-size:13.5px;
+    font-family:ui-monospace,Consolas,monospace}
+  .pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:700}
+  .pill.ok{background:var(--success-bg);color:var(--success)}
+  .pill.warn{background:var(--warning-bg);color:var(--warning)}
+  .pill.err{background:var(--danger-bg);color:var(--danger)}
+  .pill.mut{background:var(--surface-2);color:var(--muted)}
+  .pill.seed{background:var(--primary-light);color:var(--primary);margin-left:auto}
+  table.tbl{width:100%;border-collapse:collapse;margin:16px 0;font-size:13px}
+  table.tbl th,table.tbl td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--border)}
+  table.tbl th{color:var(--muted);font-weight:500;font-size:12px}
+  pre.cmd{background:var(--surface-2);border:1px solid var(--border);border-radius:9px;padding:14px;
+    overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;color:var(--text);
+    white-space:pre-wrap;word-break:break-all}
+  .cmdbox{border:1px solid var(--border);border-radius:9px;padding:14px;background:var(--surface-2);margin-top:12px}
+  .cmdhead{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  .cmdhead .t{font-size:13.5px;font-weight:700}
+  .note{background:var(--surface-2);border:1px solid var(--border);border-radius:9px;padding:12px 14px;
+    font-size:12.5px;color:var(--muted);margin-top:12px}
+  .note b{color:var(--text)}
+  .note.ok{background:var(--success-bg);border-color:var(--success-border)}
+  .blk{border-left:3px solid var(--warning);background:var(--surface-2);padding:10px 14px;
+    border-radius:6px;margin:8px 0;font-size:13px}
+  .blk.block{border-color:var(--danger)}
+  .blk .lv{font-weight:700;font-size:11px}
+  .blk.block .lv{color:var(--danger)}
+  .blk .lv{color:var(--warning)}
+  .empty{color:var(--muted);font-size:13px;padding:18px;text-align:center;
+    border:1px dashed var(--border);border-radius:9px;margin-top:14px}
+  .okline{color:var(--success)}
+  .vipwrap{display:flex;align-items:center;gap:8px}
+  .vipwrap input{flex:1}
+  .vipfix{background:var(--surface-2);border:1px solid var(--border);border-right:none;
+    border-radius:9px 0 0 9px;padding:10px 12px;color:var(--muted);font-size:13.5px;white-space:nowrap}
+  .vipwrap input.pre{border-radius:0 9px 9px 0}
+  .chkmsg{font-size:12px;margin-top:6px;color:var(--muted)}
+  .chkmsg.ok{color:var(--success)}.chkmsg.err{color:var(--danger)}.chkmsg.warn{color:var(--warning)}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:9px;overflow:hidden;margin-bottom:12px}
+  .seg button{background:var(--surface-2);border:none;color:var(--muted);padding:8px 16px;
+    font-size:13px;cursor:pointer;font-weight:600}
+  .seg button.active{background:var(--primary);color:#04121a}
+  .adv{border:1px solid var(--border);border-radius:9px;background:var(--surface-2);margin-top:14px;overflow:hidden}
+  .advhead{padding:12px 15px;font-size:13px;font-weight:700;cursor:pointer;color:var(--muted)}
+  .advhead:hover{color:var(--text)}
+  .advbody{padding:14px 15px;border-top:1px solid var(--border)}
+  .advbody .grp{font-size:12px;color:var(--muted);margin:8px 0 6px;font-weight:700}
+  .next-card{border:1px dashed var(--primary);border-radius:10px;padding:16px 18px;margin-top:18px;
+    background:var(--primary-light)}
+  .next-card h4{margin:0 0 8px;color:var(--primary);font-size:14px}
+  .next-card ol{margin:0;padding-left:18px;color:var(--muted);font-size:12.5px}
 </style>
 
-<div class="card">
-  <div class="step-bar">
-    <span class="st on" id="st1"><span class="n">1</span>填节点</span> ›
-    <span class="st" id="st2"><span class="n">2</span>探测</span> ›
-    <span class="st" id="st3"><span class="n">3</span>接管参数</span> ›
-    <span class="st" id="st4"><span class="n">4</span>执行</span>
+<div class="ad-wrap">
+  <p class="ad-sub">挂载旧库为节点，建单节点集群；后续加从库获主从 + VIP 漂移。接管仅装 sidecar，不重装、不碰数据。</p>
+
+  <div class="hstep" id="hstep">
+    <div class="hs" data-step="1" onclick="adGo(1)"><span class="dot">1</span>
+      <div><b>添加旧库</b><small>填写正在跑的实例</small></div></div>
+    <div class="hsline" data-line="1"></div>
+    <div class="hs" data-step="2" onclick="adGo(2)"><span class="dot">2</span>
+      <div><b>版本校验与探测</b><small>只读 · 可反复跑</small></div></div>
+    <div class="hsline" data-line="2"></div>
+    <div class="hs" data-step="3" onclick="adGo(3)"><span class="dot">3</span>
+      <div><b>创建集群</b><small>集群名 + VIP</small></div></div>
+    <div class="hsline" data-line="3"></div>
+    <div class="hs" data-step="4" onclick="adGo(4)"><span class="dot">4</span>
+      <div><b>执行挂载</b><small>装 sidecar + 引导命令</small></div></div>
   </div>
 
-  <div class="note">
-    接管 = <b>纳管</b>，不是重建：老库正在跑业务，本向导<b>不碰数据、不重装数据库</b>。
-    流程是「只读探测 → 建 Custos 账号 → 登记 → 在节点上执行一行命令装 keepalived + agent」。
+  <!-- ① 添加旧库 -->
+  <div class="ad-panel" id="p1">
+    <h2>① 添加旧库</h2>
+    <p class="ph">填写这台正在跑的旧库连接信息。它以 seed master 身份进入新集群；Custos 只在其上装 sidecar。</p>
+    <div class="infobox"><b>i</b><div>这是一台已上线、跑着业务的实例。接管过程对它只读、不重启、不改动 my.cnf（修复命令另给，由你择机执行）。</div></div>
+    <div class="row of3">
+      <label class="fld"><span>IP 地址</span><input id="f_ip" value="192.168.1.177"></label>
+      <label class="fld"><span>端口</span><input id="f_port" value="3307"></label>
+      <label class="fld"><span>管理员用户</span><input id="f_user" value="root"></label>
+    </div>
+    <label class="fld"><span>管理员口令</span><input id="f_pass" type="password" value=""></label>
   </div>
 
-  <!-- 第 1 步 -->
-  <h3 style="margin:16px 0 8px;font-size:14px">① 要接管的节点</h3>
-  <div id="nodeList"></div>
-  <button class="btn btn-sm" onclick="addRow()">＋ 再加一个节点</button>
-
-  <!-- 第 2 步 -->
-  <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
-    <button class="btn btn-primary btn-sm" onclick="doProbe()">② 开始探测（只读）</button>
-    <span id="probeTip" style="color:var(--muted);font-size:12px;align-self:center"></span>
+  <!-- ② 探测 -->
+  <div class="ad-panel" id="p2" style="display:none">
+    <h2>② 版本校验与探测</h2>
+    <p class="ph">只读连接，校验版本是否受支持，并报告旧主复制能力。探测不改动账号、复制或数据。</p>
+    <div class="btnrow" style="margin-top:0">
+      <button class="btn btn-primary" id="bProbe" onclick="adProbe()">开始探测（只读）</button>
+      <button class="btn btn-ghost" id="bReProbe" onclick="adProbe()" style="display:none">重新探测（只读）</button>
+    </div>
+    <div id="probeOut"><div class="empty">尚未探测。点击上方「开始探测（只读）」生成版本校验与复制能力报告。</div></div>
   </div>
-  <div id="probeBox"></div>
 
-  <!-- 第 3 步 -->
-  <div id="step3" style="display:none">
-    <h3 style="margin:16px 0 8px;font-size:14px">③ 接管到哪个集群</h3>
-    <div class="grid2">
-      <label>集群
-        <select id="cid" onchange="onCidChange()">
-          <option value="0">＋ 新建集群</option>
-          {% for c in clusters %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
-        </select>
+  <!-- ③ 创建集群 -->
+  <div class="ad-panel" id="p3" style="display:none">
+    <h2>③ 创建集群</h2>
+    <p class="ph">以旧库为 seed master 建立单节点集群（VIP + 集群记录）。单节点可先成立；容灾靠后续加从库。</p>
+    <div class="seedcard">
+      <span class="k">主节点</span>
+      <span class="v" id="seedLabel">—</span>
+      <span class="pill seed">seed master</span>
+    </div>
+    <div class="row">
+      <label class="fld"><span>集群名称</span><input id="f_name" placeholder="如：mariadb-old"></label>
+      <label class="fld"><span>VIP 端口（= 旧库端口）</span><input id="f_vipport" value="3307"></label>
+    </div>
+    <label class="fld"><span>VIP（同网段空闲 IP）</span>
+      <div class="vipwrap">
+        <span class="vipfix" id="vipPrefix">192.168.1.</span>
+        <input id="f_viplast" class="pre" placeholder="180">
+        <button class="btn btn-ghost" onclick="adCheckVip()">检测占用</button>
+      </div>
+      <div class="chkmsg" id="vipMsg"></div>
+    </label>
+    <div class="row">
+      <label class="fld"><span>网卡（兜底值，实际由节点自动探测校正）</span><input id="f_iface" value="eth0"></label>
+      <label class="fld"><span>VRID（1–255，同网段不可重复）</span>
+        <div class="vipwrap">
+          <input id="f_vrid" value="51">
+          <button class="btn btn-ghost" onclick="adCheckVrid()">检测冲突</button>
+        </div>
+        <div class="chkmsg" id="vridMsg"></div>
       </label>
-      <label>新集群名称<input id="cname" placeholder="例如 接管-生产库"></label>
-      <label>VIP（节点同网段空闲 IP）<input id="cvip" placeholder="例如 192.168.1.190"></label>
-      <label>VIP 端口<input id="cvipport" value="3306"></label>
     </div>
-
-    <div class="note" style="font-size:12.5px;margin-top:8px">
-      接管 = 把第 ① 步填的那些<b>旧库</b>登记成这个集群的节点。所以下面要填的是
-      <b>旧库每台机器的 IP、端口和数据库管理员口令</b>，<b>不是</b>集群里已有节点的
-      （那些由 Custos 自己管理，不需要在这里填）。
+    <div class="adv">
+      <div class="advhead" onclick="adToggleAdv()"><span id="advCaret">▸</span> 高级：自定义账号 / 密码（留空自动生成 16 位随机）</div>
+      <div class="advbody" id="advBody" style="display:none">
+        <div class="grp">管理账号 ha_monitor</div>
+        <div class="row"><input id="f_haUser" placeholder="ha_monitor"><input id="f_haPass" placeholder="留空自动生成"></div>
+        <div class="grp">复制账号 replication</div>
+        <div class="row"><input id="f_rpUser" placeholder="replication"><input id="f_rpPass" placeholder="留空自动生成"></div>
+        <div class="grp">业务账号 app</div>
+        <div class="row"><input id="f_apUser" placeholder="app"><input id="f_apPass" placeholder="留空自动生成"></div>
+      </div>
     </div>
-    <div class="note" style="font-size:12.5px;margin-top:6px;color:#a16207">
-      ⚠ 如果上面选的是<b>已有集群、且里面已经有节点</b>，把一台单机旧库接进去会因两边数据不一致而建不了复制。
-      这种情况请改选「＋ 新建集群」（例如把 177 纳管成独立集群）。
-    </div>
-
-    <h3 style="margin:16px 0 8px;font-size:14px">③ 被接管节点的数据库管理员账号</h3>
-    <div class="note" style="font-size:12.5px">
-      为每台被接管节点填写其数据库的<b>管理员账号与口令</b>（通常叫 root，是<b>数据库账号</b>，
-      不是服务器的系统 root）。Custos 将用它在对应节点上创建专用账号并完成登记。
-      主机从下拉框选择（只列第 ① 步探测成功的节点，不用手填），
-      <b>端口默认带出该节点的端口，可按需修改</b>；未单独填写的项会用下面的「统一管理员账号 / 统一口令」兜底。
-    </div>
-    <div style="display:flex;gap:8px;align-items:end;margin:10px 0;flex-wrap:wrap">
-      <label>统一管理员账号<input id="ruserAll" value="root" style="width:140px"></label>
-      <label>统一口令（兜底）<input id="rpassAll" type="password" placeholder="各台都一样时填，可留空" style="width:190px"></label>
-      <button class="btn btn-sm" onclick="fillAllRoots()">应用到全部</button>
-      <button class="btn btn-sm" onclick="testAllRoots()">全部测试连通性</button>
-    </div>
-    <div class="note" style="font-size:12.5px">
-      口令填完先点「全部测试连通性」逐台验证：<b>必须每台都测通，才能执行接管</b>。
-      改了账号或口令，那一台的测试结果会自动作废，需要重新测。
-    </div>
-    <div id="nodeRootList"></div>
-    <div style="margin-top:12px">
-      <button class="btn btn-accent btn-sm" onclick="doAdopt()">④ 执行接管</button>
-    </div>
+    <div class="note">VIP 前缀自动取自旧库网段，只需填最后一段。占用检测：登记比对（硬阻断）+ 管理器 ping（警告）+ <b>节点本机 arping（冲突即中止安装）</b>。<br>
+    部署形态（裸机 / 容器）与数据库版本由 ② 探测自动写入，不在此暴露。</div>
   </div>
 
-  <div id="resultBox"></div>
+  <!-- ④ 执行挂载 -->
+  <div class="ad-panel" id="p4" style="display:none">
+    <h2>④ 执行挂载</h2>
+    <p class="ph">建 ha_monitor 接管账号 + 登记节点 + 生成 sidecar 引导命令（只装 keepalived + agent）。</p>
+    <div class="btnrow" style="margin-top:0">
+      <button class="btn btn-primary" id="bExec" onclick="adExec()">执行接管</button>
+    </div>
+    <div id="execOut"></div>
+  </div>
+
+  <div class="btnrow">
+    <button class="btn btn-ghost" id="bPrev" onclick="adPrev()">上一步</button>
+    <button class="btn btn-primary" id="bNext" onclick="adNext()">下一步</button>
+    <button class="btn btn-primary" id="bFin" onclick="adFinish()" style="display:none">完成</button>
+  </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-  function addRow(h, p, u, pw){
-    var d=document.createElement('div'); d.className='node-row';
-    d.innerHTML =
-      '<label>IP/主机名<input class="nip" value="'+(h||'')+'" placeholder="192.168.1.50"></label>' +
-      '<label>端口<input class="nport" value="'+(p||3306)+'"></label>' +
-      '<label>用户<input class="nuser" value="'+(u||'root')+'"></label>' +
-      '<label>密码<input class="npwd" type="password" value="'+(pw||'')+'"></label>' +
-      '<button class="btn btn-sm" onclick="this.parentNode.remove()">删除</button>';
-    document.getElementById('nodeList').appendChild(d);
+var adStep = 1, adProbed = null, adForm = 'container';
+function $(id){ return document.getElementById(id); }
+function adGo(n){
+  if(n > 1 && !adProbed){ alert('请先完成第 ② 步探测'); n = Math.min(n, 2); }
+  if(n >= 3 && adBlockers().length){ alert('存在未解决的阻断项，请先修复后再继续。'); n = 2; }
+  adStep = n;
+  for(var i=1;i<=4;i++){ var p=$('p'+i); if(p) p.style.display = (i===n?'':'none'); }
+  var hs = document.querySelectorAll('.hs');
+  for(var j=0;j<hs.length;j++){
+    var s = parseInt(hs[j].getAttribute('data-step'),10);
+    hs[j].className = 'hs' + (s===n?' active':'') + (s<n?' done':'');
   }
-  function collect(){
-    var out=[];
-    document.querySelectorAll('#nodeList .node-row').forEach(function(r){
-      var ip=r.querySelector('.nip').value.trim();
-      if(!ip) return;
-      out.push({host:ip, port:parseInt(r.querySelector('.nport').value||3306,10),
-                user:r.querySelector('.nuser').value.trim()||'root',
-                password:r.querySelector('.npwd').value});
-    });
-    return out;
+  var ln = document.querySelectorAll('.hsline');
+  for(var k=0;k<ln.length;k++){
+    var l = parseInt(ln[k].getAttribute('data-line'),10);
+    ln[k].className = 'hsline' + (l<n?' done':'');
   }
-  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-  function post(url, fd){
-    return fetch(url,{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:fd.toString(), credentials:'same-origin'}).then(function(r){return r.json();});
+  $('bPrev').disabled = (n===1);
+  $('bNext').style.display = (n===4?'none':'');
+  if(n<4) $('bFin').style.display='none';
+  if(n===3) adSyncSeed();
+}
+function adNext(){ if(adStep<4) adGo(adStep+1); }
+function adPrev(){ if(adStep>1) adGo(adStep-1); }
+function adToggleAdv(){
+  var b=$('advBody'); var showing = b.style.display!=='none';
+  b.style.display = showing?'none':'block';
+  $('advCaret').textContent = showing?'▸':'▾';
+}
+function adSyncSeed(){
+  $('seedLabel').textContent = $('f_ip').value + ':' + $('f_port').value;
+  var parts = $('f_ip').value.split('.');
+  if(parts.length===4) $('vipPrefix').textContent = parts[0]+'.'+parts[1]+'.'+parts[2]+'.';
+}
+function adBlockers(){
+  if(!adProbed) return ['未探测'];
+  var out = [];
+  (adProbed.issues||[]).forEach(function(i){ if(i.level==='blocker') out.push(i.msg); });
+  (adProbed.nodes||[]).forEach(function(n){
+    (n.issues||[]).forEach(function(i){ if(i.level==='blocker') out.push(i.msg); });
+  });
+  return out;
+}
+
+/* ---------- ② 探测 ---------- */
+function adProbe(){
+  var fd = new FormData();
+  fd.append('nodes', JSON.stringify([{host:$('f_ip').value, port:parseInt($('f_port').value||3306,10),
+    user:$('f_user').value, password:$('f_pass').value}]));
+  fetch('/api/adopt/probe', {method:'POST', body:fd, credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(j){
+      if(j && j.ok===false){ alert('探测失败：'+(j.error||'未知')); return; }
+      adProbed = j; adRenderProbe();
+      $('bProbe').style.display='none'; $('bReProbe').style.display='';
+      $('f_vipport').value = $('f_port').value;
+      adSyncSeed();
+    })
+    .catch(function(e){ alert('请求失败：'+e); });
+}
+function adRenderProbe(){
+  var d = adProbed || {};
+  var n = (d.nodes && d.nodes[0]) || {};
+  var h = '';
+  var supported = !!n.supported;
+  h += '<div style="margin:14px 0"><span class="verdict'+(supported?'':' bad')+'">'
+     + (supported?'版本受支持，可纳管':'版本不受支持') + '</span>'
+     + '<span class="ver-tag" style="margin-left:8px"><span class="dot"></span>'+ (n.version||'?') +'</span></div>';
+  h += '<div class="okline">✓ 同系列 MariaDB '+ (n.series||'?') +'，在本系统支持范围内（10.6 / 10.11 / 11.4 支持；新建集群推荐 12.3）</div>';
+  var pill=function(v,good,txt){ var cls = good?'ok':'err';
+    return '<span class="pill '+cls+'">'+txt+'</span>'; };
+  var binOn = !(String(n.log_bin).toUpperCase()==='OFF'||String(n.log_bin)==='0');
+  var gtOn  = !(String(n.gtid_strict_mode).toUpperCase()==='OFF'||String(n.gtid_strict_mode)==='0');
+  var fmtOK = String(n.binlog_format||'').toUpperCase()==='ROW';
+  var baOK  = (!n.bind_address) || n.bind_address==='0.0.0.0' || n.bind_address==='*';
+  var roON  = String(n.read_only).toUpperCase()==='ON'||String(n.read_only)==='1'
+            || String(n.super_read_only).toUpperCase()==='ON'||String(n.super_read_only)==='1';
+  var sizeMB = ((n.data_size_bytes||0)/1048576).toFixed(1);
+  h += '<table class="tbl"><thead><tr><th>检测项</th><th>当前值</th><th>说明</th></tr></thead><tbody>'
+    + '<tr><td>server_id</td><td>'+(n.server_id==null?'—':n.server_id)+'</td><td>加从库前须集群内唯一</td></tr>'
+    + '<tr><td>binlog</td><td>'+pill(binOn,binOn,binOn?'ON':'OFF')+'</td><td><b>加从库前置</b>（只读变量，须重启）</td></tr>'
+    + '<tr><td>gtid_strict_mode</td><td>'+pill(gtOn,gtOn,gtOn?'ON':'OFF')+'</td><td><b>加从库前置</b>（Custos 复制用 GTID）</td></tr>'
+    + '<tr><td>binlog_format</td><td>'+pill(fmtOK,fmtOK,n.binlog_format||'—')+'</td><td>建议 ROW</td></tr>'
+    + '<tr><td>bind_address</td><td>'+pill(baOK,baOK,n.bind_address||'—')+'</td><td>非 0.0.0.0 会导致 VIP 漂移后连不上</td></tr>'
+    + '<tr><td>read_only</td><td>'+pill(!roON,!roON,roON?'ON（阻断）':'OFF')+'</td><td>ON 会导致建账号失败且不能写入</td></tr>'
+    + '<tr><td>数据量</td><td>'+sizeMB+' MB</td><td>后续加从库需全量导出导入，耗时参考此值</td></tr>'
+    + '</tbody></table>';
+  (n.issues||[]).forEach(function(i){
+    var blk = i.level==='blocker';
+    h += '<div class="blk'+(blk?' block':'')+'"><span class="lv">'+(blk?'BLOCKER':'WARN')+'</span> '
+       + i.msg + '<div style="color:var(--muted);margin-top:4px">'+ (i.fix||'') +'</div></div>';
+  });
+  if(roON && n.role!=='slave'){
+    h += '<div class="btnrow"><button class="btn btn-primary" onclick="adReleaseRO()">自动解除只读</button>'
+       + '<span style="color:var(--muted);font-size:12.5px">该实例是单机（非从库），可安全自动解除</span></div>';
   }
-  var _probe=null;
-  var _creds={};
-  var _rootTest={};
-  function doProbe(){
-    var nodes=collect();
-    if(!nodes.length){alert('请至少填一个节点');return;}
-    _creds={};
-    nodes.forEach(function(n){_creds[n.host+':'+n.port]={user:n.user,password:n.password};});
-    document.getElementById('probeTip').textContent='探测中…（只读，不会改动老库）';
-    var fd=new URLSearchParams(); fd.set('nodes', JSON.stringify(nodes));
-    post('/api/adopt/probe', fd).then(function(d){
-      document.getElementById('probeTip').textContent='';
-      _probe=d; renderProbe(d);
-    }).catch(function(e){document.getElementById('probeTip').textContent='探测失败：'+e;});
-  }
-  function renderProbe(d){
-    var box=document.getElementById('probeBox');
-    if(d.error){
-      box.innerHTML='<div class="issues"><li class="blocker">'+esc(d.error)+'</li></div>';
-      // 探测失败就收起下一步，避免拿上一次的旧结果继续接管
-      document.getElementById('step3').style.display='none';
-      return;
-    }
-    var vn={ready:'可以接管',needs_change:'需先整改',unsupported:'不支持接管'}[d.verdict]||d.verdict;
-    var h='<h3 style="margin:16px 0 8px;font-size:14px">② 探测结果</h3>';
-    h+='<div>结论：<span class="verdict '+esc(d.verdict)+'">'+esc(vn)+'</span>'
-      +' ｜ 场景：'+esc(d.scenario_label||d.scenario)+' ｜ 同网段：'+(d.l2_ok?'是':'否（'+esc(d.l2_note)+'）')+'</div>';
-    var iss=(d.issues||[]).map(function(i){
-      return '<li class="'+esc(i.level)+'">'+esc(i.msg)+(i.fix?'<br><span style="opacity:.8">→ '+esc(i.fix)+'</span>':'')+'</li>';
-    }).join('');
-    if(iss) h+='<ul class="issues">'+iss+'</ul>';
-    (d.nodes||[]).forEach(function(n, idx){
-      h+='<div style="margin-top:10px;font-size:12.5px"><b>'+esc(n.host)+':'+esc(n.port)+'</b> '
-        +(n.ok?'✅ 可连接':'❌ '+esc(n.error||'连接失败'))
-        +' ｜ 版本 '+esc(n.version||'?')+' ｜ server_id '+esc(n.server_id)
-        +' ｜ 角色 '+esc(n.role||'standalone')+' ｜ binlog '+esc(n.log_bin)+'</div>';
-      var ni=(n.issues||[]).map(function(i){
-        return '<li class="'+esc(i.level)+'">'+esc(i.msg)+(i.fix?'<br><span style="opacity:.8">→ '+esc(i.fix)+'</span>':'')+'</li>';}).join('');
-      if(ni) h+='<ul class="issues">'+ni+'</ul>';
-      if(n.fix_cmd){
-        var cid='fxcmd'+idx;
-        // 端口不是 3306（如 1Panel 的 3307）多半是容器/面板装的，默认勾容器让用户确认
-        var isC=!!(n.port&&n.port!=3306);
-        h+='<div style="display:flex;gap:8px;align-items:end;margin:8px 0;flex-wrap:wrap">'
-          +'<label>这台数据库跑在哪<select id="fxf'+idx+'" onchange="toggleCtn('+idx+')" style="width:180px">'
-          +'<option value=""'+(isC?'':' selected')+'>裸机（系统服务）</option>'
-          +'<option value="c"'+(isC?' selected':'')+'>容器（Docker / 1Panel）</option></select></label>'
-          +'<label id="fxcn'+idx+'" style="display:'+(isC?'':'none')+'">容器名'
-          +'<input id="fxc'+idx+'" placeholder="宿主机上 docker ps 能看到" style="width:190px"></label>'
-          +'<button class="btn btn-sm" onclick="regenFix('+idx+')">按这个重新生成命令</button></div>'
-          +(isC?'<div style="font-size:12px;color:#a16207;margin-bottom:6px">端口不是 3306，看着像容器/面板装的，已默认选「容器」，请确认</div>':'')
-          +'<div style="margin:8px 0"><button class="btn btn-sm" onclick="copyCmd(\''+cid+'\',this)">复制修复命令</button>'
-          +'<span style="font-size:12px;margin-left:6px;color:'+(isC?'#a16207':'var(--muted)')+'">'
-          +(isC?'⚠ 下面这条默认是「裸机」版，对容器无效：先选「容器」+填容器名，点「按这个重新生成命令」后再复制'
-                :'默认「裸机」版；容器请先选形态并重新生成。改完重启，再点「重新探测」验证')
-          +'</span></div>'
-          +'<pre class="cmd" id="'+cid+'">'+esc(n.fix_cmd)+'</pre>'
-          +'<div id="fxm'+idx+'" style="font-size:12px;color:var(--muted)"></div>';
-        if(n.can_tune){
-          h+='<div style="margin:8px 0;padding:8px 10px;border:1px dashed var(--border);border-radius:8px">'
-            +'<label style="display:flex;gap:6px;align-items:center;font-size:12.5px">'
-            +'<input type="checkbox" id="fxt'+idx+'"> 用探测账号在线设置 server_id（可省一次重启；配置仍要写进文件防回退）</label>'
-            +'<div style="display:flex;gap:8px;align-items:end;margin-top:6px">'
-            +'<label>server_id<input id="fxs'+idx+'" style="width:130px" value="'+esc(n.suggested_server_id||'')+'"></label>'
-            +'<button class="btn btn-sm" onclick="applyFix('+idx+')">应用</button></div>'
-            +'<div id="fxr'+idx+'"></div></div>';
-        }
-      }
-    });
-    box.innerHTML=h;
-    // 铁律：只要还有阻断项就不放开下一步，绝不带病接管
-    var blocked = (d.verdict==='unsupported') || hasBlocker(d);
-    document.getElementById('step3').style.display = blocked?'none':'block';
-    if(blocked) box.innerHTML += '<div class="issues"><li class="blocker">存在阻断项，按上面命令整改后点「重新探测」，全部清除才能接管</li></div>';
-    box.innerHTML += '<div style="margin-top:10px"><button class="btn btn-sm" onclick="doProbe()">重新探测</button></div>';
-    renderNodeRoots(d);
-  }
-  function hasBlocker(d){
-    if((d.issues||[]).some(function(i){return i.level==='blocker';})) return true;
-    return (d.nodes||[]).some(function(n){
-      return (n.issues||[]).some(function(i){return i.level==='blocker';});
-    });
-  }
-  function copyCmd(id,btn){
-    var el=document.getElementById(id); if(!el) return;
-    var t=el.textContent||'';
-    function done(){var o=btn.textContent;btn.textContent='已复制';setTimeout(function(){btn.textContent=o;},1500);}
-    function fallback(){
-      var ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta);
-      ta.select(); try{document.execCommand('copy');}catch(e){}
-      document.body.removeChild(ta); done();
-    }
-    if(navigator.clipboard&&navigator.clipboard.writeText){
-      navigator.clipboard.writeText(t).then(done,fallback);
-    }else{fallback();}
-  }
-  function applyFix(idx){
-    var n=((_probe&&_probe.nodes)||[])[idx]; if(!n) return;
-    var on=document.getElementById('fxt'+idx);
-    if(on&&!on.checked){alert('请先勾选「在线设置 server_id」开关');return;}
-    var sid=parseInt((document.getElementById('fxs'+idx)||{}).value||'0',10);
-    if(!sid){alert('请先填 server_id（非 0、集群内唯一）');return;}
-    var c=(_creds&&_creds[n.host+':'+n.port])||{};
-    var fd=new URLSearchParams();
-    fd.set('host',n.host); fd.set('port',n.port||3306);
-    fd.set('db_user',c.user||'root'); fd.set('db_pass',c.password||'');
-    fd.set('server_id',sid);
-    var rb=document.getElementById('fxr'+idx); if(!rb) return;
-    rb.innerHTML='<span style="color:var(--muted);font-size:12px">执行中…</span>';
-    post('/api/adopt/fix_switch',fd).then(function(r){
-      var t='';
-      if(!r.ok){t='<div class="issues"><li class="blocker">'+esc(r.error||'失败')+'</li></div>';}
-      else{
-        (r.applied||[]).forEach(function(a){t+='<div style="font-size:12.5px;color:#0ABAB5">✅ '+esc(a)+'</div>';});
-        (r.need_restart||[]).forEach(function(a){t+='<div style="font-size:12.5px;color:#a16207">⚠ '+esc(a)+'</div>';});
-        if(r.command){
-          var cid='fxrc'+idx;
-          t+='<div style="margin-top:6px"><button class="btn btn-sm" onclick="copyCmd(\''+cid+'\',this)">复制命令</button></div>'
-            +'<pre class="cmd" id="'+cid+'">'+esc(r.command)+'</pre>';
-        }
-      }
-      rb.innerHTML=t;
-    }).catch(function(e){
-      rb.innerHTML='<div class="issues"><li class="blocker">失败：'+esc(e)+'</li></div>';
-    });
-  }
-  function renderNodeRoots(d){
-    var box=document.getElementById('nodeRootList'); if(!box) return;
-    _rootTest={};   // 重新探测后节点集合可能变了，旧测试结果全部作废
-    var okNodes=((d&&d.nodes)||[]).filter(function(n){return n.ok;});
-    if(!okNodes.length){
-      box.innerHTML='<div style="color:var(--muted);font-size:12.5px">还没有可连接的节点，请先完成探测</div>';
-      return;
-    }
-    // 下拉只列 IP；端口单独一个输入框，默认带出该节点探测到的端口（可改）
-    var ips=[];
-    okNodes.forEach(function(n){
-      var h=String(n.host);
-      if(ips.indexOf(h)<0) ips.push(h);
-    });
-    var h='';
-    okNodes.forEach(function(n){
-      var ip=String(n.host), pt=n.port||3306;
-      h+='<div class="node-row" style="grid-template-columns:1.4fr .6fr .8fr 1fr auto auto">'
-        +'<label>主机 IP<select class="rh" onchange="onHostPick(this)">'
-        +ips.map(function(x){return '<option'+(x===ip?' selected':'')+'>'+esc(x)+'</option>';}).join('')
-        +'</select></label>'
-        +'<label>端口<input class="rpt" value="'+esc(pt)+'" oninput="resetTest(this)"></label>'
-        +'<label>管理员账号<input class="ru" value="root" oninput="resetTest(this)"></label>'
-        +'<label>口令<input class="rp" type="password" placeholder="这台机的数据库口令" oninput="resetTest(this)"></label>'
-        +'<button class="btn btn-sm rtBtn" onclick="testRoot(this)">测试</button>'
-        +'<button class="btn btn-sm" onclick="this.parentNode.remove()">删除</button></div>';
-    });
-    box.innerHTML=h;
-  }
-  function onHostPick(sel){
-    // 换了主机就把端口带成那台探测到的端口（端口本身仍可手改）
-    var row=(sel&&sel.closest)?sel.closest('.node-row'):null; if(!row) return;
-    var m=((_probe&&_probe.nodes)||[]).filter(function(n){return String(n.host)===sel.value;})[0];
-    var p=row.querySelector('.rpt');
-    if(p) p.value=(m&&m.port)||3306;
-    resetTest(sel);
-  }
-  function fillAllRoots(){
-    var u=(document.getElementById('ruserAll')||{}).value||'root';
-    var p=(document.getElementById('rpassAll')||{}).value||'';
-    document.querySelectorAll('#nodeRootList .node-row').forEach(function(r){
-      var a=r.querySelector('.ru'), b=r.querySelector('.rp');
-      if(a) a.value=u; if(b) b.value=p;
-      if(b) resetTest(b);   // 口令变了，这一台的测试结果作废
-    });
-  }
-  // 取值口径必须和「提交时用的一致」，否则测的是一套、用的是另一套
-  function rootUserOf(row){
-    return ((row.querySelector('.ru')||{}).value||'').trim()
-      || ((document.getElementById('ruserAll')||{}).value||'root');
-  }
-  function rootPassOf(row){
-    return (row.querySelector('.rp')||{}).value
-      || ((document.getElementById('rpassAll')||{}).value||'');
-  }
-  function resetTest(el){
-    var row=(el&&el.closest)?el.closest('.node-row'):null;
-    if(!row) return;
-    var _ip=((row.querySelector('.rh')||{}).value||'').trim();
-    var _pt=parseInt((row.querySelector('.rpt')||{}).value||'0',10)||3306;
-    delete _rootTest[_ip+':'+_pt];
-    var b=row.querySelector('.rtBtn');
-    if(b){b.textContent='测试'; b.style.color=''; b.title='';}
-  }
-  function testRoot(btn){
-    var row=(btn&&btn.closest)?btn.closest('.node-row'):null; if(!row) return;
-    var host=((row.querySelector('.rh')||{}).value||'').trim();
-    if(!host){alert('请先选主机');return;}
-    var port=parseInt((row.querySelector('.rpt')||{}).value||'0',10)||3306;
-    var u=rootUserOf(row), p=rootPassOf(row);
-    btn.textContent='测试中…'; btn.disabled=true;
-    var fd=new URLSearchParams();
-    fd.set('host',host); fd.set('port',port); fd.set('db_user',u); fd.set('db_pass',p);
-    post('/api/adopt/test_root',fd).then(function(r){
-      btn.disabled=false;
-      var ok=!!r.ok;
-      btn.textContent= ok?'✅ 正常':'❌ 失败';
-      btn.title=r.msg||''; btn.style.color= ok?'#0ABAB5':'#E11D74';
-      _rootTest[host+':'+port]={ok:ok,msg:r.msg||''};
-    }).catch(function(e){
-      btn.disabled=false; btn.textContent='❌ 失败'; btn.title=String(e);
-      btn.style.color='#E11D74';
-      _rootTest[host+':'+port]={ok:false,msg:String(e)};
-    });
-  }
-  function testAllRoots(){
-    var btns=document.querySelectorAll('#nodeRootList .rtBtn');
-    if(!btns.length){alert('还没有节点行，请先完成探测');return;}
-    btns.forEach(function(b){testRoot(b);});
-  }
-  function collectNodeRoots(){
-    var out=[];
-    document.querySelectorAll('#nodeRootList .node-row').forEach(function(r){
-      var ip=((r.querySelector('.rh')||{}).value||'').trim();
-      var pt=parseInt((r.querySelector('.rpt')||{}).value||'0',10)||3306;
-      var u=rootUserOf(r);
-      if(!ip||!u) return;
-      out.push({host:ip, port:pt, user:u, password:rootPassOf(r)});
-    });
-    return out;
-  }
-  function validateRoots(){
-    var rows=collectNodeRoots();
-    var byHost={}; rows.forEach(function(r){byHost[r.host]=1;});
-    var miss=((_probe&&_probe.nodes)||[]).filter(function(n){
-      return n.ok && !byHost[String(n.host)];
-    }).map(function(n){return n.host+':'+n.port;});
-    if(miss.length){
-      alert('这些节点还没填管理员口令：'+miss.join('、')+'\n请补齐后再执行。');
-      return false;
-    }
-    // 铁律：每一行的口令都必须逐台测通，没测过或测失败的都不许接管
-    var un=[], bad=[];
-    rows.forEach(function(r){
-      var k=r.host+':'+r.port, t=_rootTest[k];
-      if(!t) un.push(k);
-      else if(!t.ok) bad.push(k+'（'+t.msg+'）');
-    });
-    if(un.length||bad.length){
-      alert('管理员口令还没验证通过，不能接管：'
-        +(bad.length?'\n测试失败：'+bad.join('、'):'')
-        +(un.length?'\n还没测试：'+un.join('、'):'')
-        +'\n请点「全部测试连通性」逐台验证。');
-      return false;
-    }
-    return true;
-  }
-  function toggleCtn(idx){
-    var sel=document.getElementById('fxf'+idx), box=document.getElementById('fxcn'+idx);
-    if(box) box.style.display=(sel&&sel.value==='c')?'':'none';
-  }
-  function regenFix(idx){
-    var n=((_probe&&_probe.nodes)||[])[idx]; if(!n) return;
-    var isC=(document.getElementById('fxf'+idx)||{}).value==='c';
-    var cn=((document.getElementById('fxc'+idx)||{}).value||'').trim();
-    if(isC&&!cn){
-      alert('请先填容器名：在宿主机上跑 docker ps 就能看到（NAME 那一列）');
-      return;
-    }
-    var c=(_creds&&_creds[n.host+':'+n.port])||{};
-    var sid=parseInt((document.getElementById('fxs'+idx)||{}).value||'0',10);
-    var fd=new URLSearchParams();
-    fd.set('host',n.host); fd.set('port',n.port||3306);
-    fd.set('db_user',c.user||'root'); fd.set('db_pass',c.password||'');
-    fd.set('server_id',sid||0); fd.set('container',isC?cn:'');
-    var pre=document.getElementById('fxcmd'+idx); if(pre) pre.textContent='生成中…';
-    var mbox=document.getElementById('fxm'+idx); if(mbox) mbox.textContent='';
-    post('/api/adopt/fix_cmd',fd).then(function(r){
-      if(pre) pre.textContent=r.command||r.msg||'';
-      if(mbox) mbox.textContent=r.msg||'';
-    }).catch(function(e){ if(pre) pre.textContent='生成失败：'+e; });
-  }
-  function onCidChange(){
-    var v=document.getElementById('cid').value;
-    var isNew=(v==='0');
-    ['cname','cvip','cvipport'].forEach(function(id){
-      document.getElementById(id).parentNode.style.display = isNew?'':'none';
-    });
-  }
-  function doAdopt(){
-    if(!validateRoots()) return;
-    var nodes=collect();
-    var fd=new URLSearchParams();
-    fd.set('nodes', JSON.stringify(nodes));
-    fd.set('cluster_id', document.getElementById('cid').value);
-    fd.set('name', document.getElementById('cname').value);
-    fd.set('vip', document.getElementById('cvip').value);
-    fd.set('vip_port', document.getElementById('cvipport').value||'3306');
-    fd.set('root_user', (document.getElementById('ruserAll')||{}).value||'root');
-    fd.set('root_pass', (document.getElementById('rpassAll')||{}).value||'');
-    fd.set('node_roots', JSON.stringify(collectNodeRoots()));
-    document.getElementById('resultBox').innerHTML='<div class="note">接管执行中…</div>';
-    post('/api/adopt/run', fd).then(function(d){
-      var h='<h3 style="margin:16px 0 8px;font-size:14px">④ 执行结果</h3>';
-      if(!d.ok){h+='<div class="issues"><li class="blocker">'+esc(d.error||'失败')+'</li></div>';}
-      else{
-        h+='<div>集群 ID：'+esc(d.cluster_id)+'</div>';
-        (d.bootstrap||[]).forEach(function(b){
-          h+='<div style="margin-top:12px"><b>'+esc(b.ip)+'</b>：'+esc(b.msg)
-            +(b.command?'<pre class="cmd">'+esc(b.command)+'</pre>':'')+'</div>';
-        });
-        h+='<div class="note" style="margin-top:12px">把上面每条命令分别拿到对应节点主机上以 root 执行，'
-          +'即可完成 sidecar（keepalived + agent）安装。命令含一次性凭据，请勿外传。</div>';
-      }
-      document.getElementById('resultBox').innerHTML=h;
-    }).catch(function(e){
-      document.getElementById('resultBox').innerHTML='<div class="issues"><li class="blocker">失败：'+esc(e)+'</li></div>';
-    });
-  }
-  addRow(); onCidChange();
+  adForm = (n.deploy_form==='bare')?'bare':'container';
+  h += '<div class="cmdbox">'
+    + '<div class="cmdhead"><span class="t">旧主修复命令（开 binlog + GTID + 监听地址 + 解除只读）</span></div>'
+    + '<div class="note" style="margin-top:0">部署形态：<b>'+(adForm==='bare'?'裸机':'容器')+'</b>（自动识别，可切换）</div>'
+    + '<div class="seg"><button id="segC" onclick="adSetForm(\'container\')">Docker 容器</button>'
+    + '<button id="segB" onclick="adSetForm(\'bare\')">裸机</button></div>'
+    + '<div id="cnWrap"><label class="fld" style="margin:0"><span>容器名</span><input id="f_cn" value=""></label></div>'
+    + '<div class="cmdhead"><button class="btn btn-primary" onclick="adFixCmd()">生成修复命令</button>'
+    + '<button class="btn btn-ghost" id="bCopyFix" onclick="adCopyFix()">复制修复命令</button></div>'
+    + '<pre class="cmd" id="fixCmd"></pre>'
+    + '<div class="note">裸机：改 conf.d + systemctl 重启；容器：写<b>容器内</b>配置 + docker restart。执行后点「重新探测」验证。</div>'
+    + '</div>';
+  $('probeOut').innerHTML = h;
+  adSetForm(adForm);
+}
+function adSetForm(f){
+  adForm = f;
+  var c=$('segC'), b=$('segB');
+  if(c) c.className = (f==='container'?'active':'');
+  if(b) b.className = (f==='bare'?'active':'');
+  var w=$('cnWrap'); if(w) w.style.display = (f==='bare'?'none':'');
+  adFixCmd();
+}
+function adFixCmd(){
+  var n = (adProbed && adProbed.nodes && adProbed.nodes[0]) || {};
+  var fd = new FormData();
+  fd.append('host', $('f_ip').value); fd.append('port', $('f_port').value);
+  fd.append('db_user', $('f_user').value); fd.append('db_pass', $('f_pass').value);
+  fd.append('server_id', (n.suggested_server_id||n.server_id||0));
+  if(adForm==='container') fd.append('container', $('f_cn').value);
+  fetch('/api/adopt/fix_cmd', {method:'POST', body:fd, credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(j){ $('fixCmd').textContent = j.command || j.msg || ''; })
+    .catch(function(e){ $('fixCmd').textContent = '生成失败：'+e; });
+}
+function adCopyFix(){
+  var t = $('fixCmd').textContent;
+  if(t) navigator.clipboard && navigator.clipboard.writeText(t);
+  var b=$('bCopyFix'); b.textContent='已复制 ✓'; setTimeout(function(){b.textContent='复制修复命令';},1500);
+}
+function adReleaseRO(){
+  var fd = new FormData();
+  fd.append('host',$('f_ip').value); fd.append('port',$('f_port').value);
+  fd.append('db_user',$('f_user').value); fd.append('db_pass',$('f_pass').value);
+  fetch('/api/adopt/release_read_only',{method:'POST',body:fd,credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(j){ alert(j.ok?('已处理：\n'+(j.applied||[]).join('\n')):('失败：'+(j.msg||''))); adProbe(); })
+    .catch(function(e){ alert('请求失败：'+e); });
+}
+
+/* ---------- ③ 检测 ---------- */
+function adCheckVip(){
+  var v = ($('vipPrefix').textContent + ($('f_viplast').value||'').trim());
+  if(!$('f_viplast').value.trim()){ $('vipMsg').className='chkmsg err'; $('vipMsg').textContent='请先填写 VIP 最后一段'; return; }
+  var fd=new FormData(); fd.append('vip', v);
+  fetch('/api/adopt/check_vip',{method:'POST',body:fd,credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(j){
+      var m=$('vipMsg');
+      m.className='chkmsg '+(j.level==='block'?'err':(j.level==='warn'?'warn':'ok'));
+      m.textContent=(j.level==='ok'?'✓ ':'') + (j.msg||'');
+    }).catch(function(e){ $('vipMsg').textContent='检测失败：'+e; });
+}
+function adCheckVrid(){
+  var fd=new FormData();
+  fd.append('vrid',$('f_vrid').value);
+  fd.append('vip',$('vipPrefix').textContent+($('f_viplast').value||'').trim());
+  fetch('/api/adopt/check_vrid',{method:'POST',body:fd,credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(j){
+      var m=$('vridMsg');
+      m.className='chkmsg '+(j.level==='block'?'err':(j.level==='warn'?'warn':'ok'));
+      m.textContent=(j.msg||'');
+      if(j.level==='block' && j.suggest){ $('f_vrid').value=j.suggest; }
+    }).catch(function(e){ $('vridMsg').textContent='检测失败：'+e; });
+}
+
+/* ---------- ④ 执行 ---------- */
+function adExec(){
+  var bl = adBlockers();
+  if(bl.length){ alert('存在未解决的阻断项，不能执行接管：\n- '+bl.join('\n- ')); return; }
+  var fd = new FormData();
+  fd.append('nodes', JSON.stringify([{host:$('f_ip').value, port:parseInt($('f_port').value||3306,10),
+    user:$('f_user').value, password:$('f_pass').value}]));
+  fd.append('name', $('f_name').value);
+  fd.append('vip', $('vipPrefix').textContent + ($('f_viplast').value||'').trim());
+  fd.append('vip_port', $('f_vipport').value);
+  fd.append('vip_prefix','24');
+  fd.append('root_user', $('f_user').value);
+  fd.append('root_pass', $('f_pass').value);
+  fd.append('deploy_form', adForm);
+  if(adForm==='container') fd.append('container', $('f_cn').value);
+  fd.append('ha_user',$('f_haUser').value); fd.append('ha_pass',$('f_haPass').value);
+  fd.append('repl_user',$('f_rpUser').value); fd.append('repl_pass',$('f_rpPass').value);
+  fd.append('app_user',$('f_apUser').value); fd.append('app_pass',$('f_apPass').value);
+  $('bExec').disabled = true;
+  fetch('/api/adopt/run',{method:'POST',body:fd,credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(j){
+      $('bExec').disabled = false;
+      if(!j.ok){ alert('接管失败：'+(j.error||'')); return; }
+      var h = '<div class="note ok"><b>阶段 1 完成。</b>集群 ID '+j.cluster_id+'：已建 ha_monitor 账号、登记节点、生成 sidecar 引导命令。</div>';
+      var c = (j.probe && j.probe.nodes && j.probe.nodes[0]) || {};
+      h += '<div class="cmdbox"><div class="cmdhead"><span class="t">集群账号（已加密入库，仅展示一次）</span>'
+         + '<button class="btn btn-ghost" id="bCopyCred" onclick="adCopyCreds()">复制</button></div>'
+         + '<pre class="cmd" id="credBox">由集群自动生成，可在集群详情页「⚙ 修改配置/密码」查看与修改</pre>'
+         + '<div class="note">留空自动生成 16 位随机密码；事后可在集群详情页修改，保存即 agent 自动推送生效。</div></div>';
+      (j.bootstrap||[]).forEach(function(b){
+        h += '<div class="cmdbox"><div class="cmdhead"><span class="t">节点 '+b.ip+' 引导命令（sidecar_only）</span>'
+           + '<button class="btn btn-ghost" onclick="adCopyTxt(this)">复制</button></div>'
+           + '<pre class="cmd">'+(b.command||'')+'</pre>'
+           + '<div class="note">以 root 在旧库主机执行。只装 keepalived + agent，不重装数据库、不碰数据。'
+           + '引导脚本内嵌预检：root 权限 → docker / docker compose 存在（缺失则报错退出，不自动安装 docker）→ 磁盘 ≥5GB。</div></div>';
+      });
+      $('execOut').innerHTML = h;
+      $('bFin').style.display='';
+    })
+    .catch(function(e){ $('bExec').disabled=false; alert('请求失败：'+e); });
+}
+function adCopyCreds(){
+  var t=$('credBox').textContent; navigator.clipboard && navigator.clipboard.writeText(t);
+  var b=$('bCopyCred'); b.textContent='已复制 ✓'; setTimeout(function(){b.textContent='复制';},1500);
+}
+function adCopyTxt(btn){
+  var pre = btn.parentNode.parentNode.querySelector('pre');
+  if(pre) navigator.clipboard && navigator.clipboard.writeText(pre.textContent);
+  btn.textContent='已复制 ✓'; setTimeout(function(){btn.textContent='复制';},1500);
+}
+function adFinish(){ location.href='/clusters'; }
+
+window.addEventListener('DOMContentLoaded', function(){
+  ['f_ip','f_port'].forEach(function(id){ var e=$(id); if(e) e.addEventListener('input', adSyncSeed); });
+  adSyncSeed();
+  adGo(1);
+});
 </script>
 {% endblock %}

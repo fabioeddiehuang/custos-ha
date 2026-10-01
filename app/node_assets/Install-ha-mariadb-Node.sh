@@ -19,15 +19,42 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# 节点包目录归整：本脚本位于 <节点>/mariadb12.3.3/scripts/，故：
+# 节点包目录归整：本脚本位于 <节点>/mariadb${MARIADB_VERSION}/scripts/，故：
 #   NODE_ROOT = <节点>/                  （keepalived/ 与 docker-compose.yaml 所在）
-#   CONF_DIR  = <节点>/mariadb12.3.3/conf/（服务端生成的 my.cnf / init_mariadb.sql 等）
+#   CONF_DIR  = <节点>/mariadb${MARIADB_VERSION}/conf/（服务端生成的 my.cnf / init_mariadb.sql 等）
 NODE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONF_DIR="$SCRIPT_DIR/../conf"
 cd "$NODE_ROOT"
 
-# ---------- 可手动替换的下载链接（留空则只尝试用本地已存在的安装包） ----------
-MARIADB_DOWNLOAD_URL="${MARIADB_DOWNLOAD_URL:-https://mirrors.tuna.tsinghua.edu.cn/mariadb//mariadb-12.3.3/bintar-linux-systemd-x86_64/mariadb-12.3.3-linux-systemd-x86_64.tar.gz}"
+# ---------- 可手动替换的版本 / 下载链接 ----------
+# MARIADB_VERSION：要安装的 MariaDB 版本（默认主线 12.3.3）。
+#   受支持矩阵见 version_profile：12.3（主线）/ 11.4 / 10.11（支持）/ 10.6（legacy）。
+#   想装其它版本，指定 MARIADB_VERSION 并确保镜像源有对应 bintar 即可（注意老版本需自检 glibc）。
+# 下载地址优先级：显式 MARIADB_DOWNLOAD_URL > 按 MARIADB_VERSION 由镜像源动态构建
+#   （aliyun 主，tencent / 官方 archive 备；清华源 mirrors.tuna.tsinghua.edu.cn 曾长期 403，仅兜底）。
+# 版本跟随（2026-10-02）：默认版本取自【本脚本所在目录的父目录名】
+#   <节点>/mariadb11.4.13/scripts/Install-ha-mariadb-Node.sh  →  11.4.13
+# 服务端生成节点包时目录名已带版本（mariadb<版本>），这样裸机安装的 MariaDB 版本
+# 与「集群登记版本 / 容器镜像 tag / my.cnf 版本分支」三者始终一致，不会再出现
+# 「目录写着 11.4、实际装成 12.3.3」的错配。显式环境变量仍优先。
+_dir_ver="$(basename "$(cd "$SCRIPT_DIR/.." && pwd)" 2>/dev/null \
+  | sed -n 's/^mariadb\([0-9][0-9.]*\)$/\1/p')"
+MARIADB_VERSION="${MARIADB_VERSION:-${_dir_ver:-12.3.3}}"
+build_mariadb_url() {
+  local v="$1" m url
+  for m in \
+    "https://mirrors.aliyun.com/mariadb/mariadb-$v/bintar-linux-systemd-x86_64" \
+    "https://mirrors.cloud.tencent.com/mariadb/mariadb-$v/bintar-linux-systemd-x86_64" \
+    "https://archive.mariadb.org/mariadb-$v/bintar-linux-systemd-x86_64" ; do
+    url="$m/mariadb-$v-linux-systemd-x86_64.tar.gz"
+    if curl -fsI --max-time 8 "$url" >/dev/null 2>&1; then echo "$url"; return 0; fi
+  done
+  # 兜底（清华曾 403，仅当以上镜像均不可达时回退）
+  echo "https://mirrors.tuna.tsinghua.edu.cn/mariadb/mariadb-$v/bintar-linux-systemd-x86_64/mariadb-$v-linux-systemd-x86_64.tar.gz"
+}
+if [[ -z "${MARIADB_DOWNLOAD_URL:-}" ]]; then
+  MARIADB_DOWNLOAD_URL="$(build_mariadb_url "$MARIADB_VERSION")"
+fi
 
 # ---------- 安装路径（如需指定，改这里；或加环境变量 MARIADB_INSTALL_DIR 覆盖） ----------
 INSTALL_DIR="${MARIADB_INSTALL_DIR:-/opt/mariadb}"
@@ -179,7 +206,7 @@ fi
 log "MariaDB 程序已就位：$INSTALL_DIR/bin/mariadbd"
 
 # ---------- 2.5) 运行前兼容性自检（关键）----------
-# MariaDB 12.3.3 的 linux-systemd 二进制要求宿主 glibc ≥ 2.28、libstdc++ 带
+# MariaDB ${MARIADB_VERSION} 的 linux-systemd 二进制要求宿主 glibc ≥ 2.28、libstdc++ 带
 # GLIBCXX_3.4.20+、libcrypt(XCRYPT_2.0)、libsystemd(LIBSYSTEMD_227)。
 # 老系统（如 CentOS 7 / glibc 2.17、Ubuntu 18.04 / glibc 2.27）会直接报
 # "... version `GLIBC_2.28' not found" 且 bootstrap 静默失败，极难看懂。
@@ -187,9 +214,9 @@ log "MariaDB 程序已就位：$INSTALL_DIR/bin/mariadbd"
 if ! out="$("$INSTALL_DIR/bin/mariadbd" --version 2>&1)"; then
   err "本节点无法运行 $INSTALL_DIR/bin/mariadbd（操作系统 / 运行时库版本过低）。缺失的符号："
   echo "$out" | grep -iE 'not found|version .* not|GLIBC|GLIBCXX|XCRYPT|LIBSYSTEMD|CXXABI' | head -8 | sed 's/^/      /' || true
-  die "该节点的 glibc/libstdc++ 低于 MariaDB 12.3.3(linux-systemd) 的要求（需 glibc≥2.28 等）。"\
-"此类老系统请改用 Docker 方式部署 MariaDB 12.3.3（容器自带运行时，不受宿主 glibc 限制）："\
-"在本节点目录用官方镜像 mariadb:12.3.3（host 网络，挂载 mariadb12.3.3/conf/my.cnf 与 /data/mariadb），"\
+  die "该节点的 glibc/libstdc++ 低于 MariaDB ${MARIADB_VERSION}(linux-systemd) 的要求（需 glibc≥2.28 等）。"\
+"此类老系统请改用 Docker 方式部署 MariaDB ${MARIADB_VERSION}（容器自带运行时，不受宿主 glibc 限制）："\
+"在本节点目录用官方镜像 mariadb:${MARIADB_VERSION}（host 网络，挂载 mariadb${MARIADB_VERSION}/conf/my.cnf 与 /data/mariadb），"\
 "再按裸机流程执行 init_mariadb.sql 并拉起 keepalived 客户端即可。"\
 "或升级该节点系统 / glibc 后重试裸机安装。"
 fi
@@ -536,7 +563,7 @@ echo "  • MariaDB 程序目录 : $INSTALL_DIR"
 echo "  • 数据目录         : $DATA_DIR"
 echo "  • 监听端口         : $PORT"
 echo "  • systemd 单元     : $SYSTEMD_UNIT（systemctl start/stop/status $SYSTEMD_UNIT）"
-echo "  • 卸载方式         : sudo bash mariadb12.3.3/scripts/Uninstall-mariadb-Node.sh"
+echo "  • 卸载方式         : sudo bash mariadb${MARIADB_VERSION}/scripts/Uninstall-mariadb-Node.sh"
 echo
 echo
 if [[ "$MARIADB_OK" -eq 1 ]]; then
@@ -546,4 +573,4 @@ else
 fi
 echo "后续：等待各节点都安装完成后，管理器会自动建复制、选主、漂移 VIP。"
 echo "若需指定安装路径/端口，编辑节点目录 my.cnf（服务端生成）或设置环境变量"
-echo "MARIADB_INSTALL_DIR / MARIADB_DATA_DIR / MARIADB_DOWNLOAD_URL 后重跑本脚本。"
+echo "MARIADB_INSTALL_DIR / MARIADB_DATA_DIR / MARIADB_VERSION / MARIADB_DOWNLOAD_URL 后重跑本脚本。"
