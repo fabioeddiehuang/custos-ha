@@ -730,6 +730,13 @@ def delete_backup(cid, filename: str):
                 cand.unlink()
             except Exception:
                 pass
+    # 删文件必须连带清记录（备份铁律）：否则「备份记录」页继续显示一份磁盘上已
+    # 不存在的备份，运维据此误判有可用备份，真要恢复时才发现文件没了。
+    # 手动删除路径此前漏了这一步（purge 路径已有），与自动清理行为不一致 —— 补齐。
+    try:
+        _remove_history_entries(cid, [filename])
+    except Exception:
+        pass
     return {"ok": True, "msg": f"已删除 {p.name}"}
 
 

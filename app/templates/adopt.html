@@ -102,7 +102,7 @@
 </style>
 
 <div class="ad-wrap">
-  <p class="ad-sub">挂载旧库为节点，建单节点集群；后续加从库获主从 + VIP 漂移。接管仅装 sidecar，不重装、不碰数据。</p>
+  <p class="ad-sub">挂载旧库为节点，建<b>单节点集群</b>（含 VIP + 监控 + 自动故障切换）。接管仅装 sidecar，不重装、不碰数据。<b>注意：接管本身不会自动扩充副本</b>——若需要「一主一从」高可用，请在集群建成后用「添加节点」手动加入从库。</p>
 
   <div class="hstep" id="hstep">
     <div class="hs" data-step="1" onclick="adGo(1)"><span class="dot">1</span>
@@ -405,7 +405,10 @@ function adExec(){
     .then(function(j){
       $('bExec').disabled = false;
       if(!j.ok){ alert('接管失败：'+(j.error||'')); return; }
-      var h = '<div class="note ok"><b>阶段 1 完成。</b>集群 ID '+j.cluster_id+'：已建 ha_monitor 账号、登记节点、生成 sidecar 引导命令。</div>';
+      var h = '<div class="note ok"><b>接管完成（单节点集群）。</b>集群 ID '+j.cluster_id
+        + '：已建 ha_monitor 账号、登记节点、生成 sidecar 引导命令。<br>'
+        + '<b>下一步</b>：用页面顶部「集群 → 该集群 → 添加节点」加入从库，即可获得一主一从 + VIP 自动漂移的高可用。'
+        + '（当前版本暂不自动把单机扩成主从，需手动加从库。）</div>';
       var c = (j.probe && j.probe.nodes && j.probe.nodes[0]) || {};
       h += '<div class="cmdbox"><div class="cmdhead"><span class="t">集群账号（已加密入库，仅展示一次）</span>'
          + '<button class="btn btn-ghost" id="bCopyCred" onclick="adCopyCreds()">复制</button></div>'

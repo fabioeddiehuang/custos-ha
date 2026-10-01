@@ -300,7 +300,8 @@ def _install_dest(install_dir=None):
     return node_install_dest(NODE_INSTALL_BASE)
 
 
-def node_install_cmds(ip, node_type, sidecar_only=False, install_dir=None):
+def node_install_cmds(ip, node_type, sidecar_only=False, install_dir=None,
+                      mysql_version=None):
     """按节点形态给出安装/启动命令序列。
 
     裸机 MariaDB（mariadb）：数据库本体由 Install-ha-mariadb-Node.sh 全量安装
@@ -310,8 +311,12 @@ def node_install_cmds(ip, node_type, sidecar_only=False, install_dir=None):
     sidecar_only=True（**接管场景**）：只在已有数据库上装 keepalived + agent。
     必须跳过 Install 脚本——接管的是**正在跑业务的库**，跑安装脚本等于重装数据库。
 
-    安装脚本位于单元目录的 <MARIADB_NODE_CONF_DIR>/scripts/ 下（与 node_gen 生成一致），
+    安装脚本位于单元目录的 <数据库配置目录>/scripts/ 下（与 node_gen 生成一致），
     此前误写成 scripts/ 顶层导致裸机形态引导后不自动安装，已修正。
+
+    ⚠ 目录名必须**跟随版本**（mariadb11.4.13 / mariadb10.6.28 / mariadb12.3.3）：
+    版本跟随上线后若仍写死 mariadb12.3.3，11.4/10.6 裸机节点的引导安装会去执行一个
+    不存在的路径 —— 引导装完却没装数据库。故按 mysql_version 动态取，取不到回退主线。
     """
     dest = _install_dest(install_dir)
     if node_type == "mariadb" or sidecar_only:
@@ -323,9 +328,9 @@ def node_install_cmds(ip, node_type, sidecar_only=False, install_dir=None):
         cmds = ["cd %s && docker compose up -d --force-recreate "
                 "keepalived custos-node-agent" % dest]
         if node_type == "mariadb" and not sidecar_only:
-            from .node_gen import MARIADB_NODE_CONF_DIR
+            from .node_gen import _node_conf_dir
             cmds.insert(0, "bash %s/%s/scripts/Install-ha-mariadb-Node.sh"
-                        % (dest, MARIADB_NODE_CONF_DIR))
+                        % (dest, _node_conf_dir(node_type, mysql_version)))
         return cmds
     return ["cd %s && docker compose up -d --force-recreate" % dest]
 
@@ -410,7 +415,8 @@ def check_bootstrap_prereqs(node_type="docker", sidecar_only=False, images=None)
 
 
 def render_bootstrap_script(ip, token, node_type="docker", images=None,
-                            sidecar_only=False, install_dir=None):
+                            sidecar_only=False, install_dir=None,
+                            mysql_version=None):
     """渲染引导安装脚本（bash）。
 
     脚本是**幂等**的：重复执行会覆盖单元并重新 up，便于失败重试与后续升级
@@ -422,7 +428,7 @@ def render_bootstrap_script(ip, token, node_type="docker", images=None,
     mgr = manager_base_url()
     dest = _install_dest(install_dir)
     cmds = node_install_cmds(ip, node_type, sidecar_only=sidecar_only,
-                             install_dir=install_dir)
+                             install_dir=install_dir, mysql_version=mysql_version)
 
     # 镜像分发（F2）：服务端托管 tar，节点 docker load。未配置时跳过。
     if images is None:

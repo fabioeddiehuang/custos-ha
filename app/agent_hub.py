@@ -62,6 +62,10 @@ DISPATCH_LIMIT_PER_HEARTBEAT = 3
 # 指令默认有效期（秒）。过期不再下发，避免"几天前的指令突然被执行"。
 DEFAULT_CMD_TTL = 3600
 
+# 单条指令载荷上限（字节）。下发节点变更文件时整包 base64 后写入 payload，
+# 列已扩容为 LONGTEXT，但仍需挡住异常大的载荷（避免管理库被撑爆 / 复制卡顿）。
+MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
+
 
 def _now():
     return datetime.now()
@@ -120,12 +124,27 @@ def enqueue(ip, verb, payload=None, actor="", ttl_sec=DEFAULT_CMD_TTL,
             pass
 
     exp = _now() + timedelta(seconds=int(ttl_sec or DEFAULT_CMD_TTL))
-    new_id = execute(
-        "INSERT INTO agent_commands (ip, verb, payload, actor, expires_at, dedupe_key) "
-        "VALUES (%s,%s,%s,%s,%s,%s)",
-        (ip, verb, json.dumps(payload or {}, ensure_ascii=False), actor or "",
-         exp, dedupe_key or ""),
-    )
+    _body = json.dumps(payload or {}, ensure_ascii=False)
+    # 体积保护：单条指令设上限，超了宁可明确报错，也不要把几十 MB 塞进管理库。
+    if len(_body.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        raise ValueError(
+            "指令载荷 %.1f MB 超过上限 %d MB（verb=%s ip=%s）：请减少单次下发的文件数，"
+            "或分批下发" % (len(_body.encode("utf-8")) / 1048576.0,
+                            MAX_PAYLOAD_BYTES // 1048576, verb, ip))
+    try:
+        new_id = execute(
+            "INSERT INTO agent_commands (ip, verb, payload, actor, expires_at, dedupe_key) "
+            "VALUES (%s,%s,%s,%s,%s,%s)",
+            (ip, verb, _body, actor or "", exp, dedupe_key or ""),
+        )
+    except Exception as e:
+        # 1406 = Data too long：payload 仍是 TEXT(64KB) 的老库会遇到。给出可执行指引，
+        # 而不是让调用方只看到一句 MySQL 原文（自动下发就此静默失败）。
+        if "1406" in str(e):
+            raise RuntimeError(
+                "指令写入失败：agent_commands.payload 列仍是 TEXT(64KB)，装不下本次载荷。"
+                "请重启服务端触发自动扩容（init_db 会把它 ALTER 成 LONGTEXT）。原始错误：%s" % e)
+        raise
     return new_id
 
 

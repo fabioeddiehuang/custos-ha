@@ -1084,6 +1084,27 @@ def render_update_node():
 #       管理器在数分钟内自动自愈（账号 / 复制 / 半同步），无需手动干预。
 set -e
 cd "$(dirname "$0")"
+
+# ---- 版本跟随后清理旧版本配置目录（P1，2026-10-02）----
+# 接管 / 升级导致集群版本变化时，节点目录里会残留旧版本目录（如 mariadb12.3.3），
+# 而新包只带当前版本目录（mariadb11.4.13 / mariadb10.6.28 ...）。旧目录不再被任何
+# 服务引用，留着只会增加排错混淆、还可能被误当成「节点实际版本」。故：保留包内
+# 当前那个配置目录，其余 mariadb*/mysql8.0 一律清掉。
+_conf=""
+for d in mariadb* mysql8.0; do
+  [ -d "$d" ] || continue
+  _conf="$d"
+  break
+done
+if [ -n "$_conf" ]; then
+  for d in mariadb* mysql8.0; do
+    [ -d "$d" ] || continue
+    [ "$d" = "$_conf" ] && continue
+    echo "[update-node] 清理旧版本配置目录 $d"
+    rm -rf "$d"
+  done
+fi
+
 echo "[update-node] 停止并移除现有容器（保留数据与日志目录）..."
 docker compose down
 echo "[update-node] 重新拉起节点..."
@@ -2221,7 +2242,10 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         "mariadb": "/data/mariadb",              # 裸机默认（与 render_mariadb_my_cnf 默认值一致）
         "mariadb-docker": MARIADB_DOCKER_DATA_DIR,
     }.get(node_type, MYSQL_DOCKER_DATA_DIR)
-    conf_dir = _node_conf_dir(node_type)
+    # 目录名必须跟随版本（与上面的 _mconf 同源）：否则 11.4/10.6 节点会把
+    # logrotate / prepare-logs.sh / update-node.sh 写进 mariadb12.3.3/，
+    # 而数据库配置在 mariadb11.4.13/ —— 安装脚本里的日志初始化路径随之错位。
+    conf_dir = _mconf
     _write(d / conf_dir / "conf" / "custos-ha-logrotate.conf", render_logrotate_conf(), mode=0o644)
     _write(d / conf_dir / "scripts" / "prepare-logs.sh",
            render_prepare_logs(node_type, _log_dir_host(_data_dir_for_log)), mode=0o755)
@@ -2502,7 +2526,7 @@ def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_r
                 fix_sql = render_fix_node_creds_sql(
                     ha_user, ha_pass, repl_user, repl_pass, root_user, root_pass, manager_public_ip,
                     manager_subnet, auth_plugin=_auth_plugin_for(mysql_version, node_type))
-            _write(_safe_node_path(ip) / _node_conf_dir(node_type) / "conf" / "fix-node-creds.sql", fix_sql, mode=0o644)
+            _write(_safe_node_path(ip) / _node_conf_dir(node_type, mysql_version) / "conf" / "fix-node-creds.sql", fix_sql, mode=0o644)
             synced += 1
 
     # 复制账号改名/改密后，从库仍用旧 repl_user 连主库；主库 DROP 旧账号前必须先把

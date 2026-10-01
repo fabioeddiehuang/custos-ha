@@ -435,6 +435,31 @@ def init_schema():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
             except Exception as e:
                 print(f"[init_db] 创建 migration_tasks 表失败(可忽略): {e}")
+            # ---- v2.5.0：agent 指令载荷列扩容（免 SSH 运维能落地的前提）----
+            # agent_commands.payload 建表时是 TEXT（上限 64KB），而「重新生成节点后自动
+            # 下发变更文件」会把 my.cnf / compose / 脚本等 base64 后整包写进去，实测必
+            # 然触发 1406 Data too long for column 'payload' —— 自动下发永远失败，只能让
+            # 运维照「待生效操作」手工执行，v2.5.0 主打的免 SSH 运维形同虚设。
+            # 故升级到 LONGTEXT；仅在列类型确实偏小时才 ALTER（幂等，可反复执行）。
+            try:
+                c.execute("SELECT DATA_TYPE FROM information_schema.COLUMNS "
+                          "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='agent_commands' "
+                          "AND COLUMN_NAME='payload'")
+                _prow = c.fetchone()
+                # 注意：init_db 里的 c 是 DictCursor，行是字典不是元组
+                # （写 _prow[0] 会抛 KeyError: 0，异常信息就是个光秃秃的 "0"，极难排查）。
+                if isinstance(_prow, dict):
+                    _pdt = ((_prow.get("DATA_TYPE") or "") or "").lower()
+                elif _prow:
+                    _pdt = (str(_prow[0]) or "").lower()
+                else:
+                    _pdt = ""
+                if _pdt and _pdt not in ("longtext", "mediumtext", "longblob", "mediumblob"):
+                    c.execute("ALTER TABLE agent_commands MODIFY payload LONGTEXT")
+                    print("[init_db] agent_commands.payload 已扩容为 LONGTEXT"
+                          "（修复自动下发 1406）", flush=True)
+            except Exception as e:
+                print(f"[init_db] agent_commands.payload 扩容失败(可忽略): {e}")
             # ---- 迁移向导：百分比进度与「当前阶段」文字（后台线程执行 + 前端轮询）----
             # progress = 整任务百分比(0~100)；stage = 正在做什么的人类可读短句。
             # 后台线程直接 UPDATE 这两列，前端轮询 /status 渲染进度条，避免长任务阻塞请求。

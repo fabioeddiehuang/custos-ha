@@ -973,9 +973,12 @@ def api_bootstrap_script(token: str, request: Request):
                         status_code=403, media_type="text/plain; charset=utf-8")
     ip = row["ip"]
     try:
-        rows = query("SELECT node_type, compose_path FROM nodes WHERE ip=%s", (ip,))
+        rows = query("SELECT node_type, compose_path, mysql_version FROM nodes WHERE ip=%s", (ip,))
         node_type = (rows[0].get("node_type") if rows else "") or "mariadb-docker"
         node_dir_val = (rows[0].get("compose_path") if rows else "") or ""
+        # 版本跟随：引导脚本里的安装脚本路径必须按节点版本取目录名（mariadb11.4.13/...），
+        # 否则 11.4/10.6 裸机节点引导后根本找不到 Install 脚本。
+        _node_ver = (rows[0].get("mysql_version") if rows else "") or ""
     except Exception:
         node_type = "docker"
         node_dir_val = ""
@@ -991,7 +994,8 @@ def api_bootstrap_script(token: str, request: Request):
         _sidecar = bool(int(row.get("sidecar_only") or 0))
         script = bootstrap.render_bootstrap_script(ip, token, node_type,
                                                    install_dir=_dir or None,
-                                                   sidecar_only=_sidecar)
+                                                   sidecar_only=_sidecar,
+                                                   mysql_version=_node_ver or None)
     except Exception as e:
         return Response(f"生成引导脚本失败：{e}", status_code=500,
                         media_type="text/plain; charset=utf-8")
