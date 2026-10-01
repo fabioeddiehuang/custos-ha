@@ -4446,6 +4446,7 @@ def nodes_add(
     mysql_version: str = Form(""),
     server_id: str = Form(""),
     install_dir: str = Form(""),
+    interface: str = Form(""),
     user=Depends(auth_required),
 ):
     initial_role = "master" if initial_role == "master" else "slave"
@@ -4499,6 +4500,21 @@ def nodes_add(
             server_id=server_id.strip() or None,
             install_dir=install_dir or None,
         )
+        # 节点级 interface（v2.5.0）：页面未指定时，缺省沿用集群登记的网卡；
+        # 多网卡主机混部的集群，每个节点网卡可能不同，需逐节点设置才能正确上浮 VIP。
+        _iface = (interface or "").strip()
+        if not _iface:
+            try:
+                from .clusters import get_cluster as _gc
+                _iface = ((_gc(int(cid)) or {}).get("interface") or "").strip()
+            except Exception:
+                _iface = ""
+        if _iface:
+            try:
+                execute("UPDATE nodes SET interface=%s WHERE ip=%s AND port=%s",
+                        (_iface, ip, int(port)))
+            except Exception:
+                pass
         audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
                         "add_node", f"{ip}:{port}",
                         f"type={node_type} ver={mysql_version}", cluster_id=cid)

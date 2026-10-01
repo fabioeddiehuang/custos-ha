@@ -1343,14 +1343,14 @@ def _refresh_all_keepalived_conf(cluster_id=None):
     """
     try:
         if cluster_id:
-            rows = query("SELECT ip, port, server_id, cluster_id FROM nodes WHERE cluster_id=%s",
+            rows = query("SELECT ip, port, server_id, cluster_id, interface FROM nodes WHERE cluster_id=%s",
                          (cluster_id,))
         else:
             # F8（2026-09-16 真机）：此前 SELECT **漏选 cluster_id**，而下方 `cid = r.get("cluster_id")
             # 恒为 None → `_peer_ips(ip, None)` 直接返回 [] → 重新生成的 keepalived.conf 里
             # `unicast_peer {}` 恒为空 → 节点间 VRRP 互不知情（脑裂 / VIP 不切换）。
             # 实测 33 的 generated_nodes 配置 peer 为空即此因。
-            rows = query("SELECT ip, port, server_id, cluster_id FROM nodes")
+            rows = query("SELECT ip, port, server_id, cluster_id, interface FROM nodes")
     except Exception:
         return
     for r in rows:
@@ -1360,7 +1360,8 @@ def _refresh_all_keepalived_conf(cluster_id=None):
         creds = get_cluster_creds(cid) if cid else None
         vip = (creds or {}).get("vip") or get_setting("VIP") or VIP
         vip_prefix = (creds or {}).get("vip_prefix") or VIP_PREFIX
-        interface = (creds or {}).get("interface") or INTERFACE
+        # 节点级 interface 优先（v2.5.0），缺省回退集群级 / 全局
+        interface = r.get("interface") or (creds or {}).get("interface") or INTERFACE
         vrid = (creds or {}).get("vrid") or VRID
         try:
             conf = _render_keepalived_conf(
@@ -1390,10 +1391,9 @@ def regenerate_cluster_compose(cluster_id):
     vip_port = (creds or {}).get("vip_port") or VIP_PORT
     vip = (creds or {}).get("vip") or ""
     vip_prefix = (creds or {}).get("vip_prefix") or VIP_PREFIX
-    interface = (creds or {}).get("interface") or INTERFACE
     vrid = (creds or {}).get("vrid") or VRID
     rows = query(
-        "SELECT ip, port, root_pass, server_id, node_type FROM nodes WHERE cluster_id=%s",
+        "SELECT ip, port, root_pass, server_id, node_type, interface FROM nodes WHERE cluster_id=%s",
         (cluster_id,))
     for r in rows:
         ip = r["ip"]
@@ -1418,6 +1418,8 @@ def regenerate_cluster_compose(cluster_id):
         # virtual_ipaddress 仍为空（只剩 /24），keepalived 报 “No VIP specified” / 解析到
         # 无效 IP “/24”，VIP 永远不上浮。VIP 非法时跳过写入（避免覆盖为坏配置）。
         peers = _peer_ips(ip, cluster_id)
+        # 节点级 interface 优先（v2.5.0），缺省回退集群级 / 全局
+        interface = r.get("interface") or (creds or {}).get("interface") or INTERFACE
         try:
             conf = _render_keepalived_conf(
                 ip, peers, vip, vip_prefix, interface, vrid,
@@ -2038,6 +2040,17 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         raise ValueError("集群 VIP 格式非法（%r），应为合法 IPv4，如 192.0.2.10" % vip)
     vip_prefix = creds["vip_prefix"] or VIP_PREFIX
     interface = creds["interface"] or INTERFACE
+    # ---- 节点级 interface 优先（v2.5.0）：多网卡主机混部的集群，各节点网卡名可能
+    # 不同，必须按节点自身网卡上浮 VIP，否则 VIP 落错网卡（漂不起来）。节点未登记
+    # 时回退集群级 interface / 全局 INTERFACE。 ---
+    try:
+        _nif = query(
+            "SELECT interface FROM nodes WHERE ip=%s AND port=%s", (ip, int(port))
+        )
+        if _nif and _nif[0].get("interface"):
+            interface = _nif[0]["interface"]
+    except Exception:
+        pass
     vrid = creds["vrid"] or VRID
     vip_port = creds.get("vip_port") or VIP_PORT
     manager_public_ip = get_manager_public_ip()

@@ -634,6 +634,34 @@ def _post_form(url, data, timeout=15):
         return json.loads((r.read() or b"{}").decode("utf-8"))
 
 
+def detect_local_interface(ip):
+    """返回承载本节点对外 IP 的网卡名；无法判定时返回 ''（不阻断心跳）。
+
+    v2.5.0：用于节点级 interface 自适应——多网卡主机混部的集群，各节点网卡名
+    不同，管理器据此逐节点设置 VIP 上浮网卡，避免漂错网卡。优先用 psutil，缺失
+    时回退解析 `ip -o addr`。
+    """
+    if not ip:
+        return ""
+    try:
+        if psutil is not None:
+            for _nic, _addrs in psutil.net_if_addrs().items():
+                for _a in _addrs:
+                    if _a.address == ip:
+                        return _nic
+        import subprocess
+        _out = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            capture_output=True, text=True, timeout=5).stdout
+        for _line in _out.splitlines():
+            _parts = _line.split()
+            if len(_parts) >= 4 and _parts[3].split("/")[0] == ip:
+                return _parts[1]
+    except Exception:
+        pass
+    return ""
+
+
 def heartbeat_loop(manager, ip, token, interval, logg=None):
     """心跳循环：上报存活 → 取回指令 → 执行 → 回报结果。
 
@@ -651,7 +679,8 @@ def heartbeat_loop(manager, ip, token, interval, logg=None):
     while True:
         try:
             res = _post_form(base + "/api/agent/heartbeat",
-                             {"ip": ip, "token": token, "agent_version": AGENT_VERSION})
+                             {"ip": ip, "token": token, "agent_version": AGENT_VERSION,
+                              "local_interface": detect_local_interface(ip)})
             backoff = max(5, int(interval))
             for c in (res.get("commands") or []):
                 try:

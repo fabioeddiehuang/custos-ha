@@ -183,6 +183,18 @@ def on_heartbeat(ip, payload=None):
     except Exception as e:
         log.debug("更新节点在线状态失败（字段可能未迁移）：%s", e)
 
+    # v2.5.0：节点级 interface 自适应。agent 心跳上报承载本机 IP 的网卡名，落库到
+    # nodes.interface（仅在节点尚未显式登记时才覆盖，避免覆盖人工设定）。多网卡主机
+    # 混部的集群据此逐节点设置 VIP 上浮网卡。字段缺失/为空时跳过。
+    _lif = (payload.get("local_interface") or "").strip()
+    if _lif:
+        try:
+            execute(
+                "UPDATE nodes SET interface=%s WHERE ip=%s AND "
+                "(interface IS NULL OR interface='')", (_lif, ip))
+        except Exception:
+            pass
+
     expire_stale()
     cmds = []
     try:

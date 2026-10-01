@@ -87,6 +87,7 @@ SCHEMA_SQL = [
         server_id INT,
         compose_path VARCHAR(255),
         cluster_id INT DEFAULT NULL,
+        interface VARCHAR(32) DEFAULT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB
     """,
@@ -351,6 +352,13 @@ def init_schema():
             # 凭证自愈与切换的 root 回退；root 密码在容器创建时固定，不随 HA_PASS 漂移）
             try:
                 c.execute("ALTER TABLE nodes ADD COLUMN root_pass VARCHAR(255) DEFAULT ''")
+            except Exception:
+                pass
+            # v2.5.0：nodes 表新增 interface（承载 VIP 的网卡名，节点级）。此前 interface
+            # 仅存于 clusters（集群级），多网卡主机混部的集群会漂错网卡（VIP 落不到正确
+            # 网卡）。改为节点级后，生成 keepalived 配置优先用节点自身网卡，缺省回退集群值。
+            try:
+                c.execute("ALTER TABLE nodes ADD COLUMN interface VARCHAR(32) DEFAULT NULL")
             except Exception:
                 pass
             # 兼容旧 schema：switch_history 增加 cluster_id（按集群区分切换记录）
