@@ -1,6 +1,6 @@
 # Custos
 
-> 当前版本：**v2.5.0**（主线：集群接管 + 节点 curl 一行引导安装 + agent 指令通道免 SSH 运维 + 滚动升级 + 集群级定时备份 + 强制同步 + 无保护窗口提示）
+> 当前版本：**v2.5.1**（主线：集群接管 + 节点 curl 一行引导安装 + agent 指令通道免 SSH 运维 + 滚动升级 + 集群级定时备份 + 强制同步 + 无保护窗口提示；v2.5.1 为 bug 修复与稳定性增强版）
 > 稳定版：**v2.4.0**（数据迁移向导：MariaDB↔MariaDB + MySQL 5.7→MariaDB；该分支只修 bug）
 > 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)；**v2.3 起**每个版本的独立规划见 [`doc/releases/`](./doc/releases/)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。

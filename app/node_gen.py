@@ -164,17 +164,9 @@ def render_agent_service(log_dir_host):
   custos-node-agent:
     image: python:3-slim
     container_name: custos-node-agent
-    command:
-      - python3
-      - /app/node_agent.py
-      - --port
-      - '28889'
-      - --bind
-      - 0.0.0.0
-      - --root
-      - /host
-      - --log
-      - /var/log/custos-ha/node_agent.log
+    # 保持 exec 列表（流式数组）形式，语义与原多段 block 列表完全一致。
+    command: ["python3", "/app/node_agent.py", "--port", "28889", "--bind", "0.0.0.0",
+              "--root", "/host", "--log", "/var/log/custos-ha/node_agent.log"]
     restart: always
     pid: host
     network_mode: host
@@ -349,27 +341,15 @@ services:
       # 跳过官方镜像在初始化阶段对 /usr/share/zoneinfo 的全量装载（耗时数秒且会刷一堆
       # "Unable to load ... as time zone" 警告；仅需系统时区，无需命名时区表）。
       MYSQL_INITDB_SKIP_TZINFO: "1"
-    command:
-      - --server-id={server_id}
-      - --gtid-mode=ON
-      - --enforce-gtid-consistency=ON
-      - --log-bin=mysql-bin
-      - --log-slave-updates=ON
-      - --relay-log=relay-bin
-      - --relay-log-recovery=ON
-      - --sync-binlog=1
-      - --innodb-flush-log-at-trx-commit=1
-      - --read-only=ON
-      # I/O 相关（避免沿用 mysql:8.0 镜像 128MB buffer pool / 200 io_capacity 的默认极小值，
-      # 否则副本追日志、主库刷脏时会把磁盘 util 打满）。buffer pool 可按宿主机内存再调大。
-      - --innodb-buffer-pool-size=320M
-      - --innodb-io-capacity=2000
-      - --innodb-io-capacity-max=4000
-      # 并行复制：加快从库回放，避免高写入/大事务下复制延迟持续累积（如单节点长期滞后）。
-      # LOGICAL_CLOCK 保证提交顺序一致；preserve_commit_order=ON 维持从库提交序与主机一致。
-      - --slave-parallel-workers=4
-      - --slave-parallel-type=LOGICAL_CLOCK
-      - --slave-preserve-commit-order=ON
+    # 启动参数：保持 exec 列表（流式数组）形式——绝不能改成字符串，否则 MySQL 官方镜像
+    # 会在参数前再拼一个 mysqld 导致双命令报错，且多一层 sh -c 会让 SIGTERM 优雅关闭失效。
+    # 写成单行流式数组仅作可读性优化，与原多段 block 列表语义完全一致。
+    command: ["--server-id={server_id}", "--gtid-mode=ON", "--enforce-gtid-consistency=ON",
+              "--log-bin=mysql-bin", "--log-slave-updates=ON", "--relay-log=relay-bin",
+              "--relay-log-recovery=ON", "--sync-binlog=1", "--innodb-flush-log-at-trx-commit=1",
+              "--read-only=ON", "--innodb-buffer-pool-size=320M", "--innodb-io-capacity=2000",
+              "--innodb-io-capacity-max=4000", "--slave-parallel-workers=4",
+              "--slave-parallel-type=LOGICAL_CLOCK", "--slave-preserve-commit-order=ON"]
     ports:
 {port_lines}
     volumes:
@@ -408,10 +388,7 @@ services:
     image: mysql:8.0
     container_name: custos-init-logs
     user: "0:0"
-    entrypoint:
-      - sh
-      - -c
-      - "chown -R 999:999 /var/lib/mysql /var/log/custos-ha && echo logs-dir-ready"
+    entrypoint: ["sh", "-c", "chown -R 999:999 /var/lib/mysql /var/log/custos-ha && echo logs-dir-ready"]
     volumes:
       - {MYSQL_DOCKER_DATA_DIR}:/var/lib/mysql:z
       - {_log_dir_host(MYSQL_DOCKER_DATA_DIR)}:/var/log/custos-ha:z
@@ -883,13 +860,12 @@ services:
     # 追加进来，若这里只写官方入口而不带 mariadbd，最终 exec 拿到空参数 -> 入口 _main
     # 落到末尾 `exec "$@"`(空) -> 立即退出码 0、零日志、容器 Restarting 卡死。
     # 故把 mariadbd 显式写进 entrypoint 数组，确保 $@ 始终含 mariadbd（不再依赖被丢弃的 CMD）。
-    entrypoint:
-      - sh
-      - -c
-      - "chown -R 999:999 /var/log/custos-ha 2>/dev/null || chmod -R 777 /var/log/custos-ha 2>/dev/null; exec $@"
-      - wrap
-      - /usr/local/bin/docker-entrypoint.sh
-      - mariadbd
+    # 入口前先修一次统一日志目录属主（宿主挂载目录默认 root:root，mariadbd 写不了 error.log），
+    # 把原本独立的 init-logs 容器职责合并进本入口，避免 restart:no + depends_on 卡住节点。
+    # 保持 exec 列表（流式数组）形式：exec $@ 最终落到 docker-entrypoint.sh mariadbd，语义不变。
+    entrypoint: ["sh", "-c",
+                "chown -R 999:999 /var/log/custos-ha 2>/dev/null || chmod -R 777 /var/log/custos-ha 2>/dev/null; exec $@",
+                "wrap", "/usr/local/bin/docker-entrypoint.sh", "mariadbd"]
     environment:
       MARIADB_ROOT_PASSWORD: "{root_pass}"
       # 全站统一中国时间：节点 NOW()/日志时间均为北京时间(UTC+8)

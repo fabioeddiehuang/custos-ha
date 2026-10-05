@@ -185,10 +185,10 @@ def issue_token(ip, cluster_id=None, actor="", ttl_hours=DEFAULT_TTL_HOURS,
     token = "%s.%s" % (jti, _sig(jti, ip, exp))
     execute(
         "INSERT INTO bootstrap_tokens "
-        "(token_hash, ip, cluster_id, install_dir, sidecar_only, expires_at, issued_by) "
-        "VALUES (%s,%s,%s,%s,%s,FROM_UNIXTIME(%s),%s)",
+        "(token_hash, ip, cluster_id, install_dir, sidecar_only, expires_at, expires_ts, issued_by) "
+        "VALUES (%s,%s,%s,%s,%s,FROM_UNIXTIME(%s),%s,%s)",
         (_jti_hash(jti), ip, cluster_id, install_dir or None,
-         1 if sidecar_only else 0, exp, actor or ""),
+         1 if sidecar_only else 0, exp, exp, actor or ""),
     )
     return token
 
@@ -239,7 +239,16 @@ def verify_token(token, ip=None):
         return None
     if row.get("used_at"):
         return None
-    exp = _as_ts(row.get("expires_at"))
+    # 有效期与验签优先用签发时落库的【原始纪元秒】expires_ts —— 它与时区无关。
+    # 旧路径（由 DATETIME 反推纪元）受「管理库会话时区 vs 管理端进程时区」耦合影响：
+    # 两边不一致时差出整小时，验签必然失败（表现为所有引导 token 永远 403）。
+    # expires_ts 缺失（升级前的存量 token）才回退旧路径。
+    try:
+        exp = int(row.get("expires_ts") or 0)
+    except (TypeError, ValueError):
+        exp = 0
+    if exp <= 0:
+        exp = int(_as_ts(row.get("expires_at")))
     if exp <= 0:
         return None                      # 无法判定有效期 = 不可用
     if time.time() > exp:

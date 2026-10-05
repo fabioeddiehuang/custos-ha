@@ -693,7 +693,7 @@ def api_config_drift(cluster_id: int = 0, user=Depends(auth_required)):
 
 
 @app.post("/api/config_drift/remediate")
-def api_config_drift_remediate(cluster_id: int = 0, user=Depends(auth_required)):
+def api_config_drift_remediate(cluster_id: int = Form(0), user=Depends(auth_required)):
     """一键修复最近一次巡检的 DRIFT 项（在线 SET PERSIST，仅可在线修复项；其余标 manual）。"""
     try:
         res = config_drift.remediate_latest(int(cluster_id))
@@ -1350,19 +1350,24 @@ def api_backup_policy_get(cluster_id: int = 0, user=Depends(auth_required)):
 
 
 @app.post("/api/backup/policy")
-def api_backup_policy_set(cluster_id: int = Form(...), enabled: int = Form(0),
+def api_backup_policy_set(cluster_id: int = Form(...), enabled: bool = Form(False),
                           interval_hours: int = Form(24), retention_days: int = Form(7),
                           retention_count: int = Form(7), target: str = Form("slave"),
-                          with_data: int = Form(1), wait_catch_up: int = Form(1),
+                          with_data: bool = Form(True), wait_catch_up: bool = Form(True),
                           disk_alert_gb: int = Form(0),
                           user=Depends(auth_required)):
-    """设置集群定时备份策略（未配置的字段保持原值）。"""
+    """设置集群定时备份策略（未配置的字段保持原值）。
+
+    enabled/with_data/wait_catch_up 用 bool 声明：前端 checkbox 经
+    URLSearchParams 会把 True 编码成字符串 "true"，若按 int 解析会 422，
+    导致用户在页面勾选保存策略必失败（功能不可用）。
+    """
     from . import backup_policy
     pol = backup_policy.set_policy(
-        int(cluster_id), enabled=bool(int(enabled)),
+        int(cluster_id), enabled=bool(enabled),
         interval_hours=int(interval_hours), retention_days=int(retention_days),
         retention_count=int(retention_count), target=(target or "slave").lower(),
-        with_data=bool(int(with_data)), wait_catch_up=bool(int(wait_catch_up)),
+        with_data=bool(with_data), wait_catch_up=bool(wait_catch_up),
         disk_alert_gb=int(disk_alert_gb))
     return _json_ok({"ok": True, "policy": pol})
 

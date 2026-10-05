@@ -505,7 +505,7 @@ def make_handler(collector, token):
 # agent 拥有 root + docker.sock，等于节点上的上帝权限，因此指令**只认白名单动词**，
 # 且服务端下发后这里**再校验一次**（纵深防御：服务端被篡改也不至于让节点跑任意命令）。
 # ---------------------------------------------------------------------------
-AGENT_VERSION = "2.5.0"
+AGENT_VERSION = "2.5.1"
 ALLOWED_SCRIPTS = ("update-node.sh", "prepare-logs.sh")
 ALLOWED_SERVICES = ("keepalived", "agent", "mariadb")
 

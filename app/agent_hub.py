@@ -163,6 +163,25 @@ def expire_stale():
         log.debug("清理过期指令失败：%s", e)
 
 
+def purge_old(days: int = 7):
+    """物理删除已完成/失败/过期的旧指令，避免 agent_commands 无限增长。
+
+    agent 模型下指令写入频繁（心跳拉取 + 各类运维动作），expire_stale 只把
+    过期指令标记为 expired 而不删除，done/failed 也永久保留，长期运行会让
+    该表只增不减、拖慢心跳查询与占满管理库磁盘。这里按 created_at 保留
+    ``days`` 天（默认 7），且只删终态（done/failed/expired）记录，绝不碰
+    仍在流转的 pending/sent。
+    """
+    try:
+        execute(
+            "DELETE FROM agent_commands "
+            "WHERE status IN ('done','failed','expired') "
+            "AND created_at < DATE_SUB(NOW(), INTERVAL %s DAY)",
+            (int(days),))
+    except Exception as e:
+        log.debug("清理旧指令失败：%s", e)
+
+
 # ------------------------------------------------------------------ 心跳与分发
 
 def on_heartbeat(ip, payload=None):

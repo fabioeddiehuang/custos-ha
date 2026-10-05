@@ -1,6 +1,6 @@
 # Custos · 发布说明与路线图（RELEASE NOTES）
 
-> **主线（已发布）：v2.5.0**（镜像标签 `custos-server:v2.5.0`，`.env VERSION=v2.5.0`；集群接管 + 节点 curl 引导安装 + agent 指令通道 + 滚动升级 + 集群级定时备份 + 强制同步 + 无保护窗口提示，**真机全功能验证通过**）
+> **主线（已发布）：v2.5.1**（镜像标签 `custos-server:v2.5.1`，`.env VERSION=v2.5.1`；集群接管 + 节点 curl 引导安装 + agent 指令通道 + 滚动升级 + 集群级定时备份 + 强制同步 + 无保护窗口提示；v2.5.1 为 bug 修复与稳定性增强版）
 > **稳定版：v2.4.0**（镜像标签 `custos-server:v2.4.0`，**已发布 · 该分支只修 bug**；数据迁移向导：MariaDB↔MariaDB + MySQL 5.7→MariaDB）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
 > 配套文档：`README.md`、`doc/手册/用户操作手册.md`、`doc/手册/迁移到本集群操作手册.md`、`doc/开发/API接口文档.md`、`doc/开发/数据库字段说明.md`、`doc/开发/数据库字段说明.md`
@@ -34,6 +34,7 @@
 | v2.3.10 | 修复 | 凭证加密改为**默认关闭**（`CRED_ENCRYPTION`，零密钥依赖）；密钥持久化 + 解密钥匙串回退；修 ENC1 密文当复制口令导致复制集体瘫痪（1470）；`_repoint_slave` 返回值契约与假成功；`custosctl node install` 支持容器 MySQL/MariaDB |
 | v2.4.0 | 功能 | 数据迁移向导（MariaDB↔MariaDB + MySQL 5.7→MariaDB）；能力矩阵门禁；引擎方言适配；迁移前兼容性预检（dry-run） |
 | v2.5.0 | 功能 | 集群接管（纳管存量集群，零侵入）；节点 **curl 一行引导安装**（token + 离线镜像分发）；agent **心跳出向 + 指令通道**（免 SSH 运维）；**免 SSH 改密**（主库 ALTER+复制下发）；**滚动升级向导**（L1/L2/L3）；**集群级定时备份**（份数+天数双条件·错峰·磁盘预警·备份前追平）；**强制同步**（GTID 判据+锁写窗口）；**无保护窗口提示** |
+| v2.5.1 | 修复 | 管理库历史表无限增长治理（agent_commands / alerts / switch_history / audit_log 每日清理防磁盘撑满）；bootstrap token 时区耦合修复（验签 403 根因）；config_drift/remediate 永远「无漂移项」修复（cluster_id 未 Form）；backup/policy 保存 422 修复（enabled int→bool）；cred_reset_repl 500 修复（get_current_master 元组解包）；config_drift 整批原子提交防并发半批误判；节点 compose 启动参数 command/entrypoint 流式数组优化 |
 
 ---
 

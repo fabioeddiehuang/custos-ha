@@ -100,6 +100,7 @@ SCHEMA_SQL = [
         install_dir VARCHAR(255) DEFAULT NULL,
         issued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         expires_at DATETIME NOT NULL,
+        expires_ts BIGINT NOT NULL DEFAULT 0,
         used_at DATETIME DEFAULT NULL,
         issued_by VARCHAR(64) DEFAULT '',
         used_from VARCHAR(64) DEFAULT '',
@@ -301,6 +302,17 @@ def init_schema():
             try:
                 c.execute("ALTER TABLE bootstrap_tokens "
                           "ADD COLUMN sidecar_only TINYINT(1) DEFAULT 0")
+            except Exception:
+                pass
+            # 旧库补列：bootstrap_tokens.expires_ts（签发时的原始纪元秒）。
+            # 为什么必须有：token 签名 = HMAC(jti.ip.exp)，签发时 exp 是进程本地纪元秒，
+            # 而旧校验路径要从 expires_at(DATETIME) 反推纪元 —— DATETIME 由【管理库
+            # MySQL 的会话时区】渲染、Python .timestamp() 又按【管理端进程时区】解释，
+            # 两边时区不一致（如管理端 Asia/Shanghai + 管理库容器 UTC）时差出整小时，
+            # 验签必然失败 → 所有引导 token 永远 403。落原始纪元秒彻底解耦时区。
+            try:
+                c.execute("ALTER TABLE bootstrap_tokens "
+                          "ADD COLUMN expires_ts BIGINT NOT NULL DEFAULT 0")
             except Exception:
                 pass
             # 空闲优化：为历史表的 ts 列补单列索引。
@@ -976,8 +988,16 @@ def reset_repl_password(cluster_id):
 
     # 当前主库（用于从库重挂）；current_master 缺失时按 read_only 探测可写节点兜底
     cm = _state.get_current_master(cluster_id)
-    master_ip = cm[0]["host"] if cm else None
-    master_port = cm[0]["port"] if cm else None
+    # state.get_current_master 返回 (host, port) 元组；历史上也可能返回
+    # [dict] 或 [(host, port)]，这里统一兼容解析。
+    master_ip = master_port = None
+    if cm:
+        if isinstance(cm[0], dict):
+            master_ip, master_port = cm[0].get("host"), cm[0].get("port")
+        elif isinstance(cm[0], (list, tuple)):
+            master_ip, master_port = cm[0][0], cm[0][1]
+        else:                                             # (host, port) 元组
+            master_ip, master_port = cm[0], cm[1]
     if not master_ip and nodes:
         for n in nodes:
             try:

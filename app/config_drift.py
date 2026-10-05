@@ -154,10 +154,19 @@ def check_cluster(cluster_id):
         return sum(1 for r in out if r[5] == "DRIFT")
     _LAST_SIG[cluster_id] = sig
 
-    for host, port, var_name, expected, actual, status in out:
-        execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                (cluster_id, host, port, var_name, expected, actual, status))
+    # 整批原子提交：避免 monitor 巡检与 remediate 并发时，get_latest_drift 读到
+    # 「只插入了一半变量」的最新批次（逐行 execute 各自提交会暴露半批），从而误判无漂移。
+    from .db import get_conn
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            for host, port, var_name, expected, actual, status in out:
+                cur.execute("INSERT INTO config_drift (cluster_id, host, port, var_name, expected, actual, status) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                            (cluster_id, host, port, var_name, expected, actual, status))
+        conn.commit()
+    finally:
+        conn.close()
     _purge()
     return sum(1 for r in out if r[5] == "DRIFT")
 

@@ -1472,6 +1472,10 @@ def run_forever():
                 _verify_pending_once()
             except Exception as e:
                 print(f"[monitor] 配置待生效自动核验异常(已降级继续): {e}", flush=True)
+            try:
+                _purge_stale_data()
+            except Exception as e:
+                print(f"[monitor] 历史数据清理异常(已降级继续): {e}", flush=True)
             # 轮询间隔动态读取 setting（页面可配置），默认 2s
             try:
                 time.sleep(_safe_check_interval())
@@ -1497,7 +1501,7 @@ def _collect_due(name, seconds=0, every_cycles=0):
     指标/配置漂移之所以改用秒限频：按周期倍数的话，把 CHECK_INTERVAL 调小
     （如 2s→1s）会让采集频率同步放大，管理库 INSERT 量随之线性增长。
     """
-    _COLLECT_CYCLE[name] += 1
+    _COLLECT_CYCLE[name] = _COLLECT_CYCLE.get(name, 0) + 1
     if every_cycles > 0:
         if _COLLECT_CYCLE[name] < every_cycles:
             return False
@@ -1546,6 +1550,42 @@ def _maybe_collect():
     except Exception as e:
         print(f"[monitor] 定时备份异常: {e}", flush=True)
         import traceback; traceback.print_exc()
+
+
+def _purge_stale_data():
+    """每天一次清理管理库里会无限增长的表，避免磁盘被历史数据撑满。
+
+    这些表此前无物理删除：agent_commands（心跳/指令高频写入）、alerts（告警）、
+    switch_history（切换历史）、audit_log（审计）。保留期分别取 7/90/365/365 天，
+    且只删「终态/陈旧」记录——指令只删 done/failed/expired，告警只删已闭环的，
+    audit_log 保留 1 年合规窗口，绝不删近期需查或仍在流转的数据。
+    """
+    if not _collect_due("purge", seconds=86400):
+        return
+    from . import agent_hub
+    try:
+        agent_hub.purge_old(days=7)
+    except Exception as e:
+        print(f"[monitor] 清理 agent_commands 异常: {e}", flush=True)
+    # 已闭环的告警超过 90 天删除（open 始终保留，避免漏报）
+    try:
+        execute("DELETE FROM alerts WHERE status IN "
+                "('resolved','closed','unresolved','acked') "
+                "AND created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)")
+    except Exception as e:
+        print(f"[monitor] 清理 alerts 异常: {e}", flush=True)
+    # 切换历史超过 365 天删除（审计用途，量极小，长保留）
+    try:
+        execute("DELETE FROM switch_history "
+                "WHERE created_at < DATE_SUB(NOW(), INTERVAL 365 DAY)")
+    except Exception as e:
+        print(f"[monitor] 清理 switch_history 异常: {e}", flush=True)
+    # 审计日志超过 365 天删除（合规保留窗口）
+    try:
+        execute("DELETE FROM audit_log "
+                "WHERE created_at < DATE_SUB(NOW(), INTERVAL 365 DAY)")
+    except Exception as e:
+        print(f"[monitor] 清理 audit_log 异常: {e}", flush=True)
 
 
 def _pick_backup_nodes(cid, mode="slave"):
