@@ -13,8 +13,11 @@ backups/
 # 本地 compose 配置备份（含真实地址，切勿入库）
 docker-compose.yml.bak.*
 
-# 本地环境变量（VERSION / COMPOSE_PROJECT_NAME 等非密钥配置，可入库同步；
-# SECRET_KEY 已改由 data/secret_key 持久化，本文件不再含密钥，故纳入 git 跟踪）
+# 本地环境变量（.env）：**切勿入库（不通过 git 上传）！**
+# 虽经 v2.3.9 去密（SECRET_KEY / WEB_PASS / MGMT_MYSQL_PASS 已移出本文件），但本文件
+# 仍含真实部署拓扑（内网 IP / VIP / 管理库地址 / 网卡 / VRID 等），属环境敏感信息。
+# 仓库仅保留脱敏模板 env.example；新环境部署：cp env.example .env 再按需修改。
+.env
 # 运行时数据（含会话密钥文件 data/secret_key）
 data/
 # 节点部署单元（内含明文密码）
