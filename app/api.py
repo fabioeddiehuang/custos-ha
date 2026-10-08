@@ -351,6 +351,13 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
         if not row or not verify_pwd(row["password_hash"], password):
             return render("login.html", request, error="用户名或密码错误")
     except Exception as e:
+        # 管理库异常（DB 中断/连接超时等）必须落日志——否则登录失败在 custos.log 毫无痕迹，
+        # 运维无法区分「口令错」与「系统错」，DB 抖动等故障极难定位（2026-10-08 实测发现）。
+        try:
+            logging.getLogger("custos.api").exception(
+                "登录失败：管理库异常(user=%s): %s", username, e)
+        except Exception:
+            pass
         return render("login.html", request, error=f"管理库错误: {e}")
     resp = RedirectResponse("/", status_code=303)
     resp.set_cookie(COOKIE, serializer.dumps(username), httponly=True)

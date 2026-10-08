@@ -278,11 +278,17 @@ if [ "$WITH_DB" = "1" ]; then
   MGMT_PORT=3306
   MGMT_USER=ha
   MGMT_DB=ha
-  [ -n "$MGMT_PASS" ] || MGMT_PASS=$(rand_secret | head -c 16)
+  : "${MGMT_PASS:=$(rand_secret | head -c 16)}"
   info "已启用内置管理库（--with-db）：管理库地址=$MGMT_HOST，端口固化 $MGMT_PORT，ha 账号口令已自动生成（内部使用，无需记忆）。"
   info "启动后管理库异常会在日志给出首因，无需准备任何外部 MySQL。"
 else
-  ask "管理库地址 MGMT_MYSQL_HOST" "$DEF_MGMT_HOST"; MGMT_HOST=$REPLY
+  # 外部库安装模式：默认提示必须是「外部已有库的真实内网 IP」，绝不能是内置服务名 mgmt-mysql。
+  # mgmt-mysql 仅 --with-db 模式才会启用对应的 compose 内置服务；若此处沿用/默认成它而没用 --with-db，
+  # 装完后 custos-server 会连不上该 DNS 而反复重启。故遇 mgmt-mysql 或空/回环回退值时，强制改为占位示例。
+  case "$DEF_MGMT_HOST" in
+    mgmt-mysql|""|127.0.0.1|localhost|::1|0.0.0.0) DEF_MGMT_HOST=192.0.2.88 ;;
+  esac
+  ask "管理库地址 MGMT_MYSQL_HOST（外部已有 MySQL/MariaDB 的真实内网 IP）" "$DEF_MGMT_HOST"; MGMT_HOST=$REPLY
   # 容器的 127.0.0.1 是【容器自己】（里面没有 MySQL），填它必然导致容器连不上管理库而反复重启。
   # 这是首次安装最易踩的坑：宿主上若正好跑着 MySQL，下方的 TCP 预检还会「通过」，
   # 误导用户以为配置正确，装完才发现容器起不来。故在此直接拦截，而不是等到启动失败。

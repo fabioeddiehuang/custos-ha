@@ -60,19 +60,31 @@ MARIADB_MAINLINE_VERSION = "12.3.3"
 
 
 def mariadb_version_tag(mysql_version=None):
-    """把各形态的版本串归一化成「主.次.补丁」（用于镜像 tag 与节点包目录名）。
+    """把各形态的 MariaDB 版本串归一化成「主.次.补丁」（用于镜像 tag 与节点包目录名）。
 
     常见输入：'11.4.13-MariaDB-ubu2404-log'（容器）、'10.6.28-MariaDB-log'（裸机）、
-    '12.3.3'。取不到或非法时回退主线 MARIADB_MAINLINE_VERSION。
+    '12.3.3'。取不到、非法、或主版本 < 10（如 MySQL 风格的 '8.0'/'5.7'）时回退主线
+    MARIADB_MAINLINE_VERSION。
+
+    ⚠ 关键修复（2026-10-08）：本函数仅用于 MariaDB 节点，MariaDB 在 Docker Hub 的 tag
+    自 10.x 起，不存在 mariadb:8.0 这类镜像。此前若节点版本被误填为 MySQL 风味的 '8.0'，
+    会原样拼出 mariadb:8.0 → 镜像拉取失败 → 节点容器 restart:always 崩溃循环。
+    故主版本 < 10 一律视为非法 MariaDB 版本并回退主线（项目支持矩阵为 10.6/11.4/12.3）。
     """
     v = (mysql_version or "").strip()
     if not v:
         return MARIADB_MAINLINE_VERSION
     head = v.split("-")[0]
     parts = [p for p in head.split(".") if p.isdigit()]
-    if len(parts) >= 3:
-        return ".".join(parts[:3])
-    if len(parts) == 2:
+    if len(parts) >= 2:
+        # 主版本 < 10（MySQL 8.0/5.7 等）对 MariaDB 无效：回退主线而非拼出不存在的镜像。
+        try:
+            if int(parts[0]) < 10:
+                return MARIADB_MAINLINE_VERSION
+        except ValueError:
+            return MARIADB_MAINLINE_VERSION
+        if len(parts) >= 3:
+            return ".".join(parts[:3])
         return ".".join(parts[:2])
     return MARIADB_MAINLINE_VERSION
 
