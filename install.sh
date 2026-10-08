@@ -241,6 +241,12 @@ CUR_VER=$(grep -E '^VERSION=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '
 [ -n "$CUR_VER" ] || CUR_VER=$(grep -E '^VERSION=' env.example 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \t\r\n')
 [ -n "$CUR_VER" ] || CUR_VER=v2.2.20
 
+# 服务端基础镜像源（custos-server 构建用）：默认国内代理，避免 FROM python:3.11-slim
+# 直连 docker.io 超时。幂等：已有 .env 的值优先，否则取 env.example，再否则内置默认。
+CUR_PY_BASE=$(grep -E '^PY_BASE_IMAGE=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' \t\r\n')
+[ -n "$CUR_PY_BASE" ] || CUR_PY_BASE=$(grep -E '^PY_BASE_IMAGE=' env.example 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' \t\r\n')
+[ -n "$CUR_PY_BASE" ] || CUR_PY_BASE="docker.m.daocloud.io/library/python:3.11-slim"
+
 COMPOSE_FILE=$CUSTOS_HOME/docker-compose.yml
 cur_val() {  # 从现有 compose 取某个键的值（先去尾随空白再剥引号，兼容重装场景）
   # 关键：值可能含 '#'（如口令 P@ss#123）。旧实现直接 s/[[:space:]]*#.*$// 会把
@@ -445,6 +451,7 @@ umask 077
 cat > .env <<EOF
 # Custos 运行配置（由 install.sh 生成；SECRET_KEY、WEB_PASS、MGMT_MYSQL_PASS 均不写入本文件：SECRET_KEY 由 data/secret_key 持久化，WEB_PASS 与 MGMT_MYSQL_PASS 由 docker-compose.yml 驱动）
 VERSION=$CUR_VER
+PY_BASE_IMAGE=$CUR_PY_BASE
 COMPOSE_PROJECT_NAME=custos
 
 # 管理库（仅管理器自身存储，非集群节点）

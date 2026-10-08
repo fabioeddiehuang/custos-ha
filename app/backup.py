@@ -585,15 +585,19 @@ def list_backups(cid):
                 meta = json.loads(meta_p.read_text(encoding="utf-8"))
             except Exception:
                 meta = None
-        # 备份目录按集群【名】划分：删掉旧集群又用同名重建时，旧备份会残留在同一目录。
+        st = p.stat()
+        m = dict(meta) if isinstance(meta, dict) else {}
+        # 备份目录按集群【名】划分。删掉旧集群又用同名重建时，旧备份会残留在同一目录，
+        # 但【不能硬性隐藏】——从其它集群复制进来的备份（如生产→灾备、迁移导入）其
+        # meta.cluster_id 必然与当前集群不同，原实现直接 `continue` 会让它在恢复页消失
+        #（回归：早期版本无此过滤，跨集群备份可直接列出与恢复）。这里改为保留文件并打
+        # foreign_cluster 标记，由页面提示来源；恢复本身只读取 SQL 内容，不依赖该字段。
         if isinstance(meta, dict) and meta.get("cluster_id"):
             try:
                 if int(meta.get("cluster_id")) != int(cid):
-                    continue
+                    m["foreign_cluster"] = True
             except (TypeError, ValueError):
                 pass
-        st = p.stat()
-        m = dict(meta) if isinstance(meta, dict) else {}
         m["kind"] = m.get("kind", "file")
         out.append({
             "file": p.name,
@@ -609,11 +613,15 @@ def list_backups(cid):
             continue
         if not isinstance(meta, dict):
             continue
-        if meta.get("cluster_id") and int(meta.get("cluster_id")) != int(cid):
-            continue
         set_dir = idx.parent
         st = set_dir.stat()
         m = dict(meta)
+        # 跨集群复制进来的分库集备份：保留并打标记（理由同单文件部分），不再 continue 隐藏。
+        try:
+            if m.get("cluster_id") and int(m.get("cluster_id")) != int(cid):
+                m["foreign_cluster"] = True
+        except (TypeError, ValueError):
+            pass
         m["kind"] = m.get("kind", "set")
         out.append({
             "file": set_dir.name,

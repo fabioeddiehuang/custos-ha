@@ -2626,6 +2626,7 @@ def cluster_backup_page(request: Request, cid: int, user=Depends(auth_required),
         return RedirectResponse("/clusters?error=集群不存在或已被删除", status_code=303)
     return render("backup.html", request, user=user, cluster=c,
                   backups=backup.list_backups(cid),
+                  backup_dir=backup._cluster_dir_name(cid),
                   blog=backup.read_backup_log(cid), msg=msg, error=error)
 
 

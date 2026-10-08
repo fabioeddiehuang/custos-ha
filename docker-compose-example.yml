@@ -51,6 +51,9 @@ services:
       context: .
       args:
         VERSION: ${VERSION}
+        # 服务端基础镜像源：默认取 .env 的 PY_BASE_IMAGE（已设为国内代理），
+        # 避免 FROM python:3.11-slim 直连 docker.io 超时。不可达时在 .env 改回官方源即可。
+        PY_BASE_IMAGE: ${PY_BASE_IMAGE}
     restart: always
     # 若启用上面的 mgmt-mysql，取消下一行注释
     # depends_on:

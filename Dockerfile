@@ -8,7 +8,13 @@
 # 做法：builder 里装完整包，最终镜像只 COPY /usr/bin/mariadb-dump 这一个可执行文件。
 #   ⇒ 去掉 perl，而迁移用的仍是【同一个二进制、同一条代码路径】，功能与行为零变化。
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim AS mysqlcli-dump
+# 基础镜像源（国内源优先，与 keepalived 的 NODE_BASE_IMAGE 同一套思路）：
+#   · 默认 docker.io 官方 python:3.11-slim；构建时由 docker-compose.yml 经 build-arg
+#     PY_BASE_IMAGE=<国内镜像> 覆盖为国内源（docker.m.daocloud.io 等），不可达时把
+#     .env 的 PY_BASE_IMAGE 改回官方 python:3.11-slim 或其它源即可。
+#   · 全局 ARG：对任意 FROM 阶段均可见（FROM 行本身位于阶段首指令）。
+ARG PY_BASE_IMAGE=python:3.11-slim
+FROM ${PY_BASE_IMAGE} AS mysqlcli-dump
 RUN --mount=type=cache,id=custos-dumptool-apt,target=/var/cache/apt,sharing=locked \
     set -e; \
     tar cf /tmp/apt-src-bak.tar /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true; \
@@ -34,7 +40,10 @@ RUN --mount=type=cache,id=custos-dumptool-apt,target=/var/cache/apt,sharing=lock
 # ---------------------------------------------------------------------------
 # 阶段 2：最终镜像（精简）
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim
+# 复用上方全局 ARG PY_BASE_IMAGE（国内源覆盖）；此处显式再声明一次，确保任意 docker
+# 版本下第二阶段 FROM 都能拿到该变量（全局 ARG 跨 FROM 可见性存在版本边界差异）。
+ARG PY_BASE_IMAGE=python:3.11-slim
+FROM ${PY_BASE_IMAGE}
 
 WORKDIR /app
 

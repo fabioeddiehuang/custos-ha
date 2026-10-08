@@ -2135,10 +2135,26 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
             # 需要容器化（如 glibc 过低装不上 tarball）时，创建节点直接选 mariadb-docker 即可：
             # node_family 允许两种 MariaDB 形态同集群混部，且数据目录同为
             # /data/custos-ha/mariadb12，既有回退安装可无损迁移到纯 compose。
+            # 裸机 MariaDB 二进制安装目录（INSTALL_DIR）：默认 /opt/mariadb；
+            # 但当用户显式指定了节点安装基目录 install_dir 时，应跟随该基目录（<基>/mariadb），
+            # 避免「节点装在 /opt/soft、却在 /opt 根多生成 /opt/mariadb」的割裂（用户诉求）。
+            # 未指定 install_dir（部署单元默认落到 /home/docker/custos-node）时保持历史默认
+            # /opt/mariadb，零行为变化。
+            if install_dir:
+                mariadb_install_dir = "%s/mariadb" % str(install_dir).strip().rstrip("/")
+            else:
+                mariadb_install_dir = "/opt/mariadb"
             for sf in ("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh"):
                 src = NODE_SCRIPTS / sf
                 if src.exists():
-                    _write(d / _mconf /"scripts" / sf, src.read_text(), mode=0o755)
+                    content = src.read_text()
+                    if sf == "Install-ha-mariadb-Node.sh":
+                        # 把 Install 脚本内写死的默认安装目录替换为跟随 install_dir 的值，
+                        # 使 MARIADB_INSTALL_DIR 缺省即落到该路径（仍可被环境变量覆盖）。
+                        content = content.replace(
+                            'INSTALL_DIR="${MARIADB_INSTALL_DIR:-/opt/mariadb}"',
+                            'INSTALL_DIR="${MARIADB_INSTALL_DIR:-%s}"' % mariadb_install_dir)
+                    _write(d / _mconf /"scripts" / sf, content, mode=0o755)
     else:
         # init.sql 会被 MySQL 容器以非 root 的 mysql 用户读取执行，
         # 若权限过严（0600）会因 Permission denied 失败；改为 0644 保证可读。

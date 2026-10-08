@@ -148,7 +148,8 @@
       备份为<b>逻辑备份</b>（建表语句 + INSERT），由管理器用节点 root 账号直连导出，
       容器内无需 mysqldump，对 MySQL 8.0 / MariaDB 同样适用。<br>
       系统库（information_schema / mysql / performance_schema / sys）不参与备份。<br>
-      产物：<code class="mono">./backups/{{ cluster.id }}/&lt;时间戳&gt;.sql.gz</code>（已挂载到项目根，重建容器不丢失）。
+      产物落在 <code class="mono">./backups/{{ backup_dir }}/</code>（按【集群名称】分子目录，已挂载项目根，重建容器不丢失）。<br>
+      从其它集群复制进来的备份：请把 <code class="mono">.sql.gz</code>（建议连同 <code class="mono">.meta.json</code> 一并）放入上面的 <code class="mono">./backups/{{ backup_dir }}/</code> 目录，刷新后即在「备份文件」中显示（标「外部」），可直接恢复。
     </div>
   </div>
 
@@ -237,6 +238,7 @@
                 {% if b.meta.scope == 'all' %}<span class="badge sky">全库</span>{% else %}<span class="badge warn">指定库</span>{% endif %}
                 {% if b.meta.kind == 'set' %}<span class="badge" style="background:#1e6f5c;color:#fff" title="多库分文件备份：每库一个 .sql.gz + index.json">分库集</span>{% endif %}
                 {% if not b.meta.with_data %}<span class="badge">仅结构</span>{% endif %}
+                {% if b.meta.foreign_cluster %}<span class="badge" style="background:#b45309;color:#fff" title="来自其它集群的备份（cluster_id 不同），可直接恢复">外部</span>{% endif %}
               {% else %}<span class="badge">—</span>{% endif %}
             </td>
             <td>
