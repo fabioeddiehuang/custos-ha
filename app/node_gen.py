@@ -2183,7 +2183,21 @@ def _node_is_read_only(ip, port, root_user, root_pass, ha_user, ha_pass):
                     sro = _r2.get("sro") if isinstance(_r2, dict) else _r2[0]
             except Exception:
                 sro = 0      # MariaDB 无 super_read_only（1193）：忽略，仅以 read_only 判定
-            return bool(ro or sro)
+
+            def _on(v):
+                """统一解析 read_only 类变量：MariaDB 返回 'ON'/'OFF'，MySQL 返回 1/0。"""
+                if v is None:
+                    return False
+                if isinstance(v, bytes):
+                    v = v.decode("utf-8", "ignore")
+                if isinstance(v, (int, float)):
+                    return bool(int(v))
+                return str(v).strip().upper() in ("1", "ON", "TRUE")
+
+            # 原 `bool(ro or sro)` 对 'OFF' 得 True（非空字符串皆为真），会把**可写主库**
+            # 误判为只读副本 → 主库上的影子账号修复（F11）被跳过、漂移不自愈。
+            # 按 MariaDB/MySQL 两种返回形态统一判定。
+            return _on(ro) or _on(sro)
         except Exception as e:
             last_err = e
         finally:
