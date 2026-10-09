@@ -65,8 +65,12 @@ else
   warn "未找到安装状态文件 $STATE，将按缺省值（INSTALL_DIR=$INSTALL_DIR DATA_DIR=$DATA_DIR）尝试卸载"
 fi
 
+# 客户端程序名：优先 MariaDB 正式客户端 `mariadb`（`mysql` 已标记 Deprecated，
+# 每次调用往 stderr 打 "Deprecated program name" 警告污染日志），没有时回退 mysql。
 MYSQL_BIN=""
-[[ -x "$INSTALL_DIR/bin/mysql" ]] && MYSQL_BIN="$INSTALL_DIR/bin/mysql"
+[[ -x "$INSTALL_DIR/bin/mariadb" ]] && MYSQL_BIN="$INSTALL_DIR/bin/mariadb"
+[[ -z "$MYSQL_BIN" && -x "$INSTALL_DIR/bin/mysql" ]] && MYSQL_BIN="$INSTALL_DIR/bin/mysql"
+[[ -z "$MYSQL_BIN" && -x /usr/local/bin/mariadb ]] && MYSQL_BIN=/usr/local/bin/mariadb
 [[ -z "$MYSQL_BIN" && -x /usr/local/bin/mysql ]] && MYSQL_BIN=/usr/local/bin/mysql
 SOCK="$DATA_DIR/mysql.sock"
 
@@ -122,14 +126,19 @@ DROP USER IF EXISTS 'app'@'%';
 DROP USER IF EXISTS 'app'@'127.0.0.1';
 -- 删除本节点本地状态库
 DROP DATABASE IF EXISTS ha_local;
--- 复位持久化参数 + 关闭只读，恢复为独立实例
+-- 关闭只读 + 复位 HA 相关全局参数，恢复为独立实例
+-- ⚠ MariaDB **不支持** MySQL 8 的 SET/RESET PERSIST（没有 mysqld-auto.cnf）。
+--   旧脚本照抄 MySQL 写法（RESET PERSIST server_id 等），在【任何】MariaDB 版本上都会报
+--     ERROR 1064 ... near 'PERSIST server_id'
+--   并中断整个 SQL 清理块（连后面的 FLUSH PRIVILEGES 都执行不到），页面只看到一句
+--   「部分 SQL 清理跳过」。这里改用 MariaDB 支持的 SET GLOBAL。
+-- ⚠ log_bin / gtid_domain_id / log_slave_updates 均为【只读变量】：
+--   SET GLOBAL log_slave_updates 会报 "ERROR 1238 ... read only variable"，同样中断清理块；
+--   它们只能改 my.cnf 并重启，随后续 my.cnf 恢复处理，此处不再尝试 SET。
+--   （enforce_gtid_consistency 是 MySQL 专有变量，MariaDB 无此变量，一并去掉。）
 SET GLOBAL read_only = OFF;
-RESET PERSIST server_id;
-RESET PERSIST gtid_domain_id;
-RESET PERSIST gtid_strict_mode;
-RESET PERSIST enforce_gtid_consistency;
-RESET PERSIST log_bin;
-RESET PERSIST log_slave_updates;
+SET GLOBAL server_id = 1;
+SET GLOBAL gtid_strict_mode = OFF;
 FLUSH PRIVILEGES;
 SQL
     log "SQL 清理完成（复制/HA 账号/ha_local 已移除）"

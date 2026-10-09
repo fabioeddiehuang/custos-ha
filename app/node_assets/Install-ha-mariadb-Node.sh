@@ -156,6 +156,17 @@ if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" != "Disabled" ]];
 fi
 log "MariaDB 程序已就位：$INSTALL_DIR/bin/mariadbd"
 
+# 客户端程序名：MariaDB 10.4+ 的正式客户端是 `mariadb`，`mysql` 只是兼容软链且已被标记
+# Deprecated —— 每次调用都往 stderr 打印
+#   "Deprecated program name. It will be removed in a future release, use '.../mariadb' instead"
+# 安装日志被这类噪音刷屏，且易被误认为出错。优先用 mariadb，老版本无该程序名时回退 mysql。
+if [[ -x "${INSTALL_DIR}/bin/mariadb" ]]; then
+  MYSQL_BIN="${INSTALL_DIR}/bin/mariadb"
+else
+  MYSQL_BIN="${INSTALL_DIR}/bin/mysql"
+fi
+log "数据库客户端：$MYSQL_BIN"
+
 # ---------- 2.5) 运行前兼容性自检（关键）----------
 # MariaDB 12.3.3 的 linux-systemd 二进制要求宿主 glibc ≥ 2.28、libstdc++ 带
 # GLIBCXX_3.4.20+、libcrypt(XCRYPT_2.0)、libsystemd(LIBSYSTEMD_227)。
@@ -271,11 +282,11 @@ probe_root_pw() {
   MYSQL_PW=""
   for pw in "$OLD_ROOT_PASS" "$ROOT_PASS"; do
     [[ -n "$pw" ]] || continue
-    if "$INSTALL_DIR/bin/mysql" -uroot -p"$pw" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
+    if "$MYSQL_BIN" -uroot -p"$pw" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
       MYSQL_PW="-p$pw"; return 0
     fi
   done
-  if "$INSTALL_DIR/bin/mysql" -uroot --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
+  if "$MYSQL_BIN" -uroot --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
     MYSQL_PW=""; return 0
   fi
   return 1
@@ -311,21 +322,21 @@ systemctl enable $SYSTEMD_UNIT
 systemctl restart $SYSTEMD_UNIT
 # 等待实例起来（兼容首次安装免密 / 重装已有密码两种情形）
 for i in $(seq 1 30); do
-  if "$INSTALL_DIR/bin/mysql" -uroot --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
+  if "$MYSQL_BIN" -uroot --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
     break
   fi
-  if [[ -n "$ROOT_PASS" ]] && "$INSTALL_DIR/bin/mysql" -uroot -p"$ROOT_PASS" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
+  if [[ -n "$ROOT_PASS" ]] && "$MYSQL_BIN" -uroot -p"$ROOT_PASS" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
     break
   fi
-  if [[ -n "$OLD_ROOT_PASS" ]] && "$INSTALL_DIR/bin/mysql" -uroot -p"$OLD_ROOT_PASS" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
+  if [[ -n "$OLD_ROOT_PASS" ]] && "$MYSQL_BIN" -uroot -p"$OLD_ROOT_PASS" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
 MARIADB_OK=1
-if ! "$INSTALL_DIR/bin/mysql" -uroot --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1 \
-   && ! { [[ -n "$ROOT_PASS" ]] && "$INSTALL_DIR/bin/mysql" -uroot -p"$ROOT_PASS" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; } \
-   && ! { [[ -n "$OLD_ROOT_PASS" ]] && "$INSTALL_DIR/bin/mysql" -uroot -p"$OLD_ROOT_PASS" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; }; then
+if ! "$MYSQL_BIN" -uroot --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1 \
+   && ! { [[ -n "$ROOT_PASS" ]] && "$MYSQL_BIN" -uroot -p"$ROOT_PASS" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; } \
+   && ! { [[ -n "$OLD_ROOT_PASS" ]] && "$MYSQL_BIN" -uroot -p"$OLD_ROOT_PASS" --socket="$DATA_DIR/mysql.sock" -e "SELECT 1" >/dev/null 2>&1; }; then
   # 不硬退出：MariaDB 起不来时仍继续尝试启动 keepalived，并在结尾汇总，
   # 避免「一刀切 exit」导致 keepalived（步骤9）永远没机会执行、两个服务都看似没起。
   err "MariaDB 启动失败，请查看 journalctl -u $SYSTEMD_UNIT 与 $DATA_DIR/*.err"
@@ -342,7 +353,7 @@ if ! probe_root_pw; then
   echo
   MYSQL_PW="-p$OLD_ROOT_PASS"
 fi
-"$INSTALL_DIR/bin/mysql" -uroot $MYSQL_PW --socket="$DATA_DIR/mysql.sock" <<SQL
+"$MYSQL_BIN" -uroot $MYSQL_PW --socket="$DATA_DIR/mysql.sock" <<SQL
 ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('$ROOT_PASS');
 CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('$ROOT_PASS');
 GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
@@ -370,7 +381,7 @@ log "已创建 /usr/local/bin/mysql 等软链 + socket 软链（执行 mysql -ur
 # ---------- 7) 跑 init_mariadb.sql + fix-node-creds.sql ----------
 # 注意：必须用本地 socket 连接（VIP 此刻可能尚未上浮/由 keepalived 接管），
 # 切勿用 -h127.0.0.1（会解析到 VIP 网卡），否则连不到本机 MariaDB。
-MYSQL=("$INSTALL_DIR/bin/mysql" -uroot -p"$ROOT_PASS" --socket="$DATA_DIR/mysql.sock")
+MYSQL=("$MYSQL_BIN" -uroot -p"$ROOT_PASS" --socket="$DATA_DIR/mysql.sock")
 if [[ -f "$CONF_DIR/init_mariadb.sql" ]]; then
   log "执行 init_mariadb.sql（创建 ha_monitor/replication/app + ha_local）..."
   "${MYSQL[@]}" < "$CONF_DIR/init_mariadb.sql" || warn "init_mariadb.sql 执行有告警，请检查（以随后账号校验结果为准）"
