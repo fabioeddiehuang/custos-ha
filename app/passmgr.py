@@ -68,19 +68,32 @@ def _root_conn(cluster_id):
     return (mh, mp), c
 
 
+def _flag_on(v) -> bool:
+    """把 @@read_only 类变量统一解析为 bool（MariaDB 返回 'ON'/'OFF'，MySQL 返回 1/0）。"""
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return bool(int(v))
+    return str(v).strip().upper() in ("1", "ON", "TRUE")
+
+
 def _is_replica(conn):
     """自检：本节点是不是只读副本（是则拒绝写账号操作）。"""
     try:
         cur = conn.cursor()
+        # MariaDB 的 @@read_only 返回 'OFF'/'ON' 字符串（MySQL 为 0/1 整型）：
+        # int('ON') 抛 ValueError，会被本函数外层 except 吞掉并返回 False
+        # （"不是副本"），导致**只读副本被误判为可写**，账号写操作（ALTER USER）
+        # 直接打到副本上。故按两种形态统一解析。
         cur.execute("SELECT @@read_only")
         r = cur.fetchone()
-        ro = int(r[0] or 0) if r else 0
+        ro = _flag_on(r[0] if r else None)
         try:
             cur.execute("SELECT @@super_read_only")
             r2 = cur.fetchone()
-            sro = int(r2[0] or 0) if r2 else 0
+            sro = _flag_on(r2[0] if r2 else None)
         except Exception:
-            sro = 0
+            sro = False
         return bool(ro or sro)
     except Exception:
         return False

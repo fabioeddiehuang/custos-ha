@@ -1435,11 +1435,25 @@ def _startup_selfcheck():
             cid = cl.get("id")
             try:
                 cur_m = get_current_master(cid)
-                if not cur_m:
+                # get_current_master 返回 **(host, port) 元组**（无主库时为 (None, None)）。
+                # 原实现按 "host:port" 字符串解析：元组上 `":" in cur_m` 恒为 False，
+                # 于是整个元组被当成 host 传下去（str(('192.168.1.33', 3307))），
+                # 授权自检必然连不上、永久降级为 warn 静默失效；
+                # 且 (None, None) 是 truthy，`if not cur_m` 也拦不住"无主库"的情况。
+                # 这里显式按元组解包，并兼容历史字符串形态。
+                if isinstance(cur_m, (tuple, list)):
+                    mh = cur_m[0] if len(cur_m) > 0 else None
+                    mp = cur_m[1] if len(cur_m) > 1 else 3306
+                elif isinstance(cur_m, str) and cur_m.strip():
+                    _parts = cur_m.split(":", 1)
+                    mh = _parts[0]
+                    mp = _parts[1] if len(_parts) > 1 else 3306
+                else:
+                    mh, mp = None, 3306
+                if not mh:
                     continue
                 creds = load_creds(cid)
-                mh, mp = cur_m.split(":", 1) if ":" in cur_m else (cur_m, "3306")
-                ok, issues = selfcheck_cluster_grants(cid, mh, mp, creds)
+                ok, issues = selfcheck_cluster_grants(cid, mh, int(mp or 3306), creds)
                 for level, msg in issues:
                     print("[monitor][grants-selfcheck][%s] %s" % (level, msg), flush=True)
             except Exception as e:

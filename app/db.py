@@ -1009,7 +1009,15 @@ def reset_repl_password(cluster_id):
                     cur.execute("SELECT @@read_only")
                     ro = cur.fetchone()
                     conn.close()
-                    if ro and int(ro[0]) == 0:
+                    # MariaDB 返回 'OFF'/'ON' 字符串（MySQL 为 0/1）：int('OFF') 抛
+                    # ValueError 会被外层 except 吞掉，导致 current_master 缺失时
+                    # 按 read_only 探测主库的兜底路径永远选不出主库。统一解析两种形态。
+                    _v = ro[0] if ro else None
+                    if isinstance(_v, (int, float)):
+                        _writable = int(_v) == 0
+                    else:
+                        _writable = str(_v).strip().upper() in ("0", "OFF", "FALSE")
+                    if _writable:
                         master_ip, master_port = n["ip"], n["port"]
                         break
             except Exception:

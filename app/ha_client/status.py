@@ -628,7 +628,14 @@ def is_read_only(host, port, ha_user, ha_pass, root_user="root", root_pass="", t
         cur = conn.cursor()
         cur.execute("SELECT @@global.read_only")
         row = cur.fetchone()
-        return bool(row and row[0])
+        # MariaDB 返回字符串 'OFF'/'ON'，MySQL 返回 0/1 整型。
+        # 原 `bool(row[0])` 对 'OFF' 得 True（非空字符串皆为真），把**可写主库**
+        # 误判成"只读副本"——于是主库上的账号 DDL / 全局变量修复被整体跳过，
+        # 漂移永远得不到自愈。这里按两种形态统一判"只读"。
+        _v = row[0] if row else None
+        if isinstance(_v, (int, float)):
+            return bool(int(_v))
+        return str(_v).strip().upper() in ("1", "ON", "TRUE")
     except Exception:
         return False
     finally:
@@ -855,10 +862,21 @@ def promote_to_master(host, port, user, password, root_user="root", root_pass=""
         syntax = detect_syntax(cur)
 
         # 只读快检：不产生任何写盘 / 不进 binlog
+        # ⚠ 关键：MariaDB 的 @@GLOBAL.read_only 返回**字符串** 'OFF' / 'ON'
+        #   （MySQL 才返回 0/1 整型）。原实现 int(_r[0]) 对 'OFF' 抛 ValueError，
+        #   被下方 `except Exception: pass` 静默吞掉 → 快检形同虚设，
+        #   每个监控周期都对「已经是主库」的节点跑完整 promote 流程，其中的
+        #   FLUSH BINARY LOGS 会新建一个空 binlog —— 实测刷出 2700+ 个 433B 空文件、
+        #   binlog 文件号疯涨而 GTID 纹丝不动。这里按两种形态统一判「可写」。
         try:
             cur.execute("SELECT @@GLOBAL.read_only")
             _r = cur.fetchone()
-            if _r is not None and int(_r[0]) == 0:
+            _ro = _r[0] if _r else None
+            if isinstance(_ro, (int, float)):
+                _writable = int(_ro) == 0
+            else:
+                _writable = str(_ro).strip().upper() in ("0", "OFF", "FALSE")
+            if _writable:
                 cur.execute(show_replica_status_sql(syntax))
                 if cur.fetchone() is None:
                     # 已是可写且无残留复制通道的主库：无需再做任何写操作
