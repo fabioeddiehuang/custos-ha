@@ -294,7 +294,15 @@ def _set_ro(host, port, on):
             try:
                 cur.execute("SELECT @@%s" % var)
                 r = cur.fetchone()
-                orig = int(r[0] or 0) if r else 0
+                _v = r[0] if r else None
+                # MariaDB 返回 'OFF'/'ON' 字符串（MySQL 为 0/1 整型）：int('OFF') 抛
+                # ValueError 会被下面的 except 吞掉 → orig 永远是默认值 0，
+                # **锁写前的真实只读态丢失**（恢复时会把节点错误置回可写）。
+                # 按两种返回形态统一解析。
+                if isinstance(_v, (int, float)):
+                    orig = 1 if int(_v) else 0
+                else:
+                    orig = 1 if str(_v).strip().upper() in ("1", "ON", "TRUE") else 0
                 break
             except Exception:
                 continue

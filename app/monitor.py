@@ -326,7 +326,16 @@ def _classify_repl_state(st, is_master, cur_master=None):
     if not st.get("alive"):
         return "offline"
     if is_master:
-        if st.get("ro") == 1:
+        # ⚠ MariaDB 的 @@read_only 返回**字符串** 'ON' / 'OFF'（MySQL 才是 1/0 整型）。
+        #   原 `st.get("ro") == 1` 对 'ON' 恒为 False —— MariaDB 主库若真的变成只读，
+        #   会被误判成 primary（正常主库），「只读主库」这一严重故障被**静默掩盖**
+        #   （业务写入报 1290 read-only，而监控/仪表盘仍显示正常）。两种形态统一判「只读」。
+        _ro = st.get("ro")
+        if isinstance(_ro, (int, float)):
+            _ro_on = int(_ro) == 1
+        else:
+            _ro_on = str(_ro).strip().upper() in ("1", "ON", "TRUE")
+        if _ro_on:
             return "orphan"
         return "primary"
     if st.get("purged"):
@@ -938,7 +947,11 @@ def _act_once():
             # 业务一旦写进来就会与主库数据不一致，且这类不一致**不可逆**（复制不会自动
             # 收敛，只会逐步报 1062/1032）。故持续校验并自动纠正 + 告警。
             if (not is_master and st.get("mode") == "slave"
-                    and str(st.get("ro")).strip() in ("0", "0.0", "False", "false")
+                    # MariaDB 的 @@read_only 返回 'OFF'/'ON'（MySQL 为 0/1 整型）：
+                    # 原白名单只有 0 / False 等、**缺 'OFF'** → MariaDB 从库 read_only
+                    # 被突破（变成可写）时**检测不到**，不会触发自动纠正，
+                    # 业务一旦写进来就是主从不一致且不可逆。统一按大写比对并补上 OFF。
+                    and str(st.get("ro")).strip().upper() in ("0", "0.0", "OFF", "FALSE")
                     and time.monotonic() >= _RO_FIX_AT.get(key, 0.0)):
                 _RO_FIX_AT[key] = time.monotonic() + _RO_FIX_INTERVAL
                 _ro_ok, _ro_err = False, ""

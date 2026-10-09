@@ -286,8 +286,13 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         except Exception:
             _ha_hosts = []
         _target_privs = _parse_grant_privs(ha_grant)
-        _shadow_hosts = set([h for h in _ha_hosts if h] + ["%"]
-                            + ([manager_ip] if manager_ip else []))
+        # 只对**实际存在**的 host 变体授权：对不存在的账号（例如节点上根本没有
+        # ha_monitor@'%'）执行 GRANT 会报 ERROR 1133
+        # "Can't find any matching row in the user table" —— GRANT 不会隐式建号
+        # （需先 CREATE USER）。这既每周期刷错误日志，还会被 repair_ha_shadow_grants
+        # 记成 missing 而触发**误告警**，把真实的权限缺口淹没。
+        # 账号若完全不存在，由 ensure_ha_creds 负责 CREATE，此处不越俎代庖。
+        _shadow_hosts = [h for h in _ha_hosts if h]
         for _h in _shadow_hosts:
             try:
                 if _target_privs and _target_privs.issubset(_granted_privs(cur, ha_user, _h)):
@@ -495,8 +500,10 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
             _hosts = [r[0] for r in (cur.fetchall() or [])]
         except Exception:
             _hosts = []
-        cand = set([h for h in _hosts if h] + ["%"]
-                   + ([manager_ip] if manager_ip else []))
+        # 同上：只对**实际存在**的 host 变体授权。对不存在的 ha_monitor@'%'
+        # 执行 GRANT 会报 1133，被下面的 except 记进 missing 当成「权限缺口」，
+        # 进而触发「授权自愈未完全成功」的**误告警**并可能发邮件。
+        cand = [h for h in _hosts if h]
         _binlog_off = False
         try:
             cur.execute("SET SESSION sql_log_bin=0")

@@ -43,6 +43,16 @@ def collect_metrics(cluster_id=None):
             seconds_behind = st.get("seconds_behind")
             repl_delay = seconds_behind if (seconds_behind is not None) else None
             ro = st.get("ro")
+            # MariaDB 的 @@read_only 返回 'ON'/'OFF' 字符串（MySQL 为 1/0 整型）。
+            # 原 `1 if ro else 0` 对 'OFF'（**可写**）得 1 —— 非空字符串为真，
+            # 于是把**可写**节点记成只读，metric_history.ro 与变更检测签名整体反了。
+            # 这里按两种形态统一解析成 0/1。
+            if ro is None:
+                ro_i = 0
+            elif isinstance(ro, (int, float)):
+                ro_i = 1 if int(ro) else 0
+            else:
+                ro_i = 1 if str(ro).strip().upper() in ("1", "ON", "TRUE") else 0
             connections = st.get("connections")
             threads_running = st.get("threads_running")
             # 变更检测：与上次落库快照一致则整条跳过（稳态零写入）
@@ -50,7 +60,7 @@ def collect_metrics(cluster_id=None):
                 "" if seconds_behind is None else str(seconds_behind),
                 st.get("slave_io") or "",
                 st.get("slave_sql") or "",
-                "1" if ro else "0",
+                str(ro_i),
                 "" if connections is None else str(connections),
             )
             key = (cid, ip, port)
@@ -63,7 +73,7 @@ def collect_metrics(cluster_id=None):
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (cid, ip, port, seconds_behind,
                  st.get("slave_io"), st.get("slave_sql"),
-                 1 if ro else 0, connections, repl_delay),
+                 ro_i, connections, repl_delay),
             )
             count += 1
     _purge()
