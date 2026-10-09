@@ -129,10 +129,14 @@ DROP DATABASE IF EXISTS ha_local;
 --   并中断整个 SQL 清理块（连后面的 FLUSH PRIVILEGES 都执行不到），页面只看到一句
 --   「部分 SQL 清理跳过」。这里改用 MariaDB 支持的 SET GLOBAL；
 --   log_bin / gtid_domain_id 属只读变量（只能改配置文件），随后续 my.cnf 恢复处理。
+-- ⚠ log_slave_updates 同样是【只读变量】：MariaDB 上 SET GLOBAL 会直接报
+--   "ERROR 1238 (HY000): Variable 'log_slave_updates' is a read only variable"，
+--   且这一报错会中断整个 SQL 清理块（后面的 FLUSH PRIVILEGES 也执行不到），
+--   页面只会看到「部分 SQL 清理跳过」。它只能改 my.cnf 并重启，故此处不再尝试 SET。
+--   同理 gtid_domain_id 亦为只读，均随后续 my.cnf 恢复处理。
 SET GLOBAL read_only = OFF;
 SET GLOBAL server_id = 1;
 SET GLOBAL gtid_strict_mode = OFF;
-SET GLOBAL log_slave_updates = OFF;
 FLUSH PRIVILEGES;
 SQL
     log "SQL 清理完成（复制/HA 账号/ha_local 已移除）"
