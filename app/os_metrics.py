@@ -23,12 +23,30 @@ _cache = {}          # {(cluster_id, ip): (ts, payload)}
 _cache_lock = threading.Lock()
 
 
+def _token_for(ip):
+    """取访问该节点 agent 的令牌：优先「每节点独立 token」，缺失时回退全局配置。
+
+    必须与心跳通道同源（agent_hub.node_token）：节点 compose 里注入的
+    NODE_AGENT_TOKEN 是 nodes.agent_token（每节点独立随机值），若这里仍拿全局
+    NODE_AGENT_TOKEN 去请求，agent 侧 _allow() 一律 401，表现为「心跳在线、
+    但 OS 指标 / 节点日志统统显示 agent 不可达」。
+    """
+    try:
+        from . import agent_hub
+        return agent_hub.node_token(ip) or ""
+    except Exception:
+        return NODE_AGENT_TOKEN or ""
+
+
 def _fetch(ip):
     """拉取单个节点 agent 的 /stats；失败返回含 error 的 dict。"""
+    token = _token_for(ip)
     url = f"http://{ip}:{NODE_AGENT_PORT}/stats"
-    if NODE_AGENT_TOKEN:
-        url += f"?token={NODE_AGENT_TOKEN}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {NODE_AGENT_TOKEN}"} if NODE_AGENT_TOKEN else {})
+    if token:
+        # 令牌是随机串，可能含 + / = 等字符，必须 urlencode
+        # （否则 query 里的 + 会被解析成空格，agent 侧字符串比对失败）
+        url += "?" + urllib.parse.urlencode({"token": token})
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"} if token else {})
     try:
         with urllib.request.urlopen(req, timeout=NODE_AGENT_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -64,10 +82,11 @@ def fetch_node_log(ip, name: str = "error", lines: int = 400, path: str = "",
     q = {"name": name, "lines": str(int(lines))}
     if path:
         q["path"] = path
-    if NODE_AGENT_TOKEN:
-        q["token"] = NODE_AGENT_TOKEN
+    token = _token_for(ip)
+    if token:
+        q["token"] = token
     url = f"http://{ip}:{NODE_AGENT_PORT}/logs?" + urllib.parse.urlencode(q)
-    headers = {"Authorization": f"Bearer {NODE_AGENT_TOKEN}"} if NODE_AGENT_TOKEN else {}
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
