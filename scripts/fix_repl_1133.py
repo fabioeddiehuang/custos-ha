@@ -9,7 +9,7 @@
 且错误为可跳过冲突时，注入空事务 / SET GLOBAL sql_slave_skip_counter=1 跳过并重起复制。
 
 用法:
-  python3 scripts/fix_repl_1133.py --host 192.168.1.33 --port 3307 --root-pass <节点root密码>
+  python3 scripts/fix_repl_1133.py --host 192.0.2.33 --port 3307 --root-pass <节点root密码>
   # 可加入 cron 定时巡检：对各从库每分钟跑一次（无冲突时直接返回“复制正常”）。
 """
 import argparse

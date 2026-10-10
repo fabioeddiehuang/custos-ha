@@ -3090,7 +3090,7 @@ async def api_migration_unlock(request: Request, user=Depends(auth_required)):
     执行 DELETE FROM migration_locks / migration_tasks，但无需手敲 SQL。默认同时
     清理指向该节点的 running 任务（重装后这些任务已无意义）。
 
-    body: {"host": "192.168.1.203", "port": 3307, "clear_tasks": true}
+    body: {"host": "192.0.2.203", "port": 3307, "clear_tasks": true}
     """
     b = await _json_body(request)
     host = (b.get("host") or "").strip()

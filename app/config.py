@@ -47,7 +47,7 @@ ACCOUNT_HOST_MODE = (env("ACCOUNT_HOST_MODE", "additive") or "additive").strip()
 
 
 def segment_of(ip):
-    """由 IPv4 推导 C 段通配：192.168.1.100 -> 192.168.1.%。
+    """由 IPv4 推导 C 段通配：192.0.2.100 -> 192.0.2.%。
 
     非 IPv4 或无法推导时返回 None —— 调用方必须回退 @'%'，绝不能猜测网段：
     猜错会让管理器连不上所有节点，比保留 % 危险得多。

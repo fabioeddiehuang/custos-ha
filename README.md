@@ -1,7 +1,7 @@
 # Custos
 
 > 当前版本：**v2.4.0**（数据迁移向导：MariaDB↔MariaDB + MySQL 5.7→MariaDB）
-> 版本定位与变更记录（含路线图）见 [`RELEASE_NOTES.md`](./RELEASE_NOTES.md)；**v2.3 起**每个版本的独立规划见 [`doc/releases/`](./doc/releases/)。
+> 版本定位与变更记录（含路线图）见 [`doc/RELEASE_NOTES.md`](./doc/RELEASE_NOTES.md)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
 
 基于 **Keepalived + MySQL/MariaDB 主从（GTID）** 的 MySQL 高可用方案，附带一个轻量管理器：
@@ -241,3 +241,13 @@ cp env.example .env            # 改 MGMT_MYSQL_* / WEB_PASS / SECRET_KEY / VIP 
 - 节点真实版本由管理器连库 `SELECT VERSION()` 探测并回写 `nodes.mysql_version`。
 - 特权按 `SHOW PRIVILEGES` 能力探测，不按版本号硬编码；授权唯一来源 `app/mariadb_matrix.py`。
 - 半同步变量名：MariaDB 全系列沿用 `rpl_semi_sync_master/slave`（11.5+ 的 `source/replica` 只是别名），**勿照 MySQL 改**，否则 10.6~11.4 启动即崩。
+
+---
+
+## 六、致谢与第三方软件
+
+Custos 站在诸多开源软件与平台的肩膀上。本项目以 MIT 许可证发布，完整致谢与引用清单见 [`NOTICE.md`](./NOTICE.md)。
+
+核心依赖（致谢）：**MariaDB / MySQL**（被纳管数据库）、**Keepalived**（VIP 高可用核心）、**Docker / Docker Compose**（部署载体），以及 Python 生态（FastAPI、Uvicorn、Jinja2、PyMySQL、itsdangerous、python-multipart、cryptography）。
+
+© 2026 fabiohuang，保留所有权利。

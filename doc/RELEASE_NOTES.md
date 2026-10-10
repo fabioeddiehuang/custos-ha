@@ -2,7 +2,7 @@
 
 > 当前版本：**v2.4.0**（镜像标签 `custos-server:v2.4.0`）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
-> 配套文档：`README.md`、`doc/用户操作手册.md`、`doc/API接口文档.md`、`doc/数据库字段说明.md`、`doc/业务流程图.xmind`
+> 配套文档：[`../README.md`](../README.md)、[`doc/API接口文档.md`](./API接口文档.md)、[`doc/数据库字段说明.md`](./数据库字段说明.md)。用户操作手册、业务流程图等见仓库 `文档/` 目录（不随本仓库开源发布，详见 `.gitignore`）。
 
 ---
 
@@ -292,7 +292,7 @@
   后续再改名 / 迁移目录不会导致容器「孤儿」或重名冲突。
 - **修复**：`init_schema()` 每次启动都对所有节点无条件 `UPDATE nodes SET compose_path=…`，
   造成无谓写库（节点多时拖慢启动）。改为仅更新「当前值与目标值不一致」的行。
-- 新增 `LICENSE`（MIT，版权 eddys.cn）。
+- 新增 `LICENSE`（MIT，版权 fabiohuang）。
 
 ---
 
