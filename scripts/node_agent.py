@@ -366,8 +366,15 @@ def _proc_started_at(root, comm):
                     s = f.read()
             except Exception:
                 continue
+            # /proc/<pid>/stat 形如 `4159013 (keepalived) S 1 ...`：
+            # comm 必须取【第一个 '(' 与最后一个 ')' 之间】的内容。
+            # 此前误写为 s[1:rp]（只跳过了 pid 的首位数字），实际得到的却是
+            # `159013 (keepalived`，与 comm 永远不相等 —— 于是
+            # keepalived_started_at 恒为 None，管理器的 proc:* 自动核验
+            # 永远判定「agent 未上报启动时间」，「配置待生效」徽标无法自动消失。
+            lp = s.find("(")
             rp = s.rfind(")")
-            if rp < 0 or s[1:rp] != comm:
+            if lp < 0 or rp <= lp or s[lp + 1:rp] != comm:
                 continue
             return _proc_starttime_epoch(root, pid)
     except Exception:
