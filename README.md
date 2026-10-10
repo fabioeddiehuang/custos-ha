@@ -1,5 +1,13 @@
 # Custos
 
+> 📌 **使用须知 / Disclaimer**
+>
+> 1. 本项目由 AI 辅助开发，初衷仅供个人学习与日常使用；如果在使用过程中遇到问题，欢迎随时提交 Issue。
+> 2. 本项目完全免费、开源（采用 MIT 许可）。**若因使用 Custos 造成任何数据丢失、业务中断或其他损失，作者不承担任何法律责任与义务，请务必自行做好备份与风险评估。**
+> 3. 强烈建议先在测试环境中充分验证、确认无误后再上生产，**安全第一**。
+> 4. 本项目的开发纯属个人爱好，欢迎感兴趣的小伙伴一起参与共建与交流。
+> 5. 若有做得不到位的地方，还请多多指正，不胜感激！
+
 > 当前版本：**v2.4.0**（数据迁移向导：MariaDB↔MariaDB + MySQL 5.7→MariaDB）
 > 版本定位与变更记录（含路线图）见 [`doc/RELEASE_NOTES.md`](./doc/RELEASE_NOTES.md)。
 > 仓库目录名与产品名统一为 **`custos-ha` / Custos**（v2.2.0 起完成目录改名）；下文命令路径以仓库根目录 `custos-ha/` 为准。
@@ -26,7 +34,7 @@
 
 ```bash
 git clone <仓库地址> custos-ha && cd custos-ha
-sudo sh install.sh               # 交互收集管理库/VIP/网卡/Web 账号，自动生成 .env（SECRET_KEY/WEB_PASS 随机）、写回 compose、装 custosctl
+sudo sh install.sh               # 交互收集管理库/VIP/网卡/Web 账号；自动生成 .env（非密钥项）、把连接信息与口令写回 docker-compose.yml、安装 custosctl；口令默认首次启动随机生成（见日志）
 # 或 sudo sh install.sh -y        （非交互，全默认 + 随机口令）
 # 或 sudo sh install.sh --with-db （零外部依赖：内置 mgmt-mysql 一键起管理端，演示/小规模推荐；管理库地址自动填 mgmt-mysql、端口固化 3306）
 ```
@@ -43,22 +51,23 @@ sudo sh install.sh               # 交互收集管理库/VIP/网卡/Web 账号�
 
 ```bash
 cd custos-ha
-cp env.example .env            # 改 MGMT_MYSQL_* / WEB_PASS / SECRET_KEY / VIP 等
-# 把参数写回 docker-compose.yml（含取消注释 VIP）
+cp docker-compose-example.yml docker-compose.yml   # 生成 compose（已存在可跳过）
+# 在 docker-compose.yml 的 environment 中修改：MGMT_MYSQL_*（管理库地址/账号/口令）、WEB_PASS（留空=首次启动随机生成）、VIP（取消注释并填入同网段空闲 IP）
+# 可选：在 .env 设置 SECRET_KEY / WEB_PORT（经变量注入 compose）；连接类敏感信息仅在 compose 内配置，不在 .env
 ./scripts/deploy.sh            # = docker compose up -d --build
 ```
 
-服务端环境变量（写在 `.env`，由 compose `environment` 透传；改后重启管理器生效）：
+服务端配置变量（多数连接 / 口令类写在 `docker-compose.yml` 的 `environment`；仅 `SECRET_KEY` / `WEB_PORT` 可经 `.env` 注入；改后重启管理器生效）：
 
 | 变量 | 说明 | 默认 |
 |------|------|------|
-| `MGMT_MYSQL_HOST` | 管理库可达 IP（**务必填外部库真实 IP，不要写 auto / 127.0.0.1**；用 `install.sh --with-db` 时自动填 `mgmt-mysql` 服务名） | `192.0.2.88` |
+| `MGMT_MYSQL_HOST` | 管理库可达 IP（**务必填外部库真实 IP，不要写 auto / 127.0.0.1**；用 `install.sh --with-db` 时自动填 `mgmt-mysql` 服务名） | `192.0.2.20`（示例占位，部署前替换） |
 | `MGMT_MYSQL_PORT` / `USER` / `PASS` / `DB` | 管理库连接 | `3306` / `ha` / `ha` / `ha` |
-| `WEB_PORT` | Web 端口 | `28888` |
-| `WEB_USER` / `WEB_PASS` | Web 登录（默认 `admin`/`admin`，生产务必修改） | `admin` / `admin` |
-| `SECRET_KEY` | 会话密钥（生产务必改） | `change-me-in-production` |
+| `WEB_PORT` | Web 端口 | `28888`（可由 `.env` 注入） |
+| `WEB_USER` / `WEB_PASS` | Web 登录（`WEB_PASS` 留空则首次启动随机生成并打印日志，生产务必设固定强口令） | `admin` / `""`（留空=随机） |
+| `SECRET_KEY` | 会话密钥（在 `.env` 设置；留空则首次启动随机生成并持久化到 `./data/secret_key`，生产建议固定） | `""`（留空=随机） |
 | `CHECK_INTERVAL` / `FAIL_THRESHOLD` | 探活间隔(秒) / 连续失败阈值（失联≈`间隔×阈值` 触发切换） | `3` / `2` |
-| `VIP` / `VIP_PREFIX` / `INTERFACE` / `VRID` / `VIP_PORT` | VIP / 掩码位 / 网卡 / 虚拟路由ID / VIP 对外端口 | 空 / `24` / `eth0` / `51` / `3307` |
+| `VIP` / `VIP_PREFIX` / `INTERFACE` / `VRID` | VIP / 掩码位 / 网卡 / 虚拟路由ID（VIP 必填，同网段空闲 IP；`VIP_PORT` 已移除，不在 compose 配置） | 空（必填）/ `24` / `eth0` / `51` |
 | `SEMI_SYNC` | 半同步开关：置 `"1"` 启用（主库提交等待从库 ACK） | `"1"` |
 | `MANAGER_PUBLIC_IP` | 管理器向节点下发的地址（keepalived 上报/校验用）。**建议显式配置**，不要依赖自动探测 | 自动探测 |
 
