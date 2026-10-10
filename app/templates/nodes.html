@@ -114,6 +114,10 @@
              红色徽标会被误读成"这台机器有故障待修复"，故改用中性信息色 + ⚙ 图标。 #}
           {% if n.pending_count %}<span class="badge pending-badge" style="margin-left:6px;background:rgba(10,186,181,.14);color:#0ABAB5;border:1px solid rgba(10,186,181,.45);cursor:pointer;font-weight:500"
             onclick="showPending('{{ n.ip }}')" title="该节点有 {{ n.pending_count }} 项操作待执行（非故障；在节点执行后会自动消失）">⚙ {{ n.pending_count }} 项待办</span>{% endif %}
+          {# 「配置已重新生成」是**事实留痕**而非待办：事实不需要被完成，故永不挂死。
+             灰色小字，不做成徽标、不用告警色，仅告知运维"配置确实更新过"。 #}
+          {% if n.gen_updated_at %}<span class="gen-stamp" style="margin-left:6px;font-size:11.5px;color:var(--muted,#94a3b8)"
+            title="部署配置最近一次重新生成的时间（变更留痕，非待办，无需处理）">↻ 配置 {{ (n.gen_updated_at|string)[5:16] }} 已更新</span>{% endif %}
         </td>
         <td>
           {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-right:4px">MariaDB 裸机</span>
@@ -753,7 +757,13 @@
         var body = document.getElementById("regenBody");
         var acts = (d.ok && d.actions) ? d.actions : [];
         if(!acts.length){
-          body.innerHTML = '<div class="banner ok">✓ <div>该节点没有待生效的配置变更。</div></div>';
+          // 无待办时也要告知「配置确实重新生成过」，否则运维无法确认 regen 是否生效
+          var stampEl = null, tr = document.querySelector('tr[data-host^="'+ip+':"]');
+          if(tr){ stampEl = tr.querySelector('.gen-stamp'); }
+          var stamp = stampEl ? ('<div style="margin-top:6px;font-size:12px;opacity:.8">'
+                     + esc(stampEl.textContent.trim())
+                     + ' —— 本次变更均已生效或属可选维护，无需在节点执行操作。</div>') : '';
+          body.innerHTML = '<div class="banner ok">✓ <div>该节点没有需要在节点上执行的动作。' + stamp + '</div></div>';
         } else {
           // 中性信息框（不用告警红）：这是「待办清单」，不是故障告警
           body.innerHTML = '<div style="background:rgba(10,186,181,.10);border:1px solid rgba(10,186,181,.45);color:#0ABAB5;border-radius:8px;padding:10px 12px;margin-bottom:12px">'

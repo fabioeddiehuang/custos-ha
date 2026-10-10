@@ -541,6 +541,14 @@ def init_schema():
                     c.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_def}")
                 except Exception:
                     pass
+            # v2.5.1：配置最近一次**实际变更**的时间（仅当 gen_fingerprint 变化时才写）。
+            # 用途：页面展示「配置已于 X 重新生成」。这是**事实陈述**而非待办——
+            # 事实不需要被"完成"，因此它永不像待办徽标那样挂死（此前 regen 后毫无提示，
+            # 运维无法确认配置到底有没有重新生成；而做成待办又会永久悬挂被当成 bug）。
+            try:
+                c.execute("ALTER TABLE nodes ADD COLUMN gen_updated_at DATETIME DEFAULT NULL")
+            except Exception:
+                pass
             # hosts 增加半同步复制健康指标（monitor.get_status 采集，仪表盘展示 + 退化告警）。
             # SEMI_SYNC=0 时变量恒为 OFF，这些列保持 NULL，不影响核心探活。
             for _col, _def in (

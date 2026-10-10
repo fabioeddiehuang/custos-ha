@@ -2511,8 +2511,11 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     _pending = [a for a in (_actions or []) if not is_optional_action(a)]
     if _fp != _prev_fp:
         try:
+            # gen_updated_at 记录「配置确实重新生成过」；无真待办时 pending_since 置 NULL，
+            # 避免留下一个没有待办却非空的起始时间戳。
             execute("UPDATE nodes SET gen_fingerprint=%s, pending_actions=%s, "
-                    "pending_since=NOW() WHERE ip=%s",
+                    "gen_updated_at=NOW(), pending_since=" + ("NOW()" if _pending else "NULL") +
+                    " WHERE ip=%s",
                     (_fp, json.dumps(_pending, ensure_ascii=False) if _pending else "", ip))
         except Exception:
             pass
@@ -2776,26 +2779,48 @@ def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_r
     return synced
 
 
+def _fill_gen_updated_at(rows):
+    """gen_updated_at 为空时回退到节点生成目录的 mtime。
+
+    该列随本次改动新增，存量行全是 NULL；但那些节点**早就重新生成过**配置，
+    若不回退则页面对它们一片空白，运维仍看不出"配置是否已重新生成"。
+    """
+    for n in rows or []:
+        if n.get("gen_updated_at"):
+            continue
+        try:
+            p = os.path.join(NODES_DIR, str(n.get("ip") or ""))
+            if os.path.isdir(p):
+                n["gen_updated_at"] = datetime.fromtimestamp(os.path.getmtime(p))
+        except Exception:
+            pass
+
+
 def list_nodes(cluster_id=None):
     try:
         if cluster_id:
-            return query(
+            rows = query(
                 "SELECT n.ip, n.port, n.root_user, n.root_pass, n.server_id, n.compose_path, n.created_at, "
                 "n.node_type, n.mysql_version, n.pending_actions, n.pending_since, "
+                "n.gen_updated_at, "
                 "h.initial_role, h.role, h.status, n.cluster_id "
                 "FROM nodes n LEFT JOIN hosts h ON h.host = n.ip AND h.cluster_id=n.cluster_id "
                 "WHERE n.cluster_id=%s ORDER BY n.ip",
                 (cluster_id,),
             )
-        return query(
-            "SELECT n.ip, n.port, n.root_user, n.root_pass, n.server_id, n.compose_path, n.created_at, "
-            "n.node_type, n.mysql_version, n.pending_actions, n.pending_since, "
-            "h.initial_role, h.role, h.status, n.cluster_id "
-            "FROM nodes n LEFT JOIN hosts h ON h.host = n.ip AND h.cluster_id=n.cluster_id "
-            "ORDER BY n.cluster_id, n.ip"
-        )
+        else:
+            rows = query(
+                "SELECT n.ip, n.port, n.root_user, n.root_pass, n.server_id, n.compose_path, n.created_at, "
+                "n.node_type, n.mysql_version, n.pending_actions, n.pending_since, "
+                "n.gen_updated_at, "
+                "h.initial_role, h.role, h.status, n.cluster_id "
+                "FROM nodes n LEFT JOIN hosts h ON h.host = n.ip AND h.cluster_id=n.cluster_id "
+                "ORDER BY n.cluster_id, n.ip"
+            )
     except Exception:
         return []
+    _fill_gen_updated_at(rows)
+    return rows
 
 
 def delete_node_dir(ip):
