@@ -222,10 +222,13 @@ def _render_keepalived_conf(local_ip, peers, vip, vip_prefix, interface, vrid, r
     if not _valid_vip(vip):
         raise ValueError("VIP 非法（%r），拒绝生成 keepalived.conf，请先在集群管理设置正确 VIP" % vip)
     peer_block = "\n".join(f"        {p}" for p in peers)
+    # ⚠ 切勿在配置里写 `log_file`：keepalived 2.2.x **不识别**该关键字，会报
+    # `(Line N) Unknown keyword 'log_file'` 并拒绝加载配置 —— VIP 探活/漂移随之失效。
+    # 日志统一走容器启动参数 --log-console（docker logs 直接可见）；
+    # 确需落文件请用命令行 --log-file，而不是写进 keepalived.conf。
     return f"""global_defs {{
     router_id {router_id}
     enable_script_security
-    log_file /var/log/custos-ha/keepalived.log
 }}
 
 vrrp_script chk_mysql_master {{
