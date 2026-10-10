@@ -246,6 +246,9 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
     """真正投递（含同类冷却节流）。由 send_alert 或观察期到点后调用。"""
     global last_error
     last_error = ""
+    # 冷却节流：仅在**发送成功后**才落时间戳（见下方 try 内 [alert:sent] 处）；
+    # 发送失败则不落，避免 SMTP 故障期间同类告警被冷却静默吞掉。
+    _throttle_key, _throttle_now = None, 0.0
     # v2.3.3：维护窗口内抑制「状态类」告警（离线/复制/延迟/半同步），避免维护期刷屏。
     # 放在投递层而不是 send_alert：自愈观察期挂起的告警是到点后直接走 _deliver 的，
     # 只在 send_alert 判断会漏掉这批，维护期照样收到一堆邮件。
@@ -277,10 +280,13 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
                     _suppressed[key] = _suppressed.get(key, 0) + 1
                     print(f"[alert:throttled] 同类冷却中，抑制重复发送：{subject} (cluster={cluster_id})")
                     return False
-                # 冷却已过，允许发送；记下来并在发送成功后落盘时间戳
+                # 冷却已过，允许发送。
+                # ⚠ 不在这里落时间戳：若下面 SMTP 发送失败却已记时间戳，冷却期内后续
+                #   同类告警会被全部抑制 → 真实故障的邮件被**静默吞掉**。
+                #   改为「发送成功后才落」（见 try 内 [alert:sent] 处）。
                 n_suppressed = _suppressed.get(key, 0)
                 _suppressed[key] = 0
-                _last_sent[key] = now
+                _throttle_key, _throttle_now = key, now
             if n_suppressed > 0 and _alert_merge_enabled():
                 mins = max(1, cooldown // 60)
                 body = body + f"\n\n[注] 本类告警在过去的 {mins} 分钟内已被同类冷却抑制 {n_suppressed} 次。"
@@ -311,6 +317,10 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
                     s.login(c["user"], c["passwd"])
                 s.sendmail(msg["From"], recipients, msg.as_string())
         print(f"[alert:sent] {subject} -> {recipients}")
+        # 发送**成功**才落冷却时间戳（失败则不落，避免同类告警在冷却期内被静默抑制）
+        if _throttle_key is not None:
+            with _alert_lock:
+                _last_sent[_throttle_key] = _throttle_now
         return True
     except Exception as e:
         last_error = str(e)

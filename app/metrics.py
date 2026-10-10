@@ -5,11 +5,16 @@ monitor 周期性调用 collect_metrics()，把每个节点的复制状态快照
 - repl_delay 即复制延迟（秒），趋势图主指标；NULL 表示无复制通道（主库）。
 保留期由 setting METRIC_RETENTION_DAYS 控制（默认 30 天）。
 """
+import threading
+
 from .db import query, execute, get_setting
 from .ha_client import get_status, connect_robust
 
 # 每个节点上一次落库快照的签名，用于变更检测（一致则不 INSERT）
+# 加锁：collect_metrics 由监控线程周期性调用，也可能被其它后台任务触发；
+# 无保护的字典读写在并发下会让签名交错、变更检测失真（漏插或重复插快照）。
 _LAST_SIG = {}
+_SIG_LOCK = threading.Lock()
 
 
 def _cluster_ids(cluster_id=None):
@@ -64,9 +69,10 @@ def collect_metrics(cluster_id=None):
                 "" if connections is None else str(connections),
             )
             key = (cid, ip, port)
-            if _LAST_SIG.get(key) == sig:
-                continue
-            _LAST_SIG[key] = sig
+            with _SIG_LOCK:
+                if _LAST_SIG.get(key) == sig:
+                    continue
+                _LAST_SIG[key] = sig
             execute(
                 "INSERT INTO metric_history "
                 "(cluster_id, host, port, seconds_behind, slave_io, slave_sql, ro, connections, repl_delay) "
