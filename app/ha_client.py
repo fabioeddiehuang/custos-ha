@@ -1746,6 +1746,19 @@ def fix_node_mysql_params(host, port, root_user="root", root_pass="",
                               f"（请先确认已创建 root@'<管理器IP>' 且密码正确）"}
     cur = conn.cursor()
     report = {"changes": [], "warns": [], "before": {}}
+
+    def _var_on(v):
+        """@@log_bin 这类开关变量判「开」。
+
+        MariaDB 返回**字符串** 'ON'/'OFF'（实测 12.3.3：`SELECT @@log_bin` → ON），
+        MySQL 返回 1/0 整型 —— int('ON') 会抛 ValueError，必须两种都识别。
+        """
+        if v is None:
+            return False
+        if isinstance(v, (int, float)):
+            return bool(int(v))
+        return str(v).strip().upper() in ("1", "ON", "TRUE")
+
     try:
         # MariaDB 与 MySQL 双路径完全独立：
         #  - MariaDB 没有 gtid_mode 变量（只有 gtid_domain_id），@@gtid_mode 会直接报错；
@@ -1768,8 +1781,11 @@ def fix_node_mysql_params(host, port, root_user="root", root_pass="",
                     report["changes"].append(f"server_id={target_server_id}")
                 except Exception as e:
                     report["warns"].append(f"server_id 设置失败: {e}")
-            # log_bin 无法在线开启，仅告警
-            if int(lb or 0) != 1:
+            # log_bin 无法在线开启，仅告警。
+            # ⚠ MariaDB 的 @@log_bin 返回**字符串** 'ON'/'OFF'（实测 12.3.3 为 'ON'），
+            #   并非旧注释所称的"整型 0/1"：int('ON') 抛 ValueError 会让整段
+            #   fix_node_mysql_params 以 error 收场（而非仅告警）。按两种形态统一判定。
+            if not _var_on(lb):
                 report["warns"].append(
                     "log_bin=OFF：复制需要 binlog，需重启 MariaDB（裸机请重跑 Install 脚本或 "
                     "在 my.cnf 增加 log_bin 后重启）")
@@ -1813,9 +1829,10 @@ def fix_node_mysql_params(host, port, root_user="root", root_pass="",
             except Exception as e:
                 report["warns"].append(f"server_id 设置失败: {e}")
         # log_bin 无法在线开启，仅告警。
-        # 注意：@@log_bin 返回整型 0/1（非 'ON'/'OFF' 字符串），故按真值判断，
-        # 避免把正常的 log_bin=1 误报成 log_bin=OFF。
-        if int(lb or 0) != 1:
+        # ⚠ 旧注释称"@@log_bin 返回整型 0/1"并不总成立：部分版本/分支返回
+        #   'ON'/'OFF' 字符串，int() 会抛异常。统一按两种形态判定，
+        #   既避免误报 log_bin=OFF，也避免抛错中断整段修复。
+        if not _var_on(lb):
             report["warns"].append(
                 "log_bin=OFF：复制需要 binlog，SET PERSIST 无法在线开启；"
                 "需在 my.cnf 增加 log_bin 后重启 MySQL（裸机请跑 Install 脚本或手动追加片段后重启）")
@@ -2700,8 +2717,13 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         except Exception:
             _ha_hosts = []
         _target_privs = _parse_grant_privs(ha_grant)
-        _shadow_hosts = set([h for h in _ha_hosts if h] + ["%"]
-                            + ([manager_ip] if manager_ip else []))
+        # 只对**实际存在**的 host 变体授权：对不存在的账号（例如节点上根本没有
+        # ha_monitor@'%'）执行 GRANT 会报 ERROR 1133
+        # "Can't find any matching row in the user table" —— GRANT 不会隐式建号
+        # （需先 CREATE USER）。这既每周期刷错误日志，还会被 repair_ha_shadow_grants
+        # 记成 missing 而触发**误告警**，把真实的权限缺口淹没。
+        # 账号若完全不存在，由 ensure_ha_creds 负责 CREATE，此处不越俎代庖。
+        _shadow_hosts = [h for h in _ha_hosts if h]
         for _h in _shadow_hosts:
             try:
                 if _target_privs and _target_privs.issubset(_granted_privs(cur, ha_user, _h)):
@@ -2899,8 +2921,10 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
             _hosts = [r[0] for r in (cur.fetchall() or [])]
         except Exception:
             _hosts = []
-        cand = set([h for h in _hosts if h] + ["%"]
-                   + ([manager_ip] if manager_ip else []))
+        # 同上：只对**实际存在**的 host 变体授权。对不存在的 ha_monitor@'%'
+        # 执行 GRANT 会报 1133，被下面的 except 记进 missing 当成「权限缺口」，
+        # 进而触发「授权自愈未完全成功」的**误告警**并可能发邮件。
+        cand = [h for h in _hosts if h]
         _binlog_off = False
         try:
             cur.execute("SET SESSION sql_log_bin=0")

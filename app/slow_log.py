@@ -89,9 +89,12 @@ def _is_writable(cur):
     try:
         cur.execute("SELECT @@read_only, @@super_read_only")
         row = cur.fetchone() or (0, 0)
-        ro = str(row[0] if row[0] is not None else 0)
-        sro = str(row[1] if len(row) > 1 and row[1] is not None else 0)
-        return ro in ("0", "b'0'", "") and sro in ("0", "b'0'", "")
+        # MariaDB 返回 'OFF'/'ON' 字符串（MySQL 为 0/1 整型）：原白名单只有 0 / b'0'，
+        # **缺 'OFF'** → MariaDB 的**可写**节点被判成"不可写"，慢日志采集被整体跳过
+        #（表现为慢日志面板恒空）。统一按大写比对并补上 OFF。
+        ro = str(row[0] if row[0] is not None else 0).strip().upper()
+        sro = str(row[1] if len(row) > 1 and row[1] is not None else 0).strip().upper()
+        return ro in ("0", "OFF", "B'0'", "") and sro in ("0", "OFF", "B'0'", "")
     except Exception:
         return True
 

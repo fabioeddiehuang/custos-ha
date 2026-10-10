@@ -111,6 +111,12 @@ def check_cluster(cluster_id):
             if var == "gtid_domain_id":
                 # gtid_domain_id 期望非 0（0 为未显式指定，视为漂移）
                 status = "OK" if str(actual).upper() not in ("0", "NONE", "") else "DRIFT"
+            elif var == "log_bin":
+                # ⚠ log_bin 是**开关变量**：MariaDB 返回 'ON'/'OFF' 字符串，
+                #   MySQL 返回 1/0 整型。原按字符串与 "ON" 全等比较，
+                #   MySQL 节点（返回 1）会被**误报 DRIFT**。两种形态统一判「开」。
+                _v = str(actual).strip().upper()
+                status = "OK" if _v in ("1", "ON", "TRUE", "YES") else "DRIFT"
             else:
                 status = "OK" if str(actual).upper() == exp else "DRIFT"
             out.append((snap["_ip"], snap["_port"], var, exp, str(actual), status))

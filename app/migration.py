@@ -925,7 +925,10 @@ def precheck(task_id):
                 try:
                     cur = c2.cursor()
                     for d in databases:
-                        cur.execute(f"DROP DATABASE IF EXISTS `{_PRECHECK_PREFIX}{d}`")
+                        # 库名是**标识符**（源自源库/用户选择）：反引号内必须把 ` 转义成 ``，
+                        # 否则库名含反引号会破坏语句（语法错误乃至注入）。
+                        _db = (_PRECHECK_PREFIX + str(d)).replace("`", "``")
+                        cur.execute("DROP DATABASE IF EXISTS `%s`" % _db)
                 finally:
                     c2.close()
             except Exception:
