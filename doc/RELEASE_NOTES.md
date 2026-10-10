@@ -3,7 +3,7 @@
 > **主线（已发布）：v2.5.1**（镜像标签 `custos-server:v2.5.1`，`.env VERSION=v2.5.1`；集群接管 + 节点 curl 引导安装 + agent 指令通道 + 滚动升级 + 集群级定时备份 + 强制同步 + 无保护窗口提示；v2.5.1 为 bug 修复与稳定性增强版）
 > **稳定版：v2.4.0**（镜像标签 `custos-server:v2.4.0`，**已发布 · 该分支只修 bug**；数据迁移向导：MariaDB↔MariaDB + MySQL 5.7→MariaDB）
 > 设计目标（v3 高保真稿）：`design/mockup_v3.html`
-> 配套文档：`README.md`、`doc/手册/用户操作手册.md`、`doc/手册/迁移到本集群操作手册.md`、`doc/开发/API接口文档.md`、`doc/开发/数据库字段说明.md`、`doc/开发/数据库字段说明.md`
+> 配套文档：[`../README.md`](../README.md)、[`doc/API接口文档.md`](./API接口文档.md)（REST API 端点）、[`doc/数据库字段说明.md`](./数据库字段说明.md)（管理库表结构）。用户/迁移操作手册、内部研发与设计文档见仓库 `文档/` 目录（不随本仓库开源发布，详见 `.gitignore`）。
 
 ---
 
@@ -70,11 +70,11 @@
 
 ### v2.3.7 · 待生效自动核验
 - `deploy_actions` 每动作带 `verify` 字段（`db_uptime`/`proc:<svc>`/`db_alive`/`manual`）；`verify_node_pending` 自动核验落实后移除徽标；旧 JSON 无 `verify` 按 `manual` 保留。
-- 详见 [`doc/releases/v2.3.7.md`](./doc/releases/v2.3.7.md)。
+- 详见仓库 `doc/releases/`（内部历史变更文档，不随本仓库开源发布，详见 `.gitignore` 发布范围说明）。
 
 ### v2.3.8 · 待生效徽标真实性 + 运维防呆
 - `ack_node_pending` 改**核验门禁**（未落实保留并回 `reason`，`force` 人工兜底）；`decrypt()` 失败**原样返回密文**（防凭证被空口令覆盖）；`list_nodes` 补 `pending_actions`/`pending_since` 列；`ensure_semisync_runtime` 改 `SHOW VARIABLES` 复核真 ON（修半同步假成功）；`/api/heal` 加 15s 冷却 + 按(集群,主机,端口)去重；只读账号 403 提示；首次部署 `verify` 改 `db_alive`。
-- 详见 [`doc/releases/v2.3.8.md`](./doc/releases/v2.3.8.md)。
+- 详见仓库 `doc/releases/`（内部历史变更文档，不随本仓库开源发布，详见 `.gitignore` 发布范围说明）。
 
 ### v2.3.9 · 节点部署目录结构归整 + 无口令 `.env`
 
@@ -84,7 +84,7 @@
   - `WEB_PASS` / `MGMT_MYSQL_PASS` → 由 `docker-compose.yml` 的 `environment` 驱动（`WEB_PASS` 留空则首次启动随机生成并打印到日志）；
   - `.env` 现仅含 `VERSION` + `COMPOSE_PROJECT_NAME` 等非密钥项，已纳入 git 跟踪（仓库不再忽略）。
 - **升级注意（重要）**：从 v2.3.8 及更早升级时，`install.sh` 重跑会自动把旧 `.env` 的 `SECRET_KEY` 迁移到 `data/secret_key`（仅当 `data/secret_key` 不存在），**请勿在旧 `SECRET_KEY` 未迁移前手动删掉它**；否则由它派生的凭据密钥会变化、旧 `ENC1:` 凭据需靠管理库 `secrets` 表自愈（见 v2.3.1）。建议升级步骤：拉取新代码 → `sh install.sh`（自动迁移）→ 重启管理器。
-- 详见 [`doc/releases/v2.3.9.md`](./doc/releases/v2.3.9.md)。
+- 详见仓库 `doc/releases/`（内部历史变更文档，不随本仓库开源发布，详见 `.gitignore` 发布范围说明）。
 
 ### v2.3.10 · 凭证加密默认关闭 + 复制自愈保底
 
@@ -98,7 +98,7 @@
 - **卸载保底：密钥保险库（`/var/lib/custos`）**：`scripts/uninstall.sh` 无论是否 `-f`，都会先把 `data/cred.key` / `data/secret_key` 镜像到**项目目录之外**的 `/var/lib/custos/`（该目录卸载不删除）；`install.sh` 重装时若 `data/` 下缺失会自动取回，应用启动时 `crypto.bootstrap()` 也会从保险库回补，并把它纳入解密钥匙串。效果：**即便整个项目目录被删除后重装，存量凭证仍能解开**；只有删除 `/var/lib/custos` 才会真正失效。
 - **启动自检（主动告警）**：`init_db` 启动时执行 `startup_credential_check()`，若存在解不开的凭证，立即在启动日志打印明细并写入告警中心（`alert_type=cred_key`，按集群聚合、24h 内同内容不重复）。这类故障原本**完全静默** —— 要等复制把密文当口令报 1470 才暴露，现象是「源库不可达」，与密钥毫无关联，排查成本极高。
 - **凭证加密 Web 开关 + 一键回填 + 批量重置复制口令**：设置页「凭证加密」可在线切换开关、重置密钥，并新增「从节点包回填明文」「批量重置复制口令」两个一键按钮。
-- 详见 [`doc/releases/v2.3.10.md`](./doc/releases/v2.3.10.md)。
+- 详见仓库 `doc/releases/`（内部历史变更文档，不随本仓库开源发布，详见 `.gitignore` 发布范围说明）。
 
 ---
 
@@ -115,25 +115,25 @@
 - **后台异步逐步执行**：seed / bridge / verify / cutover / cleanup，进度 / 阶段文字 / 实时日志落库，前端 1.5s 轮询。
 - **修复 7 个实测必炸点**：mariadb-dump 无 `--set-gtid-purged`、MariaDB 无 `@@log_replica_updates`、管理器镜像缺数据库客户端（Dockerfile 已补 `mariadb-client`）、GTID 位点写入 dump 冲突、方言按文件名误判、自签证书 TLS 校验失败、subprocess 二次 flush 崩溃。
 - **已知边界**：`bridge / verify / cutover / cleanup` 四步尚未端到端实测；物理通道未实测（镜像内尚缺 `mariabackup`，且跨引擎本就被门禁拒绝）；账号/权限迁移未实现（当前排除 `mysql` 系统库）；MySQL 8.0 → MariaDB 按决策暂不实现。
-- 详见 [`doc/releases/v2.4.0.md`](./doc/releases/v2.4.0.md)。
+- 详见仓库 `doc/releases/`（内部历史变更文档，不随本仓库开源发布，详见 `.gitignore` 发布范围说明）。
 
 #### v2.4.0 稳定版定位
 
 - **v2.4.0 为稳定版**：自本版起，**v2.4.0 分支只修 bug，不再新增功能**；新功能（集群接管 / 节点引导安装 / agent 指令通道）统一进入 **v2.5.0**。
 - 镜像标签：`custos-server:v2.4.0`；版本号唯一来源 `.env` 的 `VERSION=`。
 - **使用说明入口**（按使用场景选）：
-  - 安装与部署：[`README.md`](./README.md)「一、快速开始」「1.4 添加被管节点（三种部署形态）」
-  - Web 各页面与按钮：[`README.md`](./README.md)「二、Web 控制台各页面与按钮说明」
-  - 日常运维 / 切换 / 备份 / 告警：[`doc/手册/用户操作手册.md`](./doc/手册/用户操作手册.md)
-  - **把现有数据库搬进 Custos（v2.4.0 主线功能）**：[`doc/手册/迁移到本集群操作手册.md`](./doc/手册/迁移到本集群操作手册.md)（分步图解，小白版）
-  - 接口对接：[`doc/开发/API接口文档.md`](./doc/开发/API接口文档.md)；字段含义：[`doc/开发/数据库字段说明.md`](./doc/开发/数据库字段说明.md)
+  - 安装与部署：[`../README.md`](../README.md)「一、快速开始」「1.4 添加被管节点（三种部署形态）」
+  - Web 各页面与按钮：[`../README.md`](../README.md)「二、Web 控制台各页面与按钮说明」
+  - 接口对接（REST API 端点）：[`doc/API接口文档.md`](./API接口文档.md)
+  - 管理库表结构（字段含义）：[`doc/数据库字段说明.md`](./数据库字段说明.md)
+  - 用户/迁移操作手册、内部研发与设计文档：见仓库 `文档/` 目录（不随本仓库开源发布，详见 `.gitignore`）
 - **升级方式**：`./scripts/deploy.sh up -d --build`（版本号经环境变量注入容器，**必须重建镜像才生效**）；节点侧无需升级。
 
 ---
 
 ## v2.5.0 详细变更（主线 · 真机全功能验证通过）
 
-> v2.5.0 在真实 4 节点环境（203 主 / 213 从 / 177 / 33，MariaDB 12.3.3 容器 + 裸机混合）完成 F1–F11 全部端到端验证，并修复一批实测必炸点。
+> v2.5.0 在真实多节点环境（节点 A 主 / 节点 B 从 / 节点 C / 节点 D，MariaDB 12.3.3 容器 + 裸机混合）完成 F1–F11 全部端到端验证，并修复一批实测必炸点。
 
 ### v2.5.0 · 接管 + 引导安装 + agent 指令通道 + 运维增强
 
@@ -351,7 +351,7 @@
   后续再改名 / 迁移目录不会导致容器「孤儿」或重名冲突。
 - **修复**：`init_schema()` 每次启动都对所有节点无条件 `UPDATE nodes SET compose_path=…`，
   造成无谓写库（节点多时拖慢启动）。改为仅更新「当前值与目标值不一致」的行。
-- 新增 `LICENSE`（MIT，版权 eddys.cn）。
+- 新增 `LICENSE`（MIT，版权 fabiohuang）。
 
 ---
 

@@ -124,7 +124,7 @@
     <p class="ph">填写这台正在跑的旧库连接信息。它以 seed master 身份进入新集群；Custos 只在其上装 sidecar。</p>
     <div class="infobox"><b>i</b><div>这是一台已上线、跑着业务的实例。接管过程对它只读、不重启、不改动 my.cnf（修复命令另给，由你择机执行）。</div></div>
     <div class="row of3">
-      <label class="fld"><span>IP 地址</span><input id="f_ip" value="192.168.1.177"></label>
+      <label class="fld"><span>IP 地址</span><input id="f_ip" placeholder="节点 IP"></label>
       <label class="fld"><span>端口</span><input id="f_port" value="3307"></label>
       <label class="fld"><span>管理员用户</span><input id="f_user" value="root"></label>
     </div>
@@ -157,7 +157,7 @@
     </div>
     <label class="fld"><span>VIP（同网段空闲 IP）</span>
       <div class="vipwrap">
-        <span class="vipfix" id="vipPrefix">192.168.1.</span>
+        <span class="vipfix" id="vipPrefix">192.0.2.</span>
         <input id="f_viplast" class="pre" placeholder="180">
         <button class="btn btn-ghost" onclick="adCheckVip()">检测占用</button>
       </div>

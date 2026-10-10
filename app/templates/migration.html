@@ -197,7 +197,7 @@
   <div class="mig-flow">
     <div class="mf-col">
       <div class="mf-hd">源库 <span class="mf-role">被迁移</span></div>
-      <div class="field"><label>地址</label><input id="srcHost" placeholder="如 10.20.30.177"></div>
+      <div class="field"><label>地址</label><input id="srcHost" placeholder="如 192.0.2.10"></div>
       <div class="field"><label>端口</label><input id="srcPort" value="3306"></div>
       <div class="field"><label>账号</label><input id="srcUser" value="root"></div>
       <div class="field"><label>密码</label><input id="srcPass" type="password"></div>
@@ -211,7 +211,7 @@
 
     <div class="mf-col">
       <div class="mf-hd">目标 <span class="mf-role">新主</span></div>
-      <div class="field"><label>地址</label><input id="tgtHost" placeholder="如 10.20.30.33" onblur="autoTarget()"></div>
+      <div class="field"><label>地址</label><input id="tgtHost" placeholder="如 192.0.2.20" onblur="autoTarget()"></div>
       <div class="field"><label>端口</label><input id="tgtPort" value="3307">
         <div class="field-hint">填地址后自动识别，可改。</div></div>
       <div class="field"><label>账号</label><input id="tgtUser" value="root"></div>
@@ -404,7 +404,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-/* 地址示例 IP：默认不显示 192.168.1.x（用户要求），改用随机 10.x.x.x 示例 */
+/* 地址示例 IP：用文档示例网段 192.0.2.x（RFC 5737），避免泄露真实内网网段 */
 (function(){
   const rnd = () => Math.floor(Math.random()*254)+1;
   const ip  = () => "10."+rnd()+"."+rnd()+"."+rnd();

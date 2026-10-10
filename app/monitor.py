@@ -1450,7 +1450,7 @@ def _startup_selfcheck():
                 cur_m = get_current_master(cid)
                 # get_current_master 返回 **(host, port) 元组**（无主库时为 (None, None)）。
                 # 原实现按 "host:port" 字符串解析：元组上 `":" in cur_m` 恒为 False，
-                # 于是整个元组被当成 host 传下去（str(('192.168.1.33', 3307))），
+                # 于是整个元组被当成 host 传下去（str(('192.0.2.33', 3307))），
                 # 授权自检必然连不上、永久降级为 warn 静默失效；
                 # 且 (None, None) 是 truthy，`if not cur_m` 也拦不住"无主库"的情况。
                 # 这里显式按元组解包，并兼容历史字符串形态。

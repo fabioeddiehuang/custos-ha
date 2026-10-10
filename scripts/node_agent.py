@@ -714,7 +714,7 @@ def main():
                     help="日志文件路径（如 /var/log/custos-ha/node_agent.log）；不指定则仅 stdout")
     # v2.5.0 F5：心跳出向。给了 --manager 与 --ip 才启用（否则保持纯被动，行为不变）
     ap.add_argument("--manager", default=os.environ.get("MANAGER_URL", ""),
-                    help="管理器地址（如 http://192.168.1.66:28888）；设置后启用心跳出向 + 指令通道")
+                    help="管理器地址（如 http://192.0.2.66:28888）；设置后启用心跳出向 + 指令通道")
     ap.add_argument("--ip", default=os.environ.get("NODE_IP", ""),
                     help="本节点对外 IP（心跳上报用，需与管理器登记的一致）")
     ap.add_argument("--heartbeat", type=int,

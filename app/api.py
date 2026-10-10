@@ -1391,7 +1391,7 @@ def api_adopt_probe(nodes: str = Form(...), l2_prefix: int = Form(24),
     """只读探测一组存量节点（幂等，可反复跑，绝不写入老库）。
 
     nodes: JSON 数组字符串
-        [{"host":"192.168.1.50","port":3306,"user":"root","password":"pwd"}, ...]
+        [{"host":"192.0.2.50","port":3306,"user":"root","password":"pwd"}, ...]
     """
     from . import adopt
     try:
@@ -1739,7 +1739,7 @@ def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
 def api_upgrade_start(cluster_id: int = Form(...), actions: str = Form("{}"),
                       new_master: str = Form(""), do_switch: int = Form(1),
                       user=Depends(auth_required)):
-    """启动滚动升级。actions 为 JSON：{"192.168.1.213":"restart", ...}
+    """启动滚动升级。actions 为 JSON：{"192.0.2.213":"restart", ...}
 
     取值：restart（重启）/ rebuild（重建复制）/ pure（纯净重建）
     """
@@ -4061,7 +4061,7 @@ async def api_migration_unlock(request: Request, user=Depends(auth_required)):
     执行 DELETE FROM migration_locks / migration_tasks，但无需手敲 SQL。默认同时
     清理指向该节点的 running 任务（重装后这些任务已无意义）。
 
-    body: {"host": "192.168.1.203", "port": 3307, "clear_tasks": true}
+    body: {"host": "192.0.2.203", "port": 3307, "clear_tasks": true}
     """
     b = await _json_body(request)
     host = (b.get("host") or "").strip()

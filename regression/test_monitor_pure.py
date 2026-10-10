@@ -59,20 +59,20 @@ def test_classify_fork_when_upstream_not_current_master():
     旧逻辑只验 slave_io/slave_sql 报 repl_ok 掩盖了分叉。
     """
     st = {"alive": True, "slave_io": "Yes", "slave_sql": "Yes",
-          "master_host": "192.168.1.203", "master_port": 3307}
+          "master_host": "192.0.2.203", "master_port": 3307}
     # 上游 != 当前主库 -> 分叉（而非 repl_ok）
-    assert monitor._classify_repl_state(st, False, "192.168.1.177:3307") == "repl_fork"
+    assert monitor._classify_repl_state(st, False, "192.0.2.177:3307") == "repl_fork"
     # 上游 == 当前主库 -> 正常
-    assert monitor._classify_repl_state(st, False, "192.168.1.203:3307") == "repl_ok"
+    assert monitor._classify_repl_state(st, False, "192.0.2.203:3307") == "repl_ok"
     # 无当前主库可比对 -> 退化为旧语义（仅看线程），不误报分叉
     assert monitor._classify_repl_state(st, False) == "repl_ok"
     # 线程已断 -> 仍是 broken，不因上游校验被改成 fork
     assert monitor._classify_repl_state(
         {"alive": True, "slave_io": "No", "slave_sql": "Yes",
-         "master_host": "192.168.1.203", "master_port": 3307},
-        False, "192.168.1.177:3307") == "repl_broken"
+         "master_host": "192.0.2.203", "master_port": 3307},
+        False, "192.0.2.177:3307") == "repl_broken"
     # 端口不一致也应判分叉（防 master_port 漂移型误对齐）
     assert monitor._classify_repl_state(
         {"alive": True, "slave_io": "Yes", "slave_sql": "Yes",
-         "master_host": "192.168.1.177", "master_port": 3308},
-        False, "192.168.1.177:3307") == "repl_fork"
+         "master_host": "192.0.2.177", "master_port": 3308},
+        False, "192.0.2.177:3307") == "repl_fork"

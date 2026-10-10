@@ -919,7 +919,7 @@ def node_root_for(per_node_roots, node, root_user, root_pass):
 
     生产环境每台库的 root 口令往往不一样，接管必须支持逐台指定，否则口令不同的
     节点会建账号失败。per_node_roots 形如
-    {"192.168.1.50:3306": {"user": "root", "password": "..."}}（键也允许只写 host）。
+    {"192.0.2.50:3306": {"user": "root", "password": "..."}}（键也允许只写 host）。
     """
     host = str(node.get("host") or "").strip()
     try:

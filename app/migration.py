@@ -397,7 +397,7 @@ def _ensure_target_accounts(cfg, stage=""):
     replication / app 账号**全部消失** ⇒ 导入后目标处于「无 Custos 账号」状态：
 
       · 同集群第二节点（213）连新主（203）报 1045
-        ``Access denied for user 'replication'@'192.168.1.213'``（账号根本不存在）；
+        ``Access denied for user 'replication'@'192.0.2.213'``（账号根本不存在）；
       · 管理器自身连不上目标（ha_monitor 不存在）⇒ 仪表盘复制/IO 全是 “—”；
       · 又因「迁移锁定」让 ensure_topology 整轮跳过（见 failover），这段窗口内
         现改为：导入完成后立刻重建账号，不再依赖后续步骤兜底。
