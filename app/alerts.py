@@ -14,10 +14,44 @@ from .config import env
 from .db import get_setting, query, execute
 
 
+def _normalize_smtp(raw_host, raw_port=""):
+    """规范化 SMTP 主机 / 端口：容忍把端口或协议前缀写进「SMTP 主机」字段。
+
+    典型误填：`smtp.exmail.qq.com:465`、`smtp://smtp.qq.com:587`。
+    smtplib 会把整串当主机名交给 getaddrinfo，必然报
+    `[Errno -2] Name or service not known`；页面只显示「DNS 解析失败」，
+    用户完全看不出是自己多写了端口。这里拆出来即可自愈。
+    """
+    h = str(raw_host or "").strip()
+    p_raw = str(raw_port or "").strip()
+    port = None
+    low = h.lower()
+    for pref in ("smtp://", "smtps://", "ssl://", "tls://"):
+        if low.startswith(pref):
+            h = h[len(pref):]
+            break
+    h = h.strip().strip("/").strip()
+    # 仅当「恰好一个冒号 + 冒号后是纯数字」时才拆端口，避免误伤 IPv6(::1)
+    if h.count(":") == 1:
+        _h, _p = h.rsplit(":", 1)
+        if _p.isdigit() and _h.strip():
+            h, port = _h.strip(), int(_p)
+    if p_raw:
+        try:
+            port = int(p_raw)
+        except ValueError:
+            pass
+    return h, (port or 25)
+
+
 def _cfg():
+    host, port = _normalize_smtp(
+        get_setting("SMTP_HOST") or env("SMTP_HOST"),
+        str(get_setting("SMTP_PORT") or env("SMTP_PORT") or "").strip(),
+    )
     return dict(
-        host=get_setting("SMTP_HOST") or env("SMTP_HOST"),
-        port=int(get_setting("SMTP_PORT") or env("SMTP_PORT") or 25),
+        host=host,
+        port=port,
         user=get_setting("SMTP_USER") or env("SMTP_USER"),
         passwd=get_setting("SMTP_PASS") or env("SMTP_PASS"),
         # 独立发件人地址（可选）：部分中继（如 API-Key 登录的邮件推送服务）
@@ -34,9 +68,15 @@ def smtp_view():
     的部署上会出现：邮件其实能正常发出，但页面徽章恒显示「未配置 SMTP」——即
     「展示口径」与「运行口径」不一致导致的假告警。统一走本函数即可消除该歧义。
     """
+    host, port = _normalize_smtp(
+        get_setting("SMTP_HOST") or env("SMTP_HOST"),
+        str(get_setting("SMTP_PORT") or env("SMTP_PORT") or "").strip(),
+    )
+    raw_port = str(get_setting("SMTP_PORT") or env("SMTP_PORT") or "").strip()
     return dict(
-        smtp_host=(get_setting("SMTP_HOST") or env("SMTP_HOST") or "").strip(),
-        smtp_port=str(get_setting("SMTP_PORT") or env("SMTP_PORT") or "").strip(),
+        smtp_host=host,
+        # 端口展示与运行口径一致：未单独配置时，展示从主机里拆出的那个端口
+        smtp_port=raw_port or (str(port) if host and port != 25 else ""),
         smtp_user=(get_setting("SMTP_USER") or env("SMTP_USER") or "").strip(),
         smtp_from=(get_setting("SMTP_FROM") or env("SMTP_FROM") or "").strip(),
     )
@@ -244,7 +284,7 @@ def send_alert(subject, body, cluster_id=None, recipients=None, force=False,
 
 def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
     """真正投递（含同类冷却节流）。由 send_alert 或观察期到点后调用。"""
-    global last_error
+    global last_error, _CHANNEL_ERROR
     last_error = ""
     # 冷却节流：仅在**发送成功后**才落时间戳（见下方 try 内 [alert:sent] 处）；
     # 发送失败则不落，避免 SMTP 故障期间同类告警被冷却静默吞掉。
@@ -265,6 +305,8 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
         recipients = resolve_recipients(cluster_id)
     if not c["host"] or not recipients:
         last_error = "未配置 SMTP 服务器或告警接收邮箱"
+        # 通道已停用（未配置 SMTP / 无收件人）时不再挂「投递失败」故障横幅
+        _CHANNEL_ERROR = {}
         print(f"[alert:skip] {subject} | {body}")
         return False
 
@@ -321,6 +363,10 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
         if _throttle_key is not None:
             with _alert_lock:
                 _last_sent[_throttle_key] = _throttle_now
+        # 通道恢复即消除「邮件通道故障」横幅：此前 _CHANNEL_ERROR 只在失败时写入、
+        # 成功从不清除，导致一次投递失败（哪怕早已修好）会让横幅永久显示陈旧错误，
+        # 只有重启管理器进程才消失。
+        _CHANNEL_ERROR = {}
         return True
     except Exception as e:
         last_error = str(e)
@@ -336,6 +382,5 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
                          status="failed")
         except Exception:
             pass
-        global _CHANNEL_ERROR
         _CHANNEL_ERROR = {"ts": time.time(), "error": str(e)[:300], "subject": str(subject)[:120]}
         return False

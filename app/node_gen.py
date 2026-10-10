@@ -1832,6 +1832,19 @@ def verify_node_pending(ip):
     except (TypeError, ValueError):
         elapsed = None
 
+    # 「待办产生时刻」的 epoch 基准：用「管理器当前时间 - 已过去秒数」反推。
+    # 为什么不直接用 ps_dt.timestamp()：pending_since 是 MySQL 返回的【naive datetime】，
+    # .timestamp() 会按 Python【本地时区】去解释它；一旦管理库时区与管理器时区
+    # 不一致（库 UTC / 应用 Asia/Shanghai 这类组合很常见），就会凭空差若干小时，
+    # 于是「服务启动时间 > 待办产生时间」永远不成立 —— 表现为节点明明已经重装、
+    # 「配置待生效」却永不自动消失。而 elapsed 是 TIMESTAMPDIFF 算出的【时长】，
+    # 库端时钟偏移在相减时抵消，故 time.time() - elapsed 与库端时区/时钟无关。
+    ps_epoch = None
+    if elapsed is not None:
+        ps_epoch = time.time() - float(elapsed)
+    elif ps_dt is not None:
+        ps_epoch = ps_dt.timestamp()
+
     # 按需取证：只在确有对应类型待办时才连 DB / 拉 agent，避免无谓开销。
     db_up, agent = None, None
     if any(a.get("verify") in ("db_uptime", "db_alive") for a in acts):
@@ -1877,7 +1890,8 @@ def verify_node_pending(ip):
         elif isinstance(v, str) and v.startswith("proc:"):
             svc = v.split(":", 1)[1]
             started = _agent_svc_started(agent, svc)
-            if started is not None and ps_dt is not None and started > ps_dt.timestamp() - 2:
+            # 容差 60s：容忍节点与管理器的时钟漂移；未重启时差值通常是小时/天级，不会误判
+            if started is not None and ps_epoch is not None and started > ps_epoch - 60:
                 logger.info("节点[%s] 待办已落实(%s 已于待办后重启)：%s",
                             ip, svc, a.get("title"))
                 continue
