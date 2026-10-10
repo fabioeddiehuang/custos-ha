@@ -72,6 +72,12 @@
     {% endfor %}
   </select>
   {% endif %}
+  {# 全局「全选」：syncBatchBar/toggleSelectAll 一直引用 id=selAll，但该元素历史上并不存在，
+     导致只能逐个勾选或按集群全选。放在常驻工具条（而非默认隐藏的批量条内），
+     勾选后批量操作条自动出现。 #}
+  <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);cursor:pointer;user-select:none">
+    <input type="checkbox" id="selAll" onchange="toggleSelectAll(this)" title="全选/取消全部节点"> 全选
+  </label>
   <span class="spacer"></span>
   <span class="badge sky">共 {{ nodes|length }} 个节点 · {{ groups|length }} 个集群</span>
 </div>
