@@ -110,8 +110,10 @@
       <tr data-host="{{ n.ip }}:{{ n.port }}" data-cluster="{{ n.cluster_id or '' }}" data-install="{{ n.compose_path }}">
         <td><input type="checkbox" class="node-sel" value="{{ n.ip }}" onchange="syncBatchBar()" title="选择该节点"></td>
         <td class="mono">{{ n.ip }}:{{ n.port }}
-          {% if n.pending_actions %}<span class="badge pending-badge" style="margin-left:6px;background:#E11D74;color:#fff;cursor:pointer"
-            onclick="showPending('{{ n.ip }}')" title="有配置变更尚未在节点生效，点击查看需要在节点执行的操作">配置待生效</span>{% endif %}
+          {# 刻意**不用告警红**：这是「运维还有事要做」的清单，不是系统报错。
+             红色徽标会被误读成"这台机器有故障待修复"，故改用中性信息色 + ⚙ 图标。 #}
+          {% if n.pending_count %}<span class="badge pending-badge" style="margin-left:6px;background:rgba(10,186,181,.14);color:#0ABAB5;border:1px solid rgba(10,186,181,.45);cursor:pointer;font-weight:500"
+            onclick="showPending('{{ n.ip }}')" title="该节点有 {{ n.pending_count }} 项操作待执行（非故障；在节点执行后会自动消失）">⚙ {{ n.pending_count }} 项待办</span>{% endif %}
         </td>
         <td>
           {% if n.node_type == 'mariadb' %}<span class="badge sky" style="margin-right:4px">MariaDB 裸机</span>
@@ -154,7 +156,7 @@
             {% endif %}
             <button class="btn btn-sm btn-accent" onclick="regenNode('{{ n.ip }}', this)">重新生成</button>
             <button class="btn btn-sm" style="background:linear-gradient(135deg,#0ABAB5,#22d3ee);color:#04121a;font-weight:600" onclick="openBootstrap('{{ n.ip }}','{{ n.compose_path }}')" title="生成一行命令，在节点主机上执行即可自动完成部署">引导安装</button>
-            {% if n.pending_actions %}<button class="btn btn-sm pending-btn" style="background:#E11D74;color:#fff" onclick="showPending('{{ n.ip }}')">待生效操作</button>{% endif %}
+            {% if n.pending_count %}<button class="btn btn-sm pending-btn" style="background:rgba(10,186,181,.14);color:#0ABAB5;border:1px solid rgba(10,186,181,.45)" onclick="showPending('{{ n.ip }}')">待办清单（{{ n.pending_count }}）</button>{% endif %}
             <a class="btn btn-sm" style="background:linear-gradient(135deg,#22d3ee,#0ABAB5);color:#04121a;text-decoration:none" href="/nodes/{{ n.ip }}/creds_sql" download>下载修复SQL</a>
             <button class="btn btn-sm" style="background:var(--danger);color:#fff" onclick="delNode('{{ n.ip }}')">删除节点</button>
           </div>
@@ -628,17 +630,35 @@
     if(level==='recreate')return '#E11D74';
     if(level==='restart')return '#0ABAB5';
     if(level==='exec')return '#7C2D52';
+    if(level==='notice')return '#64748b';
     return '#64748b';
   }
   function copyCmd(el, idx){
     copyTxt(el, PENDING_CMDS[idx] || '');
   }
+  // notice（说明）不列为待办：它描述的是「仅在某些场景才需要做」的事
+  // （init SQL 只对空数据目录生效、安装/卸载脚本只在重装时才用），
+  // 对运行中的节点无需任何操作。混进待办会让「配置待生效」永远消不掉。
+  function isNotice(a){ return a && (a.level==='notice' || a.verify==='info'); }
+  // optional = 按需维护（fix-creds / prepare-logs）：健康节点通常不需要执行，
+  // 只在 regen 结果里以「可选」列出，绝不占用「待办」徽标。
+  function isOptional(a){ return a && (a.verify==='optional' || a.level==='exec'); }
   function actionsHtml(acts, ip){
     if(!acts || !acts.length) return '';
-    var h = '<div style="margin:12px 0 6px;font-weight:600">需要在节点上执行以下操作，配置才会生效：</div>';
-    acts.forEach(function(a){
+    var todo = acts.filter(function(a){return !isNotice(a) && !isOptional(a);});
+    var opts = acts.filter(isOptional);
+    var notes = acts.filter(isNotice);
+    var h = '';
+    if(!todo.length){
+      h += '<div class="banner ok">✓ <div>该节点<b>没有需要在节点上执行的动作</b>，配置已生效。</div></div>';
+    } else {
+      h += '<div style="margin:12px 0 6px;font-weight:600">需要在节点上执行以下操作，配置才会生效：</div>';
+    }
+    todo.forEach(function(a){
       var idx = PENDING_CMDS.length;
       PENDING_CMDS.push(a.cmd || '');
+      var aidx = -1;
+      if(a.ack_cmd){ aidx = PENDING_CMDS.length; PENDING_CMDS.push(a.ack_cmd); }
       h += '<div style="border:1px solid var(--border,#22304a);border-radius:8px;padding:10px 12px;margin-bottom:10px">'
         + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
         + '<span class="badge" style="background:'+actColor(a.level)+';color:#fff">'+esc(a.level_label||a.level)+'</span>'
@@ -646,10 +666,47 @@
         + '<div style="color:var(--muted,#94a3b8);font-size:12.5px;margin:6px 0">'+esc(a.why||'')+'</div>'
         + (a.cmd ? ('<div class="runcmd">'+esc(a.cmd)+'</div>'
                    + '<button class="btn btn-sm" onclick="copyCmd(this,'+idx+')">复制命令</button>') : '')
+        // 回传命令：节点执行完脚本后跑这一条，本条待办立即销账，
+        // 不必回到页面点「已执行」，徽标也不会长期挂死。
+        + (a.ack_cmd ? ('<div style="margin-top:10px;font-size:12.5px;color:var(--muted,#94a3b8)">'
+                   + '上面这条执行完成后，在节点上再跑下面这一条即可<b style="color:#fda4af">自动销账</b>'
+                   + '（本条待办立刻消失，无需回页面点确认）：</div>'
+                   + '<div class="runcmd">'+esc(a.ack_cmd)+'</div>'
+                   + '<button class="btn btn-sm" onclick="copyCmd(this,'+aidx+')">复制回传命令</button>') : '')
+        + (a.reason ? ('<div style="color:#fda4af;font-size:12.5px;margin-top:8px">'+esc(a.reason)+'</div>') : '')
         + ((a.files&&a.files.length) ? '<div style="color:var(--muted,#94a3b8);font-size:12px;margin-top:8px">涉及文件：'+esc(a.files.join('、'))+'</div>' : '')
         + '</div>';
     });
-    if(ip){
+    if(opts.length){
+      h += '<div style="margin:14px 0 6px;font-weight:600;color:var(--muted,#94a3b8)">'
+         + '可选维护：仅当节点出现对应问题时才需要执行（健康节点<b>无需操作</b>，也不会产生待办提醒）</div>';
+      opts.forEach(function(a){
+        var oidx = PENDING_CMDS.length;
+        PENDING_CMDS.push(a.cmd || '');
+        h += '<div style="border:1px dashed var(--border,#22304a);border-radius:8px;padding:10px 12px;margin-bottom:8px">'
+          + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+          + '<span class="badge" style="background:rgba(10,186,181,.14);color:#0ABAB5;'
+          + 'border:1px solid rgba(10,186,181,.45)">按需</span>'
+          + '<b>'+esc(a.title||'')+'</b></div>'
+          + '<div style="color:var(--muted,#94a3b8);font-size:12.5px;margin:6px 0">'+esc(a.why||'')+'</div>'
+          + (a.cmd ? ('<div class="runcmd">'+esc(a.cmd)+'</div>'
+                     + '<button class="btn btn-sm" onclick="copyCmd(this,'+oidx+')">复制命令</button>') : '')
+          + '</div>';
+      });
+    }
+    if(notes.length){
+      h += '<div style="margin:14px 0 6px;font-weight:600;color:var(--muted,#94a3b8)">'
+         + '附：以下仅为说明，当前节点<b>无需任何操作</b></div>';
+      notes.forEach(function(a){
+        h += '<div style="border:1px dashed var(--border,#22304a);border-radius:8px;padding:8px 12px;margin-bottom:8px;opacity:.85">'
+          + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+          + '<span class="badge" style="background:#64748b;color:#fff">说明</span>'
+          + '<b style="font-weight:600">'+esc(a.title||'')+'</b></div>'
+          + '<div style="color:var(--muted,#94a3b8);font-size:12.5px;margin:6px 0">'+esc(a.why||'')+'</div>'
+          + '</div>';
+      });
+    }
+    if(ip && todo.length){
       h += '<button class="btn btn-sm btn-primary" onclick="ackDeploy(\''+ip+'\')">已在节点执行，清除提示</button>';
     }
     return h;
@@ -698,12 +755,11 @@
         if(!acts.length){
           body.innerHTML = '<div class="banner ok">✓ <div>该节点没有待生效的配置变更。</div></div>';
         } else {
-          body.innerHTML = '<div style="background:rgba(225,29,116,.12);border:1px solid #E11D74;color:#fecdd3;border-radius:8px;padding:10px 12px;margin-bottom:12px">'
-            + '⚠ ' + esc(ip) + ' 有 ' + acts.length + ' 项配置变更尚未在节点生效。'
-            + '<div style="margin-top:6px;font-size:12px;color:#fda4af">'
-            + '「重建数据库 / 重启 keepalived / 重启 agent」这几类动作，在节点上执行后会被管理器'
-            + '<b>自动检测并消除</b>（约 1 分钟内，无需手动确认）；'
-            + '仅「需在节点本机执行」（如 fix-node-creds.sql / prepare-logs.sh）等一次性动作保留手动清除。'
+          // 中性信息框（不用告警红）：这是「待办清单」，不是故障告警
+          body.innerHTML = '<div style="background:rgba(10,186,181,.10);border:1px solid rgba(10,186,181,.45);color:#0ABAB5;border-radius:8px;padding:10px 12px;margin-bottom:12px">'
+            + '⚙ ' + esc(ip) + ' 有 ' + acts.length + ' 项操作待执行。'
+            + '<div style="margin-top:6px;font-size:12px;opacity:.85">'
+            + '这些动作在节点上执行后会被管理器<b>自动检测并消除</b>（约 1 分钟内），无需手动确认。'
             + '</div></div>' + actionsHtml(acts, ip);
         }
         document.getElementById("regenModal").classList.add("show");
@@ -713,27 +769,43 @@
   // 「配置待生效」自动监测：每 30s 复核仍挂着徽标的节点，管理器已自动核验落实的
   // 会隐去徽标与「待生效操作」按钮，无需运维每次手动点「已执行」。
   // （exec / 首次部署等节点侧一次性动作无法远程观测，仍保留手动按钮。）
-  function _syncPendingRow(tr, ip, has){
+  function _syncPendingRow(tr, ip, cnt){
+    cnt = cnt || 0;
+    var has = cnt > 0;
     // 徽标挂在节点主行的 <td class="mono"> 内
     var cell = tr.querySelector("td.mono");
     var badge = cell ? cell.querySelector(".pending-badge") : null;
     if(has){
-      if(cell && !badge){
+      // 显示**真实条数**：运维能直观看到「做完一项少一项」，
+      // 而不是一个数字永远不动的红标（会被当成系统卡死/功能 bug）。
+      // ⚙ + 中性信息色：这是「待办清单」而非故障告警，绝不用告警红
+      var txt = '⚙ ' + cnt + ' 项待办';
+      var tip = '该节点有 ' + cnt + ' 项操作待执行（非故障；在节点执行后会自动消失）';
+      var st = 'margin-left:6px;background:rgba(10,186,181,.14);color:#0ABAB5;'
+             + 'border:1px solid rgba(10,186,181,.45);cursor:pointer;font-weight:500';
+      if(badge){
+        if(badge.textContent !== txt) badge.textContent = txt;   // 回传销账后条数会变
+        badge.setAttribute('title', tip);
+        badge.setAttribute('style', st);
+      } else if(cell){
         cell.insertAdjacentHTML("beforeend",
-          '<span class="badge pending-badge" style="margin-left:6px;background:#E11D74;color:#fff;cursor:pointer"'
-          + ' onclick="showPending(\''+ip+'\')" title="有配置变更尚未在节点生效，点击查看需要在节点执行的操作">配置待生效</span>');
+          '<span class="badge pending-badge" style="'+st+'"'
+          + ' onclick="showPending(\''+ip+'\')" title="'+tip+'">'+txt+'</span>');
       }
     } else if(badge){ badge.remove(); }
-    // 「待生效操作」按钮在展开详情行（#d<ip>）的 .dd-actions 里，不在主行
+    // 「待执行操作」按钮在展开详情行（#d<ip>）的 .dd-actions 里，不在主行
     var detail = document.getElementById("d"+ip);
     if(detail){
       var box = detail.querySelector(".dd-actions");
       var btn = detail.querySelector(".pending-btn");
+      var btxt = '待办清单' + (has ? '（'+cnt+'）' : '');
       if(has){
-        if(box && !btn){
+        if(btn){ if(btn.textContent !== btxt) btn.textContent = btxt; }
+        else if(box){
           box.insertAdjacentHTML("beforeend",
-            '<button class="btn btn-sm pending-btn" style="background:#E11D74;color:#fff"'
-            + ' onclick="showPending(\''+ip+'\')">待生效操作</button>');
+            '<button class="btn btn-sm pending-btn" style="background:rgba(10,186,181,.14);color:#0ABAB5;'
+            + 'border:1px solid rgba(10,186,181,.45)"'
+            + ' onclick="showPending(\''+ip+'\')">'+btxt+'</button>');
         }
       } else if(btn){ btn.remove(); }
     }
@@ -749,7 +821,7 @@
         .then(function(r){return r.json();})
         .then(function(d){
           var acts = (d.ok && d.actions) ? d.actions : [];
-          _syncPendingRow(tr, ip, acts.length > 0);
+          _syncPendingRow(tr, ip, acts.length);
         })
         .catch(function(){});
     });

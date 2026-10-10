@@ -4406,6 +4406,23 @@ def nodes_page(request: Request, user=Depends(auth_required), msg: str = "", err
             dp = dp.split(_p, 1)[-1]
         n["dir_display"] = dp or cp
 
+    # 徽标显示**真实待办条数**（已剔除 notice 说明项）：让运维一眼看出「还剩几项、
+    # 做完就没了」，而不是看到一个数字永远不动的红标，误以为系统卡死/功能 bug。
+    try:
+        from .node_gen import is_optional_action as _is_optional
+    except Exception:
+        _is_optional = None
+    for n in nodes:
+        try:
+            _acts = json.loads(n.get("pending_actions") or "[]")
+        except Exception:
+            _acts = []
+        if not isinstance(_acts, list):
+            _acts = []
+        if _is_optional is not None:
+            _acts = [a for a in _acts if not _is_optional(a)]
+        n["pending_count"] = len(_acts)
+
     # 按集群分组：节点管理页按「一个集群一张卡片」渲染，避免多集群混在同一张表里
     by_cid = {}
     for n in nodes:
@@ -4680,6 +4697,28 @@ def api_node_pending(ip: str, user=Depends(auth_required)):
     try:
         from .node_gen import node_pending_actions
         return JSONResponse({"ok": True, "actions": node_pending_actions(ip)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.get("/api/nodes/{ip}/pending/done")
+def api_node_pending_done(ip: str, token: str = "", key: str = ""):
+    """节点执行完动作后回传「已执行」——免登录，凭一次性 token 精确销账**这一条**。
+
+    供节点侧 curl 调用（命令由待办清单的 ack_cmd 现签）：脚本跑完粘一条，该条待办
+    即从「配置待生效」消失，不必回到页面点「已执行」，也不会让徽标长期挂死。
+    token 绑定 ip+key，换机器/换条目都验签失败，泄露也只能清这一条。
+    """
+    try:
+        from .node_gen import verify_pending_ack_token, ack_pending_action
+        if not key or not verify_pending_ack_token(ip, key, token):
+            return JSONResponse({"ok": False, "msg": "token 无效或已过期，请在管理端重新获取回传命令"},
+                                status_code=403)
+        r = ack_pending_action(ip, key) or {}
+        if not r.get("found"):
+            return JSONResponse({"ok": True, "msg": "该节点已无此待办（可能已销账）"})
+        return JSONResponse({"ok": True, "cleared": r.get("cleared") or [],
+                             "msg": "已销账：%s" % "、".join(r.get("cleared") or [])})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": f"{type(e).__name__}: {e}"}, status_code=500)
 

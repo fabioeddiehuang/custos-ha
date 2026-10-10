@@ -13,6 +13,7 @@
 每个节点归属一个集群（cluster_id），其账号/VIP 均取自该集群配置。
 """
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -1488,7 +1489,20 @@ DEPLOY_LEVEL_LABEL = {
     "restart": "重启服务",
     "exec": "节点执行一次",
     "manual": "人工确认",
+    # notice = 纯「知会」，对**已在运行**的节点根本不需要任何动作
+    # （例：init SQL 只对空数据目录的首次启动生效、安装/卸载脚本只在重装/下线时才用）。
+    # 这类条目仍会在「重新生成」结果里作为说明出现，但**不进 pending_actions**，
+    # 因此不会让「配置待生效」徽标长期挂死、被运维误判成功能 bug。
+    "notice": "说明",
 }
+
+# 「知会」条目的标题特征。存量库里它们被写成 verify='manual'，改代码后无法靠
+# verify 识别，只能按标题兼容——否则这 2 条会永远挂在徽标上（正是本次要修的现象）。
+_NOTICE_TITLE_HINTS = ("仅对空数据目录", "仅在重装或卸载时", "仅在重装/下线时")
+
+# 节点回传「已执行」所用 token 的有效期（无状态 HMAC，不落库）。
+# 给足 7 天：运维常常隔几天才去节点上执行脚本。
+PENDING_ACK_TTL = 7 * 24 * 3600
 
 
 def _db_service(node_type):
@@ -1541,7 +1555,7 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
     db = _db_service(node_type)
     acts = []
 
-    def add(level, title, why, cmd, files, verify="manual"):
+    def add(level, title, why, cmd, files, verify="manual", key=""):
         acts.append({
             "level": level,
             "level_label": DEPLOY_LEVEL_LABEL.get(level, level),
@@ -1552,8 +1566,14 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
             # verify：管理器「自动核验」该待办是否已在节点落实的方式（见 verify_node_pending）：
             #   db_uptime    —— 数据库进程重启（Uptime 归零）即视为落实（重建/重启数据库类）
             #   proc:<svc>   —— 节点 agent 报告的服务进程启动时间晚于 pending_since（重启 keepalived/agent）
-            #   manual       —— 节点侧一次性动作，无法远程观测，仍由运维点「已执行」
+            #   manual       —— 节点侧一次性动作，无法远程观测，仍由运维点「已执行」或 curl 回传
+            #   info         —— 纯知会，对运行中的节点无需动作，不进待办清单（见 notice 级别）
+            #   optional     —— 按需维护（fix-creds / prepare-logs）：健康节点通常不需要，
+            #                   列为待办必然挂死，只在 regen 结果里作为「可选」展示
             "verify": verify,
+            # key：动作的稳定标识。节点执行完脚本后 curl 回传带上它，服务端据此
+            # **精确清除这一条**（而不是整份盲清），见 ack_pending_action()。
+            "key": key or "",
         })
 
     files = [str(f).replace("\\", "/") for f in (changed_files or [])]
@@ -1620,10 +1640,12 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
     # 4) init SQL：只对空数据目录生效（最常见的「改了没用」）
     sf = hit("init.sql", "init_mariadb.sql")
     if sf:
-        add("manual", "初始化 SQL 已变更：仅对空数据目录的首次启动生效",
+        # notice/info：对**已在运行**的节点，init SQL 变了什么都不用做（数据目录非空，
+        # 不会被重刷）。此前算作 manual 待办 → 永远等不到消除 → 徽标永久挂死。
+        add("notice", "初始化 SQL 已变更：仅对空数据目录的首次启动生效",
             "init SQL 只在数据目录为空时执行一次。已初始化的实例**不会**被覆盖；"
             "若确需重刷账号/权限，请在节点本机执行 fix-node-creds.sql。",
-            "", sf)
+            "", sf, "info")
 
     # 5) 账号修复脚本：需登录节点本机执行
     fx = hit("fix-node-creds.sql")
@@ -1631,7 +1653,7 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
         add("exec", "账号/权限修复脚本已更新：需在节点本机执行",
             "该文件含节点真实凭证，不经管理器下发，需登录节点用 root 执行"
             "（命令会交互式提示输入 root 密码）。",
-            "cd %s && mysql -uroot -p < %s" % (d, fx[0]), fx)
+            "cd %s && mysql -uroot -p < %s" % (d, fx[0]), fx, "optional", key="fix-creds")
 
     # 6) 节点 Agent（OS 指标采集）
     af = hit("node_agent.py")
@@ -1651,18 +1673,142 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
             # 实测（2026-10-02）：该异常只在「首次生成节点包」时触发（此时 prepare-logs.sh
             # 才属于变更文件、才会走到这一行），表现为「页面报 str/str 错误，但节点其实
             # 已经建成」，重复点一次（文件不再是变更项）就正常 —— 极难定位。
-            "cd %s && sudo bash %s" % (d, Path(_node_conf_dir(node_type)) / "conf" / "scripts" / "prepare-logs.sh"), lf)
+            "cd %s && sudo bash %s" % (d, Path(_node_conf_dir(node_type)) / "conf" / "scripts" / "prepare-logs.sh"), lf,
+            "optional", key="prepare-logs")
 
     # 8) 安装/卸载脚本：仅在重装/卸载场景执行
     inf = hit("Install-ha-mariadb-Node.sh", "Uninstall-mariadb-Node.sh",
               "Uninstall-mariadb-docker-Node.sh")
     if inf:
-        add("manual", "安装/卸载脚本已更新：仅在重装或卸载时需要执行",
+        # notice/info：正常运行中的节点无需执行，只在重装/改密/下线这种**特定场景**
+        # 才用得上。列为待办同样会造成「永远消不掉」的徽标。
+        add("notice", "安装/卸载脚本已更新：仅在重装或卸载时需要执行",
             "正常运行中的节点无需执行；重装/改密重跑 Install，下线节点跑 Uninstall。",
-            "", inf)
+            "", inf, "info")
 
     # update-node.sh 为工具脚本（按需手动用），不产生待办动作
     return acts
+
+
+def _pending_ack_secret():
+    from .config import SECRET_KEY
+    return (SECRET_KEY or "custos-ha").encode("utf-8")
+
+
+def pending_ack_token(ip, key):
+    """为「节点执行完脚本后回传已执行」签发 token（无状态 HMAC，不落库）。
+
+    绑定 ip + 动作 key：换一台机器、或换个 key 都验签失败。因此即便 URL 泄露，
+    也只能清除**该节点的这一条**待办，不能拿去乱清别人的。
+    """
+    try:
+        exp = int(time.time()) + PENDING_ACK_TTL
+        msg = ("pending-ack.%s.%s.%d" % (ip, key, exp)).encode("utf-8")
+        sig = hmac.new(_pending_ack_secret(), msg, hashlib.sha256).hexdigest()[:32]
+        return "%d.%s" % (exp, sig)
+    except Exception:
+        return ""
+
+
+def verify_pending_ack_token(ip, key, token):
+    """校验节点回传 token（签名 + 有效期）。"""
+    try:
+        exp_s, _, sig = str(token or "").partition(".")
+        exp = int(exp_s)
+    except (ValueError, TypeError):
+        return False
+    if exp <= 0 or time.time() > exp:
+        return False
+    msg = ("pending-ack.%s.%s.%d" % (ip, key, exp)).encode("utf-8")
+    want = hmac.new(_pending_ack_secret(), msg, hashlib.sha256).hexdigest()[:32]
+    return hmac.compare_digest(want, sig or "")
+
+
+def action_key(a):
+    """取动作的稳定标识；存量数据没有 key 字段时按标题回推，保证回传对老数据也有效。"""
+    k = str((a or {}).get("key") or "").strip()
+    if k:
+        return k
+    t = str((a or {}).get("title") or "")
+    if "账号/权限修复脚本" in t:
+        return "fix-creds"
+    if "日志目录" in t or "logrotate" in t:
+        return "prepare-logs"
+    return ""
+
+
+def is_notice_action(a):
+    """是否为「纯知会」条目——对运行中的节点无需任何动作，不该计入待办/挂徽标。
+
+    新版直接写 verify='info'；存量库里它们被写成 verify='manual'，只能按标题识别，
+    否则改完代码这 2 条仍会永远挂在徽标上（正是本次要修的现象）。
+    """
+    a = a or {}
+    if str(a.get("verify") or "") == "info" or a.get("level") == "notice":
+        return True
+    t = str(a.get("title") or "")
+    return any(h in t for h in _NOTICE_TITLE_HINTS)
+
+
+def is_optional_action(a):
+    """是否为「非强制」条目——不该占用「配置待生效」徽标。
+
+    两类都算非强制：
+      1. notice/info：纯说明（init SQL 只对空数据目录生效、安装脚本只在重装时用）；
+      2. optional：按需维护（fix-creds / prepare-logs），**健康节点通常不需要跑**——
+         真出问题时（账号漂移、日志目录缺失）会有独立告警顶上来，不靠这个待办提醒。
+
+    铁律：**凡无法自动核验、且对健康节点非必需的，一律不进待办清单。**
+    留在 pending 的只有能自动核验的（db_uptime / proc:* / db_alive），它们执行后
+    必然自动消失 —— 徽标因此从根上不可能挂死。
+    存量数据（verify 曾写成 manual）按 level=='exec' / 标题特征兼容识别。
+    """
+    if is_notice_action(a):
+        return True
+    a = a or {}
+    if str(a.get("verify") or "") == "optional":
+        return True
+    return a.get("level") == "exec"      # 存量 exec 项 verify 仍是 manual
+
+
+def pending_ack_cmd(ip, key):
+    """生成「执行完脚本后回传已执行」的 curl 命令（免登录、一次性 token）。
+
+    节点上跑完动作再粘这一条（或拼成 `脚本 && 本命令`），该条待办即从「配置待生效」
+    清单中消失——不必回到页面点「已执行」，也避免徽标长期挂死被当成 bug。
+    """
+    if not ip or not key:
+        return ""
+    try:
+        from .bootstrap import manager_base_url
+        base = manager_base_url()
+    except Exception:
+        return ""
+    tok = pending_ack_token(ip, key)
+    if not tok:
+        return ""
+    return ('curl -fsS "%s/api/nodes/%s/pending/done?token=%s&key=%s" -o /dev/null '
+            '|| echo "[warn] 回传失败（动作本身可能已生效，可在管理端点「已执行」）"'
+            % (base, ip, tok, key))
+
+
+def ack_pending_action(ip, key):
+    """节点回传「已执行」后，按 key **精确清除这一条**待办，其余保留。
+
+    与 ack_node_pending 的区别：后者是页面人工确认（对整份清单做判断），
+    这里是脚本回执（单条精确），不会误清尚未执行的其他动作。
+    """
+    acts = node_pending_actions(ip) or []
+    if not acts:
+        return {"cleared": [], "kept": [], "found": False}
+    remain, cleared = [], []
+    for a in acts:
+        if action_key(a) and action_key(a) == str(key):
+            cleared.append((a or {}).get("title") or "")
+        else:
+            remain.append(a)
+    _save_pending(ip, remain)
+    return {"cleared": cleared, "kept": remain, "found": bool(cleared)}
 
 
 def node_pending_actions(ip):
@@ -1688,7 +1834,18 @@ def node_pending_actions(ip):
         data = json.loads(raw)
     except Exception:
         return []
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return []
+    # 滤掉「非强制」条目（说明 + 按需维护）：它们对运行中的节点不构成**必须做**的动作，
+    # 挂进徽标只会让运维以为「系统有故障待修复」，且永远消不掉。
+    acts = [a for a in data if not is_optional_action(a)]
+    # 为每条动作**现签**回传命令（不落库：token 有 TTL，且管理器对外 IP 可能变更）。
+    for a in acts:
+        if isinstance(a, dict):
+            k = action_key(a)
+            if k:
+                a["ack_cmd"] = pending_ack_cmd(ip, k)
+    return acts
 
 
 def ack_node_pending(ip, force=False):
@@ -1908,8 +2065,17 @@ def verify_node_pending(ip):
                                "若管理器与该节点时钟不一致也会导致误判，可点「仍然清除」人工确认" % svc)
             remain.append(a)
         else:
-            # manual / exec：节点侧一次性动作，保留待运维确认或后续人工处理。
-            a["reason"] = "该动作需在节点上手工执行，无法远程核验，需人工确认"
+            # 非强制条目（说明类 + fix-creds / prepare-logs 等按需维护）：
+            # 对已在运行的节点不构成必须做的动作，必须清掉——否则它永远等不到「落实」，
+            # 徽标就永久挂死，运维只会认为这是个 bug。存量数据同样在此被清理。
+            if is_optional_action(a):
+                logger.info("节点[%s] 忽略非强制条目(运行中节点无需动作)：%s",
+                            ip, a.get("title"))
+                continue
+            # manual / exec：节点侧一次性动作，无法远程观测。保留，但给出两条
+            # 销账路径：在节点执行后用 curl 回传，或回页面点「已执行」。
+            a["reason"] = ("该动作需在节点上手工执行，无法远程核验；"
+                           "执行后粘贴条目内的 curl 命令即可自动销账，或点下方「已执行」")
             remain.append(a)
 
     if len(remain) != len(acts):
@@ -2339,11 +2505,15 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # 否则一旦生成目录被清空/迁移后重新生成，已上线节点会被误报「首次部署」。
     _actions = deploy_actions(_changed, node_type, host_compose,
                               fresh=(not _old_snap) and (not _prev_fp))
+    # 只把「非做不可且能自动核验」的落库：说明类与按需维护项（fix-creds / prepare-logs）
+    # 对运行中的节点不是必须动作，写进去只会让 pending_actions 永远非空 → 徽标永久挂死
+    #（页面徽标判据就是该字段非空）。它们仍在本次 regen 的结果弹窗里以「可选」展示。
+    _pending = [a for a in (_actions or []) if not is_optional_action(a)]
     if _fp != _prev_fp:
         try:
             execute("UPDATE nodes SET gen_fingerprint=%s, pending_actions=%s, "
                     "pending_since=NOW() WHERE ip=%s",
-                    (_fp, json.dumps(_actions, ensure_ascii=False) if _actions else "", ip))
+                    (_fp, json.dumps(_pending, ensure_ascii=False) if _pending else "", ip))
         except Exception:
             pass
     # ⚠ 不再「添加节点即任命主库」：initial_role 只是【偏好】，不是任命。
