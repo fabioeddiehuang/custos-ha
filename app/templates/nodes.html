@@ -37,6 +37,12 @@
   .ig-v.mono{font-family:var(--mono)}
   .ig-v.tr{cursor:default}
   .ig-v.tr:hover{color:var(--primary)}
+  /* 节点选择列：复选框要一眼可见，否则运维根本注意不到「可以勾选节点做批量操作」 */
+  th.sel-col,td.sel-col{text-align:center;width:46px}
+  .node-sel,.grp-sel{width:16px;height:16px;cursor:pointer;
+    accent-color:var(--primary,#0ABAB5);outline:2px solid rgba(10,186,181,.35);outline-offset:1px}
+  .node-sel:hover,.grp-sel:hover{outline-color:var(--primary,#0ABAB5)}
+  tr:hover .node-sel{outline-color:var(--primary,#0ABAB5)}
   /* 批量操作条 */
   .batch-bar{display:none;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;padding:10px 14px;border-radius:12px;background:#16233d;border:1px solid var(--border)}
   .batch-bar.show{display:flex}
@@ -76,7 +82,8 @@
      导致只能逐个勾选或按集群全选。放在常驻工具条（而非默认隐藏的批量条内），
      勾选后批量操作条自动出现。 #}
   <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);cursor:pointer;user-select:none">
-    <input type="checkbox" id="selAll" onchange="toggleSelectAll(this)" title="全选/取消全部节点"> 全选
+    <input type="checkbox" id="selAll" onchange="toggleSelectAll(this)" title="全选/取消全部节点"
+           style="width:15px;height:15px;accent-color:var(--primary,#0ABAB5);cursor:pointer;outline:2px solid rgba(10,186,181,.35);outline-offset:1px"> 全选
   </label>
   <span class="spacer"></span>
   <span class="badge sky">共 {{ nodes|length }} 个节点 · {{ groups|length }} 个集群</span>
@@ -107,14 +114,14 @@
   <table class="tbl">
     <thead>
       <tr>
-        <th style="width:36px"><input type="checkbox" class="grp-sel" onchange="toggleGroup(this,'g{{ g.id }}')" title="全选/取消本集群"></th>
+        <th class="sel-col"><input type="checkbox" class="grp-sel" onchange="toggleGroup(this,'g{{ g.id }}')" title="全选/取消本集群"></th>
         <th>节点</th><th>版本</th><th>状态</th><th>操作</th>
       </tr>
     </thead>
     <tbody id="g{{ g.id }}">
       {% for n in g.nodes %}
       <tr data-host="{{ n.ip }}:{{ n.port }}" data-cluster="{{ n.cluster_id or '' }}" data-install="{{ n.compose_path }}">
-        <td><input type="checkbox" class="node-sel" value="{{ n.ip }}" onchange="syncBatchBar()" title="选择该节点"></td>
+        <td class="sel-col"><input type="checkbox" class="node-sel" value="{{ n.ip }}" onchange="syncBatchBar()" title="勾选后可对该节点执行批量操作（重新生成 / 下载修复SQL / 删除）"></td>
         <td class="mono">{{ n.ip }}:{{ n.port }}
           {# 刻意**不用告警红**：这是「运维还有事要做」的清单，不是系统报错。
              红色徽标会被误读成"这台机器有故障待修复"，故改用中性信息色 + ⚙ 图标。 #}
