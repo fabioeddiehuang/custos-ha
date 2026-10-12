@@ -131,6 +131,47 @@ _DATA_CONFLICT_STREAK_NEED = 3
 _DATA_CONFLICT_LOGGED = set()
 
 
+# 已销账过的节点（避免每周期重复 UPDATE；节点转为不健康时清除，下次恢复可再次销账）
+_UNRESOLVED_CLEARED = set()
+
+
+def _clear_node_unresolved(cid, host, port, healthy, reason=""):
+    """节点恢复健康后，把该节点历史遗留的 unresolved 告警自动销账。
+
+    为什么必须要有它（2026-10-12）：
+      「需重建 / 复制数据冲突」这类告警以 ``status='unresolved'`` 落库（见
+      _alert_data_conflict 与「主库 binlog 已清理」分支），而 ``cancel_alert`` 只撤销
+      **观察期内待发的邮件**，不会回头改 alerts 表；源码注释里那句「复制恢复后清除」
+      清的只是内存去重集合 _DATA_CONFLICT_LOGGED（用于允许再次记录），**不是库记录**。
+      ⇒ 即使后来节点已重建、复制已正常，这些 unresolved 记录仍永久挂在告警中心，
+      成为永不消失的红标（实测 2026-09-24 的三条至今仍在，而复制 IO/SQL=Yes、SBM=0）。
+
+    healthy=False 时不销账，并清除「已销账」标记，使节点再次恢复后能重新评估。
+    """
+    key = (cid, host, port)
+    if not healthy:
+        _UNRESOLVED_CLEARED.discard(key)
+        return
+    if key in _UNRESOLVED_CLEARED:
+        return
+    try:
+        n = execute(
+            "UPDATE alerts SET status='healed' WHERE cluster_id=%s AND host=%s "
+            "AND status='unresolved'", (cid, host))
+    except Exception as e:
+        print(f"[monitor] 销账 {host} 的历史告警失败(可忽略): {e}")
+        return
+    _UNRESOLVED_CLEARED.add(key)
+    if n:
+        try:
+            record_alert(cid, host, port, "selfheal",
+                         f"节点 {host} 已恢复健康（{reason}），{n} 条历史未恢复告警"
+                         f"（需重建/数据冲突）已自动销账。")
+        except Exception:
+            pass
+        print(f"[monitor] {host} 的历史 unresolved 告警已销账 {n} 条（{reason}）")
+
+
 def _alert_data_conflict(key, host, port, cluster_name, cid, msg):
     """复制「数据冲突」告警（需连续多周期复现 + 限频）。
 
@@ -924,6 +965,15 @@ def _act_once():
                     print(f"[monitor] {h_host}:{h_port} 重建已完成，重置自愈退避与卡死计数")
             except Exception:
                 pass
+            # ---- 节点恢复健康后，销账其历史遗留的 unresolved 告警（防红标永久悬挂）----
+            try:
+                _healthy = bool(st.get("alive")) and (
+                    is_master or (st.get("slave_io") == "Yes" and st.get("slave_sql") == "Yes"
+                                  and (st.get("seconds_behind") or 0) == 0))
+                _clear_node_unresolved(cid, h_host, h_port, _healthy,
+                                       "复制 IO/SQL 正常且无延迟" if not is_master else "主库在线")
+            except Exception as e:
+                print(f"[monitor] 历史告警销账异常 {h_host}:{h_port}: {e}")
             # ---- binlog 空间守卫（仅主库，每小时一次）----
             if is_master and time.monotonic() >= _BINLOG_AT.get(key, 0.0):
                 _BINLOG_AT[key] = time.monotonic() + _BINLOG_INTERVAL
