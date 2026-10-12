@@ -128,8 +128,15 @@ _pending_lock = threading.Lock()
 _pending = {}
 
 
-def _defer_alert(cancel_key, delay, subject, body, cluster_id, recipients):
-    """挂起一封告警：delay 秒后若未被 cancel_alert 取消，才真正投递。"""
+def _defer_alert(cancel_key, delay, subject, body, cluster_id, recipients, scope=""):
+    """挂起一封告警：delay秒后若未被 cancel_alert 取消，才真正投递。
+
+    ⚠️ 本函数是【覆盖式重挂】：同一 cancel_key 再次进入时会 cancel 掉上一个 timer
+    并把 deadline 往后推 delay。因此调用方**必须**只在状态跃迁时调用
+    （monitor._alert_on_transition 的各分支都有 prev 门控）；若像历史上的 repl_fork
+    分支那样「每周期都调」，且探活周期 < 观察期，则 deadline 被无限后推、
+    告警永远不会发出（2026-10-12 深挖确认的真 bug）。
+    """
     with _pending_lock:
         old = _pending.pop(cancel_key, None)
         if old:
@@ -138,18 +145,23 @@ def _defer_alert(cancel_key, delay, subject, body, cluster_id, recipients):
             except Exception:
                 pass
         t = threading.Timer(delay, _flush_alert,
-                            args=(cancel_key, subject, body, cluster_id, recipients))
+                            args=(cancel_key, subject, body, cluster_id, recipients, scope))
         t.daemon = True
-        _pending[cancel_key] = {"timer": t, "subject": subject, "at": time.time() + delay}
+        _pending[cancel_key] = {"timer": t, "subject": subject, "scope": scope,
+                                "at": time.time() + delay}
         t.start()
     print(f"[alert:pending] 「{subject}」进入 {delay}s 自愈观察期，期内恢复则只记录不发送")
 
 
-def _flush_alert(cancel_key, subject, body, cluster_id, recipients):
-    """观察期结束仍未取消 -> 故障是真实的，投递邮件。"""
+def _flush_alert(cancel_key, subject, body, cluster_id, recipients, scope=""):
+    """观察期结束仍未取消 -> 故障是真实的，投递邮件。
+
+    scope 必须原样带回，否则到点后的冷却 key 与挂起时算的不一致
+    （2026-10-12：冷却 key 此前不含节点维度，同集群不同节点会互相吞告警）。
+    """
     with _pending_lock:
         _pending.pop(cancel_key, None)
-    _deliver(subject, body, cluster_id, recipients)
+    _deliver(subject, body, cluster_id, recipients, scope=scope)
 
 
 def cancel_alert(cancel_key, note=""):
@@ -254,13 +266,19 @@ def _subject_pass_maintenance(subject):
 
 
 def send_alert(subject, body, cluster_id=None, recipients=None, force=False,
-               grace=None, cancel_key=None):
+               grace=None, cancel_key=None, scope=""):
     """发送告警邮件。
 
     grace/cancel_key：启用「自愈观察期」。传入 cancel_key 后，告警不会立刻投递，
     而是挂起 grace 秒（缺省取 ALERT_GRACE_SEC）；期间若调用方用同一 cancel_key
     调用 cancel_alert()（表示故障已自愈），邮件被撤销，调用方改走「只记录」分支。
     force=True 时忽略观察期（测试邮件等）。
+
+    scope（2026-10-12 新增）：**节点维度**，形如 "192.168.1.188:3307"。参与同类冷却的
+    key 计算。旧实现冷却 key 只用 (主题, 集群)，而主题是字面常量、节点信息只在 body 里
+    ⇒ 同集群 A 节点的「复制中断」会把 B 节点 5 分钟内的同类故障一起静默吞掉，
+    且跃迁触发不重试 ⇒ 该告警既无邮件也无落库。传 scope 后按节点独立冷却。
+    不传则退化为旧行为（仅按主题+集群），故对既有调用方零破坏。
     """
     global last_error
     last_error = ""
@@ -276,13 +294,13 @@ def send_alert(subject, body, cluster_id=None, recipients=None, force=False,
     if not force and cancel_key:
         g = _alert_grace_sec() if grace is None else int(grace or 0)
         if g > 0:
-            _defer_alert(cancel_key, g, subject, body, cluster_id, recipients)
+            _defer_alert(cancel_key, g, subject, body, cluster_id, recipients, scope)
             return False
 
-    return _deliver(subject, body, cluster_id, recipients, force=force)
+    return _deliver(subject, body, cluster_id, recipients, force=force, scope=scope)
 
 
-def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
+def _deliver(subject, body, cluster_id=None, recipients=None, force=False, scope=""):
     """真正投递（含同类冷却节流）。由 send_alert 或观察期到点后调用。"""
     global last_error, _CHANNEL_ERROR
     last_error = ""
@@ -310,12 +328,20 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
         print(f"[alert:skip] {subject} | {body}")
         return False
 
-    # ---- 同类告警节流：同一 (主题, 集群) 在冷却期内只发一封 ----
+    # ---- 同类告警节流：同一 (主题, 集群, 节点) 在冷却期内只发一封 ----
+    # scope（节点维度）必须参与 key：主题在monitor 中是字面常量、节点信息只在 body，
+    # 旧 key 不含节点 ⇒ 同集群多节点的**独立**故障互相静默吞掉（2026-10-12 深挖）。
     if not force:
         cooldown = _alert_cooldown_sec()
         if cooldown > 0:
-            key = f"{subject.strip()}||{cluster_id if cluster_id is not None else '_global'}"
-            now = time.time()
+            key = "%s||%s||%s" % (subject.strip(),
+                                   cluster_id if cluster_id is not None else '_global',
+                                   scope or '_all')
+            # ⚠️ 必须用**单调钟**（2026-10-12）：本模块其余限频（monitor._HEAL_NEXT_AT 等）
+            # 用的都是 time.monotonic()。墙钟回拨（NTP 校正 / 人工改时）会让
+            # now - last 变成负值 ⇒ `now - last < cooldown` 恒成立 ⇒ 该 key 被
+            # **无限期抑制**（回拨 1 小时 = 该类告警静默 1 小时以上）。
+            now = time.monotonic()
             with _alert_lock:
                 last = _last_sent.get(key, 0.0)
                 if now - last < cooldown:

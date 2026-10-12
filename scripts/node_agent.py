@@ -52,6 +52,19 @@ class Collector:
         self._cache = {"ts": 0, "data": None}
         self._cache_ttl = 2.0          # 同机缓存 2s，防止短间隔重复采样 CPU
 
+    def _proc(self, name):
+        """拼出 /proc 文件路径，**统一走 self.root**（--root /host）。
+
+        ⚠️ 2026-10-12：此前只有 disks() 用 self.root，mem_info/host_info/
+        _cpu_sample 全部硬编码 "/proc/..."。而 mem_info 优先走 psutil，
+        官方 python:3-slim 镜像**不含 psutil** ⇒ 必然落到 /proc/meminfo 回退分支。
+        当前部署下 agent 容器无内存限额、且 pid: host，恰好读到宿主机数据（巧合正确）；
+        但一旦将来给 agent 加 mem_limit 或改用带 psutil 的镜像，
+        内存就会变成「容器视角」而磁盘仍是「宿主视角」⇒ **同一张表口径不一致**。
+        现统一走 self.root，与 disks()、_proc_started_at 对齐。
+        """
+        return os.path.join(self.root, "proc", name)
+
     # ---- CPU ----
     def _cpu_sample(self):
         if psutil is not None:
@@ -61,7 +74,7 @@ class Collector:
             total = sum(t)  # 所有字段求和
             return idle, total
         # /proc/stat 回退
-        with open("/proc/stat") as f:
+        with open(self._proc("stat")) as f:
             line = f.readline()
         parts = [float(x) for x in line.split()[1:]]
         idle = parts[3]
@@ -69,22 +82,35 @@ class Collector:
         return idle, total
 
     def cpu_percent(self):
-        cur = self._cpu_sample()
-        with self._lock:
-            prev = self._cpu_prev
-            self._cpu_prev = cur
-        if prev is None:
-            return 0.0
-        idle_delta = cur[0] - prev[0]
-        total_delta = cur[1] - prev[1]
-        if total_delta <= 0:
-            return 0.0
-        return round((1.0 - idle_delta / total_delta) * 100.0, 1)
+        # ⚠️ 2026-10-12：整体 try/except —— 单项指标采集失败不得让整节点指标全灭。
+        #   旧实现里 _cpu_sample 的 open("/proc/stat") 无保护，而 collect() 用同一个
+        #   dict 字面量汇总所有指标（无 per-metric 降级）：CPU 一项抛异常 →
+        #   /stats 返回 500 → **该节点所有** OS 指标（内存/磁盘/负载/启动时间）全部不可见，
+        #   且故障表现与「agent 挂了」无法区分，显著抬高排障成本。
+        try:
+            cur = self._cpu_sample()
+            with self._lock:
+                prev = self._cpu_prev
+                self._cpu_prev = cur
+            if prev is None:
+                # 差值型指标必须两次采样才有意义：首次返回 None（前端显示「—」），
+                # 而不是 0.0 —— 「CPU 0%」会被渲染成一条误导性的绿色空条。
+                return None
+            idle_delta = cur[0] - prev[0]
+            total_delta = cur[1] - prev[1]
+            if total_delta <= 0:
+                return None
+            return round((1.0 - idle_delta / total_delta) * 100.0, 1)
+        except Exception:
+            return None
 
     # ---- 内存 ----
     def mem_info(self):
         if psutil is not None:
-            vm = psutil.virtual_memory()
+            try:
+                vm = psutil.virtual_memory()
+            except Exception:
+                return None
             return {
                 "total_mb": round(vm.total / 1024 / 1024, 1),
                 "used_mb": round((vm.total - vm.available) / 1024 / 1024, 1),
@@ -92,10 +118,16 @@ class Collector:
                 "percent": round(vm.percent, 1),
             }
         info = {}
-        with open("/proc/meminfo") as f:
-            for line in f:
-                k, _, v = line.partition(":")
-                info[k.strip()] = int(v.strip().split()[0])  # KB
+        try:
+            with open(self._proc("meminfo")) as f:
+                for line in f:
+                    k, _, v = line.partition(":")
+                    parts = v.split()
+                    if not parts:
+                        continue          # 空值行：旧实现会 IndexError/ValueError
+                    info[k.strip()] = int(parts[0])  # KB
+        except Exception:
+            return None
         total = info.get("MemTotal", 0)
         avail = info.get("MemAvailable", info.get("MemFree", 0))
         used = total - avail
@@ -151,12 +183,12 @@ class Collector:
             "cpus": os.cpu_count() or 0,
         }
         try:
-            with open("/proc/uptime") as f:
+            with open(self._proc("uptime")) as f:
                 info["uptime_sec"] = int(float(f.readline().split()[0]))
         except Exception:
             pass
         try:
-            with open("/proc/loadavg") as f:
+            with open(self._proc("loadavg")) as f:
                 l1, l5, l15 = f.readline().split()[:3]
             info["load1"] = float(l1)
             info["load5"] = float(l5)
@@ -165,6 +197,21 @@ class Collector:
             pass
         return info
 
+    def _safe(self, fn, default=None, tag=""):
+        """单项指标采集的安全包装：失败返回 default，绝不冒泡到 collect()。
+
+        2026-10-12：collect() 原先把所有指标塞进同一个 dict 字面量、**无逐项降级**，
+        任一项抛异常则 /stats 整个 500，该节点**所有** OS 指标一起消失，
+        且与「agent 挂了」的现象无法区分。现在每项独立兜底：
+        单项失败只让该项为空（前端显示「—」），其余指标照常上报。
+        """
+        try:
+            return fn()
+        except Exception as e:
+            if tag:
+                print("[stats] %s 采集失败：%s" % (tag, e), flush=True)
+            return default
+
     def collect(self):
         now = time.time()
         with self._lock:
@@ -172,16 +219,17 @@ class Collector:
                 return self._cache["data"]
         data = {
             "ts": int(now),
-            "cpu_percent": self.cpu_percent(),
-            "mem": self.mem_info(),
-            "disks": self.disks(),
-            "host": self.host_info(),
+            "cpu_percent": self._safe(self.cpu_percent, None, "cpu"),
+            "mem": self._safe(self.mem_info, None, "mem"),
+            "disks": self._safe(self.disks, [], "disks"),
+            "host": self._safe(self.host_info, None, "host"),
             "agent": "custos-node-agent",
             "version": 2,
             # 进程启动时间（epoch 秒）：管理器据此自动核验 keepalived / node-agent
             # 是否已在节点上重启（「配置待生效」自动监测，无需人工点「已执行」）。
-            "agent_started_at": _self_started_at(self.root),
-            "keepalived_started_at": _proc_started_at(self.root, "keepalived"),
+            "agent_started_at": self._safe(lambda: _self_started_at(self.root), None, "agent_start"),
+            "keepalived_started_at": self._safe(
+                lambda: _proc_started_at(self.root, "keepalived"), None, "keepalived_start"),
         }
         with self._lock:
             self._cache = {"ts": now, "data": data}
@@ -514,7 +562,11 @@ def make_handler(collector, token):
 # ---------------------------------------------------------------------------
 AGENT_VERSION = "2.5.1"
 ALLOWED_SCRIPTS = ("update-node.sh", "prepare-logs.sh")
-ALLOWED_SERVICES = ("keepalived", "agent", "mariadb")
+# compose 里的 service **实名**。注意 agent 容器名是「custos-node-agent」，
+# 不是「agent」—— 传错名字 `docker compose restart agent` 会报 no such service 而
+# 静默不重启，导致「文件已下发但新代码未生效」（2026-10-12 深挖）。
+# 「agent」保留仅为兼容旧版本管理器下发。
+ALLOWED_SERVICES = ("keepalived", "custos-node-agent", "agent", "mariadb")
 
 
 def _unit_dir():
@@ -577,7 +629,15 @@ def run_command(verb, payload):
         for svc in (payload.get("restart") or []):
             if svc not in ALLOWED_SERVICES:
                 return False, "不允许重启的服务：%s" % svc
-            subprocess.run(_compose(["restart"], svc), timeout=120)
+            # ⚠️ 必须检查 returncode（2026-10-12 修复）：旧实现丢弃返回值并恒返回 True
+            # ⇒ `docker compose restart <svc>` 失败（如 no such service）时，
+            # 管理端收到 ok=1、页面显示「成功」、待办被销账，而容器其实**没重启**。
+            # 这正是「改了 agent 脚本以为生效」的完整静默失效链路。
+            p = subprocess.run(_compose(["restart"], svc), timeout=120,
+                               capture_output=True, text=True)
+            if p.returncode != 0:
+                _err = ((p.stderr or "") + (p.stdout or "")).strip().replace("\n", " ")[-300:]
+                return False, "重启服务 %s 失败(rc=%s)：%s" % (svc, p.returncode, _err or "无输出")
         return True, "已更新 %d 个文件" % len(files)
     if verb in ("restart_service", "stop_service", "start_service"):
         svc = payload.get("service")

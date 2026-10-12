@@ -55,6 +55,10 @@ MYSQL_NODE_CONF_DIR = "mysql8.0"
 # 按版本动态取名（mariadb12.3.3 / mariadb11.4.13 / mariadb10.6.28 ...）。
 MARIADB_NODE_CONF_DIR = "mariadb12.3.3"
 AGENT_DIR = "agent"
+# compose 里节点 agent 的 **service 实名**。下发「重启 agent」指令时必须用它，
+# 写错会让 `docker compose restart <name>` 报 no such service 而静默不生效
+# （2026-10-12 深挖发现 _auto_push_changed 曾误用 "agent"）。
+AGENT_COMPOSE_SERVICE = "custos-node-agent"
 
 # 主线版本：节点与集群都没登记版本时的唯一回退值。
 MARIADB_MAINLINE_VERSION = "12.3.3"
@@ -1323,8 +1327,30 @@ def render_fix_node_creds_sql_mariadb(ha_user, ha_pass, repl_user, repl_pass,
 
 
 def _write(path: Path, text: str, mode=0o600):
+    """原子写：先写同目录临时文件 → fsync → os.replace → chmod。
+
+    ⚠️ 2026-10-12 修复：旧实现是 ``path.write_text(text)``（O_TRUNC 截断后就地写入），
+    **非原子**。若在 truncate 与 write 之间进程被杀/磁盘写满，磁盘上会留下**半截文件**：
+      · node_agent.py 是 Python 脚本 ⇒ 容器重启后直接 SyntaxError 起不来；
+      · keepalived.conf / docker-compose.yaml 半截 ⇒ keepalived 拒绝加载、compose 解析失败。
+    该文件还被 :ro 挂进容器且无备份，此前一旦写坏只能人工重装节点。
+    os.replace 在同一文件系统内是原子的，配合 fsync 保证掉电后也不会拿到空/半截内容。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+    tmp = path.with_name(path.name + ".tmp-%d" % os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)      # 原子替换（POSIX 保证同 fs 内的 rename 原子性）
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise
     os.chmod(path, mode)
 
 
@@ -1372,6 +1398,63 @@ def _refresh_all_keepalived_conf(cluster_id=None):
             _write(p, conf)
 
 
+def _render_node_compose(node_type, node_name, root_pass, port, server_id, vip_port,
+                         mysql_version=None, conf_dir=None):
+    """按节点形态渲染 docker-compose —— **唯一写入方**（2026-10-12）。
+
+    三种形态口径必须一致：
+      mariadb         -> render_baremetal_compose（compose 只跑 keepalived 客户端，mysqld 由宿主 systemd 起）
+      mariadb-docker  -> render_mariadb_compose（mariadb + keepalived 合一，含版本跟随的 conf_dir）
+      mysql*          -> _render_compose（compose 内单独含 MySQL 容器）
+
+    ⚠️ 历史缺陷（2026-10-12 深挖修复）：regenerate_cluster_compose 曾对**所有** MariaDB
+    形态（含 mariadb-docker）都写 render_baremetal_compose，把 mariadb-docker 节点已有的
+    「mariadb 服务定义 + 版本跟随的 conf_dir + agent 心跳环境变量」全部抹掉。
+    而 api.py 保存集群时**无条件**调用它 ⇒ 只改个集群名字就会摧毁全集群容器化节点的
+    compose；随后 deploy_actions 亲手生成的 `docker compose up -d --force-recreate mariadb`
+    报 `no such service: mariadb`，agent 心跳与配置漂移自动下发静默失效。
+    现在两条路径共用本函数，口径不可能再分叉。
+    """
+    if node_type == "mariadb":
+        return render_baremetal_compose(node_name, vip_port)
+    if node_type == "mariadb-docker":
+        return render_mariadb_compose(node_name, root_pass, port, server_id, vip_port,
+                                      mysql_version=mysql_version, conf_dir=conf_dir)
+    return _render_compose(node_name, root_pass, port, server_id, vip_port)
+
+
+def _inject_agent_env(compose, ip, unit_dir):
+    """把 agent 心跳环境变量注入 compose 的 custos-node-agent 服务块（幂等）。
+
+    2026-10-12：从 generate_node 内联逻辑抽出，供 regenerate_cluster_compose 复用 ——
+    否则改集群配置重渲染 compose 时会丢掉心跳环境变量，节点 agent 静默变哑。
+    """
+    try:
+        _tk_rows = query("SELECT agent_token FROM nodes WHERE ip=%s", (ip,))
+        agent_token = ((_tk_rows[0] or {}).get("agent_token") if _tk_rows else "") or ""
+    except Exception:
+        agent_token = ""
+    if not agent_token:
+        from .config import rand_secret as _rand_secret
+        agent_token = _rand_secret(24)
+        try:
+            execute("UPDATE nodes SET agent_token=%s WHERE ip=%s", (agent_token, ip))
+        except Exception:
+            pass
+    from .config import WEB_PORT as _WEB_PORT
+    _mgr_url = "http://%s:%d" % (get_manager_public_ip() or "", int(_WEB_PORT))
+    _anchor = "  custos-node-agent:\n    image: python:3-slim"
+    if _anchor not in compose:
+        # 模板结构若变化，宁可显式告警也不要静默丢掉心跳配置
+        print("[warn] 未能在 compose 中找到 custos-node-agent 服务块，agent 心跳未配置", flush=True)
+        return compose
+    if "NODE_AGENT_TOKEN=" in compose:
+        return compose  # 已注入，避免重复叠加
+    return compose.replace(
+        _anchor, _anchor + "\n" +
+        agent_env_yaml(ip, agent_token, _mgr_url, unit_dir).rstrip("\n"), 1)
+
+
 def regenerate_cluster_compose(cluster_id):
     """集群 VIP 端口(vip_port)变更后，重渲染该集群所有节点的 docker-compose；
     并补拷缺失的 notify 脚本（早期版本生成节点时不拷贝 notify 脚本，会导致
@@ -1385,7 +1468,8 @@ def regenerate_cluster_compose(cluster_id):
     vip_prefix = (creds or {}).get("vip_prefix") or VIP_PREFIX
     vrid = (creds or {}).get("vrid") or VRID
     rows = query(
-        "SELECT ip, port, root_pass, server_id, node_type, interface FROM nodes WHERE cluster_id=%s",
+        "SELECT ip, port, root_pass, server_id, node_type, interface, mysql_version, install_dir "
+        "FROM nodes WHERE cluster_id=%s",
         (cluster_id,))
     for r in rows:
         ip = r["ip"]
@@ -1427,14 +1511,20 @@ def regenerate_cluster_compose(cluster_id):
         if not p.exists():
             continue
         node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
-        if is_mariadb_node(node_type):
-            # 两种 MariaDB 形态的 compose 都只含 keepalived 客户端
-            content = render_baremetal_compose(node_name, vip_port)
-        else:
-            content = _render_compose(
-                node_name, r.get("root_pass") or "", int(r["port"]),
-                int(r.get("server_id") or 0), vip_port)
-            _write(kd.parent / MYSQL_NODE_CONF_DIR / "conf" / "ha-overrides.cnf", render_docker_my_cnf(r.get("mysql_version"), int(r.get("port") or 3306)), mode=0o644)
+        _mysql_version = r.get("mysql_version")
+        _mconf = _node_conf_dir(node_type, _mysql_version) if is_mariadb_node(node_type) else None
+        # 统一走 _render_node_compose（唯一写入方）：mariadb-docker 必须拿到
+        # render_mariadb_compose（含 mariadb 服务定义 + 版本跟随 conf_dir），
+        # 不能再用 render_baremetal_compose 覆盖掉（2026-10-12 修复的P0）。
+        content = _render_node_compose(
+            node_type, node_name, r.get("root_pass") or "", int(r["port"]),
+            int(r.get("server_id") or 0), vip_port,
+            mysql_version=_mysql_version, conf_dir=_mconf)
+        if not is_mariadb_node(node_type):
+            _write(kd.parent / MYSQL_NODE_CONF_DIR / "conf" / "ha-overrides.cnf",
+                   render_docker_my_cnf(_mysql_version, int(r.get("port") or 3306)), mode=0o644)
+        # 注入 agent 心跳环境变量（否则改集群配置后 agent 心跳与自动下发静默失效）
+        content, _ = _inject_agent_env(content, ip, r.get("install_dir") or node_install_dest(None))
         _write(p, content)
         # sync node agent script (OS metrics sidecar deployed with node compose)
         agent_src = Path(__file__).resolve().parent.parent / "scripts" / "node_agent.py"
@@ -1578,6 +1668,18 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
 
     files = [str(f).replace("\\", "/") for f in (changed_files or [])]
 
+    # 真实配置目录名（跟随版本）：优先从变更文件路径里**反推**（最可靠，与实际落盘同名），
+    # 推不出时才用 mysql_version 走 _node_conf_dir。绝不硬编码 mariadb12.3.3。
+    _conf_dir = ""
+    for _f in files:
+        _parts = _f.split("/", 1)
+        if len(_parts) == 2 and _parts[0].startswith("mariadb") and \
+                _parts[1].split("/", 1)[0] in ("conf", "scripts"):
+            _conf_dir = _parts[0]
+            break
+    if not _conf_dir:
+        _conf_dir = _node_conf_dir(node_type, mysql_version)
+
     def hit(*names):
         out = []
         for f in files:
@@ -1594,7 +1696,7 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
         if node_type == "mariadb":
             add("manual", "首次部署：安装 MariaDB 并拉起 keepalived",
                 "先跑安装脚本（全量安装 MariaDB + 初始化账号），再拉起 keepalived 与节点 agent。",
-                "cd %s && sudo bash mariadb12.3.3/scripts/Install-ha-mariadb-Node.sh "
+                "cd %s && sudo bash %s/scripts/Install-ha-mariadb-Node.sh "
                 "&& docker compose up -d keepalived custos-node-agent" % d,
                 [], "db_alive")
         else:
@@ -1673,7 +1775,7 @@ def deploy_actions(changed_files, node_type, host_dir, fresh=False):
             # 实测（2026-10-02）：该异常只在「首次生成节点包」时触发（此时 prepare-logs.sh
             # 才属于变更文件、才会走到这一行），表现为「页面报 str/str 错误，但节点其实
             # 已经建成」，重复点一次（文件不再是变更项）就正常 —— 极难定位。
-            "cd %s && sudo bash %s" % (d, Path(_node_conf_dir(node_type)) / "conf" / "scripts" / "prepare-logs.sh"), lf,
+            "cd %s && sudo bash %s" % (d, Path(_conf_dir) / "conf" / "scripts" / "prepare-logs.sh"), lf,
             "optional", key="prepare-logs")
 
     # 8) 安装/卸载脚本：仅在重装/卸载场景执行
@@ -2025,6 +2127,22 @@ def verify_node_pending(ip):
         if v == "db_uptime":
             # 数据库在待办产生之后被重建/重启过（Uptime 比经过时间短）即视为落实。
             if elapsed is not None and db_up is not None and db_up < elapsed - 2:
+                # 🔴 2026-10-12 语义收窄：**只**对「进程重启类」待办销账。
+                #   旧实现对**所有** verify=db_uptime 的待办都按 Uptime 判销，而
+                #   recreate 类待办要求的是「用【新】配置重建容器」——
+                #   节点在 regen 之后因任何原因重启（崩溃自愈 / OOM / 人工 restart /
+                #   宿主机重启，compose 里 restart: always，生产并不罕见）都会让
+                #   Uptime 归零 ⇒ 待办被静默清除，而**新配置根本没下发**。
+                #   这就是 commit94a8aaa 抑制「徽标长期挂死」后的反向漏报：
+                #   **徽标消失 ≠ 配置已生效**。
+                #   现在只有 process 类（重启即可生效的脚本/配置）才凭 Uptime 销账，
+                #   recreate 类必须另有「配置指纹已一致」的证据才可清除。
+                if str(a.get("verify", "")) != "db_uptime":
+                    a["reason"] = ("数据库已重启（Uptime=%ss < 待办年龄 %.0fs），但本条待办要求"
+                                   "【用新配置重建容器】，重启不等于已应用新配置，"
+                                   "请确认已执行重建命令；如确已生效可点「仍然清除」。"
+                                   % (db_up, elapsed))
+                    continue
                 logger.info("节点[%s] 待办已落实(数据库已重启, Uptime=%ss<%.0fs)：%s",
                             ip, db_up, elapsed, a.get("title"))
                 continue
@@ -2133,14 +2251,24 @@ def _auto_push_changed(ip, changed, unit_dir):
         if r.startswith("keepalived"):
             restart.add("keepalived")
         elif r.startswith("agent"):
-            restart.add("agent")
+            # ⚠️ compose 里的 service 实名是 **custos-node-agent**（见下方常量）。
+            # 旧值 "agent" 会让 agent 侧 `docker compose restart agent` 报
+            # `no such service: agent` → 容器**不重启** → 新代码不生效；再加上
+            # node_agent.py 侧不检查 returncode、恒回报成功 ⇒
+            # 「文件写进宿主、容器没重启、页面显示成功、待办被销账」，
+            # 是典型的「改了脚本以为生效」静默失效链路（2026-10-12 深挖）。
+            restart.add(AGENT_COMPOSE_SERVICE)
     if not files:
         return None
     return agent_hub.enqueue(
         ip, "update_files",
         {"files": files, "restart": sorted(restart)},
         actor="node_gen", ttl_sec=3600,
-        dedupe_key="drift_%s_%s" % (ip, abs(hash(tuple(sorted(files)))) % 10**8),
+        # ⚠️ 不得用内置 hash()：CPython 对 str 的 hash 受 PYTHONHASHSEED 随机化，
+        # 管理器每次重启后同一批文件会算出不同 key → enqueue 的「同 key 去重」失效
+        # → 反复下发同一批文件、反复触发 keepalived 重启。改用稳定摘要（2026-10-12）。
+        dedupe_key="drift_%s_%s" % (ip, hashlib.sha1(
+            "\n".join(sorted(files)).encode("utf-8")).hexdigest()[:16]),
     )
 
 
@@ -2398,41 +2526,17 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     if ctl_src.exists():
         _write(d / "custosctl", ctl_src.read_text(), mode=0o755)
 
-    # 5) docker-compose.yaml
-    #    MariaDB 裸机（mariadb）：compose 只跑 keepalived 客户端（mysqld 由宿主 systemd 起）；
-    #    MariaDB 容器化（mariadb-docker）：纯 compose（mariadb + keepalived 合一）；
-    #    仅 MySQL Docker 才在 compose 内单独含 MySQL 容器。
-    if node_type == "mariadb":
-        compose = render_baremetal_compose(node_name, vip_port)
-    elif node_type == "mariadb-docker":
-        compose = render_mariadb_compose(node_name, root_pass, port, server_id, vip_port,
-                                         mysql_version=mysql_version, conf_dir=_mconf)
-    else:
-        compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
+    # 5) docker-compose.yaml（渲染与 agent 环境注入统一走 _render_node_compose /
+    #    _inject_agent_env，与 regenerate_cluster_compose 共用同一实现，
+    #    杜绝「同一个文件两个写入方、口径不一致」的漂移 —— 2026-10-12 修复）
+    compose = _render_node_compose(
+        node_type, node_name, root_pass, port, server_id, vip_port,
+        mysql_version=mysql_version, conf_dir=_mconf)
 
     # ---- v2.5.0 F5：每节点独立 agent token + 心跳环境变量 ----
     # regen 时**保留既有 token**：换 token 会让已经在线的 agent 立刻认证失败、心跳断连，
     # 而重新下发单元/重启容器并不是总能同时发生。
-    try:
-        _tk_rows = query("SELECT agent_token FROM nodes WHERE ip=%s", (ip,))
-        agent_token = ((_tk_rows[0] or {}).get("agent_token") if _tk_rows else "") or ""
-    except Exception:
-        agent_token = ""
-    if not agent_token:
-        from .config import rand_secret as _rand_secret
-        agent_token = _rand_secret(24)
-    from .config import WEB_PORT as _WEB_PORT
-    _mgr_url = "http://%s:%d" % (get_manager_public_ip() or "", int(_WEB_PORT))
-    _unit_dir = _install_dest
-    _anchor = "  custos-node-agent:\n    image: python:3-slim"
-    if _anchor in compose:
-        compose = compose.replace(
-            _anchor,
-            _anchor + "\n" + agent_env_yaml(ip, agent_token, _mgr_url, _unit_dir).rstrip("\n"),
-            1)
-    else:
-        # 模板结构若变化，宁可显式告警也不要静默丢掉心跳配置
-        print("[warn] 未能在 compose 中找到 custos-node-agent 服务块，agent 心跳未配置", flush=True)
+    compose, agent_token = _inject_agent_env(compose, ip, _install_dest)
 
     _write(d / "docker-compose.yaml", compose)
 
@@ -2481,6 +2585,16 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         "ON DUPLICATE KEY UPDATE initial_role=%s, cluster_id=%s",
         (ip, port, initial_role, cluster_id, initial_role, cluster_id),
     )
+    # 🔴 2026-10-12 顺序修正：必须在**快照之前**刷新全集群 keepalived.conf。
+    #   旧顺序是「快照 → 算 changed → 写指纹/待办 → 之后才 _refresh_all_keepalived_conf」，
+    #   于是 refresh 造成的 keepalived.conf 变化（新增/删除节点后 unicast_peer 改变）
+    #   **完全落在快照之后**，既不计入 _changed、也不产生待办、也不经 _auto_push_changed
+    #   下发 ⇒ 「改了 A 但判定看的是 B」的方向性失配：新增节点后老节点 VRRP 互不知情，
+    #   页面全程无提示，运维日后 regen 该节点时 _old_snap 已含新 peer ⇒ 永远不会补出待办。
+    #   现在 refresh 在快照之前 ⇒ peer 变更能被正常判为「已变更」并生成待办。
+    #   （前提：此刻本节点已完成 nodes/hosts 登记，故 _peer_ips 读到的是最新节点表。）
+    _refresh_all_keepalived_conf(cluster_id)
+
     # ---- v2.3.0：变更生效提示 ----
     # 只有指纹真的变了才刷新待办（幂等：重复 regen 不会把已确认的待办又刷回来，
     # 也不会因为「无变化」而误清空运维尚未执行的动作）。
@@ -2504,7 +2618,8 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # fresh（首次部署）必须同时满足：生成目录为空 **且** 库中无历史指纹（此前从未生成过）。
     # 否则一旦生成目录被清空/迁移后重新生成，已上线节点会被误报「首次部署」。
     _actions = deploy_actions(_changed, node_type, host_compose,
-                              fresh=(not _old_snap) and (not _prev_fp))
+                              fresh=(not _old_snap) and (not _prev_fp),
+                              mysql_version=mysql_version)
     # 只把「非做不可且能自动核验」的落库：说明类与按需维护项（fix-creds / prepare-logs）
     # 对运行中的节点不是必须动作，写进去只会让 pending_actions 永远非空 → 徽标永久挂死
     #（页面徽标判据就是该字段非空）。它们仍在本次 regen 的结果弹窗里以「可选」展示。
@@ -2527,8 +2642,6 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
     # 预设主库【上线后】才被选为主；上线前其余节点等待且强制只读。
 
     # 7) 新增节点后刷新同集群所有节点的对等列表
-    _refresh_all_keepalived_conf(cluster_id)
-
     # MariaDB 裸机节点：宿主机已原生运行 MariaDB，只需拉起 keepalived + 节点 agent 容器
     # （compose 不含数据库服务，故不会另起一个 MySQL 容器抢占 3306；agent 即 custos-node-agent）。
     # 容器化 MariaDB 节点（mariadb-docker）：纯 compose 部署，入口即 docker compose up -d
@@ -2614,7 +2727,12 @@ def _node_is_read_only(ip, port, root_user, root_pass, ha_user, ha_pass):
                 pass
     if last_err:
         logger.warning("只读副本检测失败 %s:%s: %s", ip, port, last_err)
-    return False
+    # 🔴 2026-10-12：不再 fail-open。旧实现对「探测失败」返回 False，而 False 的语义是
+    #   「确定是可写主库」⇒ 调用方（下方 sync_node_creds）会在**可能确实是副本**的节点上
+    #   跑 ensure_ha_creds（CREATE/ALTER USER），与复制线程争用 mysql.* 元数据锁
+    #   （Waiting for dependent transaction to commit → 复制卡死）。
+    #   改为返回 None = 未知，调用方按**副本**处理（fail-closed）。
+    return None
 
 
 def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_repl_pass=None, old_app_user=None):
@@ -2681,8 +2799,9 @@ def sync_node_creds(cluster_id=None, old_ha_user=None, old_repl_user=None, old_r
                     logger.info("节点 %s:%s 影子账号权限已修复：%s", ip, port, _rmsg)
             except Exception as _e:
                 logger.info("节点 %s:%s 影子账号修复跳过：%s", ip, port, _e)
-            if _node_is_read_only(ip, port, root_user, root_pass, ha_user, ha_pass):
-                logger.info("节点 %s:%s 为只读副本，跳过直接账号同步（凭证由复制同步）", ip, port)
+            if _node_is_read_only(ip, port, root_user, root_pass, ha_user, ha_pass) is not False:
+                logger.info("节点 %s:%s 为只读副本或角色未知，跳过直接账号同步（凭证由复制同步）",
+                            ip, port)
                 ok, msg = True, "replica-skip"
             else:
                 # 优先用 ha_monitor（已知正确）自愈账号密码，并把 root@'<管理器IP>' 密码
@@ -2824,11 +2943,22 @@ def list_nodes(cluster_id=None):
 
 
 def delete_node_dir(ip):
-    """仅删除生成目录（不含 MySQL-data 数据卷）。"""
+    """仅删除生成目录（不含 MySQL-data 数据卷）。**返回删除的文件数**。
+
+    2026-10-12 修复：本函数原先**无 return**，而调用方 api.nodes_delete 写的是
+    ``extra = f"，并清理项目目录 {deleted} 个文件" if deleted else ""``
+    ⇒ deleted 恒为 None ⇒ 前端确认框承诺的「将同时清理项目目录中已生成的同名部署文件」
+    **100% 不会出现在返回消息里**，且清理失败也被 ``ignore_errors=True`` 静默吞掉。
+    现在返回实际删除数；清理失败向上抛（调用方据此把「DB 已删、目录未清」如实告知）。
+    """
     import shutil as _sh
     d = _safe_node_path(ip)
-    if d.exists():
-        _sh.rmtree(d, ignore_errors=True)
+    if not d.exists():
+        return 0
+    n = sum(len(files) for _r, _d, files in os.walk(d))
+    if not _sh.rmtree(d):        # rmtree 失败会抛异常，不再 ignore_errors
+        raise OSError("删除节点目录失败：%s" % d)
+    return n
 
 
 def delete_node(ip):

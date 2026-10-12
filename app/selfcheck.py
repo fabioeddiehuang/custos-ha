@@ -134,6 +134,26 @@ def _parse_grant_privs(grant_row):
     return privs
 
 
+def _probe_host_specs():
+    """授权自检要探测的 host 名单 —— 与 ensure_ha_creds **建号口径完全一致**。
+
+    取 _account_hosts()（ACCOUNT_HOST_MODE 决定：legacy=['%'] / additive=['%','<段>.%'] /
+    segment=['<段>.%']），再补 localhost / 127.0.0.1 两个本机变体。
+    绝不硬编码：探测名单与建号名单一旦分叉，就会把「账号存在」误判成「未找到」
+    （见 selfcheck_cluster_grants 内注释）。
+    """
+    try:
+        from app.ha_client.credentials import _account_hosts
+        from app.config import get_manager_public_ip
+        hosts = list(_account_hosts(get_manager_public_ip()))
+    except Exception:
+        hosts = ["%"]
+    for extra in ("localhost", "127.0.0.1"):
+        if extra not in hosts:
+            hosts.append(extra)
+    return hosts
+
+
 def selfcheck_cluster_grants(cluster_id, master_host, master_port, creds):
     """按 grants_spec 单一真相源核验集群主库账号授权，**MariaDB/MySQL 各自用正确集**。
 
@@ -142,7 +162,15 @@ def selfcheck_cluster_grants(cluster_id, master_host, master_port, creds):
     也不会漏检 MySQL 专有特权（如 SYSTEM_VARIABLES_ADMIN）。
     **能力感知**：期望集再按服务器真实支持的特权（SHOW PRIVILEGES）过滤，老版本缺特权
     不误报。best-effort：无 SHOW GRANTS FOR 权限时降级为提示，绝不阻断监控。
-    返回 (ok, [(level, msg)])。
+
+    **分级（L2 噪音治理，2026-10-12）**：本函数是「观测」，不是「告警通道」——
+    自愈负责补齐、send_alert 负责上报。因此这里发现的漂移**全部按 info 返回**：
+    本函数只在启动时跑一次（`_startup_selfcheck` 有 `_STARTUP_CHECKED` 守卫），
+    每条 warn 都会恰好刷在启动日志最显眼处，误判成本极高；而这些漂移几乎都能被
+    ensure_ha_creds 在下一轮补上。真正补不上的情况由 `repair_ha_shadow_grants`
+    的 send_alert（真告警路径）上报，不会因本处降级而丢失。
+
+    返回 (ok, [(level, msg)])，level ∈ {ok, info}。
     """
     issues = []
     ha_user = creds.get("ha_user") or "ha_monitor"
@@ -151,7 +179,9 @@ def selfcheck_cluster_grants(cluster_id, master_host, master_port, creds):
         conn = connect(str(master_host), int(master_port), ha_user, ha_pass)
     except Exception as e:
         # 拿不到主库连接不阻塞监控，仅记录（自愈/监控本身也连不上时会各自降级）
-        return True, [("warn", "授权自检跳过（主库不可连：%s）" % e)]
+        # 分级 info（L2 噪音治理）：主库不可连本身由monitor/心跳等**真告警路径**负责上报，
+        # 此处再报一次 warn 属重复告警，且自检只跑一次、必然刷在启动日志最显眼处。
+        return True, [("info", "授权自检跳过（主库不可连：%s）" % e)]
     try:
         from app.grants_spec import REQUIRED_ACCOUNTS, required_privileges
         from app.mariadb_matrix import server_privileges
@@ -162,9 +192,19 @@ def selfcheck_cluster_grants(cluster_id, master_host, master_port, creds):
         except Exception:
             flavour = F_MARIADB  # 探测失败按 MariaDB（项目主线）处理
         available = server_privileges(cur)  # None=探测失败，按全集比对
+        # —— 探测口径必须与【创建口径】一致（单一真相源）——
+        # 旧实现硬编码 ("%","localhost","127.0.0.1")，但节点上的账号是按
+        # _account_hosts() 建的：ACCOUNT_HOST_MODE ∈ {additive,segment} 时为
+        # ['%','<段>.%'] 或 ['<段>.%']。于是账号明明存在于 '<段>.%'，却被判
+        # 「未找到授权记录」→ warn 假阳性（真机 2026-10-12：账号 app 恒报此warn）。
+        # 这与 repair_ha_shadow_grants 的 1133 同源：**MySQL/MariaDB 按 host 精确度
+        # 优先匹配**，探测名单与真实建号名单分叉就会误判。
+        # 注：本函数以 ha_monitor 连接，**无权读 mysql.user**（不像 repair_ 走 root），
+        # 故不能像那里一样直接枚举真实 host，只能对齐「配置口径」。
+        host_specs = _probe_host_specs()
         for acct in REQUIRED_ACCOUNTS:
             actual = set()
-            for host_spec in ("%", "localhost", "127.0.0.1"):
+            for host_spec in host_specs:
                 try:
                     cur.execute("SHOW GRANTS FOR %s@%s", (acct, host_spec))
                     for row in cur.fetchall() or []:
@@ -174,7 +214,9 @@ def selfcheck_cluster_grants(cluster_id, master_host, master_port, creds):
                 except Exception:
                     continue
             if not actual:
-                issues.append(("warn", "账号 %s 未找到授权记录（ensure_ha_creds 会自愈补建）" % acct))
+                issues.append(("info", "账号 %s 在 %s 上未找到授权记录"
+                               "（ensure_ha_creds 会自愈补建）"
+                               % (acct, "/".join(host_specs))))
                 continue
             # 期望集：先按风味选对（MariaDB/MySQL 不同），再按服务器能力过滤，
             # 避免老版本缺特权被误报、也避免跨风味误报。
@@ -183,10 +225,13 @@ def selfcheck_cluster_grants(cluster_id, master_host, master_port, creds):
                 expected = [p for p in expected if p.upper() in available]
             missing = sorted(set(expected) - set(p.upper() for p in actual))
             if missing:
-                issues.append(("warn", "账号 %s 缺少特权 %s（授权漂移，下一轮 ensure_ha_creds 将补齐）"
+                # 分级 info（L2 噪音治理）：本条属「有兜底」——ensure_ha_creds 每轮都会
+                # 重授，下一轮即消失；真正补不上的情况由 repair_ha_shadow_grants 的
+                # send_alert 治本告警（真告警路径）上报，不会因本处降级而丢失。
+                issues.append(("info", "账号 %s 缺少特权 %s（授权漂移，下一轮 ensure_ha_creds 将补齐）"
                                % (acct, ",".join(missing))))
     except Exception as e:
-        issues.append(("warn", "授权自检异常(可忽略): %s" % e))
+        issues.append(("info", "授权自检异常(可忽略): %s" % e))
     finally:
         try:
             conn.close()

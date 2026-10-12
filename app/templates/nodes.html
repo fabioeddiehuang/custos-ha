@@ -114,7 +114,7 @@
   <table class="tbl">
     <thead>
       <tr>
-        <th class="sel-col"><input type="checkbox" class="grp-sel" onchange="toggleGroup(this,'g{{ g.id }}')" title="全选/取消本集群"></th>
+        <th class="sel-col"><input type="checkbox" class="grp-sel" data-tbody="g{{ g.id }}" onchange="toggleGroup(this,'g{{ g.id }}')" title="全选/取消本集群"></th>
         <th>节点</th><th>版本</th><th>状态</th><th>操作</th>
       </tr>
     </thead>
@@ -580,6 +580,17 @@
       var total = document.querySelectorAll(".node-sel").length;
       all.checked = (total > 0 && n === total);
     }
+    // 2026-10-12：同步回写各集群表头的分组复选框。此前只回写 #selAll，
+    //  导致「点顶部全选后分组框仍显示未勾选 / 全选状态下取消某节点分组框仍显示已勾选」。
+    //  这个状态直接决定批量删除的影响范围判断，误判代价很高。
+    document.querySelectorAll(".grp-sel").forEach(function(g){
+      var tb = document.getElementById(g.getAttribute("data-tbody") || "");
+      var box = tb ? tb.querySelectorAll(".node-sel") : [];
+      var checked = 0;
+      Array.prototype.forEach.call(box, function(b){ if(b.checked) checked++; });
+      g.checked = (box.length > 0 && checked === box.length);
+      g.indeterminate = (checked > 0 && checked < box.length);
+    });
   }
   function toggleSelectAll(el){
     document.querySelectorAll(".node-sel").forEach(function(i){ i.checked = !!el.checked; });
@@ -600,15 +611,40 @@
   // 串行执行，避免并发把管理端/节点打爆；结束后汇总成功/失败数
   function runBatch(ips, fn, label){
     var ok = 0, fail = 0, chain = Promise.resolve();
+    var errs = [], actions = [];
     ips.forEach(function(ip){
       chain = chain.then(function(){
-        return fn(ip).then(function(d){ if(d && d.ok) ok++; else fail++; })
-                     .catch(function(){ fail++; });
+        // ⚠ 2026-10-12 修复：① 收集每个节点的 msg/actions（此前全部丢弃，失败只剩一个数字，
+        //   403「只读账号无权」与 422 也只表现为 fail++，用户完全不知道原因）；
+        //   ② 「配置已生成」≠「节点已生效」—— actions 里的 recreate/restart/exec 必须到节点执行，
+        //   旧实现直接丢弃后报「成功 N 个」，等于系统替运维承诺配置已生效；
+        //   ③ 汇总改用 alert 阻塞展示：toast 生命周期 2600ms，而旧代码 900ms 后 reload
+        //   会把 DOM 重建、提示实际只显示 0.9 秒。
+        return Promise.resolve().then(function(){ return fn(ip); }).then(function(d){
+          if(d && d.ok){
+            ok++;
+            if(d.actions && d.actions.length){
+              actions.push(ip + " → " + d.actions.map(function(a){
+                return (a.title || a.reason || "") + (a.cmd ? ("  [" + a.cmd + "]") : "");
+              }).join("；"));
+            }
+          } else {
+            fail++;
+            errs.push(ip + "：" + ((d && (d.msg || d.error || d.detail)) || "失败（无返回信息）"));
+          }
+        }).catch(function(e){
+          fail++; errs.push(ip + "：" + (e && e.message ? e.message : "请求异常"));
+        });
       });
     });
     return chain.then(function(){
-      toast(label + "完成：成功 " + ok + " 个" + (fail ? ("，失败 " + fail + " 个") : ""), fail ? "err" : "ok");
-      setTimeout(function(){ location.reload(); }, 900);
+      var lines = [label + "完成：成功 " + ok + " 个" + (fail ? ("，失败 " + fail + " 个") : "")];
+      if(errs.length) lines.push("", "失败明细：", errs.join("\n"));
+      if(actions.length){
+        lines.push("", "⚠ 以下节点配置已生成，但仍需到节点执行动作后才生效：", actions.join("\n"));
+      }
+      alert(lines.join("\n"));
+      setTimeout(function(){ location.reload(); }, 200);
     });
   }
   function batchDelete(){
@@ -623,7 +659,8 @@
   function batchRegen(){
     var ips = selectedIps();
     if(!ips.length){ toast("请先勾选节点","err"); return; }
-    if(!confirm("确认批量重新生成以下 " + ips.length + " 个节点的配置文件？将覆盖原文件。\n\n" + ips.join("\n")))return;
+    if(!confirm("确认批量重新生成以下 " + ips.length + " 个节点的配置文件？将覆盖原文件。\n\n" + ips.join("\n")
+        + "\n\n注意：生成后部分节点仍需到节点执行重启/重建动作才会真正生效。"))return;
     runBatch(ips, function(ip){
       return fetch("/nodes/" + encodeURIComponent(ip) + "/regen",{method:"POST"}).then(function(r){return r.json();});
     }, "重新生成");
@@ -631,15 +668,27 @@
   function batchDownload(){
     var ips = selectedIps();
     if(!ips.length){ toast("请先勾选节点","err"); return; }
+    // 2026-10-12：补二次确认与风险提示 —— 该文件含 root/ha/replication **明文口令**，
+    // 一次勾选即可导出全集群凭据；且服务端失败时返回的 JSON/HTML 会被 download
+    // 属性原样存成 .sql，浏览器也可能拦截连续自动下载（而旧代码一律报「已触发」）。
+    if(!confirm("即将下载 " + ips.length + " 个节点的「账号/权限修复脚本」(fix-node-creds.sql)。\n\n"
+        + "⚠ 该文件含数据库 **明文口令**（root / ha_monitor / replication），"
+        + "请仅保存到受控位置、用后及时删除。\n\n" + ips.join("\n"))) return;
+    var done = 0;
     ips.forEach(function(ip, idx){
       setTimeout(function(){
         var a = document.createElement("a");
         a.href = "/nodes/" + encodeURIComponent(ip) + "/creds_sql";
         a.download = "fix-node-creds-" + ip + ".sql";
         document.body.appendChild(a); a.click(); a.remove();
+        done++;
+        if(done === ips.length){
+          alert("已触发 " + ips.length + " 个修复 SQL 下载。\n\n"
+            + "请逐个确认文件内容：若浏览器拦截了下载、或下载到的文件其实是 JSON/登录页"
+            + "（说明该节点失败或会话已过期），请回到节点列表单独重试。");
+        }
       }, idx * 400);
     });
-    toast("已触发 " + ips.length + " 个修复 SQL 下载，请留意浏览器下载提示","ok");
   }
   // ---- v2.3.0：变更生效动作清单 ----
   var PENDING_CMDS = [];

@@ -16,7 +16,7 @@ from pymysql import OperationalError, ProgrammingError, DatabaseError
 
 from app.config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, is_semi_sync_enabled
 from app import mariadb_matrix
-from .db_ops import ident_clause
+from .db_ops import ident_clause, _norm_priv
 from . import db_ops  # db_ops.set_read_only 避免与本模块 set_read_only 重名冲突
 
 
@@ -269,7 +269,12 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         except Exception:
             _extra_hosts = []
         if not _extra_hosts:
-            _extra_hosts = [h for h in ("%", manager_ip) if h]
+            # 🔴 2026-10-12：探测失败/无结果时**不再**回落塞 '%' / manager_ip。
+            #   GRANT 不隐式建号 → 对不存在的账号执行必报 1133，与本函数上方
+            #   「不存在的账号绝不 GRANT」的注释自相矛盾。宁可跳过额外特权补授
+            #   （真正的 GRANT 本身带 except 兜底），也不制造 1133 误报。
+            #   ⚠️ 6 份副本之一，改动必须 6/6 同步。
+            _extra_hosts = []
         for extra in _extra_privs:
             # 对每一个实际存在的 host 变体补授（精确 host 优先匹配，管理器连入命中的
             # 那个账号才必须齐权；缺 REPLICATION MASTER ADMIN 会导致 enable_semisync
@@ -280,8 +285,10 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                 try:
                     if extra.upper() not in _granted_privs(cur, ha_user, _h):
                         cur.execute("GRANT %s ON *.* TO '%s'@'%s'" % (extra, _esc_sql(ha_user), _h))
-                except Exception:
-                    pass
+                except Exception as _e:
+                    import logging as _lg
+                    # 补授失败→后续 enable_semisync 的 SET GLOBAL 会 Access Denied，必须露出
+                    _lg.getLogger(__name__).warning("补授半同步额外权限 %s 失败(ha_monitor@%s): %s", extra, _h, _e)
         # ---- F11：消除「精确 host 影子账号」造成的能力落差（2026-09-16 真机）----
         # 现象：节点上残留 ha_monitor@'<管理器IP>'（历史 fix 脚本交叉污染 / 旧版本遗留），
         #   MariaDB / MySQL 按 host **精确度优先**匹配 —— 管理器从管理器主机 IP 连入时
@@ -298,8 +305,13 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         except Exception:
             _ha_hosts = []
         _target_privs = _parse_grant_privs(ha_grant)
-        _shadow_hosts = set([h for h in _ha_hosts if h] + ["%"]
-                            + ([manager_ip] if manager_ip else []))
+        # 只对**实际存在**的 host 变体授权：对不存在的账号（例如节点上根本没有
+        # ha_monitor@'%'）执行 GRANT 会报 ERROR 1133
+        # "Can't find any matching row in the user table" —— GRANT 不会隐式建号
+        # （需先 CREATE USER）。这既每周期刷错误日志，还会被 repair_ha_shadow_grants
+        # 记成 missing 而触发**误告警**，把真实的权限缺口淹没。
+        # 账号若完全不存在，由 ensure_ha_creds 负责 CREATE，此处不越俎代庖。
+        _shadow_hosts = [h for h in _ha_hosts if h]
         for _h in _shadow_hosts:
             try:
                 if _target_privs and _target_privs.issubset(_granted_privs(cur, ha_user, _h)):
@@ -334,8 +346,9 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         if _binlog_off:
             try:
                 cur.execute("SET SESSION sql_log_bin=1")
-            except Exception:
-                pass
+            except Exception as _e:
+                import logging as _lg
+                _lg.getLogger(__name__).warning("恢复会话 binlog 失败(SET SESSION sql_log_bin=1): %s", _e)
         # 节点本地状态库 ha_local 的读写授权（见 _ensure_local_state_grant 说明）
         local_state_ok[0] = _ensure_local_state_grant(cur, ha_user)
 
@@ -415,8 +428,9 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         if used_for_connect == "ha_monitor" and root_pass:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as _e:
+                import logging as _lg
+                _lg.getLogger(__name__).debug("关闭连接异常: %s", _e)
             try:
                 conn = connect(host, port, root_user, root_pass, timeout=5)
                 cur = conn.cursor()
@@ -434,16 +448,20 @@ def ensure_ha_creds(host, port, root_user, root_pass,
             _rc = connect(host, port, root_user, root_pass, timeout=5)
             _ensure_local_state_grant(_rc.cursor(), ha_user)
             _rc.close()
-        except Exception:
-            pass
+        except Exception as _e:
+            import logging as _lg
+            # 此处失败会导致 ha_local 授权未补全 → keepalived 读不到 current_master → VIP 无法归属
+            _lg.getLogger(__name__).warning("root 回退补全 ha_local 授权失败: %s", _e)
     try:
         cur.execute("FLUSH PRIVILEGES")
-    except Exception:
-        pass
+    except Exception as _e:
+        import logging as _lg
+        _lg.getLogger(__name__).warning("FLUSH PRIVILEGES 失败: %s", _e)
     try:
         conn.close()
-    except Exception:
-        pass
+    except Exception as _e:
+        import logging as _lg
+        _lg.getLogger(__name__).debug("关闭连接异常: %s", _e)
     return True, "ok (via %s)" % used
 
 
@@ -495,7 +513,9 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
         else:
             target = ("REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
                       "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE, EXECUTE")
-        target_set = {p.strip().upper() for p in target.split(",") if p.strip()}
+        # ⚠️ 归一化后再比对（2026-10-12），理由见 connection.py 同处注释。
+        #   ⚠️ 6 份副本之一，改动必须 6/6 同步。
+        target_set = {_norm_priv(p) for p in target.split(",") if p.strip()}
         try:
             cur.execute("SELECT DISTINCT Host FROM mysql.user WHERE User=%s", (ha_user,))
             _hosts = [r[0] for r in (cur.fetchall() or [])]
@@ -511,8 +531,11 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
         try:
             cur.execute("SET SESSION sql_log_bin=0")
             _binlog_off = True
-        except Exception:
-            pass
+        except Exception as _e:
+            # 关 binlog 失败则后续 GRANT 会进 binlog（被复制到从库），值得告警。
+            # 2026-10-12：此前这里是静默 pass，而本函数被设计为「可在只读副本上安全执行」
+            # （前提正是全程 sql_log_bin=0）；前提失效却无任何日志，副本侧会被污染。
+            _logger.warning("关闭会话 binlog 失败(SET SESSION sql_log_bin=0): %s", _e)
         repaired = 0
         missing = []  # 未能补齐授权的 host（缺口），不再「可忽略」
         for h in cand:
@@ -526,16 +549,20 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
                       % (host, port, h), flush=True)
             except Exception as e:
                 missing.append((h, str(e)))
-                # 缺口会导致 1227（CHANGE REPLICATION / SET read_only 失败），必须露出
-                print("[ha-shadow] %s:%s ha_monitor@%s 授权失败: %s"
-                      % (host, port, h, e), flush=True)
-                _logger.warning("[ha-shadow] %s:%s ha_monitor@%s 授权失败(缺口): %s",
-                                host, port, h, e)
+                # 缺口会导致 1227（CHANGE REPLICATION / SET read_only 失败），必须露出。
+                # 但本函数每轮自愈都会跑：同一缺口会**反复**刷屏，而 root 可用时它往往
+                # 下一轮就被补上 ⇒ 属 L2 定义的「有兜底」噪音。故：日志降 info + 6h 限频，
+                # 真正需要人工介入时由下方 send_alert 邮件承载（那里也限频，不丢告警）。
+                if warn_throttled(("ha-shadow-grant", host, int(port), h)):
+                    print("[ha-shadow] %s:%s ha_monitor@%s 授权失败: %s"
+                          % (host, port, h, e), flush=True)
+                    _logger.info("[ha-shadow] %s:%s ha_monitor@%s 授权失败(缺口): %s",
+                                 host, port, h, e)
         if _binlog_off:
             try:
                 cur.execute("SET SESSION sql_log_bin=1")
-            except Exception:
-                pass
+            except Exception as _e:
+                _logger.warning("恢复会话 binlog 失败(SET SESSION sql_log_bin=1): %s", _e)
         # 治本告警：存在授权缺口时明确暴露根因，避免「连得上却没权限」长期潜伏。
         # - root 不可达(used_root=False)是缺口主因：回退 ha_monitor 无 GRANT OPTION 无法补齐
         #   → 提示运维检查管理器 root_pass，否则手动/自动切换可能 1227 失败。
@@ -555,11 +582,14 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
                          "缺授权 host: %s。"
                          "请检查管理器 root_pass 配置；否则手动/自动切换可能因 1227 权限不足失败。"
                          % (host, port, _detail))
-            try:
-                from app.alerts import send_alert
-                send_alert(_subj, _body)
-            except Exception as _ae:
-                _logger.warning("send_alert 失败(授权缺口告警未发出): %s", _ae)
+            # 邮件是「真告警路径」，但同样限频：缺口若持续存在，6h 一封足够，
+            # 避免每轮自愈都发一封把邮箱刷爆（L2 噪音治理）。
+            if warn_throttled(("ha-shadow-alert", host, int(port))):
+                try:
+                    from app.alerts import send_alert
+                    send_alert(_subj, _body)
+                except Exception as _ae:
+                    _logger.warning("send_alert 失败(授权缺口告警未发出): %s", _ae)
         return repaired, ("已修复 %d 个影子账号" % repaired if repaired else "无需修复")
     except Exception as e:
         return 0, "异常: %s" % e
@@ -567,8 +597,9 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
         try:
             if conn:
                 conn.close()
-        except Exception:
-            pass
+        except Exception as _e:
+            import logging as _lg
+            _lg.getLogger(__name__).debug("关闭连接异常: %s", _e)
 
 """节点状态读取：只读/可写、复制位点、binlog 用量、提主等。"""
 
@@ -628,19 +659,31 @@ def db_uptime(host, port, user, password, root_user="root", root_pass="", timeou
 def is_read_only(host, port, ha_user, ha_pass, root_user="root", root_pass="", timeout=5):
     from .connection import (connect_robust)
     from .credentials import (ensure_ha_creds)
-    """判断节点是否只读（副本）。
+    """判断节点是否只读（副本）。**三态返回**（2026-10-12 修复 fail-open）。
 
-    用于自愈时跳过只读副本上的「直接账号 DDL / 改全局参数 DDL」：副本的账号与
-    gtid_mode/server_id 均来自主库经复制同步，管理器在副本上直接执行这些 DDL 会与其
-    复制来的同名语句争用元数据锁并漂权限（表现为 1045/1227 告警）。副本账号由主库
-    ensure_ha_creds 周期性 binlog 出去自动纠正。
+    返回：
+        True  = 确定是只读副本
+        False = 确定不是只读副本（可写主库）
+        None  = **探测失败，结论未知**（连不上 / 查询异常 / 返回空行）
+
+    🔴 旧实现对「探测失败」一律 ``return False``，而 False 的语义是
+      「确定是可写主库」。failover 的自愈据此走 else 分支，在节点上执行
+      ``fix_node_mysql_params``（SET GLOBAL gtid_mode/server_id）与
+      **全量 ensure_ha_creds**（含 CREATE / ALTER USER）——而这恰恰是本函数
+      docstring 花 200 字警告「绝对不能在副本上做」的操作，会与副本复制来的
+      同名 DDL 争用元数据锁（Waiting for dependent transaction to commit → 复制卡死）。
+      触发条件（节点瞬时不可连 / 双凭据 1045 / 超时）比正常自愈路径**更高频**，
+      讽刺的是这条分支的唯一目的就是防止在副本上跑 DDL。
+
+    语义改为「未知」并**fail-closed**：调用方应把 ``None`` 按**副本**处理
+    （最坏结果只是幂等地少跑一次自愈，无副作用）。
     """
     try:
         conn = connect_robust(host, port, ha_user, ha_pass, root_user, root_pass, timeout)
     except Exception:
-        return False
+        return None
     if conn is None:
-        return False
+        return None
     try:
         cur = conn.cursor()
         cur.execute("SELECT @@global.read_only")
@@ -652,9 +695,11 @@ def is_read_only(host, port, ha_user, ha_pass, root_user="root", root_pass="", t
         _v = row[0] if row else None
         if isinstance(_v, (int, float)):
             return bool(int(_v))
+        if _v is None:
+            return None          # 查不到值 = 未知，而不是「不是副本」
         return str(_v).strip().upper() in ("1", "ON", "TRUE")
     except Exception:
-        return False
+        return None
     finally:
         try:
             conn.close()

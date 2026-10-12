@@ -1125,11 +1125,20 @@ def api_node_ready(ip: str, request: Request, token: str = Form(""),
 # ==================================================================
 @app.post("/api/agent/heartbeat")
 def api_agent_heartbeat(ip: str = Form(""), token: str = Form(""),
-                        agent_version: str = Form(""), facts: str = Form("")):
+                        agent_version: str = Form(""), facts: str = Form(""),
+                        local_interface: str = Form("")):
     """agent 心跳：上报存活并取回待执行指令。
 
     为什么不用登录态：节点上跑的是 daemon，没有浏览器会话。
     安全性由「每节点独立 token + 白名单动词」保证。
+
+    ⚠️ `local_interface` 必须在此**显式声明**（2026-10-12 修复）：
+      agent 每 30s 会上报本机承载节点 IP 的网卡名，但 FastAPI 只绑定声明过的
+      Form 字段，未声明的多余字段被**静默丢弃** ⇒ agent_hub.on_heartbeat 里
+      `payload.get("local_interface")` 恒为 None ⇒ `UPDATE nodes SET interface=...`
+      永不执行 ⇒ v2.5.0 的「节点网卡自适应」**从未真正生效过**，且无任何报错。
+      这正是「生成方 vs 消费方字段契约断裂」的典型：需要声明参数 **且** 放进 payload，
+      只改一处仍无效。
     """
     from . import agent_hub
     ip = (ip or "").strip()
@@ -1142,7 +1151,11 @@ def api_agent_heartbeat(ip: str = Form(""), token: str = Form(""),
         facts_d = json.loads(facts) if facts else {}
     except Exception:
         facts_d = {}
-    res = agent_hub.on_heartbeat(ip, {"version": agent_version, "facts": facts_d})
+    res = agent_hub.on_heartbeat(ip, {
+        "version": agent_version,
+        "facts": facts_d,
+        "local_interface": (local_interface or "").strip(),
+    })
     # 心跳顺带把 agent 版本记下来（排障时一眼看出哪些节点还是旧 agent）
     if agent_version:
         try:
@@ -1582,6 +1595,9 @@ def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
                   node_roots: str = Form(""),
                   deploy_form: str = Form(""), container: str = Form(""),
                   vrid: str = Form(""), interface: str = Form(""),
+                  ha_user: str = Form(""), ha_pass: str = Form(""),
+                  repl_user: str = Form(""), repl_pass: str = Form(""),
+                  app_user: str = Form(""), app_pass: str = Form(""),
                   user=Depends(auth_required)):
     """执行接管：建 Custos 账号 → 登记 nodes/hosts → 生成 sidecar 引导命令。
 
@@ -1628,7 +1644,20 @@ def api_adopt_run(nodes: str = Form(...), cluster_id: int = Form(0),
                                  vip_port=_vip_port,
                                  vrid=(vrid or "").strip() or None,
                                  interface=(interface or "").strip() or None,
-                                 node_type=_ntype)
+                                 node_type=_ntype,
+                                 # ⚠️ 接管向导第③步的「高级：自定义账号/密码」必须透传
+                                 #（2026-10-12 修复）：此前前端把这 6 个值放进 FormData，
+                                 # 但本端点**未声明**它们 ⇒ FastAPI 静默丢弃 ⇒
+                                 # create_cluster 全部走随机口令回落
+                                 # （ha_pass = ha_pass or rand_secret(16) …），
+                                 # 用户在 UI 上输了一整套口令，集群实际用的却是随机口令，
+                                 # 且**没有任何报错**。典型的「不报错、只丢值」契约断裂。
+                                 ha_user=(ha_user or "").strip() or None,
+                                 ha_pass=ha_pass or None,
+                                 repl_user=(repl_user or "").strip() or None,
+                                 repl_pass=repl_pass or None,
+                                 app_user=(app_user or "").strip() or None,
+                                 app_pass=app_pass or None)
         except Exception as e:
             return _json_ok({"ok": False, "error": "创建集群失败：%s" % e})
 
@@ -4573,12 +4602,43 @@ def nodes_add(
 
 @app.post("/nodes/delete")
 def nodes_delete(ip: str = Form(...), user=Depends(auth_required)):
+    """删除单个节点（批量删除由前端串行调用本接口，故审计按单节点逐条记录）。
+
+    ⚠️ 2026-10-12：`delete_node` 内部是 3 条**独立 commit** 的 DELETE（非事务），
+    第二条失败时第一条已提交 ⇒ 节点已从库中消失却报「删除失败」，前端无从判断
+    哪些是真删掉了。这里把「DB 已删、目录清理失败」明确区分为 warning 并如实回传，
+    而不是笼统的 ok:false。
+    """
+    actor = user.get("username") if isinstance(user, dict) else str(user)
     try:
         delete_node(ip)
         # 同步删除项目目录下已生成的同名部署单元（generated_nodes/<ip>）
-        deleted = delete_node_dir(ip)
+        try:
+            deleted = delete_node_dir(ip)
+        except Exception as de:
+            # 节点记录已删除，只是目录清理失败：如实报告，不谎报整体失败
+            try:
+                audit.add_audit(actor, "nodes_delete", ip,
+                                "成功（部署目录清理失败：%s）" % de)
+            except Exception:
+                pass
+            return JSONResponse({
+                "ok": True,
+                "warn": "部署目录清理失败",
+                "msg": "节点记录已删除，但部署目录清理失败：%s。请手工检查 "
+                       "generated_nodes/%s。" % (de, ip),
+            })
     except Exception as e:
+        try:
+            audit.add_audit(actor, "nodes_delete", ip, "失败：%s" % e)
+        except Exception:
+            pass
         return JSONResponse({"ok": False, "msg": f"删除失败：{e}"})
+    try:
+        audit.add_audit(actor, "nodes_delete", ip,
+                        "成功（并清理部署目录 %s 个文件）" % deleted)
+    except Exception:
+        pass
     extra = f"，并清理项目目录 {deleted} 个文件" if deleted else ""
     return JSONResponse({"ok": True, "msg": "已删除节点" + extra})
 
@@ -4623,14 +4683,25 @@ def nodes_regen(ip: str, user=Depends(auth_required)):
                 if f.is_file():
                     h = hashlib.md5(f.read_bytes()).hexdigest()
                     md5s.append({"file": str(f.relative_to(base)), "md5": h})
+        _acts = info.get("actions") or []
+        _chg = info.get("changed_files") or []
+        # 2026-10-12：批量 regen 会覆盖 N 套部署文件，此前**不留任何审计痕迹**
+        # （同文件的 add_node / create_cluster / failover / change_password 都有）。
+        try:
+            audit.add_audit(user.get("username") if isinstance(user, dict) else str(user),
+                            "nodes_regen", ip,
+                            "changed=%d pending_actions=%d" % (len(_chg), len(_acts)),
+                            cluster_id=int(n.get("cluster_id") or 0) or None)
+        except Exception:
+            pass
         return JSONResponse({
             "ok": True,
             "msg": f"已重新生成节点 {info['node_name']}",
             "run_cmd": info.get("run_cmd"),
             "md5s": md5s,
             # v2.3.0：变更生效动作清单（recreate / restart / exec / manual）
-            "actions": info.get("actions") or [],
-            "changed_files": info.get("changed_files") or [],
+            "actions": _acts,
+            "changed_files": _chg,
         })
     except Exception as e:
         return JSONResponse({"ok": False, "msg": f"重新生成失败: {e}"})
@@ -4752,6 +4823,21 @@ def nodes_ack_deploy(ip: str, force: bool = False, user=Depends(auth_required)):
         return JSONResponse({"ok": False, "msg": f"标记失败：{type(e).__name__}: {e}"})
 
 
+def require_not_viewer(user):
+    """只读账号（role=viewer）禁止访问**含明文凭证**的只读端点。
+
+    `auth_required` 只对**非 GET/HEAD/OPTIONS** 做角色校验，而本端点是 GET
+    ⇒ 只读账号可畅通访问，一次勾选就能批量拖走全集群明文口令（2026-10-12 深挖）。
+    与同页 `/api/node_detail`（POST，viewer 被 403）形成「同一能力、两个入口、
+    权限相反」的矛盾。此处显式补齐，使「拿明文口令」一律要求非只读角色。
+    """
+    if get_user_role(user) == ROLE_VIEWER:
+        raise HTTPException(
+            status_code=403,
+            detail="当前登录账号为「只读」（viewer），无权查看/下载含明文口令的修复 SQL。"
+                   "请改用管理员账号登录后重试。")
+
+
 @app.get("/nodes/{ip}/creds_sql")
 def node_creds_sql(ip: str, user=Depends(auth_required)):
     """下载该节点的「账号/权限修复脚本」fix-node-creds.sql。
@@ -4759,7 +4845,11 @@ def node_creds_sql(ip: str, user=Depends(auth_required)):
     该文件含真实凭证（ha_monitor / replication / root 及管理器服务端后台 IP），
     用于节点本机以真实 root 执行自愈：修正 ha_monitor 仅 GRANT USAGE、root@'<管理器IP>'
     密码漂移、复制账号缺失等问题。业务通信仅发生在「管理器服务端后台 IP」与节点之间。
+
+    ⚠️ 显式追加只读角色校验（2026-10-12）：GET 请求不会被 auth_required 的角色检查拦住，
+    而本文件含 root 明文口令。只读账号批量下载 = 一次拖走全集群凭据。
     """
+    require_not_viewer(user)
     try:
         row = query(
             "SELECT n.ip, n.port, n.node_type, n.root_user, n.root_pass, n.cluster_id "
@@ -4785,7 +4875,11 @@ def api_node_creds_sql(cluster_id: int = 0, host: str = "", port: int = 0,
 
     复用与 /nodes/<ip>/creds_sql 相同的渲染逻辑，供集群节点详情抽屉中
     「查看/下载自愈 SQL」按钮调用（抽屉只有 cluster_id+host+port，无独立 IP 入口）。
+
+    ⚠️ 同为 GET 且含明文口令，必须显式追加只读角色校验（2026-10-12），理由见
+    `require_not_viewer`。否则与 /nodes/<ip>/creds_sql 一起成为只读账号的越权出口。
     """
+    require_not_viewer(user)
     try:
         row = query(
             "SELECT n.ip, n.port, n.node_type, n.root_user, n.root_pass, n.cluster_id "

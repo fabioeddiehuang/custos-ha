@@ -853,7 +853,14 @@ def adopt_node(node, root_user, root_pass, creds, manager_ip="", manager_subnet=
     # 接管流程在第一步就卡死，且错误信息「节点不可达」极具误导性（其实是字段对不上）。
     if not (node.get("ok") or node.get("reachable")):
         return False, "节点探测未通过，无法建立账号（请先确认探测结果）"
-    from app.ha_client.credentials import ensure_ha_creds
+    # ⚠️ 必须从 facade（app.ha_client）导入，**不要**直连子模块（2026-10-12 修复）。
+    # 直连 `app.ha_client.credentials` 会拿到**未修版**的 ensure_ha_creds：
+    # 上一轮 1133 修复（只对实际存在的 host 变体 GRANT）当时只改了 connection/
+    # replication 两份，credentials 这份仍是「无脑塞 '%' + manager_ip」的老写法，
+    # 而 facade 按 connection→…→replication 顺序 import *（后者覆盖前者），
+    # 对外生效的一直是 replication.py 那份 ⇒ 直连子模块恰好命中唯一漏网的那份，
+    # 接管老库时稳定复现 ERROR 1133。
+    from app.ha_client import ensure_ha_creds
     ok, msg = ensure_ha_creds(
         host=node["host"], port=node["port"],
         root_user=root_user, root_pass=root_pass,

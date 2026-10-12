@@ -1084,6 +1084,16 @@ def startup_credential_check():
         return 0
     broken = [i for i in h.get("items", []) if i.get("status") == "broken"]
     if not broken:
+        # ✅ 2026-10-12 补销账：全库凭证都能解密 ⇒ 历史遗留的 cred_key/'open' 告警已过期。
+        #   此前该告警**只产生不销账**（全仓无任何代码把 cred_key 或 'open' 改成 healed），
+        #   运维重录凭证、密钥修好之后，那几条 open 会永久挂在告警中心；
+        #   而 alerts 表的 UI 又**不渲染 status 列**（只显示 acked 徽章），
+        #   运维既看不到它「未闭环」，也没有任何 resolve 接口 ⇒ 红标永久悬挂。
+        try:
+            execute("UPDATE alerts SET status='healed' "
+                    "WHERE alert_type='cred_key' AND status='open'")
+        except Exception as e:
+            print(f"[init_db] 销账凭证告警失败(可忽略): {e}")
         return 0
 
     print("=" * 62, flush=True)

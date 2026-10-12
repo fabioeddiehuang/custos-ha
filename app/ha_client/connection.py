@@ -16,7 +16,7 @@ from pymysql import OperationalError, ProgrammingError, DatabaseError
 
 from app.config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, is_semi_sync_enabled
 from app import mariadb_matrix
-from .db_ops import ident_clause
+from .db_ops import ident_clause, _norm_priv
 
 
 import os as _os
@@ -268,7 +268,12 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         except Exception:
             _extra_hosts = []
         if not _extra_hosts:
-            _extra_hosts = [h for h in ("%", manager_ip) if h]
+            # 🔴 2026-10-12：探测失败/无结果时**不再**回落塞 '%' / manager_ip。
+            #   GRANT 不隐式建号 → 对不存在的账号执行必报 1133，与本函数上方
+            #   「不存在的账号绝不 GRANT」的注释自相矛盾。宁可跳过额外特权补授
+            #   （真正的 GRANT 本身带 except 兜底），也不制造 1133 误报。
+            #   ⚠️ 6 份副本之一，改动必须 6/6 同步。
+            _extra_hosts = []
         for extra in _extra_privs:
             # 对每一个实际存在的 host 变体补授（精确 host 优先匹配，管理器连入命中的
             # 那个账号才必须齐权；缺 REPLICATION MASTER ADMIN 会导致 enable_semisync
@@ -507,7 +512,12 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
         else:
             target = ("REPLICATION SLAVE, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN, "
                       "SYSTEM_VARIABLES_ADMIN, PROCESS, SELECT, RELOAD, SUPER, DELETE, EXECUTE")
-        target_set = {p.strip().upper() for p in target.split(",") if p.strip()}
+        # ⚠️ 归一化后再比对（2026-10-12）：_granted_privs 已走 _parse_grant_privs（内含
+        #   _norm_priv），若此处仍用字面大写比对，「REPLICATION SLAVE ADMIN」（MySQL 官方
+        #   空格写法）与「REPLICATION_SLAVE_ADMIN」（本仓库写法）会被判为不同
+        #   ⇒ 幂等判定恒为 False ⇒ 每周期重复 GRANT、binlog 持续写盘。
+        #   ⚠️ 6 份副本之一，改动必须 6/6 同步。
+        target_set = {_norm_priv(p) for p in target.split(",") if p.strip()}
         try:
             cur.execute("SELECT DISTINCT Host FROM mysql.user WHERE User=%s", (ha_user,))
             _hosts = [r[0] for r in (cur.fetchall() or [])]
@@ -537,11 +547,15 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
                       % (host, port, h), flush=True)
             except Exception as e:
                 missing.append((h, str(e)))
-                # 缺口会导致 1227（CHANGE REPLICATION / SET read_only 失败），必须露出
-                print("[ha-shadow] %s:%s ha_monitor@%s 授权失败: %s"
-                      % (host, port, h, e), flush=True)
-                _logger.warning("[ha-shadow] %s:%s ha_monitor@%s 授权失败(缺口): %s",
-                                host, port, h, e)
+                # 缺口会导致 1227（CHANGE REPLICATION / SET read_only 失败），必须露出。
+                # 但本函数每轮自愈都会跑：同一缺口会**反复**刷屏，而 root 可用时它往往
+                # 下一轮就被补上 ⇒ 属 L2 定义的「有兜底」噪音。故：日志降 info + 6h 限频，
+                # 真正需要人工介入时由下方 send_alert 邮件承载（那里也限频，不丢告警）。
+                if warn_throttled(("ha-shadow-grant", host, int(port), h)):
+                    print("[ha-shadow] %s:%s ha_monitor@%s 授权失败: %s"
+                          % (host, port, h, e), flush=True)
+                    _logger.info("[ha-shadow] %s:%s ha_monitor@%s 授权失败(缺口): %s",
+                                 host, port, h, e)
         if _binlog_off:
             try:
                 cur.execute("SET SESSION sql_log_bin=1")
@@ -566,11 +580,14 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
                          "缺授权 host: %s。"
                          "请检查管理器 root_pass 配置；否则手动/自动切换可能因 1227 权限不足失败。"
                          % (host, port, _detail))
-            try:
-                from app.alerts import send_alert
-                send_alert(_subj, _body)
-            except Exception as _ae:
-                _logger.warning("send_alert 失败(授权缺口告警未发出): %s", _ae)
+            # 邮件是「真告警路径」，但同样限频：缺口若持续存在，6h 一封足够，
+            # 避免每轮自愈都发一封把邮箱刷爆（L2 噪音治理）。
+            if warn_throttled(("ha-shadow-alert", host, int(port))):
+                try:
+                    from app.alerts import send_alert
+                    send_alert(_subj, _body)
+                except Exception as _ae:
+                    _logger.warning("send_alert 失败(授权缺口告警未发出): %s", _ae)
         return repaired, ("已修复 %d 个影子账号" % repaired if repaired else "无需修复")
     except Exception as e:
         return 0, "异常: %s" % e

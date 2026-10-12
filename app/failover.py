@@ -924,7 +924,14 @@ def _selfheal_cluster(cluster_id):
         # 否则副本重装后 init SQL 写入的 ha_monitor/root 与库存不一致时，管理器连不上副本 ->
         # 副本永远 "down" -> 不被重指向、不自动加入集群（这正是「重装节点难自动加入」的根因之一）。
         # 故副本仅跑 ensure_connect_creds（只校正 ha_monitor/root，且全程 sql_log_bin=0 不回灌主库）。
-        if is_read_only(ip, port, creds["ha_user"], creds["ha_pass"], ru, rp):
+        # ⚠️ 必须 `is not False`（2026-10-12 修复 fail-open）：is_read_only 现为三态，
+        #   None = 探测失败、**结论未知**。旧式写法 `if is_read_only(...)` 会把 None
+        #   当成「不是副本」而走进 else 分支，在**可能确实是副本**的节点上执行
+        #   fix_node_mysql_params（SET GLOBAL gtid_mode/server_id）与全量
+        #   ensure_ha_creds（CREATE/ALTER USER）—— 正是 ha_client.status.is_read_only
+        #   的 docstring 明确警告会造成「元数据锁争用 → 复制卡死」的操作。
+        #   现改为 fail-closed：True 与 None 一律按副本处理（最坏只是少跑一次自愈）。
+        if is_read_only(ip, port, creds["ha_user"], creds["ha_pass"], ru, rp) is not False:
             _ts = _SELFHEAL_CRED_TS.get(cluster_id)
             if _ts is None or (time.time() - _ts) >= CRED_SELFHEAL_INTERVAL:
                 cok, cmsg = ensure_connect_creds(

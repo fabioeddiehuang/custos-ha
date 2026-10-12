@@ -399,6 +399,10 @@ function adExec(){
   fd.append('ha_user',$('f_haUser').value); fd.append('ha_pass',$('f_haPass').value);
   fd.append('repl_user',$('f_rpUser').value); fd.append('repl_pass',$('f_rpPass').value);
   fd.append('app_user',$('f_apUser').value); fd.append('app_pass',$('f_apPass').value);
+  // 2026-10-12 修复：网卡/VRID 之前只在「检测冲突」那一步发送，执行接管时漏发
+  // ⇒ 用户填的 VRID 从未落库（create_cluster 回落到全局默认值），且无任何报错。
+  fd.append('vrid', $('f_vrid').value);
+  fd.append('interface', $('f_iface').value);
   $('bExec').disabled = true;
   fetch('/api/adopt/run',{method:'POST',body:fd,credentials:'same-origin'})
     .then(function(r){return r.json();})

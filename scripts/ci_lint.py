@@ -3,7 +3,7 @@
 """ci_lint.py — Custos 稳定性「静态门禁」（v2.5 改造，对应 MR5）。
 
 解决「修了又复现」的**制度性**根因：没有门禁，同类 bug 一定换场景再犯。
-本脚本在 CI / pre-commit / 构建前运行，发现即失败，覆盖 5 类历史复发坑：
+本脚本在 CI / pre-commit / 构建前运行，发现即失败，覆盖 6 类历史复发坑：
 
   1. 裸 `except:`（吞异常，错误不可见）            —— MR2
   2. `except ...: pass` 单行静默吞（无日志）       —— MR2
@@ -11,8 +11,11 @@
        GTID_SUBSET(  /  super_read_only  /  IDENTIFIED WITH  /  IDENTIFIED VIA
      —— 只允许出现在 app/mysql_compat.py 与 app/ha_client/db_ops.py  —— MR1
   4. ha_client 子模块使用 detect_flavour/F_MARIADB/detect_syntax/F_MYSQL8
-     但未导入（拆包漏导入曾导致运行时 NameError）                 —— MR1
+    但未导入（拆包漏导入曾导致运行时 NameError）                 —— MR1
   5. 前端模板 <div> 开闭不平衡（页面变形头号元凶，UI-001 两次复发） —— 易用/MR3
+  6. ha_client 同名函数的多份副本必须逐字一致（AST 归一化比对）。
+     拆包时整段复制函数体 + facade `import *` 后者覆盖前者 ⇒ 「改一份不等于修好」。
+     1133 授权 bug 连续两轮以「只改了 N 份」的形式复发，本门禁用于杜绝第三次。 —— 2026-10-12
 
 用法：
     python3 scripts/ci_lint.py [--app-dir app] [--templates-dir app/templates]
@@ -23,6 +26,11 @@ import ast
 import os
 import re
 import sys
+
+# 门禁 6 白名单：**有意**不同的同名符号（不算副本漂移）。
+# - set_read_only：status.py 是主机级 7 参、db_ops.py 是游标级 3 参（facade 已显式再绑定）
+# - connect / _esc_sql：credentials.py 等为惰性转发到 connection.py 的薄封装
+_DUP_ALLOWED_DIFF = {"set_read_only", "connect", "_esc_sql"}
 
 # 风味敏感 SQL 只允许出现的「授权文件」
 # - mysql_compat.py：兼容层（含风味分支说明）
@@ -166,6 +174,53 @@ def check_div_balance(rel, src):
     return []
 
 
+def check_dup_function_consistency(ha_dir):
+    """门禁 6：ha_client 同名函数的多份副本必须**逐字一致**（AST 归一化后比对）。
+
+    背景（2026-10-12，两轮 1133 bug 的制度性根因）：
+      `app/ha_client/` 按职责拆包时，把 `ensure_ha_creds` / `repair_ha_shadow_grants` /
+      `_ensure_account` 等大函数**整段复制**到了 6 个子模块；`__init__.py` 又按
+      connection→status→gtid→credentials→local_state→replication 顺序 `import *`，
+      **后者覆盖前者** ⇒ 对外生效的一直是 replication.py 那份。
+      于是出现「改了 1 份、以为修好了，另 5 份没动」的经典失效：
+      1133 修复当时只落 2/6，而 adopt.py 直连 credentials 拿到的恰是唯一漏网的那份
+      ⇒ 接管老库稳定复现 ERROR 1133。本门禁就是用来杜绝第三次复发。
+
+    判定：以 AST dump（忽略注释/空白）做哈希；同名函数出现 ≥2 个不同哈希即报错。
+    白名单 `_DUP_ALLOWED_DIFF` 收录**有意不同**的同名符号（如主机级/游标级 set_read_only）。
+    """
+    import hashlib
+    files = sorted(f for f in os.listdir(ha_dir) if f.endswith(".py"))
+    buckets = {}
+    for fn in files:
+        p = os.path.join(ha_dir, fn)
+        try:
+            with open(p, encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+        except SyntaxError as e:
+            yield (fn, getattr(e, "lineno", 0) or 0,
+                   "语法错误，无法参与副本比对：%s" % e)
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            h = hashlib.sha1(
+                ast.dump(ast.Module(body=node.body, type_ignores=[])).encode()
+            ).hexdigest()[:10]
+            buckets.setdefault(node.name, {}).setdefault(h, []).append(fn)
+
+    for name, variants in sorted(buckets.items()):
+        if len(variants) <= 1:
+            continue
+        if name in _DUP_ALLOWED_DIFF:
+            continue
+        detail = "；".join("hash=%s -> %s" % (h, ", ".join(fs))
+                          for h, fs in sorted(variants.items()))
+        yield ("app/ha_client/", 0,
+               "同名函数 `%s` 存在 %d 种不同实现（facade 后导入者覆盖前者 ⇒ "
+               "改一份不等于修好）：%s" % (name, len(variants), detail))
+
+
 def main():
     ap = argparse.ArgumentParser()
     here = os.path.dirname(os.path.abspath(__file__))
@@ -187,6 +242,12 @@ def main():
             all_errors.append((rel, ln, "[风味SQL] " + msg))
         for ln, msg in check_ha_client_imports(path, rel, src):
             all_errors.append((rel, ln, "[缺导入] " + msg))
+
+    # 门禁 6：同名函数副本一致性（ha_client 拆包产物必须逐字一致）
+    ha_dir = os.path.join(args.app_dir, "ha_client")
+    if os.path.isdir(ha_dir):
+        for rel, ln, msg in check_dup_function_consistency(ha_dir):
+            all_errors.append((rel, ln, "[副本漂移] " + msg))
 
     if os.path.isdir(args.templates_dir):
         for root2, _d, files in os.walk(args.templates_dir):
@@ -212,7 +273,8 @@ def main():
             print("  %s:%s  %s" % (rel, ln, msg))
         print("=" * 60)
         sys.exit(1)
-    print("ci_lint 通过：无裸 except / 直拼风味 SQL / ha_client 缺导入 / <div> 不平衡")
+    print("ci_lint 通过：无裸 except / 直拼风味 SQL / ha_client 缺导入 / <div> 不平衡 / "
+      "ha_client 同名函数副本一致")
     sys.exit(0)
 
 

@@ -21,8 +21,17 @@ from .clusters import list_clusters
 from . import node_gen
 from . import backup, metrics, slow_log, config_drift
 
-# 复制延迟告警阈值（秒）。超过即发邮件告警，避免重复刷屏只在「跨阈值的那一刻」触发。
+# 复制延迟告警阈值（秒）的**默认值**。实际取值请用 _lag_alert_sec() 读取，
+# 它会优先取告警规则页写入的 ALERT_LAG_THRESHOLD。
+# 🔴 2026-10-12：此前 UI 把「复制延迟阈值」写进 ALERT_LAG_THRESHOLD 后**再无任何读取处**
+# （全仓唯一出现点就是那次 upsert），运维改完页面回显「已保存」但实际判定仍用硬编码 30s
+# —— 一个只写不读的死设置。现已接线。
 REPL_LAG_ALERT_SEC = 30
+
+# 销账健康判定允许的复制延迟容差（秒）。见 _clear_node_unresolved 调用处的说明：
+# 销账条件不得要求 seconds_behind 严格为 0，否则持续写入的集群红标永不消失。
+LAG_HEAL_TOLERANCE_SEC = 1
+
 # 各节点上一次观测状态（用于状态跃迁告警，避免每个周期重复刷屏）
 _PREV = {}
 # 各集群每个节点的连续探活失败计数（用于阈值触发自动切换）。
@@ -135,8 +144,13 @@ _DATA_CONFLICT_STREAK_NEED = 3
 _DATA_CONFLICT_LOGGED = set()
 
 
-# 已销账过的节点（避免每周期重复 UPDATE；节点转为不健康时清除，下次恢复可再次销账）
-_UNRESOLVED_CLEARED = set()
+# 已销账过的节点（避免每周期重复 UPDATE；节点转为不健康时清除，下次恢复可再次销账）。
+# 🔴 2026-10-12：改为 key -> 置位时刻，并在下方做 TTL 过期。
+# 旧实现是无 TTL 的 set() 且「无论 UPDATE 影响几行都置位」：一旦某次 UPDATE 因任何原因
+# 影响 0 行（记录已被别的路径改过、端口不匹配、DB 抖动），该节点此后再插入的
+# unresolved 记录就**永远销不掉**了 —— 红标永久悬挂。
+_UNRESOLVED_CLEARED = {}
+_UNRESOLVED_CLEARED_TTL = 900  # 15 分钟：足够避免每周期重复 UPDATE，又不会把标记变成永久
 
 
 def _clear_node_unresolved(cid, host, port, healthy, reason=""):
@@ -150,30 +164,42 @@ def _clear_node_unresolved(cid, host, port, healthy, reason=""):
       ⇒ 即使后来节点已重建、复制已正常，这些 unresolved 记录仍永久挂在告警中心，
       成为永不消失的红标（实测 2026-09-24 的三条至今仍在，而复制 IO/SQL=Yes、SBM=0）。
 
+    ⚠️ 三处必须精确（2026-10-12 修复，均有实测依据）：
+      ① UPDATE **必须带 port**。项目明确允许「同机不同端口」（见 _is_mgmt_endpoint 注释），
+         旧 SQL 只按 cluster_id+host 过滤 ⇒ 同 host:3306 恢复健康会把同 host:3307
+         仍坏着的红标一并抹掉（误销账）。
+      ② 只有 ``n > 0`` 才置「已销账」标记。旧实现无条件置位 ⇒ n=0 也置位，
+         此后该节点新插入的 unresolved 永远销不掉（永不销账）。
+      ③ 标记要有 TTL（见 _UNRESOLVED_CLEARED_TTL），否则一次误置位就是永久的。
+
     healthy=False 时不销账，并清除「已销账」标记，使节点再次恢复后能重新评估。
     """
     key = (cid, host, port)
     if not healthy:
-        _UNRESOLVED_CLEARED.discard(key)
+        _UNRESOLVED_CLEARED.pop(key, None)
         return
-    if key in _UNRESOLVED_CLEARED:
+    now = time.monotonic()
+    if now - _UNRESOLVED_CLEARED.get(key, -1e18) < _UNRESOLVED_CLEARED_TTL:
         return
     try:
         n = execute(
             "UPDATE alerts SET status='healed' WHERE cluster_id=%s AND host=%s "
-            "AND status='unresolved'", (cid, host))
+            "AND port=%s AND status='unresolved'", (cid, host, port))
     except Exception as e:
         print(f"[monitor] 销账 {host} 的历史告警失败(可忽略): {e}")
         return
-    _UNRESOLVED_CLEARED.add(key)
-    if n:
-        try:
-            record_alert(cid, host, port, "selfheal",
-                         f"节点 {host} 已恢复健康（{reason}），{n} 条历史未恢复告警"
-                         f"（需重建/数据冲突）已自动销账。")
-        except Exception:
-            pass
-        print(f"[monitor] {host} 的历史 unresolved 告警已销账 {n} 条（{reason}）")
+    # 🔴 只有真的销掉过才置标记（2026-10-12）。旧实现无条件置位：n=0 时把
+    # 「已销账」标记打上，此后再插入的 unresolved 记录永远不会被尝试销账。
+    if not n:
+        return
+    _UNRESOLVED_CLEARED[key] = now
+    try:
+        record_alert(cid, host, port, "selfheal",
+                     f"节点 {host} 已恢复健康（{reason}），{n} 条历史未恢复告警"
+                     f"（需重建/数据冲突）已自动销账。")
+    except Exception:
+        pass
+    print(f"[monitor] {host} 的历史 unresolved 告警已销账 {n} 条（{reason}）")
 
 
 def _alert_data_conflict(key, host, port, cluster_name, cid, msg):
@@ -504,20 +530,39 @@ def _in_maintenance(cluster_id, host=None):
         return False
 
 
+def _lag_alert_sec():
+    """复制延迟告警阈值（秒）：优先取告警规则页写入的 ALERT_LAG_THRESHOLD。
+
+    2026-10-12：该设置此前**只写不读**（全仓唯一出现点是那次 upsert），UI 改阈值
+    回显「已保存」但判定仍走硬编码 30s。现接线，取不到时回退 REPL_LAG_ALERT_SEC。
+    """
+    try:
+        v = int(get_setting("ALERT_LAG_THRESHOLD", "") or 0)
+    except Exception:
+        v = 0
+    return v if v > 0 else REPL_LAG_ALERT_SEC
+
+
 def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, cluster_id,
                          semi=None, repl_state=None, cur_master=None, upstream=None):
     """根据与上一次观测的差异发送告警，仅在状态跃迁时触发（避免刷屏）。"""
     prev = _PREV.get(key)
+    # ⚠️ 维护窗口内**不能**推进基线（2026-10-12 修复）。
+    # 旧实现先 `_PREV[key] = ...` 再判断维护窗口并 return：跃迁被抑制的同时基线已更新，
+    # 窗口结束后状态不再变化 ⇒ 「维护期间发生并持续的故障」**永远不会有任何告警**，
+    # 运维看到的是「维护结束后一切正常，从未收到过告警」。
+    # 现在提前 return 且不写基线 ⇒ 窗口结束后 prev仍是旧状态，跃迁照常触发。
+    if _in_maintenance(cluster_id, key[0]):
+        return
     _PREV[key] = dict(status=status, is_master=is_master, repl_ok=repl_ok, delay=delay,
                       semi=semi, repl_state=repl_state)
     if prev is None:
         return  # 首次观测只建立基线，不告警
-    # v2.3.3：维护窗口内抑制状态类告警（离线/复制/延迟/半同步），避免维护期刷屏。
-    # 切换类与「需人工处理」类不受影响（见 alerts._subject_pass_maintenance）。
-    if _in_maintenance(cluster_id, key[0]):
-        return
     host = f"{key[0]}:{key[1]}"
     h_host, h_port, h_cid = key[0], key[1], key[2]
+    # 冷却按**节点**独立（2026-10-12）：原先冷却 key 只含 (主题,集群)，而主题是字面常量
+    # ⇒ 同集群 A 节点的「复制中断」会把 B 节点的独立故障一起吞掉。
+    _scope = "%s:%s" % (h_host, h_port)
     tag = f"【{cluster_name}】" if cluster_name else ""
     # 自愈观察期：以下「状态类」告警先挂起 ALERT_GRACE_SEC 秒。期间若故障被自愈逻辑
     # 修复，cancel_alert() 会撤销邮件，只往告警中心记一条 info（见各分支的 healed 判定）。
@@ -531,7 +576,7 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
         if prev["status"] != status:
             if status == "down":
                 send_alert("节点离线", f"{tag}节点 {host} 已离线，监控连续探活失败。若为主库将触发自动切换。",
-                           cluster_id=cluster_id, cancel_key=_ck_offline)
+                           cluster_id=cluster_id, cancel_key=_ck_offline, scope=_scope)
             else:
                 # 观察期内就恢复了：不发「离线」也不发「恢复」邮件，只记录
                 if cancel_alert(_ck_offline, note=f"{host} 已恢复在线"):
@@ -539,11 +584,11 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
                                  f"{tag}节点 {host} 短时离线后已自动恢复（观察期内，未发送邮件）")
                 else:
                     send_alert("节点恢复在线", f"{tag}节点 {host} 已恢复在线，若为旧主将自动重新加入集群为从库。",
-                               cluster_id=cluster_id)
+                               cluster_id=cluster_id, scope=_scope)
         # 2) 复制中断（仅非主库且节点在线时；节点离线属于「节点离线」告警，不重复报）
         if status == "up" and not is_master and prev["repl_ok"] and not repl_ok:
             send_alert("复制中断", f"{tag}节点 {host} 复制异常（Slave_IO 或 Slave_SQL 非 Yes），请检查复制链路。",
-                       cluster_id=h_cid, cancel_key=_ck_repl)
+                       cluster_id=h_cid, cancel_key=_ck_repl, scope=_scope)
         elif status == "up" and not is_master and (not prev["repl_ok"]) and repl_ok:
             # 观察期内复制已自愈：撤销待发的「复制中断」邮件，只记一条自愈记录
             if cancel_alert(_ck_repl, note=f"{host} 复制已恢复"):
@@ -551,13 +596,14 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
                              f"{tag}节点 {host} 复制中断后已自动恢复（观察期内，未发送邮件）")
         # 3) 复制延迟过高（仅在「跨过阈值」那一刻告警，且仅在线节点）
         if status == "up" and not is_master and delay is not None:
-            crossed = delay >= REPL_LAG_ALERT_SEC and (
-                prev["delay"] is None or prev["delay"] < REPL_LAG_ALERT_SEC)
+            _lag_thr = _lag_alert_sec()
+            crossed = delay >= _lag_thr and (
+                prev["delay"] is None or prev["delay"] < _lag_thr)
             if crossed:
-                send_alert("复制延迟过高", f"{tag}节点 {host} 复制延迟 {delay}s，已超过阈值 {REPL_LAG_ALERT_SEC}s。",
-                           cluster_id=cluster_id, cancel_key=_ck_lag)
-            elif (prev["delay"] is not None and prev["delay"] >= REPL_LAG_ALERT_SEC
-                  and delay < REPL_LAG_ALERT_SEC):
+                send_alert("复制延迟过高", f"{tag}节点 {host} 复制延迟 {delay}s，已超过阈值 {_lag_thr}s。",
+                           cluster_id=cluster_id, cancel_key=_ck_lag, scope=_scope)
+            elif (prev["delay"] is not None and prev["delay"] >= _lag_thr
+                  and delay < _lag_thr):
                 if cancel_alert(_ck_lag, note=f"{host} 延迟已回落至 {delay}s"):
                     record_alert(cluster_id, h_host, h_port, "selfheal",
                                  f"{tag}节点 {host} 复制延迟已回落至 {delay}s（观察期内，未发送邮件）")
@@ -567,11 +613,11 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
                 send_alert("半同步退化(异步)",
                            f"{tag}主库 {host} 已退化为异步复制（半同步 master_status=OFF）。此期间提交的事务不等待从库 ACK，"
                            f"存在故障切换后数据丢失(RPO)风险。请检查从库连通性与 Slave_IO 线程、rpl_semi_sync_master_timeout。",
-                           cluster_id=cluster_id, cancel_key=_ck_semi)
+                           cluster_id=cluster_id, cancel_key=_ck_semi, scope=_scope)
             else:
                 send_alert("半同步降级",
                            f"{tag}从库 {host} 未处于半同步态（slave_status=OFF）。若该从库被提升为主库，可能缺失主库已提交事务。",
-                           cluster_id=cluster_id, cancel_key=_ck_semi)
+                           cluster_id=cluster_id, cancel_key=_ck_semi, scope=_scope)
         # 5) 半同步恢复：由非 ON 回到 ON
         if semi is not None and prev.get("semi") is not None and prev["semi"] != "ON" and semi == "ON":
             if cancel_alert(_ck_semi, note=f"{host} 半同步已恢复"):
@@ -580,19 +626,25 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
             else:
                 send_alert("半同步恢复",
                            f"{tag}节点 {host} 半同步已恢复（status=ON），数据丢失(RPO)风险解除。",
-                           cluster_id=cluster_id)
+                           cluster_id=cluster_id, scope=_scope)
         # 6) 复制指向错误主库（静默数据不一致，F14）：从库线程双 Yes 但上游≠当前主库。
         #    旧逻辑只看 slave_io/slave_sql，会把它当 repl_ok 掩盖；此处显式告警，
         #    并依赖每周期 ensure_topology 自动重指回当前主库（重指成功后取消告警）。
+        # 🔴 跃迁门控是【必需】的（2026-10-12 修复）：本分支原先无 prev 判据，每探活周期
+        #    （默认 2s）都调 send_alert(cancel_key=_ck_fork) → 进入观察期 → _defer_alert
+        #    每次 pop 掉旧 timer 重新挂起 ⇒ 因 CHECK_INTERVAL(2s) < ALERT_GRACE_SEC(30s)，
+        #    deadline 被无限后推、timer 永不到期 ⇒ 这条「静默数据不一致」告警
+        #    **既不发邮件、也不落 alerts 表、连 print 都没有**，唯一痕迹只有
+        #    hosts.repl_state 这一列。监控数据不一致的最后一道防线 100% 失效。
         _ck_fork = ("fork", h_cid, h_host, h_port)
         if status == "up" and not is_master:
-            if repl_state == "repl_fork":
+            if repl_state == "repl_fork" and prev.get("repl_state") != "repl_fork":
                 send_alert(
                     "复制指向错误主库(数据不一致风险)",
                     f"{tag}节点 {host} 复制线程正常(IO/SQL=Yes)，但其上游是 {upstream}，"
                     f"并非当前主库 {cur_master}。该节点正从「幽灵/旧主」拉数据，存在静默数据不一致；"
                     f"管理器将在下一周期自动重指回当前主库，若持续请检查拓扑与 current_master 记录。",
-                    cluster_id=cluster_id, cancel_key=_ck_fork)
+                    cluster_id=cluster_id, cancel_key=_ck_fork, scope=_scope)
             elif prev.get("repl_state") == "repl_fork":
                 # 此前是不一致、现已重指回正确主库：撤销告警并记一条自愈记录
                 if cancel_alert(_ck_fork, note=f"{host} 已重指回当前主库 {cur_master}"):
@@ -971,9 +1023,16 @@ def _act_once():
                 pass
             # ---- 节点恢复健康后，销账其历史遗留的 unresolved 告警（防红标永久悬挂）----
             try:
+                # 🔴 2026-10-12：销账健康条件不得要求 ``seconds_behind`` **严格等于 0**。
+                # 该值在持续写入的集群里本就会在 0/1/2 之间抖动（旧写法），导致
+                # 「需重建 / 数据冲突」这类红标在**任何有写入的生产集群上永不消失**。
+                # 对照：告警【升级】用了「连续 N 周期」容错（见 _DATA_CONFLICT_STREAK），
+                # 销账却零容错 —— 口径不对称。现统一为「延迟 <= 容差」。
+                _sb = st.get("seconds_behind")
+                _lag_ok = (_sb is None) or (float(_sb) <= LAG_HEAL_TOLERANCE_SEC)
                 _healthy = bool(st.get("alive")) and (
                     is_master or (st.get("slave_io") == "Yes" and st.get("slave_sql") == "Yes"
-                                  and (st.get("seconds_behind") or 0) == 0))
+                                  and _lag_ok))
                 _clear_node_unresolved(cid, h_host, h_port, _healthy,
                                        "复制 IO/SQL 正常且无延迟" if not is_master else "主库在线")
             except Exception as e:
@@ -1644,10 +1703,18 @@ def _purge_stale_data():
         agent_hub.purge_old(days=7)
     except Exception as e:
         print(f"[monitor] 清理 agent_commands 异常: {e}", flush=True)
-    # 已闭环的告警超过 90 天删除（open 始终保留，避免漏报）
+    # 已闭环的告警超过 90 天删除（'open' 始终保留，避免漏报）
+    # ⚠️ 2026-10-12 修正名单：此前漏了 'healed' 与 'failed'。'healed' 是**绝大多数**
+    #   自愈/已恢复记录（占全表绝大部分），不在清理列表 ⇒ alerts 表事实上**只增不减**、
+    #   无限增长；而注释却写「已闭环的告警删除」。'failed' 是 `alert_channel` 的
+    #   **邮件投递失败旁证**（SMTP/DNS 故障期产生），同样会永久滞留并被误读为
+    #   「数据库有问题」。两者都已闭环或只是投递证据，纳入 90 天清理。
+    #   另注：'unresolved' 超过 90 天被物理删除，会让「需重建 / 数据冲突」这类
+    #   **未闭环**问题凭空消失。改为：unresolved 保留（只有真正闭环才清理），
+    #   由 _clear_node_unresolved / 人工 resolve 负责销账。
     try:
         execute("DELETE FROM alerts WHERE status IN "
-                "('resolved','closed','unresolved','acked') "
+                "('resolved','closed','acked','healed','failed') "
                 "AND created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)")
     except Exception as e:
         print(f"[monitor] 清理 alerts 异常: {e}", flush=True)

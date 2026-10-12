@@ -84,11 +84,27 @@ trap 'rc=$?; if [[ $_REPORTED -eq 0 ]]; then _REPORTED=1; err "脚本在第 $LIN
 trap 'rc=$?; if [[ $rc -ne 0 && $_REPORTED -eq 0 ]]; then err "脚本意外退出：退出码 $rc（无更多上下文）"; fi' EXIT
 
 # 安全读取 KEY=VALUE：文件不存在 / 键缺失 / 无匹配时返回空串，且**绝不**触发 set -e 退出
+#
+# ⚠️ 2026-10-12 修复转义口径不一致：写入方 app/node_gen.py 的 _shq() 产出的是
+#   **shell 单引号串**，口令里的单引号被转义成 '\'' 序列：
+#       LOCAL_ROOT_PASS='Abc'\''def'
+#   keepalived 侧用 `. "$CONF"` / source 消费，能正确还原成  Abc'def。
+#   而旧实现是 grep|cut|sed「只剥掉首尾各一个单引号」，得到的是 Abc'\''def
+#   （多出中间的 '\''）⇒ `mysql -uroot -p"$ROOT_PASS"` 用错口令 →
+#   步骤 6 设密/校验失败、安装中断或账号漂移。
+#   典型「写入方与读取方对同一字节序列解释不同」的坑。
+#   现改为**让 shell 自己做解析**（eval printf），语义与 source 完全一致。
+#   安全性：只对本脚本自身生成 / 管理端生成的 conf 求值，键名由调用方字面量传入。
 conf_get() {
-  local f="$1" k="$2"
+  local f="$1" k="$2" raw out
   [[ -f "$f" ]] || return 0
-  grep -E "^${k}=" "$f" 2>/dev/null | tail -1 | cut -d= -f2- \
-    | sed -E "s/^'//; s/'$//" || true
+  raw="$(grep -E "^${k}=" "$f" 2>/dev/null | tail -1 | cut -d= -f2-)" || true
+  [[ -z "$raw" ]] && return 0
+  # 整串拼进 printf 的**未加引号**参数，由 shell 完成引号剥离与 '\'' 还原。
+  # 外层 "$( )" 只捕获 stdout；解析异常返回空串，绝不因 set -e 中断整个安装。
+  out="$( eval "printf '%s' ${raw}" 2>/dev/null )" || out=""
+  printf '%s' "$out"
+  return 0
 }
 
 if [[ $EUID -ne 0 ]]; then
