@@ -88,8 +88,12 @@ _pending_lock = threading.Lock()
 _pending = {}
 
 
-def _defer_alert(cancel_key, delay, subject, body, cluster_id, recipients):
-    """挂起一封告警：delay 秒后若未被 cancel_alert 取消，才真正投递。"""
+def _defer_alert(cancel_key, delay, subject, body, cluster_id, recipients, scope=None):
+    """挂起一封告警：delay 秒后若未被 cancel_alert 取消，才真正投递。
+
+    scope：节点维度（如 "host:port"），观察期到点后原样带回投递层，
+    保证冷却 key 不会把不同节点的同类告警互相抑制。
+    """
     with _pending_lock:
         old = _pending.pop(cancel_key, None)
         if old:
@@ -98,18 +102,18 @@ def _defer_alert(cancel_key, delay, subject, body, cluster_id, recipients):
             except Exception:
                 pass
         t = threading.Timer(delay, _flush_alert,
-                            args=(cancel_key, subject, body, cluster_id, recipients))
+                            args=(cancel_key, subject, body, cluster_id, recipients, scope))
         t.daemon = True
-        _pending[cancel_key] = {"timer": t, "subject": subject, "at": time.time() + delay}
+        _pending[cancel_key] = {"timer": t, "subject": subject, "at": time.monotonic() + delay}
         t.start()
     print(f"[alert:pending] 「{subject}」进入 {delay}s 自愈观察期，期内恢复则只记录不发送")
 
 
-def _flush_alert(cancel_key, subject, body, cluster_id, recipients):
+def _flush_alert(cancel_key, subject, body, cluster_id, recipients, scope=None):
     """观察期结束仍未取消 -> 故障是真实的，投递邮件。"""
     with _pending_lock:
         _pending.pop(cancel_key, None)
-    _deliver(subject, body, cluster_id, recipients)
+    _deliver(subject, body, cluster_id, recipients, scope=scope)
 
 
 def cancel_alert(cancel_key, note=""):
@@ -190,16 +194,26 @@ def _subject_pass_maintenance(subject):
 
 
 def send_alert(subject, body, cluster_id=None, recipients=None, force=False,
-               grace=None, cancel_key=None):
+               grace=None, cancel_key=None, scope=None):
     """发送告警邮件。
 
     grace/cancel_key：启用「自愈观察期」。传入 cancel_key 后，告警不会立刻投递，
     而是挂起 grace 秒（缺省取 ALERT_GRACE_SEC）；期间若调用方用同一 cancel_key
     调用 cancel_alert()（表示故障已自愈），邮件被撤销，调用方改走「只记录」分支。
     force=True 时忽略观察期（测试邮件等）。
+
+    scope：节点维度（如 "host:port"）。冷却 key 必须含它，否则同集群多个节点
+    同时发生同类故障时，只有第一个节点的告警能发出去，其余全被「同类冷却」吞掉。
+    未显式传入时从 cancel_key 末位推导（监控侧的 cancel_key 形如
+    ("offline", cid, host, port)），保证调用方不传也不会退化。
     """
     global last_error
     last_error = ""
+    if scope is None and cancel_key:
+        try:
+            scope = str(cancel_key[-1])
+        except Exception:
+            scope = None
     c = _cfg()
     if recipients is None:
         recipients = resolve_recipients(cluster_id)
@@ -212,13 +226,13 @@ def send_alert(subject, body, cluster_id=None, recipients=None, force=False,
     if not force and cancel_key:
         g = _alert_grace_sec() if grace is None else int(grace or 0)
         if g > 0:
-            _defer_alert(cancel_key, g, subject, body, cluster_id, recipients)
+            _defer_alert(cancel_key, g, subject, body, cluster_id, recipients, scope)
             return False
 
-    return _deliver(subject, body, cluster_id, recipients, force=force)
+    return _deliver(subject, body, cluster_id, recipients, force=force, scope=scope)
 
 
-def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
+def _deliver(subject, body, cluster_id=None, recipients=None, force=False, scope=None):
     """真正投递（含同类冷却节流）。由 send_alert 或观察期到点后调用。"""
     global last_error
     last_error = ""
@@ -244,12 +258,15 @@ def _deliver(subject, body, cluster_id=None, recipients=None, force=False):
         print(f"[alert:skip] {subject} | {body}")
         return False
 
-    # ---- 同类告警节流：同一 (主题, 集群) 在冷却期内只发一封 ----
+    # ---- 同类告警节流：同一 (主题, 集群, 节点) 在冷却期内只发一封 ----
     if not force:
         cooldown = _alert_cooldown_sec()
         if cooldown > 0:
-            key = f"{subject.strip()}||{cluster_id if cluster_id is not None else '_global'}"
-            now = time.time()
+            key = (f"{subject.strip()}||{cluster_id if cluster_id is not None else '_global'}"
+                   f"||{scope if scope else '_any'}")
+            # 单调钟：墙钟回拨（NTP 校正 / 手动改时间）会让 now-last 变成负数或
+            # 突然远大于冷却，表现为「告警被永久抑制」或「冷却形同虚设」。
+            now = time.monotonic()
             with _alert_lock:
                 last = _last_sent.get(key, 0.0)
                 if now - last < cooldown:

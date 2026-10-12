@@ -1301,6 +1301,16 @@ def regenerate_cluster_compose(cluster_id):
     keepalived 配置指向不存在的脚本、VIP 不上浮）。
 
     仅写入节点部署文件，不影响正在运行的容器；需到各节点执行 docker compose up -d 生效。
+
+    v2.4.0 修复：补写 pending_actions。
+      此前本函数重写了 compose / keepalived.conf / notify 脚本，却**从不写回待办**，
+      而 generate_node 是通过 deploy_actions() + pending_actions 把「改了文件之后
+      要在节点上做什么」告诉运维的。⇒ 批量 regen（保存集群、改 VIP、改名都会触发）
+      之后，运维在页面上看不到任何待办，只看到「已刷新各节点部署文件」，
+      必须自己 diff 才知道要重启什么 ⇒ 改了配置却以为生效、或漏重启 keepalived。
+      现在按节点比对生成目录快照，把真实变更翻译成待办并落库（与 generate_node 同源）。
+
+    返回 {ip: [actions...]}，供调用方提示。
     """
     creds = get_cluster_creds(cluster_id) if cluster_id else None
     vip_port = (creds or {}).get("vip_port") or VIP_PORT
@@ -1311,12 +1321,15 @@ def regenerate_cluster_compose(cluster_id):
     rows = query(
         "SELECT ip, port, root_pass, server_id, node_type FROM nodes WHERE cluster_id=%s",
         (cluster_id,))
+    out = {}
     for r in rows:
         ip = r["ip"]
         node_type = r.get("node_type") or "docker"
         kd = _safe_node_path(ip) / "keepalived"
         if not kd.exists():
             continue
+        # 变更比对基线：必须在写入任何文件**之前**取快照，否则 diff 恒为空。
+        _old_snap = _snapshot_dir(kd.parent)
         # 刷新 keepalived 运行期脚本。
         # v2.2.12 关键：改为【总是覆盖】而非「仅在缺失时补齐」。
         # 原因：把节点置为可写的动作在 notify_master.sh 里，而旧版把错误全部静默吞掉
@@ -1349,19 +1362,36 @@ def regenerate_cluster_compose(cluster_id):
         if not p.exists():
             continue
         node_name = f"mysql-ha-node-{ip.replace('.', '-')}"
-        if is_mariadb_node(node_type):
-            # 两种 MariaDB 形态的 compose 都只含 keepalived 客户端
-            content = render_baremetal_compose(node_name, vip_port)
-        else:
-            content = _render_compose(
-                node_name, r.get("root_pass") or "", int(r["port"]),
-                int(r.get("server_id") or 0), vip_port)
+        content = _render_node_compose(
+            node_name, node_type, vip_port,
+            root_pass=r.get("root_pass") or "",
+            port=int(r["port"]),
+            server_id=int(r.get("server_id") or 0),
+        )
+        if not is_mariadb_node(node_type):
             _write(kd.parent / MYSQL_NODE_CONF_DIR / "conf" / "ha-overrides.cnf", render_docker_my_cnf(r.get("mysql_version"), int(r.get("port") or 3306)), mode=0o644)
         _write(p, content)
         # sync node agent script (OS metrics sidecar deployed with node compose)
         agent_src = Path(__file__).resolve().parent.parent / "scripts" / "node_agent.py"
         if agent_src.exists():
             _write(kd.parent / AGENT_DIR / "node_agent.py", agent_src.read_text(), mode=0o644)
+        # ---- 把「这次 regen 改了哪些文件」翻译成运维待办并落库（v2.4.0 修复）----
+        # 与 generate_node 同源：deploy_actions() + nodes.pending_actions。
+        # 只在内容真的变化时刷新，避免重复保存集群把运维已确认的待办又刷回来。
+        try:
+            _new_snap = _snapshot_dir(kd.parent)
+            _changed = sorted(k for k in (set(_new_snap) | set(_old_snap))
+                              if _new_snap.get(k) != _old_snap.get(k))
+            if _changed:
+                _acts = deploy_actions(_changed, node_type, str(kd.parent), fresh=False)
+                if _acts:
+                    execute(
+                        "UPDATE nodes SET pending_actions=%s, pending_since=NOW() WHERE ip=%s",
+                        (json.dumps(_acts, ensure_ascii=False), ip))
+                    out[ip] = _acts
+        except Exception as e:
+            logger.warning("集群 %s 节点 %s 写回待生效清单失败(可忽略): %s", cluster_id, ip, e)
+    return out
 
 
 def _clean_generated_dir(d: Path):
@@ -1412,6 +1442,31 @@ DEPLOY_LEVEL_LABEL = {
     "exec": "节点执行一次",
     "manual": "人工确认",
 }
+
+
+def _render_node_compose(node_name, node_type, vip_port, root_pass="", port=3306,
+                         server_id=0, mysql_version=None):
+    """按 node_type 渲染该节点的 docker-compose 内容 —— **compose 的唯一渲染入口**。
+
+    为什么必须收敛到一处（本轮修复的真根因）：
+      compose 有两个写入方 —— generate_node（建节点）与 regenerate_cluster_compose
+      （改 VIP 后批量重渲染）。二者曾各写一份 if/elif 分派，而两处的判据不同：
+        - generate_node：按 node_type 精确三分支（mariadb / mariadb-docker / 其他）；
+        - regenerate_cluster_compose：用 ``is_mariadb_node(node_type)`` 两分支。
+      而 ``is_mariadb_node`` 对 **mariadb-docker 也为真**（它只判断「是不是 MariaDB」），
+      ⇒ 容器化节点在 regen 时被判成裸机形态，套用 render_baremetal_compose
+      （**只含 keepalived、没有 mariadb 服务**），于是「保存集群 / 改名 / 任何触发
+      regenerate_cluster_compose 的操作」都会把该节点的 mariadb 服务定义**摧毁**，
+      节点下次 `docker compose up -d` 起不来数据库。
+      现在两个写入方统一走本函数，形态判据只此一份，不可能再分叉。
+    """
+    if node_type == "mariadb":
+        # 裸机：MariaDB 由宿主 systemd 管理，compose 只跑 keepalived 客户端。
+        return render_baremetal_compose(node_name, vip_port)
+    if node_type == "mariadb-docker":
+        # 容器化：mariadb + keepalived 合一的**纯 compose**（含 mariadb 服务 + 端口映射）。
+        return render_mariadb_compose(node_name, root_pass, port, server_id, vip_port)
+    return _render_compose(node_name, root_pass, port, server_id, vip_port)
 
 
 def _db_service(node_type):
@@ -2045,15 +2100,11 @@ def generate_node(ip, port, root_user, root_pass, initial_role="slave", cluster_
         _write(d / "custosctl", ctl_src.read_text(), mode=0o755)
 
     # 5) docker-compose.yaml
-    #    MariaDB 裸机（mariadb）：compose 只跑 keepalived 客户端（mysqld 由宿主 systemd 起）；
-    #    MariaDB 容器化（mariadb-docker）：纯 compose（mariadb + keepalived 合一）；
-    #    仅 MySQL Docker 才在 compose 内单独含 MySQL 容器。
-    if node_type == "mariadb":
-        compose = render_baremetal_compose(node_name, vip_port)
-    elif node_type == "mariadb-docker":
-        compose = render_mariadb_compose(node_name, root_pass, port, server_id, vip_port)
-    else:
-        compose = _render_compose(node_name, root_pass, port, server_id, vip_port)
+    #    形态分派统一走 _render_node_compose（与 regenerate_cluster_compose 同一入口），
+    #    避免两个写入方判据不一致 —— 历史上正因 regen 用 is_mariadb_node 把
+    #    mariadb-docker 误判为裸机，regen 一次就摧毁该节点的 mariadb 服务定义。
+    compose = _render_node_compose(node_name, node_type, vip_port,
+                                   root_pass=root_pass, port=port, server_id=server_id)
     _write(d / "docker-compose.yaml", compose)
 
     # 5.5) 统一日志目录：logrotate 配置 + 目录初始化脚本（三形态一致）

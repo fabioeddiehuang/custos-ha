@@ -201,6 +201,25 @@ def auth_required(request: Request):
     return user
 
 
+def require_not_viewer(user):
+    """拦截「只读（viewer）」账号访问**敏感只读**接口。
+
+    为什么需要独立于 auth_required：auth_required 只对**写操作**做角色校验
+    （`request.method not in ("GET","HEAD","OPTIONS")`），因为绝大多数 GET 只是看页面。
+    但少数 GET 会**吐出明文凭证**（fix-node-creds.sql 内含 ha_monitor / replication /
+    root 的真实密码与管理器后台 IP）。这类接口若沿用 auth_required，则只读账号
+    可直接 GET 拖走全集群节点口令 ⇒ 仅授予「查看」权限就等价于拿到数据库最高权限，
+    角色分级形同虚设。故对这类端点显式加这道校验。
+    """
+    if get_user_role(user) == ROLE_VIEWER:
+        raise HTTPException(
+            status_code=403,
+            detail="当前登录账号为「只读」（viewer），无权下载/查看含明文口令的文件"
+                   "（修复 SQL 内含数据库真实密码）。请退出登录后，改用管理员账号重新登录再试。"
+        )
+    return user
+
+
 def render(name, request, **ctx):
     ctx["request"] = request
     return HTMLResponse(TEMPLATES.get_template(name).render(ctx))
@@ -3700,7 +3719,11 @@ def node_creds_sql(ip: str, user=Depends(auth_required)):
     该文件含真实凭证（ha_monitor / replication / root 及管理器服务端后台 IP），
     用于节点本机以真实 root 执行自愈：修正 ha_monitor 仅 GRANT USAGE、root@'<管理器IP>'
     密码漂移、复制账号缺失等问题。业务通信仅发生在「管理器服务端后台 IP」与节点之间。
+
+    ⚠ 该文件内含**明文口令**：这是 GET 接口，不受 auth_required 的 viewer 写操作拦截，
+    故此处必须显式 require_not_viewer()，否则只读账号可直接拖走全集群节点口令。
     """
+    require_not_viewer(user)
     try:
         row = query(
             "SELECT n.ip, n.port, n.node_type, n.root_user, n.root_pass, n.cluster_id "
@@ -3726,7 +3749,10 @@ def api_node_creds_sql(cluster_id: int = 0, host: str = "", port: int = 0,
 
     复用与 /nodes/<ip>/creds_sql 相同的渲染逻辑，供集群节点详情抽屉中
     「查看/下载自愈 SQL」按钮调用（抽屉只有 cluster_id+host+port，无独立 IP 入口）。
+
+    ⚠ 同为含明文口令的 GET 接口，必须显式 require_not_viewer() 拦只读账号。
     """
+    require_not_viewer(user)
     try:
         row = query(
             "SELECT n.ip, n.port, n.node_type, n.root_user, n.root_pass, n.cluster_id "

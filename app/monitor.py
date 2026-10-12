@@ -21,6 +21,10 @@ from . import backup, metrics, slow_log, config_drift
 
 # 复制延迟告警阈值（秒）。超过即发邮件告警，避免重复刷屏只在「跨阈值的那一刻」触发。
 REPL_LAG_ALERT_SEC = 30
+# 销账时的「已追平」判定容差（秒）。Seconds_Behind_Master 只统计 IO 线程距
+# 「最后一个事件」的时间，库繁忙时只要还在持续处理就恒 >0；用严格 ==0 判健康会让
+# 忙库的销账通道永久不触发。取 1s：既能容忍测量抖动，又远小于告警阈值 30s。
+_LAG_HEAL_TOLERANCE_SEC = 1
 # 各节点上一次观测状态（用于状态跃迁告警，避免每个周期重复刷屏）
 _PREV = {}
 # 各集群每个节点的连续探活失败计数（用于阈值触发自动切换）。
@@ -132,7 +136,11 @@ _DATA_CONFLICT_LOGGED = set()
 
 
 # 已销账过的节点（避免每周期重复 UPDATE；节点转为不健康时清除，下次恢复可再次销账）
-_UNRESOLVED_CLEARED = set()
+# 用 dict 存 monotonic 时刻而非 set：销账标记必须能过期，否则「标记已置位但那一刻
+# 库里恰好没有可销记录」的节点将永久跳过复核（见 _clear_node_unresolved 的 n>0 判定）。
+_UNRESOLVED_CLEARED = {}
+# 销账标记有效期：到期后允许重新评估，避免瞬时无记录导致该节点销账能力被永久冻结。
+_UNRESOLVED_CLEARED_TTL = 900.0   # 15 分钟
 
 
 def _clear_node_unresolved(cid, host, port, healthy, reason=""):
@@ -146,23 +154,34 @@ def _clear_node_unresolved(cid, host, port, healthy, reason=""):
       ⇒ 即使后来节点已重建、复制已正常，这些 unresolved 记录仍永久挂在告警中心，
       成为永不消失的红标（实测 2026-09-24 的三条至今仍在，而复制 IO/SQL=Yes、SBM=0）。
 
+    两个必须注意的实现细节（否则销账通道形同虚设）：
+      1) SQL 必须带 ``port``：同机跑多实例（同一 host 不同 port）时，只按 host
+         匹配会把**别的实例**的 unresolved 记录一并置 healed。
+      2) 只有真的销到记录（n>0）才置「已销账」标记：若无条件置位，节点恰好在
+         「标记置位那一刻」没有可销记录（例如冲突刚被另一条路径写入），
+         之后每周期都被短路的 return 跳过 ⇒ 该节点此后**永远无法销账**。
+         配合 _UNRESOLVED_CLEARED_TTL，即使出现漏销也会在 TTL 后重新评估。
+
     healthy=False 时不销账，并清除「已销账」标记，使节点再次恢复后能重新评估。
     """
     key = (cid, host, port)
     if not healthy:
-        _UNRESOLVED_CLEARED.discard(key)
+        _UNRESOLVED_CLEARED.pop(key, None)
         return
-    if key in _UNRESOLVED_CLEARED:
+    now = time.monotonic()
+    last = _UNRESOLVED_CLEARED.get(key)
+    if last is not None and (now - last) < _UNRESOLVED_CLEARED_TTL:
         return
     try:
         n = execute(
-            "UPDATE alerts SET status='healed' WHERE cluster_id=%s AND host=%s "
-            "AND status='unresolved'", (cid, host))
+            "UPDATE alerts SET status='healed' WHERE cluster_id=%s AND host=%s AND port=%s "
+            "AND status='unresolved'", (cid, host, int(port)))
     except Exception as e:
         print(f"[monitor] 销账 {host} 的历史告警失败(可忽略): {e}")
         return
-    _UNRESOLVED_CLEARED.add(key)
     if n:
+        # 仅在真正销到记录时置标记；标记带 TTL，漏销会在 TTL 后自动重试。
+        _UNRESOLVED_CLEARED[key] = now
         try:
             record_alert(cid, host, port, "selfheal",
                          f"节点 {host} 已恢复健康（{reason}），{n} 条历史未恢复告警"
@@ -580,9 +599,16 @@ def _alert_on_transition(key, status, is_master, repl_ok, delay, cluster_name, c
         # 6) 复制指向错误主库（静默数据不一致，F14）：从库线程双 Yes 但上游≠当前主库。
         #    旧逻辑只看 slave_io/slave_sql，会把它当 repl_ok 掩盖；此处显式告警，
         #    并依赖每周期 ensure_topology 自动重指回当前主库（重指成功后取消告警）。
+        #    ⚠ 必须加「跃迁门控」and prev.get("repl_state") != "repl_fork"：
+        #    本分支在**每周期**都会命中（repl_state 由 _classify 每周期重算，而 _PREV
+        #    在 _alert_on_transition 开头就被本周期值覆盖，prev 恒等于当前值）。
+        #    send_alert 带 cancel_key 会走观察期 _defer_alert，它每次 pop 旧 timer
+        #    并重挂新的 grace 计时；而 CHECK_INTERVAL(2s) < ALERT_GRACE_SEC(30s)
+        #    ⇒ deadline 被无限后推，Timer 永不 fire ⇒ 这条「静默数据不一致」的最后
+        #    防线**永远不会发出任何告警**（既不发邮件也不落库）。
         _ck_fork = ("fork", h_cid, h_host, h_port)
         if status == "up" and not is_master:
-            if repl_state == "repl_fork":
+            if repl_state == "repl_fork" and prev.get("repl_state") != "repl_fork":
                 send_alert(
                     "复制指向错误主库(数据不一致风险)",
                     f"{tag}节点 {host} 复制线程正常(IO/SQL=Yes)，但其上游是 {upstream}，"
@@ -967,9 +993,13 @@ def _act_once():
                 pass
             # ---- 节点恢复健康后，销账其历史遗留的 unresolved 告警（防红标永久悬挂）----
             try:
+                # 延迟用容差判定而非严格 ==0：seconds_behind 由 SHOW SLAVE STATUS 取
+                # Seconds_Behind_Master，业务繁忙时它是「距最后一次事件的时间」，
+                # 只要库还在持续处理就恒 >0 ⇒ 严格相等会让**忙库永远达不到健康**，
+                # 销账通道对忙库形同虚设（与告警延迟阈值同一把尺子）。
                 _healthy = bool(st.get("alive")) and (
                     is_master or (st.get("slave_io") == "Yes" and st.get("slave_sql") == "Yes"
-                                  and (st.get("seconds_behind") or 0) == 0))
+                                  and (st.get("seconds_behind") or 0) <= _LAG_HEAL_TOLERANCE_SEC))
                 _clear_node_unresolved(cid, h_host, h_port, _healthy,
                                        "复制 IO/SQL 正常且无延迟" if not is_master else "主库在线")
             except Exception as e:
