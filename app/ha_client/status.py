@@ -257,11 +257,24 @@ def ensure_ha_creds(host, port, root_user, root_pass,
         else:
             _extra_privs = ("CREATE USER", "READ_ONLY ADMIN", "BINLOG ADMIN",
                             "REPLICATION MASTER ADMIN")
+        # 2026-10-12：补授对象必须是「ha_monitor 在 mysql.user 里**实际存在**的 host 变体」，
+        # 不能只写死 @'%' 与 @manager_ip —— 实测 188 上 ha_monitor 只有 '%' 与 '192.168.1.%'
+        # （根本没有 @'192.168.1.100'），而管理器正是从 192.168.1.100 连入、按**精确度优先**
+        # 命中 @'192.168.1.%' ⇒ 补到 @'%'/@manager_ip 上的特权它一个也用不到，
+        # SHOW BINARY LOGS 照样 1227（binlog 守卫静默失效）。故取实际变体并集后逐个补授；
+        # 探测失败时才回退旧口径，且不存在的账号绝不 GRANT（GRANT 不隐式建号，会报 1133）。
+        try:
+            cur.execute("SELECT DISTINCT Host FROM mysql.user WHERE User=%s", (ha_user,))
+            _extra_hosts = [r[0] for r in (cur.fetchall() or []) if r[0]]
+        except Exception:
+            _extra_hosts = []
+        if not _extra_hosts:
+            _extra_hosts = [h for h in ("%", manager_ip) if h]
         for extra in _extra_privs:
-            # 同时授予 @'%' 与管理器实际连入用的 @manager_ip 账号（精确 host 优先匹配，
-            # 管理器大多以 ha_monitor@<manager_ip> 连入，缺 REPLICATION MASTER ADMIN 会导致
-            # enable_semisync 的 SET GLOBAL rpl_semi_sync_master_* 报 Access Denied）。
-            for _h in ("%", manager_ip):
+            # 对每一个实际存在的 host 变体补授（精确 host 优先匹配，管理器连入命中的
+            # 那个账号才必须齐权；缺 REPLICATION MASTER ADMIN 会导致 enable_semisync
+            # 的 SET GLOBAL rpl_semi_sync_master_* 报 Access Denied）。
+            for _h in _extra_hosts:
                 if not _h:
                     continue
                 try:
@@ -488,8 +501,12 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
             _hosts = [r[0] for r in (cur.fetchall() or [])]
         except Exception:
             _hosts = []
-        cand = set([h for h in _hosts if h] + ["%"]
-                   + ([manager_ip] if manager_ip else []))
+        # 2026-10-12：只对**实际存在**的 host 变体授权 —— 把 '%' / manager_ip 无脑塞进候选时，
+        # 若节点上根本没有 ha_monitor@'%' 或 @'<管理器IP>'，GRANT 会报 ERROR 1133
+        # "Can't find any matching row in the user table"（GRANT 不隐式建号），
+        # 该错误被下面 except 记进 missing ⇒ 触发「ha_monitor 授权自愈未完全成功」**误告警**。
+        # 账号确实不存在时由 ensure_ha_creds 负责 CREATE；本函数只做 GRANT，不越俎代庖。
+        cand = [h for h in _hosts if h]
         _binlog_off = False
         try:
             cur.execute("SET SESSION sql_log_bin=0")
@@ -963,8 +980,57 @@ def get_node_utc_time(host, port, user, password, root_user="root", root_pass=""
 
 
 
+_BINLOG_USAGE_WARNED = set()
+
+
+def _show_binary_logs(host, port, user, password, root_user="root", root_pass=""):
+    """执行 SHOW BINARY LOGS；ha_monitor 权限不足时**回退 root** 重试。
+
+    ⚠ 这是 binlog 空间守卫的真正命门（2026-10-12 生产实测）：
+      MariaDB 10.5+ 把该语句所需权限拆成了 **BINLOG MONITOR**；只给 ha_monitor 授了
+      REPLICATION CLIENT 会报 1227（Access denied... BINLOG MONITOR privilege）。
+      旧实现把异常吞成 (None, None, None)，调用方 `_binlog_guard` 第一行就 return
+      ⇒ **既不告警也不清理**，整条守护链路静默失效：节点 binlog 无限增长、各节点
+      /data 目录越差越多，而页面与邮件全无提示。故这里必须显式回退 root 重试
+      （root 恒为 ALL PRIVILEGES）。
+
+    彻底根治另见 mariadb_matrix：已把 BINLOG MONITOR 加进 ha_monitor 特权集与补授
+    列表，存量节点由 ensure_ha_creds 自愈补上；本函数的 root 回退是「补授生效前」的兜底。
+
+    失败时每个节点只 warn 一次（避免每周期刷屏），但**绝不静默**。
+    """
+    _attempts = [(user, password)]
+    if root_pass and (root_user, root_pass) != (user, password):
+        _attempts.append((root_user, root_pass))
+    _last = None
+    for _u, _p in _attempts:
+        conn = None
+        try:
+            conn = connect(host, port, _u, _p, timeout=5)
+            if conn is None:
+                continue
+            cur = conn.cursor()
+            cur.execute("SHOW BINARY LOGS")
+            return cur.fetchall() or []
+        except Exception as e:
+            _last = e
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+    _k = (host, port)
+    if _k not in _BINLOG_USAGE_WARNED:
+        _BINLOG_USAGE_WARNED.add(_k)
+        import logging as _lg
+        _lg.getLogger(__name__).warning(
+            "读取 %s:%s 的 binlog 占用失败（ha_monitor 可能缺 BINLOG MONITOR 权限）: %s；"
+            "binlog 空间守卫对该节点本轮不生效", host, port, _last)
+    return None
+
+
 def get_binlog_usage(host, port, user, password, root_user="root", root_pass=""):
-    from .connection import (connect_robust)
     """读取 binlog 占用总量（无需 SSH / OS 权限，纯 MySQL 侧可得）。
 
     为什么重要：远程节点没有 agent，OS 级磁盘指标不可得（api.py 注释明确说明），
@@ -973,35 +1039,21 @@ def get_binlog_usage(host, port, user, password, root_user="root", root_pass="")
 
     返回 (total_bytes, file_count, oldest_file)；失败返回 (None, None, None)。
     """
-    try:
-        conn = connect_robust(host, port, user, password, root_user, root_pass)
-    except Exception:
+    rows = _show_binary_logs(host, port, user, password, root_user, root_pass)
+    if rows is None:
         return None, None, None
-    if conn is None:
-        return None, None, None
-    try:
-        cur = conn.cursor()
-        cur.execute("SHOW BINARY LOGS")
-        rows = cur.fetchall()
-        if not rows:
-            return 0, 0, None
-        total = 0
-        oldest = None
-        for r in rows:
-            try:
-                total += int(r[1])
-            except (TypeError, ValueError, IndexError):
-                continue
-            if oldest is None:
-                oldest = r[0]
-        return total, len(rows), oldest
-    except Exception:
-        return None, None, None
-    finally:
+    if not rows:
+        return 0, 0, None
+    total = 0
+    oldest = None
+    for r in rows:
         try:
-            conn.close()
-        except Exception:
-            pass
+            total += int(r[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if oldest is None:
+            oldest = r[0]
+    return total, len(rows), oldest
 
 
 
