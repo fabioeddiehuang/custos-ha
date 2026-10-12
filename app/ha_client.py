@@ -36,6 +36,29 @@ from .config import ACCOUNT_HOST_MODE, segment_of, get_manager_public_ip, is_sem
 from . import mariadb_matrix
 
 
+# —— 后台自愈日志限频（L2 噪音治理，2026-10-12；与主线 Custos-HA/arch 对齐）——
+# 主线把限频器放在 ha_client/_const.py 并经 __all__ 导出，供 6 个副本共享；
+# v2.4.0 仍是**单文件** ha_client.py，故就地定义（语义、窗口完全一致）。
+# 背景：Custos 的自愈是「静默成功、失败才记日志」。同一失败每轮 monitor 都会再记一条，
+# 而它往往下一轮就被自愈修掉 ⇒ 日志堆满 warn，用户误判为「系统有问题」。
+_WARN_THROTTLE = {}
+WARN_THROTTLE_INTERVAL = 6 * 3600  # 6 小时，与项目既有告警限频惯例一致
+
+
+def warn_throttled(key, interval=WARN_THROTTLE_INTERVAL):
+    """限频闸门：True=本次应记录；False=窗口内已记过，应静默。
+
+    刻意不做线程安全：最坏情况只是多记一条日志，绝不丢告警 —— 噪音治理不能
+    以牺牲「可观测性」为代价。key 应包含 节点(host,port) + 故障类别 + 账号。
+    """
+    now = time.time()
+    last = _WARN_THROTTLE.get(key)
+    if last is not None and (now - last) < interval:
+        return False
+    _WARN_THROTTLE[key] = now
+    return True
+
+
 # 复制错误码分类 —— 两类语义完全不同，绝不可混为一谈：
 #
 #  ① 幂等类（1007/1050/1061/1396/1133）：库/表/索引/账号「已存在或不存在」，属 DDL/DCL
@@ -2783,7 +2806,11 @@ def ensure_ha_creds(host, port, root_user, root_pass,
                 print("[ha-shadow] 已为 ha_monitor@%s 补齐全集特权（消除精确 host 影子账号）"
                       % _h, flush=True)
             except Exception as _e:
-                print("[ha-shadow] 修复 ha_monitor@%s 权限失败(可忽略): %s" % (_h, _e))
+                # L2 噪音治理：该缺口每轮自愈都会重试，多数下一轮即被补上 ⇒ 属
+                #「有兜底」噪音，6h 限频一次即可，避免刷屏被误读为系统故障。
+                if warn_throttled(("ha-shadow-ensure", host, int(port), _h)):
+                    print("[ha-shadow] 修复 ha_monitor@%s 权限失败(可忽略): %s" % (_h, _e),
+                          flush=True)
         # 账号改名：删除节点上残留的旧账号（旧账号可能以多个 host 存在）。
         # 必须在 sql_log_bin=0 作用域内执行，避免 DROP USER 经复制下放到从库。
         def _drop_old(cur, old_user, new_user):
@@ -2991,8 +3018,12 @@ def repair_ha_shadow_grants(host, port, ha_user, ha_pass, root_user="root", root
                 print("[ha-shadow] %s:%s 的 ha_monitor@%s 已补齐全集特权"
                       % (host, port, h), flush=True)
             except Exception as e:
-                print("[ha-shadow] %s:%s ha_monitor@%s 授权失败(可忽略): %s"
-                      % (host, port, h, e))
+                # L2 噪音治理：同上——「有兜底」类失败降为 6h 一条，不每轮刷屏。
+                # v2.4.0 此函数无 send_alert 治本告警路径，故真实缺口的可见性
+                # 完全依赖此日志，**限频窗口不宜调小**（6h 与主线一致）。
+                if warn_throttled(("ha-shadow-grant", host, int(port), h)):
+                    print("[ha-shadow] %s:%s ha_monitor@%s 授权失败(可忽略): %s"
+                          % (host, port, h, e), flush=True)
         if _binlog_off:
             try:
                 cur.execute("SET SESSION sql_log_bin=1")
